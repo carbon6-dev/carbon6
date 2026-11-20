@@ -91,6 +91,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
+        .route("/api/v1/sessions/{id}/placement", get(session_placement).post(change_session_placement))
         .route("/api/v1/sessions/{id}/attachments/{seq}/{index}", get(attachment))
         .route("/api/v1/sessions/{id}/export", get(export_session))
         .route("/api/v1/sessions/{id}/outputs/{seq}", get(output))
@@ -2210,6 +2211,26 @@ async fn rewind_session(
 ) -> ApiResult<StatusCode> {
     crate::sessions::rewind(&st, &id, &req).await?;
     Ok(StatusCode::ACCEPTED)
+}
+
+async fn session_placement(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<crate::sessions::Placement>>> {
+    let session = visible_session(&st, &caller, &id).await?;
+    Ok(Json(crate::sessions::placements(&st, &session.id).await?))
+}
+
+async fn change_session_placement(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(request): Json<crate::sessions::PlacementRequest>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    let session = visible_session(&st, &caller, &id).await?;
+    let command_id = crate::sessions::change_place(&st, &session, &request).await?;
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "command_id": command_id }))))
 }
 
 async fn task_snapshot(State(st): State<Arc<HeadState>>, Path((id, task)): Path<(String, String)>) -> ApiResult<Json<api::TaskSnapshot>> {

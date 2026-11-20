@@ -2449,8 +2449,27 @@ mod message_origin_tests {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionPlace {
+    pub cwd: String,
+    pub repo: String,
+    pub worktree_branch: String,
+    pub repo_root: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
+    /// Placement survives conversation rewind; the paths are historical facts.
+    PlaceChanged {
+        command_id: String,
+        from: SessionPlace,
+        to: SessionPlace,
+        copied_paths: Vec<String>,
+        uncommitted_files: u32,
+        #[serde(default)]
+        setup_log: String,
+    },
     Started {
         connection_id: String,
         model: String,

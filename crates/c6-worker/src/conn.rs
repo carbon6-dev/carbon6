@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use c6_proto::{
     CommandRejected, HeadMsg, Hello, Ping, RpcResponse, SessionCursor, SessionEvent, SessionEventBatch, WorkerMsg, head_msg,
-    worker_hub_client::WorkerHubClient, worker_msg,
+    session_command, worker_hub_client::WorkerHubClient, worker_msg,
 };
 use prost::Message;
 use tokio::sync::{mpsc, watch};
@@ -194,12 +194,35 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                     },
                 };
                 let (command_id, session_id) = (cmd.command_id.clone(), cmd.session_id.clone());
-                if let Err(reason) = worker.sessions.handle(cmd).await {
-                    warn!(session = %session_id, %reason, "command rejected");
-                    let rejected = CommandRejected { command_id, session_id, reason };
-                    if tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Rejected(rejected)) }).await.is_err() {
-                        return;
+                let result = match cmd.kind {
+                    Some(session_command::Kind::ChangePlace(place)) => {
+                        // Put the move in the mailbox before dispatching the next command,
+                        // but let the actor finish slow workspace preparation on its own.
+                        match worker.sessions.enqueue_change_place(&session_id, &command_id, place).await {
+                            Ok(Some(result)) => {
+                                let (tx, stop) = (tx.clone(), stop.clone());
+                                tokio::spawn(async move {
+                                    tokio::select! {
+                                        _ = stop.cancelled() => {},
+                                        _ = async {
+                                            if let Err(reason) = result.await {
+                                                let _ = reject_command(&tx, command_id, session_id, reason).await;
+                                            }
+                                        } => {},
+                                    }
+                                });
+                                continue;
+                            }
+                            Ok(None) => continue, // already applied; the journal event is its ack
+                            Err(reason) => Err(reason),
+                        }
                     }
+                    _ => worker.sessions.handle(cmd).await,
+                };
+                if let Err(reason) = result
+                    && reject_command(&tx, command_id, session_id, reason).await.is_err()
+                {
+                    return;
                 }
             }
         });
@@ -276,6 +299,17 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
             },
         }
     }
+}
+
+async fn reject_command(
+    tx: &mpsc::Sender<WorkerMsg>,
+    command_id: String,
+    session_id: String,
+    reason: String,
+) -> Result<(), mpsc::error::SendError<WorkerMsg>> {
+    warn!(session = %session_id, %reason, "command rejected");
+    let rejected = CommandRejected { command_id, session_id, reason };
+    tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Rejected(rejected)) }).await
 }
 
 /// Streams journaled events the head has not acknowledged, in seq order per

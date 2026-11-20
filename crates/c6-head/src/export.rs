@@ -68,6 +68,17 @@ pub fn markdown(session: &SessionRow, events: &[SessionEvent]) -> String {
                 out.push_str(&format!("\n## Summary of the earlier conversation\n\n{}\n", c.summary.trim_end()));
             }
             Some(Kind::Error(e)) => out.push_str(&format!("\n> **Error:** {}\n", e.message)),
+            Some(Kind::PlaceChanged(p)) => {
+                if let (Some(from), Some(to)) = (&p.from, &p.to) {
+                    out.push_str(&format!(
+                        "\n> **Place changed:** `{}` → `{}`; {} files copied, {} uncommitted files carried.\n",
+                        from.cwd,
+                        to.cwd,
+                        p.copied_paths.len(),
+                        p.uncommitted_files
+                    ));
+                }
+            }
             _ => {}
         }
     }

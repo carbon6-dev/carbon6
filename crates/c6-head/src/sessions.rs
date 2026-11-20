@@ -1865,6 +1865,154 @@ pub async fn resume(
     Ok(api::QueuedInput { command_id: id, text, created_at: now_ms(), rejected: None, with_agent: false })
 }
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum PlacementRequest {
+    Folder {
+        expected_place_seq: u64,
+        cwd: String,
+        #[serde(default)]
+        copy_scratch: bool,
+    },
+    Worktree {
+        expected_place_seq: u64,
+        #[serde(default)]
+        options: api::starts::WorktreeOptions,
+    },
+    LeaveWorktree {
+        expected_place_seq: u64,
+        #[serde(default)]
+        merge: bool,
+    },
+    Back {
+        expected_place_seq: u64,
+        place_seq: u64,
+    },
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct Placement {
+    seq: u64,
+    cwd: String,
+    worktree_branch: String,
+    repo_root: String,
+    copied_paths: Vec<String>,
+    uncommitted_files: u32,
+}
+
+/// Current and previous places, newest first. This reads raw events because
+/// conversation rewind must neither undo placement nor erase its history.
+pub(crate) async fn placements(st: &HeadState, session_id: &str) -> anyhow::Result<Vec<Placement>> {
+    let events = st.store.events_after(session_id, 0, i64::MAX).await?;
+    Ok(events
+        .into_iter()
+        .rev()
+        .filter_map(|event| match event.kind {
+            Some(session_event::Kind::Started(s)) => Some(Placement {
+                seq: event.seq,
+                cwd: s.cwd,
+                worktree_branch: s.worktree_branch,
+                repo_root: s.repo_root,
+                copied_paths: Vec::new(),
+                uncommitted_files: 0,
+            }),
+            Some(session_event::Kind::PlaceChanged(p)) => p.to.map(|s| Placement {
+                seq: event.seq,
+                cwd: s.cwd,
+                worktree_branch: s.worktree_branch,
+                repo_root: s.repo_root,
+                copied_paths: p.copied_paths,
+                uncommitted_files: p.uncommitted_files,
+            }),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Queues a user-authorized same-worker change. `session` must already have
+/// been resolved in the caller's realm. Only its worker can commit the move.
+pub(crate) async fn change_place(st: &HeadState, session: &SessionRow, req: &PlacementRequest) -> anyhow::Result<String> {
+    use crate::{conflict, forbidden};
+    let worker_id: WorkerId = session.worker_id.parse()?;
+    let worker = st.store.worker(worker_id).await?.ok_or_else(|| not_found("no such worker"))?;
+    if !crate::realms::available(&worker.realms, &session.realm) {
+        return Err(forbidden("the session's realm may not use this worker"));
+    }
+    let live = st.registry.get(worker_id).ok_or_else(|| conflict("worker is not connected"))?;
+    if !live.capabilities.iter().any(|c| c == "same_worker_placement_v1") {
+        return Err(conflict("this worker does not support changing place"));
+    }
+    if session.parent_id.is_some()
+        || session.root_id.is_some()
+        || !session.remote_template.is_empty()
+        || session.observed
+        || !session.ssh_target.is_empty()
+        || st.store.connection(&session.connection_id).await?.is_some_and(|c| c.kind == "claude_code")
+    {
+        return Err(bad_request("changing place is only supported for top-level local sessions in carbon6's own loop"));
+    }
+    if session.status != "idle" || session.archived != 0 {
+        return Err(conflict("only an idle, unarchived session can change place"));
+    }
+    let mut change = c6_proto::ChangePlace {
+        notice_template: crate::prompts::get(st, "session.place_changed", &session.realm).await,
+        ..Default::default()
+    };
+    match req {
+        PlacementRequest::Folder { expected_place_seq, cwd, copy_scratch } => {
+            if cwd.is_empty() || cwd.len() > 4096 || cwd.contains('\0') {
+                return Err(bad_request("choose a destination folder"));
+            }
+            change.expected_place_seq = *expected_place_seq;
+            change.cwd.clone_from(cwd);
+            change.copy_scratch = *copy_scratch;
+        }
+        PlacementRequest::Worktree { expected_place_seq, options } => {
+            api::starts::check_options(options).map_err(bad_request)?;
+            // A placement worktree is retained for Move back; archival policy
+            // needs to cover all retained places before it can remove one.
+            if options.cleanup_mode() != "off" {
+                return Err(bad_request("placement worktrees are kept for Move back; automatic cleanup is not supported yet"));
+            }
+            change.expected_place_seq = *expected_place_seq;
+            change.action = "worktree".into();
+            change.worktree_spec = Some(c6_proto::WorktreeSpec {
+                branch: api::starts::branch_name(&options.branch, &session.title, None),
+                base: options.base.clone(),
+                fetch: options.fetch,
+                track: options.track,
+                setup: options.setup.clone(),
+            });
+        }
+        PlacementRequest::LeaveWorktree { expected_place_seq, merge } => {
+            change.expected_place_seq = *expected_place_seq;
+            change.action = "leave_worktree".into();
+            change.merge = *merge;
+        }
+        PlacementRequest::Back { expected_place_seq, place_seq } => {
+            change.expected_place_seq = *expected_place_seq;
+            change.action = "back".into();
+            change.previous_place_seq = *place_seq;
+        }
+    }
+    let current = placements(st, &session.id).await?;
+    if current.first().is_none_or(|p| p.seq != change.expected_place_seq) {
+        return Err(conflict("the session's place changed; refresh and try again"));
+    }
+    if change.action == "back" && !current.iter().skip(1).any(|p| p.seq == change.previous_place_seq) {
+        return Err(bad_request("choose an earlier place from this session's placement history"));
+    }
+    let id = Uuid::now_v7().to_string();
+    let data =
+        SessionCommand { command_id: id.clone(), session_id: session.id.clone(), kind: Some(session_command::Kind::ChangePlace(change)) }
+            .encode_to_vec();
+    if !st.store.enqueue_placement_command(&NewCommand { id: &id, session_id: &session.id, worker_id, data, text: None }).await? {
+        return Err(conflict("wait for the session's pending commands before changing place"));
+    }
+    st.registry.deliver(worker_id);
+    Ok(id)
+}
+
 /// Queues a rewind (applied after a running turn is interrupted). Commands
 /// keep their order, so a message sent right after lands on the rewound
 /// conversation.

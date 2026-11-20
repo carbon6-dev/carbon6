@@ -1261,6 +1261,19 @@ impl Store {
                         .await?;
                 }
                 Some(Kind::Rewound(r)) => done.push(r.command_id.clone()),
+                Some(Kind::PlaceChanged(p)) => {
+                    if let Some(place) = &p.to {
+                        sqlx::query("UPDATE sessions SET cwd = ?, folder = ?, repo = ? WHERE id = ?")
+                            .bind(&place.cwd)
+                            .bind(&place.cwd)
+                            .bind(&place.repo)
+                            .bind(session_id)
+                            .execute(&mut *tx)
+                            .await?;
+                        crate::agent_ops::finish_placement_command(&mut tx, session_id, &p.command_id, Ok((ev.seq, &place.cwd))).await?;
+                        done.push(p.command_id.clone());
+                    }
+                }
                 // A remote subagent's report reached its parent.
                 Some(Kind::SubagentReported(r)) => done.push(r.command_id.clone()),
                 Some(Kind::TurnStarted(_)) => status = "running".into(),
@@ -1583,6 +1596,18 @@ impl Store {
         insert_command(&mut conn, c, false).await
     }
 
+    pub(crate) async fn enqueue_placement_command(&self, c: &NewCommand<'_>) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let idle: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ? AND worker_id = ? AND status = 'idle' AND archived = 0) AND NOT EXISTS(SELECT 1 FROM commands WHERE session_id = ? AND state IN ('pending', 'held'))")
+            .bind(c.session_id).bind(c.worker_id.to_string()).bind(c.session_id).fetch_one(&mut *tx).await?;
+        if idle {
+            crate::agent_ops::link_placement_command(&mut tx, c.session_id, c.id).await?;
+            insert_command(&mut tx, c, false).await?;
+        }
+        tx.commit().await?;
+        Ok(idle)
+    }
+
     /// Retiring delivery obligations and queuing their report are one
     /// transaction. A stable report id makes replay safe even after ack.
     pub async fn enqueue_subagent_report(&self, c: &NewCommand<'_>, inputs: &[String]) -> anyhow::Result<()> {
@@ -1736,6 +1761,9 @@ impl Store {
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
+        } else if matches!(kind, Some(c6_proto::session_command::Kind::ChangePlace(_))) {
+            sqlx::query("UPDATE commands SET text = 'Placement change refused' WHERE id = ?").bind(id).execute(&mut *tx).await?;
+            crate::agent_ops::finish_placement_command(&mut tx, &session_id, id, Err(reason)).await?;
         } else if matches!(kind, Some(c6_proto::session_command::Kind::Create(_))) {
             // Rewind and other controls also have no text. Only a rejected
             // Create means the session could not start.

@@ -18,6 +18,7 @@ pub mod link;
 mod mcp_bridge;
 pub mod mentions;
 mod notice_guard;
+mod place_files;
 pub mod policy;
 pub mod pty;
 pub mod rpc;
@@ -182,6 +183,7 @@ pub(crate) fn capabilities(worker: &Worker, claude_code: bool, runtime: bool) ->
     c.push("queue_ops".into());
     c.push("send_now".into());
     c.push("user_input_prompt_v1".into());
+    c.push("same_worker_placement_v1".into());
     if runtime && worker.runs_kit_jobs() {
         c.push("kits".into());
     }

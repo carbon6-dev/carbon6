@@ -26,6 +26,14 @@ pub(crate) struct Env {
 
 impl Env {
     pub(crate) async fn new() -> Self {
+        Self::start_head(false).await
+    }
+
+    pub(crate) async fn signed_in() -> Self {
+        Self::start_head(true).await
+    }
+
+    async fn start_head(auth: bool) -> Self {
         let mock = MockLlm::start().await;
         let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let head = c6_head::start(HeadConfig {
@@ -33,13 +41,33 @@ impl Env {
             bind: vec!["127.0.0.1".parse().unwrap()],
             ui_port: 0,
             worker_port: 0,
-            auth: false,
+            auth,
             ..Default::default()
         })
         .await
         .unwrap();
         let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
-        let http = reqwest::Client::new();
+        let client = reqwest::Client::new();
+        let http = if auth {
+            // Some actions (such as rewind) require a person-authored message.
+            let token = head.state.store.create_login_link().await.unwrap();
+            let login =
+                client.post(format!("{api}/auth/link")).json(&json!({"token": token})).send().await.unwrap().error_for_status().unwrap();
+            let cookie = login.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
+            reqwest::Client::builder()
+                .default_headers(
+                    [
+                        (reqwest::header::COOKIE, cookie.parse().unwrap()),
+                        (reqwest::header::HeaderName::from_static("x-c6-realm"), "admin".parse().unwrap()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+                .build()
+                .unwrap()
+        } else {
+            client
+        };
         let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
         enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
         let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();

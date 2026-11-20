@@ -349,6 +349,13 @@ impl SessionTools {
         *self.cwd.lock().unwrap() = cwd;
     }
 
+    /// Install a new session workspace at a turn boundary. File observations
+    /// from the old workspace cannot authorize writes in the new one.
+    pub fn relocate(&self, cwd: PathBuf) {
+        self.set_cwd(cwd);
+        self.seen.lock().unwrap().clear();
+    }
+
     /// Resolves a model-supplied path against the session's cwd (on the
     /// SSH target, `~` is the remote home).
     pub fn resolve(&self, path: &str) -> PathBuf {

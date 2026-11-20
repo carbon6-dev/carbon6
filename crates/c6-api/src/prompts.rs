@@ -198,7 +198,10 @@ document about it: find the operation, then call it. Making things is free, even
 their things asks them first; say so, and carry on when you hear their answer. Use work and doc for this session's own work and \
 documents. Realms organise; they don't isolate. Realm-scoped APIs, grants and credential delivery have enforced checks, but \
 commands run as the worker's OS user: shared-worker sessions can reach each other's files. A worker limited to one realm \
-doesn't prevent delegation to agents with wider access.";
+doesn't prevent delegation to agents with wider access. If this conversation needs a different working folder or worktree, use \
+sessions.place.list and ask with sessions.place.change, giving the reason at the top of input. Changing place always asks the user \
+for one-time consent, even for your own session. A submitted request is not confirmation: wait for the placement result; do not \
+silently move the conversation or assume files were copied.";
 
 pub const TASK_CARDS: &str = "While you work you may notice things worth doing that do not belong in the task you were given. Propose \
 each as a task card with task_propose instead of doing it (it would bloat this change) or forgetting it; the user can start it as a \

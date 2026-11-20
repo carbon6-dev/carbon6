@@ -34,7 +34,30 @@ message SessionEvent {
     SubagentReported subagent_reported = 30;
     NoticeQueued notice_queued = 31;
     InputDelivered input_delivered = 32;
+    PlaceChanged place_changed = 33;
   }
+}
+
+// Placement is part of session ownership, not of the rewindable conversation.
+// A same-worker move changes no routing and records the former place here.
+message SessionPlace {
+  string cwd = 1;
+  string repo = 2;
+  string worktree_branch = 3;
+  string repo_root = 4;
+}
+
+message PlaceChanged {
+  string command_id = 1;
+  SessionPlace from = 2;
+  SessionPlace to = 3;
+  repeated string copied_paths = 4;
+  uint32 uncommitted_files = 5;
+  string system_prompt = 6;
+  string notice = 7;
+  repeated string tools = 8;
+  string tool_profile = 9;
+  string setup_log = 10;
 }
 
 // One of your messages reached the agent while it was working: it is in
@@ -566,7 +589,21 @@ message SessionCommand {
     SetSubagentModel set_subagent_model = 18;
     DelegationEnded delegation_ended = 19;
     ReleaseNotices release_notices = 20;
+    ChangePlace change_place = 21;
   }
+}
+
+message ChangePlace {
+  // Optimistic concurrency token: Started or the latest PlaceChanged seq.
+  uint64 expected_place_seq = 1;
+  string cwd = 2;
+  string notice_template = 3;
+  bool copy_scratch = 4;
+  // Empty means folder for compatibility with the first implementation.
+  string action = 5;
+  WorktreeSpec worktree_spec = 6;
+  bool merge = 7;
+  uint64 previous_place_seq = 8;
 }
 
 // How a turn of a remote subagent ended, for its parent (this session):

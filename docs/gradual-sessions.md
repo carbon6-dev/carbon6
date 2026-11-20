@@ -13,6 +13,39 @@ its first working directory. Deliver this in four independently verified steps:
 This document describes the intended contract, not a claim that all four steps
 are implemented. A release must explicitly report its implemented subset.
 
+### Implemented subset and refusals
+
+Minimal creation uses scratch by default. Same-worker placement supports an
+idle, unarchived, top-level local session running carbon6's own loop. The
+Folder/Worktree dialog and `sessions.place.list` / `sessions.place.change`
+catalog operations share the same checked command path. Agent changes always
+require a fresh approval for the exact request, even when the agent already
+owns the session or holds a general write grant.
+
+Cross-worker moves, native Claude Code moves, SSH transitions, delegated or
+observed sessions, and moves with configured MCP servers are **not supported**
+by this implementation. The worker chip does not offer a migration action.
+Worker and realm capabilities are checked again by the command path; an old or
+offline worker cannot silently fall back to an unsafe move.
+
+Scratch copies retain their source, refuse symlinks/special files and existing
+destination files, and are limited to 200,000,000 bytes, 4,096 entries, and 32
+directory levels. Ordinary file permissions are preserved without set-id bits.
+Worktree entry carries staged, unstaged, and non-ignored untracked changes;
+ignored files remain in the source checkout. Binary, conflicted, or changed
+submodule patches are refused. Setup output is retained on the placement event.
+Leaving keeps the worktree and branch. Optional merging is fast-forward only
+and requires both checkouts clean. Git preparation and the event journal are
+not one filesystem transaction: a crash can leave a prepared worktree, and a
+successful merge followed by a journal failure can leave the source branch
+advanced while the session still reports its old place. Neither case deletes
+the original files or changes the authoritative session place without an event.
+
+Placement worktrees use cleanup `off`: retained places are not yet integrated
+with archival cleanup. Move back is a new move, not a filesystem rollback; a
+recorded worktree's repository, registration, path, and branch are revalidated.
+Rewind across a move keeps placement and files in place and reports that fact.
+
 ## Creation and presentation
 
 Only a worker and model are necessary; connection routing and last-used model
@@ -76,6 +109,18 @@ offers an explicit merge-first option. A failed merge does not switch place.
 Do not delete a branch or worktree as a side effect of leaving it.
 
 ## Another worker
+
+This step remains unimplemented. Do not implement it by changing `worker_id`
+and sending `Restore`: a prior destination journal can make Restore a no-op,
+and queued commands still carry the old worker ID. The required foundation is
+a durable move ID and state machine: fence routing and all command/report
+queues; freeze the source actor and its processes durably; confirm the head's
+event high-water mark; stage an inactive destination; atomically compare and
+swap ownership; then activate with retryable receipts. Recovery must either
+finish the same activation or safely abort before ownership changes. Returning
+to an earlier worker also needs token-aware journal incarnation replacement.
+The worker RPC message limit is smaller than the 200 MB transfer cap, so file
+transfer must use bounded chunks rather than one large protobuf payload.
 
 For carbon6's own loop, resume using the head's durable event history, as the
 existing resume path already does. Ensure the source stops owning the session

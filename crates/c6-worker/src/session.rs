@@ -200,6 +200,7 @@ impl TaskLossCause {
 }
 
 pub(crate) enum ActorMsg {
+    ChangePlace(String, c6_proto::ChangePlace, tokio::sync::oneshot::Sender<Result<(), String>>),
     /// An up-front refusal still needs a durable Error for the Rewind panel.
     RewindRefused {
         command_id: String,
@@ -822,8 +823,41 @@ impl SessionManager {
                 }
                 Ok(())
             }
+            Some(session_command::Kind::ChangePlace(place)) => {
+                match self.enqueue_change_place(&cmd.session_id, &cmd.command_id, place).await? {
+                    Some(result) => result.await,
+                    None => Ok(()),
+                }
+            }
             None => Err("unsupported command".into()),
         }
+    }
+
+    /// Enqueue in command order, returning a separate wait for the actor's result.
+    pub(crate) async fn enqueue_change_place(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        place: c6_proto::ChangePlace,
+    ) -> Result<Option<impl Future<Output = Result<(), String>> + Send + use<>>, String> {
+        let internal = |e: anyhow::Error| format!("worker error: {e:#}");
+        if self.journal.is_applied(command_id).await.map_err(internal)? {
+            return Ok(None);
+        }
+        let actor = self.actor(session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let stopped = "session stopped before changing place";
+        actor.send(ActorMsg::ChangePlace(command_id.to_owned(), place, reply)).map_err(|_| stopped)?;
+        let (journal, command_id) = (self.journal.clone(), command_id.to_owned());
+        Ok(Some(async move {
+            let result = result.await.unwrap_or_else(|_| Err(stopped.into()));
+            // A replay can queue before the first receipt is written and reach the
+            // actor after it starts other work. The durable success still wins.
+            if result.is_err() && matches!(journal.is_applied(&command_id).await, Ok(true)) {
+                return Ok(());
+            }
+            result
+        }))
     }
 
     async fn create(&self, session_id: &str, command_id: &str, spec: CreateSession) -> Result<(), String> {
@@ -1635,11 +1669,26 @@ fn apply_handoff(started: &mut SessionStarted, h: &c6_proto::Handoff) {
     started.system_prompt = h.system_prompt.clone();
 }
 
-/// The runtime a session runs on as of its log: its `Started`, with the
-/// tool profile, tools and system prompt of its last handoff.
+fn apply_place(started: &mut SessionStarted, place: &c6_proto::PlaceChanged) {
+    if let Some(to) = &place.to {
+        started.cwd = to.cwd.clone();
+        started.repo = to.repo.clone();
+        started.repo_root = to.repo_root.clone();
+        started.worktree_branch = to.worktree_branch.clone();
+        started.system_prompt = place.system_prompt.clone();
+        started.tools = place.tools.clone();
+        started.tool_profile = place.tool_profile.clone();
+    }
+}
+
+/// Runtime and placement are not conversation history: neither is rewound.
 fn runtime_of(mut started: SessionStarted, events: &[SessionEvent]) -> SessionStarted {
-    if let Some(h) = events.iter().rev().find_map(handoff_of) {
-        apply_handoff(&mut started, h);
+    for event in events {
+        if let Some(h) = handoff_of(event) {
+            apply_handoff(&mut started, h);
+        } else if let Some(session_event::Kind::PlaceChanged(place)) = &event.kind {
+            apply_place(&mut started, place);
+        }
     }
     started
 }
@@ -3489,6 +3538,16 @@ impl Actor {
                             && rx.is_empty();
                         let _ = reply.send(idle);
                     }
+                    Some(ActorMsg::ChangePlace(command_id, place, reply)) => {
+                        let result = if running.is_some() || rewind_blocked || adoption_blocked
+                            || !self.inbox.lock().unwrap().queue.is_empty() || !self.deferred.is_empty()
+                        {
+                            Err(anyhow::anyhow!("Wait for the current turn and queued work before changing place"))
+                        } else {
+                            self.change_place(&command_id, place).await
+                        };
+                        let _ = reply.send(result.map_err(|e| format!("{e:#}")));
+                    }
                 },
                 _ = tokio::time::sleep_until(self.local_report_retry_at.unwrap_or_else(tokio::time::Instant::now)), if self.local_report_retry_at.is_some() => {
                     if let Err(e) = self.settle_delegations().await {
@@ -4221,6 +4280,184 @@ impl Actor {
         (running && self.stopping) || self.stopped_until.is_some_and(|t| std::time::Instant::now() < t)
     }
 
+    /// Prepare a local workspace, commit the event, then install it in this
+    /// actor before anything else can start a turn.
+    async fn change_place(&mut self, command_id: &str, request: c6_proto::ChangePlace) -> anyhow::Result<()> {
+        let sid = self.writer.session_id.clone();
+        anyhow::ensure!(
+            self.spec.delegation.is_none()
+                && self.spec.depth == 0
+                && self.started.ssh_target.is_empty()
+                && !self.runs_claude_code()
+                && self.claude.is_none(),
+            "Changing place is only supported for top-level local sessions in carbon6's own loop"
+        );
+        anyhow::ensure!(
+            self.spec.mcp_servers_json.trim().is_empty() || self.spec.mcp_servers_json.trim() == "[]",
+            "Changing place with configured MCP servers is not supported yet"
+        );
+        let mut events = self.journal.events_after(&sid, 0, u32::MAX).await?;
+        if events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::PlaceChanged(p)) if p.command_id == command_id)) {
+            return Ok(()); // The command crossed a reconnect after committing.
+        }
+        let current =
+            events.iter().rev().find(|e| matches!(e.kind, Some(session_event::Kind::Started(_) | session_event::Kind::PlaceChanged(_))));
+        anyhow::ensure!(
+            current.is_some_and(|e| e.seq == request.expected_place_seq),
+            "This session's place changed; refresh and try again"
+        );
+        anyhow::ensure!(
+            !self.session_tools.background.list().iter().any(|task| task.running),
+            "Stop or wait for running tasks before changing place"
+        );
+        self.manager.rewind_preflight(&sid, &events, 0, true).await?;
+        // Do not start arbitrary external hooks during preparation. Apply the
+        // same policy and tool configuration in the new directory after commit.
+        let from = c6_proto::SessionPlace {
+            cwd: self.started.cwd.clone(),
+            repo: self.started.repo.clone(),
+            repo_root: self.started.repo_root.clone(),
+            worktree_branch: self.started.worktree_branch.clone(),
+        };
+        let scratch = self.manager.state_dir.join("scratch").join(&sid);
+        let is_scratch = scratch.canonicalize().is_ok_and(|p| p == Path::new(&from.cwd)) && from.worktree_branch.is_empty();
+        let mut entered = None;
+        let mut to = match request.action.as_str() {
+            "" | "folder" => {
+                anyhow::ensure!(from.worktree_branch.is_empty(), "Leave the worktree before choosing another folder");
+                anyhow::ensure!(!request.copy_scratch || is_scratch, "Only a scratch workspace can be copied on a folder move");
+                c6_proto::SessionPlace { cwd: request.cwd.clone(), ..Default::default() }
+            }
+            "worktree" => {
+                anyhow::ensure!(from.worktree_branch.is_empty(), "This session already uses a worktree; leave it first");
+                let made = crate::worktree::enter(
+                    &self.manager.worktrees,
+                    &sid,
+                    Path::new(&from.cwd),
+                    &request.worktree_spec.clone().unwrap_or_default(),
+                )
+                .await
+                .map_err(anyhow::Error::msg)?;
+                let to = c6_proto::SessionPlace {
+                    cwd: made.made.cwd.display().to_string(),
+                    repo: from.repo.clone(),
+                    repo_root: made.made.root.clone(),
+                    worktree_branch: made.made.branch.clone(),
+                };
+                entered = Some(made);
+                to
+            }
+            "leave_worktree" => {
+                anyhow::ensure!(!from.worktree_branch.is_empty() && !from.repo_root.is_empty(), "This session is not in a worktree");
+                let cwd = crate::worktree::leave(Path::new(&from.cwd), Path::new(&from.repo_root), &from.worktree_branch, request.merge)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                c6_proto::SessionPlace { cwd: cwd.display().to_string(), ..Default::default() }
+            }
+            "back" => {
+                anyhow::ensure!(request.previous_place_seq < request.expected_place_seq, "Choose an earlier place");
+                events
+                    .iter()
+                    .find(|e| e.seq == request.previous_place_seq)
+                    .and_then(|e| match &e.kind {
+                        Some(session_event::Kind::Started(s)) => Some(c6_proto::SessionPlace {
+                            cwd: s.cwd.clone(),
+                            repo: s.repo.clone(),
+                            repo_root: s.repo_root.clone(),
+                            worktree_branch: s.worktree_branch.clone(),
+                        }),
+                        Some(session_event::Kind::PlaceChanged(p)) => p.to.clone(),
+                        _ => None,
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("That place is not in this session's history"))?
+            }
+            _ => anyhow::bail!("This worker does not support that placement action"),
+        };
+        let cwd = crate::expand_home(&to.cwd);
+        anyhow::ensure!(cwd.is_absolute(), "Choose an absolute folder on this worker");
+        let cwd = cwd.canonicalize()?;
+        anyhow::ensure!(cwd.is_dir() && cwd != Path::new(&from.cwd), "Choose a different existing folder");
+        to.cwd = cwd.to_str().ok_or_else(|| anyhow::anyhow!("The destination path is not valid UTF-8"))?.to_owned();
+        if request.action == "back" && !to.worktree_branch.is_empty() {
+            crate::worktree::validate_recorded_worktree(&cwd, Path::new(&to.repo_root), &to.worktree_branch)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+        let copied = if request.copy_scratch {
+            let source = PathBuf::from(&from.cwd);
+            let destination = cwd.clone();
+            Some(
+                tokio::task::spawn_blocking(move || crate::place_files::PreparedCopy::prepare(&source, &destination))
+                    .await?
+                    .map_err(anyhow::Error::msg)?,
+            )
+        } else {
+            None
+        };
+        to.repo = repo_slug(&cwd).await;
+        let labels = session_labels(&self.spec.labels, &to.repo, &to.cwd, &self.started.home, &spawn_model(&self.spec), "");
+        let date = time::OffsetDateTime::now_utc().date().to_string();
+        let base_prompt = build_system_prompt(&self.spec.base_prompt, &cwd, &date);
+        let mut preparing = self.spec.clone();
+        preparing.hooks_json.clear();
+        let built = own_runtime(&self.link, &self.on_behalf_of, &preparing, &cwd, &labels, base_prompt, "resume").await;
+        if !built.errors.is_empty() {
+            if let Some(entered) = &entered {
+                crate::worktree::discard(&entered.made).await;
+            }
+            anyhow::bail!("Could not prepare session tools: {}", built.errors.join("; "));
+        }
+        let notice = request.notice_template.replace("{{from}}", &from.cwd).replace("{{to}}", &to.cwd);
+        let place = c6_proto::PlaceChanged {
+            command_id: command_id.to_owned(),
+            from: Some(from),
+            to: Some(to),
+            system_prompt: built.prompt,
+            tools: built.tools.iter().map(|t| t.spec().name).collect(),
+            tool_profile: built.profile.as_str().to_owned(),
+            notice,
+            copied_paths: copied.as_ref().map(|p| p.paths().to_vec()).unwrap_or_default(),
+            uncommitted_files: entered.as_ref().map_or(0, |e| e.changed_paths.len() as u32),
+            setup_log: entered.as_ref().map(|e| e.setup_log.clone()).unwrap_or_default(),
+        };
+        let kind = session_event::Kind::PlaceChanged(place.clone());
+        let seq = match self.writer.append(kind.clone()).await {
+            Ok(seq) => seq,
+            Err(e) => {
+                if let Some(entered) = &entered {
+                    crate::worktree::discard(&entered.made).await;
+                }
+                return Err(e);
+            }
+        };
+        if let Some(copied) = copied {
+            copied.commit();
+        }
+        apply_place(&mut self.started, &place);
+        self.session_tools.relocate(cwd.clone());
+        self.checkpoints = Arc::new(Checkpoints::new(&self.manager.state_dir, &sid, &cwd));
+        self.hooks = crate::hooks::HookRunner::new(&sid, &cwd, &self.spec.hooks_json, &labels).map(Arc::new);
+        let (approval_log, mut approvals) = mpsc::unbounded_channel();
+        self.policies = crate::policy::Policies::new(&self.spec.policies_json, &labels, approval_log);
+        if let Some(policies) = &self.policies {
+            policies.set_judge(self.session_tools.head());
+        }
+        if let Some(actor) = self.manager.live(&sid) {
+            tokio::spawn(async move {
+                while let Some(approval) = approvals.recv().await {
+                    if actor.send(ActorMsg::Approval(approval)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        self.session_tools.set_hooks(own_loop_hooks(&self.policies, &self.hooks));
+        self.tools = built.tools;
+        events.push(SessionEvent { seq, ts_ms: c6_core::now_ms(), kind: Some(kind) });
+        self.conv = Some(conversation_from_log(&mut self.spec, &events));
+        Ok(())
+    }
+
     /// Rewinds the conversation to before event `to_seq`, restoring files
     /// to the checkpoint taken before it if asked to.
     async fn rewind(&mut self, command_id: String, to_seq: u64, restore_files: bool) -> anyhow::Result<()> {
@@ -4231,7 +4468,9 @@ impl Actor {
         }
         let mut restore_error = String::new();
         let mut restored = false;
-        if restore_files {
+        if events.iter().any(|e| e.seq >= to_seq && matches!(e.kind, Some(session_event::Kind::PlaceChanged(_)))) {
+            restore_error = "The session changed place after that message; files stayed where they are".into();
+        } else if restore_files {
             // Check at the shared restore boundary, not only during Claude
             // Code reset: an ancestor on carbon6's loop can also have a
             // descendant CLI writing this tree. Raw history includes retained
@@ -4239,10 +4478,15 @@ impl Actor {
             // keeps its existing runtime-specific admission behavior.
             self.manager.rewind_children_stopped(&events).await?;
             let effective = c6_agent::effective_events(&events);
-            let commit = effective.iter().filter(|e| e.seq < to_seq).rev().find_map(|e| match &e.kind {
-                Some(session_event::Kind::Checkpoint(c)) if !c.commit.is_empty() => Some(c.commit.clone()),
-                _ => None,
-            });
+            let commit = effective
+                .iter()
+                .filter(|e| e.seq < to_seq)
+                .rev()
+                .take_while(|e| !matches!(e.kind, Some(session_event::Kind::PlaceChanged(_))))
+                .find_map(|e| match &e.kind {
+                    Some(session_event::Kind::Checkpoint(c)) if !c.commit.is_empty() => Some(c.commit.clone()),
+                    _ => None,
+                });
             match commit {
                 None => restore_error = "no checkpoint was taken before that message".into(),
                 Some(c) => match self.checkpoints.restore(&c).await {
@@ -8291,6 +8535,46 @@ mod handoff_tests {
         let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
         let manager = SessionManager::new(journal, Arc::new(HeadLink::default()), dir.path().join("worktrees"));
         (dir, manager)
+    }
+
+    #[tokio::test]
+    async fn same_worker_placement_commits_once_and_reloads_the_current_place() {
+        let (dir, manager) = rewind_test_manager().await;
+        let scratch = dir.path().join("scratch/s");
+        let destination = dir.path().join("destination");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(scratch.join("keep.txt"), "stays here").unwrap();
+        let started = SessionStarted { cwd: scratch.canonicalize().unwrap().display().to_string(), ..Default::default() };
+        let spec = CreateSession::default();
+        manager.journal.create_session("s", &spec, &ev(1, session_event::Kind::Started(started))).await.unwrap();
+        let request = |id: &str, path: &Path| c6_proto::SessionCommand {
+            command_id: id.into(),
+            session_id: "s".into(),
+            kind: Some(session_command::Kind::ChangePlace(c6_proto::ChangePlace {
+                expected_place_seq: 1,
+                cwd: path.display().to_string(),
+                notice_template: "Test prompt: {{from}} to {{to}}".into(),
+                copy_scratch: false,
+                ..Default::default()
+            })),
+        };
+        let before = manager.load("s").await.unwrap().unwrap();
+        assert!(manager.handle(request("bad", &dir.path().join("missing"))).await.is_err());
+        assert_eq!(before.tools.cwd(), scratch.canonicalize().unwrap());
+        for _ in 0..2 {
+            manager.handle(request("good", &destination)).await.unwrap();
+        }
+        assert!(manager.handle(request("stale", &destination)).await.unwrap_err().contains("refresh"));
+        let events = manager.journal.events_after("s", 0, u32::MAX).await.unwrap();
+        let [_, change] = events.as_slice() else { panic!("expected one placement event") };
+        let Some(session_event::Kind::PlaceChanged(p)) = &change.kind else { panic!("expected placement") };
+        assert!(p.notice.starts_with("Test prompt: "));
+        assert_eq!(before.tools.cwd(), destination.canonicalize().unwrap());
+        assert!(scratch.join("keep.txt").is_file());
+        assert!(!destination.join("keep.txt").exists());
+        let reloaded = SessionManager::new(manager.journal.clone(), Arc::new(HeadLink::default()), dir.path().join("worktrees"));
+        assert_eq!(reloaded.load("s").await.unwrap().unwrap().tools.cwd(), destination.canonicalize().unwrap());
     }
 
     async fn rewind_actor_barrier(manager: &SessionManager, id: &str) {

@@ -887,7 +887,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
 
     let usage = feed.usage;
     let choice = ModelChoice::follow(events, Default::default());
-    let model_disclosure = RwSignal::new(None::<ModelDisclosure>);
+    let model_disclosure = RwSignal::new(None::<ChipDisclosure>);
     let model_label = Memo::new(move |_| {
         let (_, m, e) = choice.current.get();
         model_label(&m, &e)
@@ -895,11 +895,16 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let id_stored = StoredValue::new(id.clone());
     // Where the session really runs (its worktree, if it has one).
     let started = Memo::new(move |_| {
-        events.with(|evs| match evs.first().map(|e| &e.kind) {
-            Some(EventKind::Started { cwd, worktree_branch, repo_root, .. }) => {
-                Some(Started { cwd: cwd.clone(), branch: worktree_branch.clone(), repo: repo_root.clone() })
-            }
-            _ => None,
+        events.with(|evs| {
+            evs.iter().rev().find_map(|e| match &e.kind {
+                EventKind::PlaceChanged { to, .. } => {
+                    Some(Started { cwd: to.cwd.clone(), branch: to.worktree_branch.clone(), repo: to.repo_root.clone() })
+                }
+                EventKind::Started { cwd, worktree_branch, repo_root, .. } => {
+                    Some(Started { cwd: cwd.clone(), branch: worktree_branch.clone(), repo: repo_root.clone() })
+                }
+                _ => None,
+            })
         })
     });
     Effect::new(move || {
@@ -1041,6 +1046,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         as_template: Callback::new(move |()| open_as_template()),
         col,
         events,
+        queued,
         from: feed.from,
         latest: Signal::derive(move || feed.to.get().is_none()),
         usage,
@@ -1417,10 +1423,11 @@ pub(crate) struct Started {
 }
 
 #[derive(Clone, Copy)]
-struct ModelDisclosure {
+struct ChipDisclosure {
     toggle: Callback<()>,
     open: RwSignal<bool>,
     pop: StoredValue<String>,
+    dialog: bool,
 }
 
 /// What a session pane offers its tile's bar (its panes, what runs in it,
@@ -1436,6 +1443,7 @@ pub struct SessionChrome {
     as_template: Callback<()>,
     pub(crate) col: Option<ColumnCtx>,
     pub(crate) events: RwSignal<Vec<Event>>,
+    queued: RwSignal<Vec<QueuedInput>>,
     /// The first event its transcript shows (see [`Feed::from`]).
     from: RwSignal<u64>,
     /// Whether this event window includes the latest turn.
@@ -1443,7 +1451,7 @@ pub struct SessionChrome {
     pub(crate) usage: Memo<UsageStats>,
     pub(crate) started: Memo<Option<Started>>,
     pub(crate) model_label: Memo<String>,
-    model_disclosure: RwSignal<Option<ModelDisclosure>>,
+    model_disclosure: RwSignal<Option<ChipDisclosure>>,
     /// The connection it uses now.
     pub(crate) connection: Signal<String>,
     pub(crate) git: LocalResource<Option<(usize, String)>>,
@@ -1874,11 +1882,7 @@ fn session_place(s: &Session, started: Option<&Started>) -> (String, String, Opt
     // Once Started is mirrored, the head records the worker's resolved cwd.
     // The worker's scratch directories end in these exact path components.
     let cwd = started.filter(|st| !st.cwd.is_empty()).map_or(s.cwd.as_str(), |st| st.cwd.as_str());
-    if worktree.is_none()
-        && !s.on_head
-        && s.ssh.is_none()
-        && (cwd.is_empty() || std::path::Path::new(cwd).ends_with(std::path::Path::new("scratch").join(&s.id)))
-    {
+    if worktree.is_none() && !s.on_head && s.ssh.is_none() && (cwd.is_empty() || scratch_place(&s.id, cwd)) {
         return ("Scratch workspace".into(), cwd.to_owned(), None);
     }
     let folder = if let Some(wt) = worktree.filter(|wt| !wt.repo.is_empty()) {
@@ -1896,19 +1900,23 @@ fn session_place(s: &Session, started: Option<&Started>) -> (String, String, Opt
     (label, folder, worktree.map(|st| (st.branch.clone(), st.cwd.clone())))
 }
 
+fn scratch_place(id: &str, path: &str) -> bool {
+    std::path::Path::new(path).ends_with(std::path::Path::new("scratch").join(id))
+}
+
 #[component]
 fn LocationChip(
     label: &'static str,
     value: String,
     title: String,
-    #[prop(optional_no_strip)] model: Option<ModelDisclosure>,
+    #[prop(optional_no_strip)] action: Option<ChipDisclosure>,
 ) -> impl IntoView {
     const CHIP: &str = "inline-flex min-w-0 max-w-full items-center gap-1 rounded-md border border-zinc-200 px-1.5 py-0.5 text-xs text-soft dark:border-zinc-700";
     let contents = || view! { <span class="shrink-0 text-muted">{label}</span><span class="min-w-0 truncate">{value}</span> };
-    match model {
+    match action {
         Some(m) => view! {
             <button type="button" class=format!("{CHIP} hover:bg-zinc-100 pointer-coarse:min-h-8 dark:hover:bg-zinc-800")
-                title=title aria-expanded=move || m.open.try_get().unwrap_or(false).to_string() data-pop=m.pop.get_value()
+                title=title aria-haspopup=m.dialog.then_some("dialog") aria-expanded=move || m.open.try_get().unwrap_or(false).to_string() data-pop=m.pop.get_value()
                 on:click=move |ev| { ev.stop_propagation(); m.toggle.run(()); }>
                 {contents()}<span class="shrink-0 text-muted" aria-hidden="true">{crate::icons::chevron_down()}</span>
             </button>
@@ -1918,10 +1926,49 @@ fn LocationChip(
     }
 }
 
-/// The tile header's place is descriptive until moving a session is supported.
-/// The model already has an editor, so its chip opens that same composer menu.
+/// Same-worker changes use the placement dialog; the model uses the composer.
 #[component]
 pub(crate) fn SessionLocation(chrome: SessionChrome) -> impl IntoView {
+    let live = api::live();
+    let connections = crate::resources::connections();
+    let place_open = RwSignal::new(false);
+    let picking_folder = RwSignal::new(false);
+    let id = chrome.id.get_value();
+    let place_pop = StoredValue::new(format!("session-placement-{}", chrome.token));
+    let placement = ChipDisclosure {
+        open: place_open,
+        pop: place_pop,
+        dialog: true,
+        toggle: Callback::new(move |()| {
+            picking_folder.set(false);
+            place_open.update(|o| *o = !*o);
+        }),
+    };
+    let eligible = Memo::new(move |_| {
+        let Some(d) = chrome.detail.get().and_then(Result::ok) else { return false };
+        let s = live.session(&d.session.id).unwrap_or(d.session);
+        let connection = chrome.connection.get();
+        let connection = if connection.is_empty() { s.connection_id.as_str() } else { &connection };
+        let own_loop =
+            connections.get().and_then(Result::ok).is_some_and(|cs| cs.iter().any(|c| c.id == connection && c.kind != "claude_code"));
+        let worker_ready = live.workers.with(|workers| {
+            workers.iter().any(|w| {
+                w.id == s.worker_id
+                    && w.status == c6_api::WorkerStatus::Online
+                    && w.capabilities.iter().any(|c| c == "same_worker_placement_v1")
+            })
+        });
+        let external_mcp = chrome.events.with(|events| events.first().is_some_and(|e| {
+            matches!(&e.kind, EventKind::Started { tools, .. } if tools.iter().any(|t| t.starts_with("mcp__") && !t.starts_with("mcp__carbon6__")))
+        }));
+        own_loop
+            && worker_ready
+            && !external_mcp
+            && chrome.latest.get()
+            && can_change_place(&s)
+            && !chrome.running.get()
+            && chrome.background.get() == 0
+    });
     view! {
         {move || chrome.detail.get().and_then(Result::ok).map(|d| {
             let s = d.session;
@@ -1932,17 +1979,317 @@ pub(crate) fn SessionLocation(chrome: SessionChrome) -> impl IntoView {
             view! {
                 <div class="flex min-w-0 shrink-0 flex-wrap items-center gap-1 border-b border-zinc-200 px-2 py-1 dark:border-zinc-800" role="group" aria-label="Session location">
                     <LocationChip label=if s.on_head { "Runs on" } else { "Worker" } title=worker.clone() value=worker />
-                    <LocationChip label="Folder" value=folder title=path />
-                    {worktree.map(|(branch, path)| view! { <LocationChip label="Worktree" title=format!("{branch}: {path}") value=branch /> })}
+                    {move || {
+                        let action = eligible.get().then_some(placement);
+                        let title = if action.is_some() { format!("Change folder: {path}") } else { path.clone() };
+                        view! { <LocationChip label="Folder" value=folder.clone() title action /> }
+                    }}
+                    {worktree.map(|(branch, path)| move || {
+                        let action = eligible.get().then_some(placement);
+                        let title = format!("{branch}: {path}");
+                        view! { <LocationChip label="Worktree" title value=branch.clone() action /> }
+                    })}
                     {move || {
                         let current = chrome.model_label.get();
                         let value = if current.is_empty() { model_fallback.clone() } else { current };
                         let title = if chrome.model_disclosure.with(Option::is_some) { format!("Change model: {value}") } else { value.clone() };
-                        view! { <LocationChip label="Model" value title model=chrome.model_disclosure.get() /> }
+                        view! { <LocationChip label="Model" value title action=chrome.model_disclosure.get() /> }
                     }}
                 </div>
             }
         })}
+        <PlacementDialog chrome id open=place_open picking=picking_folder eligible pop=place_pop />
+    }
+}
+
+fn can_change_place(s: &Session) -> bool {
+    s.status == SessionStatus::Idle
+        && !s.archived
+        && !s.on_head
+        && !s.observed
+        && s.ssh.is_none()
+        && s.parent_id.is_none()
+        && s.parent_call_id.is_none()
+        && s.root_id.is_none()
+        && s.fork_seq.is_none()
+        && s.remote_template.is_empty()
+        && s.subagents_running == 0
+        && s.side_chats_running == 0
+        && s.tasks_running == 0
+        && s.servers_running == 0
+}
+
+#[derive(Clone)]
+enum PendingPlacement {
+    Submitting,
+    Awaiting(String),
+}
+
+fn placement_outcome(command: &str, events: &[Event], queued: &[QueuedInput]) -> Option<Result<(), String>> {
+    if events.iter().rev().any(|e| matches!(&e.kind, EventKind::PlaceChanged { command_id, .. } if command_id == command)) {
+        return Some(Ok(()));
+    }
+    queued.iter().find(|q| q.command_id == command).and_then(|q| q.rejected.clone()).map(Err)
+}
+
+#[component]
+fn PlacementDialog(
+    chrome: SessionChrome,
+    id: String,
+    open: RwSignal<bool>,
+    picking: RwSignal<bool>,
+    eligible: Memo<bool>,
+    pop: StoredValue<String>,
+) -> impl IntoView {
+    let id = StoredValue::new(id);
+    let latest_place = Memo::new(move |_| {
+        chrome.events.with(|events| events.iter().rev().find(|e| matches!(e.kind, EventKind::PlaceChanged { .. })).map(|e| e.seq))
+    });
+    Effect::new(move |last: Option<Option<u64>>| {
+        let seq = latest_place.get();
+        if seq.is_some() && last.flatten() != seq {
+            chrome.detail.refetch();
+        }
+        seq
+    });
+    let places = LocalResource::new(move || {
+        let open = open.get();
+        latest_place.track();
+        let id = id.get_value();
+        async move { if open { api::placements(id).await } else { Ok(Vec::new()) } }
+    });
+    let target = RwSignal::new(String::new());
+    let action = RwSignal::new(String::new());
+    let option = RwSignal::new(false);
+    let branch = RwSignal::new(String::new());
+    let pending = RwSignal::new(None::<PendingPlacement>);
+    let error = RwSignal::new(None::<String>);
+    let moved = RwSignal::new(false);
+    Effect::new(move || {
+        let Some(PendingPlacement::Awaiting(command)) = pending.get() else { return };
+        let outcome = chrome.events.with(|events| chrome.queued.with(|queued| placement_outcome(&command, events, queued)));
+        // A fresh detail response also carries the rejected queue, for a
+        // worker response that arrived while the transcript socket reconnected.
+        let outcome =
+            outcome.or_else(|| chrome.detail.get().and_then(Result::ok).and_then(|d| placement_outcome(&command, &[], &d.queued)));
+        if let Some(result) = outcome {
+            pending.set(None);
+            match result {
+                Ok(()) => {
+                    action.set(String::new());
+                    target.set(String::new());
+                    option.set(false);
+                    branch.set(String::new());
+                    moved.set(true);
+                }
+                Err(reason) => {
+                    error.set(Some(reason));
+                    places.refetch();
+                }
+            }
+        }
+    });
+    let submit = Callback::new(move |action: api::PlacementAction| {
+        if pending.with_untracked(Option::is_some) || !eligible.get_untracked() {
+            return;
+        }
+        let Some(seq) = places.get_untracked().and_then(Result::ok).and_then(|rows| rows.first().map(|p| p.seq)) else { return };
+        if latest_place.get_untracked().is_some_and(|latest| seq < latest) {
+            error.set(Some("The session's place has changed. Refreshing its placement history; please try again.".into()));
+            places.refetch();
+            return;
+        }
+        pending.set(Some(PendingPlacement::Submitting));
+        error.set(None);
+        moved.set(false);
+        let id = id.get_value();
+        spawn_local(async move {
+            match api::change_placement(id, seq, action).await {
+                Ok(command) => {
+                    pending.try_set(Some(PendingPlacement::Awaiting(command)));
+                }
+                Err(reason) => {
+                    pending.try_set(None);
+                    error.try_set(Some(reason));
+                    if open.try_get_untracked() == Some(true) {
+                        places.refetch();
+                    }
+                }
+            }
+        });
+    });
+    let busy = move || pending.with(Option::is_some) || !eligible.get();
+    view! {
+        <Show when=move || open.get()>
+            {move || if picking.get() {
+                let Some(d) = chrome.detail.get_untracked().and_then(Result::ok) else { return ().into_any() };
+                let start = places.get_untracked().and_then(Result::ok).and_then(|rows| rows.first().map(|p| {
+                    if scratch_place(&d.session.id, &p.cwd) { String::new() } else { p.cwd.clone() }
+                })).unwrap_or_default();
+                view! {
+                    <crate::files::FolderPicker worker_id=d.session.worker_id.to_string() start
+                        on_select=Callback::new(move |folder| { target.set(folder); picking.set(false); })
+                        on_cancel=Callback::new(move |()| picking.set(false)) />
+                }.into_any()
+            } else {
+                view! {
+                    <PlacementFrame open pop>
+                        <p class="text-sm text-muted">"Change where this session works on the same worker. The conversation stays here."</p>
+                        {move || pending.with(|p| p.as_ref().map(|p| {
+                            let text = match p {
+                                PendingPlacement::Submitting => "Requesting placement change…",
+                                PendingPlacement::Awaiting(_) => "Waiting for the worker to confirm the new place…",
+                            };
+                            view! { <p role="status" class="text-sm text-muted">{text}</p> }
+                        }))}
+                        {move || moved.get().then(|| view! { <p role="status" class="text-sm text-emerald-700 dark:text-emerald-400">"The session moved."</p> })}
+                        {move || error.get().map(|reason| view! { <ErrorBox message=reason /> })}
+                        {move || (!eligible.get() && pending.with(Option::is_none)).then(|| view! {
+                            <p class="text-sm text-muted">"Changing place requires an idle, local session on an online worker that supports placement changes."</p>
+                        })}
+                        <Suspense fallback=|| view! { <p role="status" class="text-sm text-muted">"Loading placement history…"</p> }>
+                            {move || places.get().map(|result| match result {
+                                Ok(rows) if rows.is_empty() => view! { <p class="text-sm text-muted">"The session's starting place is not available yet."</p> }.into_any(),
+                                Ok(rows) => {
+                                    let mut rows = rows.into_iter();
+                                    let current = rows.next().expect("non-empty placement history");
+                                    let in_worktree = !current.worktree_branch.is_empty();
+                                    let scratch = !in_worktree && scratch_place(&id.get_value(), &current.cwd);
+                                    let cwd = StoredValue::new(current.cwd.clone());
+                                    let previous = StoredValue::new(rows.collect::<Vec<_>>());
+                                    let destination = move |choice: &str| {
+                                        let seq = choice.parse::<u64>().ok()?;
+                                        previous.with_value(|rows| rows.iter().find(|p| p.seq == seq).cloned())
+                                    };
+                                    let actions: &[(&str, &str)] = if in_worktree {
+                                        &[("leave", "Leave the worktree")]
+                                    } else {
+                                        &[("folder", "Move to a folder"), ("worktree", "Create a Git worktree")]
+                                    };
+                                    view! {
+                                        <div class="space-y-3">
+                                            <div class="min-w-0 text-xs text-muted">"Current place: " <PlacementSummary place=current /></div>
+                                            <fieldset disabled=busy class="space-y-3 disabled:opacity-60">
+                                                <label class="block text-xs text-muted">"Action"
+                                                    <select class=INPUT prop:value=move || action.get() on:change=move |ev| {
+                                                        action.set(event_target_value(&ev));
+                                                        option.set(false);
+                                                    }>
+                                                        <option value="">"Choose a change…"</option>
+                                                        {actions.iter().map(|&(key, label)| view! { <option value=key>{label}</option> }).collect_view()}
+                                                        <optgroup label="Move back" hidden=previous.with_value(Vec::is_empty)>
+                                                            {previous.with_value(|places| places.iter().map(|p| {
+                                                                let label = if p.worktree_branch.is_empty() { p.cwd.clone() } else { format!("{} ({})", p.cwd, p.worktree_branch) };
+                                                                view! { <option value=p.seq.to_string()>{label}</option> }
+                                                            }).collect_view())}
+                                                        </optgroup>
+                                                    </select>
+                                                </label>
+                                                <div class="space-y-2" hidden=move || !action.with(|s| s == "folder")>
+                                                    <button type="button" class=BUTTON_QUIET on:click=move |_| picking.set(true)>"Choose folder…"</button>
+                                                    <p class="break-all font-mono text-xs">{move || target.get()}</p>
+                                                </div>
+                                                <div class="space-y-2" hidden=move || !action.with(|s| s == "worktree")>
+                                                    <p class="text-xs text-muted">"Start from this checkout’s HEAD and carry tracked and non-ignored untracked changes. Ignored files stay behind; binary and submodule changes are refused. The original checkout stays intact."</p>
+                                                    <label class="block max-w-xs text-xs text-muted">"Branch (optional)"
+                                                        <input class=INPUT placeholder="Generated c6/… branch" prop:value=move || branch.get() on:input=move |ev| branch.set(event_target_value(&ev)) />
+                                                    </label>
+                                                </div>
+                                                <p class="text-xs text-muted" hidden=move || !action.with(|s| s == "leave")>
+                                                    "Return to the main checkout. The worktree and branch remain available for Move back."
+                                                </p>
+                                                <label class="space-x-2" hidden=move || !action.with(|s| s == "leave" || (scratch && s == "folder"))>
+                                                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || option.get()
+                                                        on:change=move |ev| option.set(event_target_checked(&ev)) />
+                                                    {move || if action.with(|s| s == "leave") { "Merge the branch first (fast-forward only)" }
+                                                        else { "Copy scratch files without overwriting (otherwise leave them in scratch)" }}
+                                                </label>
+                                                {move || action.with(|s| destination(s)).map(|place| view! {
+                                                    <p class="text-xs text-muted">"Previous places are not backups. The destination is checked again before moving."</p>
+                                                    <PlacementSummary place />
+                                                })}
+                                                <button type="button" class=BUTTON
+                                                    disabled=move || action.with(|s| match s.as_str() {
+                                                        "folder" => in_worktree || target.with(|path| path.is_empty() || cwd.with_value(|cwd| path == cwd)),
+                                                        "worktree" => in_worktree,
+                                                        "leave" => !in_worktree,
+                                                        _ => destination(s).is_none(),
+                                                    })
+                                                    on:click=move |_| {
+                                                        let choice = action.get_untracked();
+                                                        let request = match choice.as_str() {
+                                                            "folder" => api::PlacementAction::Folder { cwd: target.get_untracked(), copy_scratch: scratch && option.get_untracked() },
+                                                            "worktree" => api::PlacementAction::Worktree { options: c6_api::starts::WorktreeOptions {
+                                                                branch: branch.get_untracked().trim().to_owned(), ..Default::default()
+                                                            } },
+                                                            "leave" => api::PlacementAction::LeaveWorktree { merge: option.get_untracked() },
+                                                            _ => {
+                                                                let Some(place) = destination(&choice) else { return };
+                                                                api::PlacementAction::Back { place_seq: place.seq }
+                                                            }
+                                                        };
+                                                        submit.run(request);
+                                                    }>
+                                                    {move || action.with(|s| match s.as_str() {
+                                                        "folder" => "Move to folder", "worktree" => "Create and enter worktree", "leave" => "Leave worktree",
+                                                        "" => "Change place", _ => "Move back",
+                                                    })}
+                                                </button>
+                                            </fieldset>
+                                        </div>
+                                    }.into_any()
+                                }
+                                Err(reason) => view! {
+                                    <ErrorBox message=reason />
+                                    <button type="button" class=BUTTON_QUIET on:click=move |_| places.refetch()>"Reload placement history"</button>
+                                }.into_any(),
+                            })}
+                        </Suspense>
+                    </PlacementFrame>
+                }.into_any()
+            }}
+        </Show>
+    }
+}
+
+#[component]
+fn PlacementSummary(place: api::Placement) -> impl IntoView {
+    let mut label = place.cwd;
+    if !place.worktree_branch.is_empty() {
+        label.push_str(&format!(" · worktree {}", place.worktree_branch));
+        if !place.repo_root.is_empty() {
+            label.push_str(&format!(" · {}", place.repo_root));
+        }
+    }
+    if place.uncommitted_files > 0 {
+        label.push_str(&format!(" · {} uncommitted files carried", place.uncommitted_files));
+    }
+    if !place.copied_paths.is_empty() {
+        label.push_str(&format!(" · {} files copied (paths in transcript)", place.copied_paths.len()));
+    }
+    view! {
+        <span class="break-all font-mono text-xs text-muted">{label}</span>
+    }
+}
+
+#[component]
+fn PlacementFrame(open: RwSignal<bool>, pop: StoredValue<String>, children: ChildrenFn) -> impl IntoView {
+    let panel = NodeRef::<leptos::html::Div>::new();
+    crate::util::modal(open, panel);
+    view! {
+        <leptos::portal::Portal>
+            <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" on:click=move |_| open.set(false)>
+                <div node_ref=panel data-pop=pop.get_value() role="dialog" aria-modal="true" aria-label="Change session place" tabindex="-1"
+                    class="max-h-[85dvh] w-full max-w-xl space-y-3 overflow-y-auto rounded-lg bg-white p-4 text-sm shadow-xl outline-none dark:bg-zinc-900"
+                    on:click=|ev| ev.stop_propagation()>
+                    <div class="flex items-center justify-between gap-2">
+                        <h2 class="font-medium">"Change session place"</h2>
+                        <button type="button" class=BUTTON_QUIET aria-label="Close placement dialog" on:click=move |_| open.set(false)>{crate::icons::x()}</button>
+                    </div>
+                    {children()}
+                </div>
+            </div>
+        </leptos::portal::Portal>
     }
 }
 
@@ -2828,6 +3175,7 @@ fn Transcript(
                                 | EventKind::Assistant { .. }
                                 | EventKind::Error { .. }
                                 | EventKind::Notice { .. }
+                                | EventKind::PlaceChanged { .. }
                                 | EventKind::Question { .. }
                                 | EventKind::Approval { .. }
                                 | EventKind::Output { .. }
@@ -4928,6 +5276,15 @@ fn render_event(
             _ => view! { <p class="flex items-center gap-2 text-xs text-muted"><span>{icon(Icon::CircleX, Size::S14)}</span><span>{format!("Not answered: {title}")}</span></p> }.into_any(),
         },
         EventKind::Notice { title, message, priority } => notice_line(title, message, priority),
+        EventKind::PlaceChanged { from, to, copied_paths, uncommitted_files, setup_log, .. } => {
+            let branch = if to.worktree_branch.is_empty() { String::new() } else { format!("; branch {}", to.worktree_branch) };
+            let message = format!("Moved from {} to {}{branch}; {} files copied, {uncommitted_files} uncommitted files carried", from.cwd, to.cwd, copied_paths.len());
+            view! { <div>
+                {notice_line("Place changed", &message, "low")}
+                {(!setup_log.is_empty()).then(|| view! { <details class="ml-5 text-xs text-muted"><summary>"Worktree setup"</summary><pre class="whitespace-pre-wrap">{setup_log.clone()}</pre></details> })}
+                {(!copied_paths.is_empty()).then(|| view! { <details class="ml-5 text-xs text-muted"><summary>"Copied files"</summary><ul class="list-inside list-disc">{copied_paths.iter().map(|p| view! { <li>{p.clone()}</li> }).collect_view()}</ul></details> })}
+            </div> }.into_any()
+        },
         EventKind::Memory { op, id, scope, text } => memory_line(op, id, scope, text),
         EventKind::BackgroundTask { task_id, kind, description, state, exit_code, elapsed_ms, .. } => {
             crate::tasks::ended_line(task_id, kind, description, state, *exit_code, *elapsed_ms).unwrap_or_else(|| ().into_any())
@@ -6024,7 +6381,7 @@ fn Composer(
     model: Option<ModelChoice>,
     /// Lets the tile header open this composer's existing model selector.
     #[prop(optional)]
-    header_model: Option<RwSignal<Option<ModelDisclosure>>>,
+    header_model: Option<RwSignal<Option<ChipDisclosure>>>,
     /// (worker id, directory): for @-mention completion.
     #[prop(optional, into)]
     files: Option<Signal<Option<(String, String)>>>,
@@ -6096,7 +6453,7 @@ fn Composer(
         },
     ));
     if let Some(header) = header_model.filter(|_| model.is_some()) {
-        let disclosure = ModelDisclosure { toggle: Callback::new(move |()| toggle()), open: picking, pop: picking_pop };
+        let disclosure = ChipDisclosure { toggle: Callback::new(move |()| toggle()), open: picking, pop: picking_pop, dialog: false };
         Effect::new(move || header.set((!disabled.get()).then_some(disclosure)));
         on_cleanup(move || {
             header.try_set(None);
@@ -8353,23 +8710,80 @@ mod tests {
     }
 
     #[test]
-    fn location_chips_only_offer_an_action_when_there_is_a_model_editor() {
+    fn location_chips_offer_only_available_actions() {
         Owner::new().with(|| {
             let worker = view! { <LocationChip label="Worker" value="dev".to_owned() title=String::new() /> }.to_html();
             assert!(worker.starts_with("<span") && !worker.contains("<button"), "{worker}");
             let open = RwSignal::new(false);
-            let editor = ModelDisclosure {
+            let editor = ChipDisclosure {
                 toggle: Callback::new(move |()| open.update(|open| *open = !*open)),
                 open,
                 pop: StoredValue::new("composer-pop".to_owned()),
+                dialog: false,
             };
-            let model = view! { <LocationChip label="Model" value="opus".to_owned() title="Change model".to_owned() model=Some(editor) /> }
-                .to_html();
+            let model =
+                view! { <LocationChip label="Model" value="opus".to_owned() title="Change model".to_owned() action=Some(editor) /> }
+                    .to_html();
             assert!(
                 model.starts_with("<button") && model.contains("aria-expanded=\"false\"") && model.contains("data-pop=\"composer-pop\""),
                 "{model}"
             );
+            editor.toggle.run(());
+            let dialog = ChipDisclosure { dialog: true, ..editor };
+            let folder =
+                view! { <LocationChip label="Folder" value="app".to_owned() title="Change folder".to_owned() action=Some(dialog) /> }
+                    .to_html();
+            assert!(folder.contains("aria-haspopup=\"dialog\"") && folder.contains("aria-expanded=\"true\""), "{folder}");
         });
+    }
+
+    #[test]
+    fn changing_place_requires_an_idle_local_top_level_session() {
+        let mut s = session(W, false);
+        assert!(!can_change_place(&s));
+        s.status = SessionStatus::Idle;
+        assert!(can_change_place(&s));
+        s.ssh = Some("remote".into());
+        assert!(!can_change_place(&s));
+        s.ssh = None;
+        s.observed = true;
+        assert!(!can_change_place(&s));
+        s.observed = false;
+        s.parent_id = Some("parent".into());
+        assert!(!can_change_place(&s));
+        s.parent_id = None;
+        s.servers_running = 1;
+        assert!(!can_change_place(&s));
+    }
+
+    #[test]
+    fn accepted_placement_waits_for_its_own_commit_or_worker_refusal() {
+        let place =
+            c6_api::SessionPlace { cwd: "/repo".into(), repo: String::new(), worktree_branch: String::new(), repo_root: String::new() };
+        let changed = Event {
+            seq: 2,
+            ts: 0,
+            kind: EventKind::PlaceChanged {
+                command_id: "committed".into(),
+                from: place.clone(),
+                to: place,
+                copied_paths: Vec::new(),
+                uncommitted_files: 0,
+                setup_log: String::new(),
+            },
+        };
+        let refused = QueuedInput {
+            command_id: "refused".into(),
+            text: "Placement change refused".into(),
+            created_at: 0,
+            rejected: Some("The destination contains existing files".into()),
+            with_agent: false,
+        };
+        let events = [changed];
+        let queued = [refused];
+        assert_eq!(placement_outcome("pending", &events, &queued), None);
+        assert_eq!(placement_outcome("committed", &events, &queued), Some(Ok(())));
+        assert_eq!(placement_outcome("refused", &events, &queued), Some(Err("The destination contains existing files".into())));
     }
 
     #[test]

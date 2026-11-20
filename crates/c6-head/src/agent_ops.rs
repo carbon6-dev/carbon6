@@ -3,7 +3,8 @@
 //! things is free; changing what it (or its family: root, side chats,
 //! subagents) made is free; changing anything else needs your OK once per
 //! thing; deleting what isn't its own needs your OK each time; and
-//! administration is yours.
+//! changing the session's place always needs your OK for that exact move;
+//! and administration is yours.
 
 use c6_core::now_ms;
 use serde_json::{Value, json};
@@ -11,10 +12,19 @@ use serde_json::{Value, json};
 use crate::HeadState;
 use crate::catalog::{self, Effect, Op, Via};
 
+const CHANGE_PLACE: &str = "sessions.place.change";
+const PLACE_APPROVAL_MS: i64 = 60 * 60 * 1000;
+const PLACE_SUBMISSION_MS: i64 = 5 * 60 * 1000;
+const PLACE_SUBMISSION_INTERRUPTED: &str =
+    "The approved placement submission was interrupted. No move was queued; ask for a new approval to retry.";
+
 tokio::task_local! {
     /// Who an internal call writes as, when an agent makes it
     /// (`session:<id>`): what it makes records it as the maker.
     pub static ACTOR: String;
+    /// The exact approval currently submitting a placement command. The
+    /// store links it to the command in the same transaction as enqueue.
+    static PLACEMENT_APPROVAL: i64;
 }
 
 /// Who the current call writes as: the agent making it, else `default`.
@@ -324,9 +334,13 @@ fn moved(op: &Op, args: &Value) -> Vec<String> {
 /// one family with it).
 async fn root_of(st: &HeadState, session: &str) -> String {
     match st.store.session(session).await.ok().flatten() {
-        Some(s) => s.root_id.clone().or(s.parent_id.clone()).unwrap_or(s.id),
+        Some(s) => family_root(&s).to_owned(),
         None => session.to_owned(),
     }
+}
+
+fn family_root(s: &crate::store::SessionRow) -> &str {
+    s.root_id.as_deref().or(s.parent_id.as_deref()).unwrap_or(&s.id)
 }
 
 /// Who made a thing, as recorded (`session:<id>`, `you`, …).
@@ -613,6 +627,11 @@ async fn call(st: &HeadState, op: &'static Op, mut args: Value, realm: &str, roo
             ),
         }));
     }
+    // Placement always needs a fresh, exact approval, even for the root and
+    // even if an unrelated session edit previously granted writing rights.
+    if op.name == CHANGE_PLACE {
+        return ask_placement(st, &args, realm, root, session).await;
+    }
     // An operation that names another realm stays in this one.
     if let Some(r) = [&args["realm"], &args["body"]["realm"]].into_iter().find_map(|v| v.as_str()).filter(|r| !r.is_empty() && *r != realm)
     {
@@ -765,6 +784,92 @@ async fn run_unscoped(st: &HeadState, op: &'static Op, args: Value, realm: &str,
     ACTOR.scope(format!("session:{root}"), crate::assistant::execute(st, op, args, &format!("session:{root}"), Some(realm))).await
 }
 
+/// Resolve both rows instead of using the fallback root or realm of an
+/// unknown session. Siblings and unrelated sessions are not valid targets.
+/// Return the requester's title for the card, even when targeting its root.
+async fn placement_family(st: &HeadState, realm: &str, root: &str, session: &str, target: &str) -> anyhow::Result<String> {
+    let refusal = || crate::forbidden("an agent can only ask to change place for itself or its root session in the same realm");
+    if target != session && target != root {
+        return Err(refusal());
+    }
+    let requester = st.store.session(session).await?.ok_or_else(refusal)?;
+    if requester.realm != realm || family_root(&requester) != root {
+        return Err(refusal());
+    }
+    if target != session {
+        let target = st.store.session(target).await?.ok_or_else(refusal)?;
+        if target.realm != realm || family_root(&target) != root {
+            return Err(refusal());
+        }
+    }
+    Ok(requester.title)
+}
+
+fn placement_input(args: &Value) -> anyhow::Result<Value> {
+    let id =
+        args["id"].as_str().filter(|id| !id.is_empty()).ok_or_else(|| crate::bad_request("changing place needs id at the top of input"))?;
+    let request: crate::sessions::PlacementRequest = serde_json::from_value(args["body"].clone())
+        .map_err(|e| crate::bad_request(format!("changing place needs a placement request under body: {e}")))?;
+    Ok(json!({"id": id, "body": request}))
+}
+
+async fn ask_placement(st: &HeadState, args: &Value, realm: &str, root: &str, session: &str) -> anyhow::Result<Value> {
+    // The only agent-specific key is presentation metadata, not input to
+    // the backend. Reject other keys instead of silently dropping them.
+    if args.as_object().is_some_and(|o| o.keys().any(|k| !matches!(k.as_str(), "id" | "body" | "reason"))) {
+        return Err(crate::bad_request("changing place takes id, body and optionally reason at the top of input"));
+    }
+    let reason = match &args["reason"] {
+        Value::Null => String::new(),
+        Value::String(reason) => reason.split_whitespace().collect::<Vec<_>>().join(" "),
+        _ => return Err(crate::bad_request("the reason for changing place must be text")),
+    };
+    let input = placement_input(args)?;
+    let target = input["id"].as_str().unwrap_or_default();
+    let asker = placement_family(st, realm, root, session, target).await?;
+    let source_seq =
+        input["body"]["expected_place_seq"].as_u64().ok_or_else(|| crate::bad_request("changing place needs expected_place_seq"))?;
+    // The public placement view is newest first and survives rewind. Never
+    // silently replace a stale sequence with the target's current place.
+    let places = crate::sessions::placements(st, target).await?;
+    if serde_json::to_value(places.first())?["seq"].as_u64() != Some(source_seq) {
+        return Err(crate::conflict("the session's place changed or isn't known; read its current placement and ask again"));
+    }
+    // Decision titles are capped at 500 bytes, not 500 Unicode characters.
+    let who = crate::util_clip(if asker.trim().is_empty() { session } else { asker.trim() }, 60);
+    let title = if reason.is_empty() {
+        format!("{who} asks to change place")
+    } else {
+        format!("{who} asks to change place: {}", crate::util_clip(&reason, 56))
+    };
+    let d = c6_api::DecisionIn {
+        kind: "approve".into(),
+        title,
+        document: format!(
+            "The session asks to change the place of `{}` from placement sequence {source_seq}.\n\n```json\n{}\n```\n\n\
+             Allow submits this exact request once. It may still be refused if the session or its place changed. Not now or expiry changes nothing.",
+            target,
+            serde_json::to_string_pretty(&input)?
+        ),
+        context: json!({"session": session, "root": root, "op": CHANGE_PLACE, "input": input, "source_place_seq": source_seq,
+            "reason": reason, "once": true, "realm": realm}),
+        source: format!("session:{session}"),
+        options: vec![
+            c6_api::DecisionOption { label: "Allow".into(), ..Default::default() },
+            c6_api::DecisionOption { label: "Not now".into(), ..Default::default() },
+        ],
+        deadline: Some(now_ms() + PLACE_APPROVAL_MS),
+        default_answer: Some("Not now".into()),
+        ..Default::default()
+    };
+    let reference = format!("agentop:{realm}:{}", uuid::Uuid::now_v7());
+    let id = crate::decisions::open(st, &d, realm, &reference).await?.id;
+    Ok(json!({"asked": id, "text": format!(
+        "Not yet: the user is asked to allow this exact change of place (decision {id}). Nothing changed. \
+         Allow submits it once if the session can safely move; no ongoing permission is granted. You'll hear the result when they answer."
+    )}))
+}
+
 /// Opens an approval card for what isn't the session's. A change, allowed,
 /// lets it change those things from then on; a delete is done on Allow.
 #[allow(clippy::too_many_arguments)]
@@ -887,6 +992,187 @@ fn lower_first(s: &str) -> String {
     c.next().map(|f| f.to_lowercase().chain(c).collect()).unwrap_or_default()
 }
 
+/// Called inside the placement enqueue transaction. A human-initiated
+/// command has no approval in scope and no requester notice obligation.
+pub(crate) async fn link_placement_command(tx: &mut sqlx::SqliteConnection, target: &str, command_id: &str) -> anyhow::Result<()> {
+    let Ok(id) = PLACEMENT_APPROVAL.try_with(|id| *id) else {
+        anyhow::ensure!(actor().is_none(), "an agent placement needs an exact approval before enqueue");
+        return Ok(());
+    };
+    let linked = sqlx::query(
+        "UPDATE decisions SET context = json_set(context, '$.placement_command_id', ?1) WHERE id = ?2 \
+         AND json_extract(context, '$.op') = ?3 AND json_extract(context, '$.input.id') = ?4 \
+         AND realm = (SELECT realm FROM sessions WHERE id = ?4) \
+         AND json_extract(context, '$.placement_consumed') = 1 AND json_extract(context, '$.placement_command_id') IS NULL \
+         AND json_extract(context, '$.placement_result') IS NULL",
+    )
+    .bind(command_id)
+    .bind(id)
+    .bind(CHANGE_PLACE)
+    .bind(target)
+    .execute(tx)
+    .await?;
+    anyhow::ensure!(linked.rows_affected() == 1, "placement command does not match an unused approval submission");
+    Ok(())
+}
+
+/// Persist the correlated outcome in the same transaction as its worker
+/// event or rejection. An unrelated, unapproved, or replayed command cannot
+/// change the outcome or create a notice.
+pub(crate) async fn finish_placement_command(
+    tx: &mut sqlx::SqliteConnection,
+    target: &str,
+    command_id: &str,
+    outcome: Result<(u64, &str), &str>,
+) -> anyhow::Result<()> {
+    if command_id.is_empty() {
+        return Ok(());
+    }
+    let result = match outcome {
+        Ok((seq, cwd)) => format!("Placement completed (command {command_id}, placement sequence {seq}): now in {cwd:?}."),
+        Err(reason) => format!("The worker refused the placement change (command {command_id}): {}", crate::util_clip(reason, 1000)),
+    };
+    sqlx::query(
+        "UPDATE decisions SET context = json_set(context, '$.placement_result', ?) \
+         WHERE ref LIKE 'agentop:%' AND json_extract(context, '$.op') = ? \
+         AND json_extract(context, '$.placement_command_id') = ? AND json_extract(context, '$.input.id') = ? \
+         AND json_extract(context, '$.placement_result') IS NULL",
+    )
+    .bind(result)
+    .bind(CHANGE_PLACE)
+    .bind(command_id)
+    .bind(target)
+    .execute(tx)
+    .await?;
+    Ok(())
+}
+
+/// The decision context is the outbox. A stable, unique input command id
+/// bridges a crash between queuing that input and marking the outbox sent.
+pub(crate) async fn sweep_placement_notices(st: &HeadState) -> anyhow::Result<()> {
+    // The head may have stopped after claiming Allow but before enqueue.
+    // This update and the transactional link exclude each other: if it
+    // wins, the result fences off even a still-running submission.
+    sqlx::query(
+        "UPDATE decisions SET context = json_set(context, '$.placement_result', ?) \
+         WHERE ref LIKE 'agentop:%' AND json_extract(context, '$.op') = ? \
+         AND json_extract(context, '$.placement_consumed') = 1 \
+         AND COALESCE(json_extract(context, '$.placement_consumed_at'), updated_at) <= ? \
+         AND json_extract(context, '$.placement_command_id') IS NULL AND json_extract(context, '$.placement_result') IS NULL",
+    )
+    .bind(PLACE_SUBMISSION_INTERRUPTED)
+    .bind(CHANGE_PLACE)
+    .bind(now_ms() - PLACE_SUBMISSION_MS)
+    .execute(&st.store.pool)
+    .await?;
+
+    let pending: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT d.id, s.id, json_extract(d.context, '$.placement_result') FROM decisions d \
+         JOIN sessions s ON s.id = json_extract(d.context, '$.session') AND s.realm = d.realm \
+         WHERE d.ref LIKE 'agentop:%' AND json_extract(d.context, '$.op') = ? \
+         AND json_extract(d.context, '$.placement_result') IS NOT NULL \
+         AND json_extract(d.context, '$.placement_notified') IS NULL \
+         AND s.archived = 0 AND s.observed = 0 AND s.status NOT IN ('failed', 'stopped') ORDER BY d.id",
+    )
+    .bind(CHANGE_PLACE)
+    .fetch_all(&st.store.pool)
+    .await?;
+    for (id, session, result) in pending {
+        let notice = format!("placement-decision:{id}");
+        let queued = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM commands WHERE id = ? AND session_id = ?)")
+            .bind(&notice)
+            .bind(&session)
+            .fetch_one(&st.store.pool)
+            .await?;
+        if !queued
+            && let Err(e) = crate::sessions::send_input_as(
+                st,
+                &session,
+                &c6_api::SendMessage { text: format!("Placement decision #{id}: {result}"), ..Default::default() },
+                notice,
+                "",
+                None,
+                false,
+            )
+            .await
+        {
+            tracing::debug!(decision = id, "could not queue the placement notice; will retry: {e:#}");
+            continue;
+        }
+        sqlx::query("UPDATE decisions SET context = json_set(context, '$.placement_notified', json('true')) WHERE id = ?")
+            .bind(id)
+            .execute(&st.store.pool)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn decide_placement(st: &HeadState, d: &c6_api::Decision, allow: bool) -> anyhow::Result<()> {
+    let c = &d.context;
+    let (realm, root, session) =
+        (c["realm"].as_str().unwrap_or_default(), c["root"].as_str().unwrap_or_default(), c["session"].as_str().unwrap_or_default());
+    if d.realm != realm || !c["once"].as_bool().unwrap_or(false) {
+        return Err(crate::bad_request("this isn't an exact placement approval"));
+    }
+
+    // Claim the card durably before any attempt. A refused attempt is not
+    // reusable, either; ask for a new approval rather than retrying silently.
+    let now = now_ms();
+    let claimed: Option<i64> = sqlx::query_scalar(
+        "UPDATE decisions SET context = CASE WHEN ?1 THEN json_set(context, '$.placement_consumed', json('true'), '$.placement_consumed_at', ?2) \
+         ELSE json_set(context, '$.placement_consumed', json('true'), '$.placement_consumed_at', ?2, '$.placement_result', \
+           CASE WHEN deadline IS NULL OR deadline <= ?2 THEN 'The approval expired. No change was requested.' \
+                ELSE 'The user chose Not now. No change was requested.' END) END \
+         WHERE id = ?3 AND realm = ?4 AND ref LIKE 'agentop:%' AND state IN ('open', 'snoozed') \
+           AND json_extract(context, '$.op') = ?5 AND json_extract(context, '$.placement_consumed') IS NULL \
+           AND (NOT ?1 OR deadline > ?2) \
+         RETURNING id",
+    )
+    .bind(allow)
+    .bind(now)
+    .bind(d.id)
+    .bind(realm)
+    .bind(CHANGE_PLACE)
+    .fetch_optional(&st.store.pool)
+    .await?;
+    if claimed.is_none() {
+        return Err(crate::bad_request("this placement approval is no longer available; ask for a new exact request"));
+    }
+    if !allow {
+        return Ok(());
+    }
+
+    let submitted = async {
+        let input = placement_input(&c["input"])?;
+        if input != c["input"] || input["body"]["expected_place_seq"] != c["source_place_seq"] {
+            return Err(crate::bad_request("the frozen placement request no longer matches its approval; ask again"));
+        }
+        placement_family(st, realm, root, session, input["id"].as_str().unwrap_or_default()).await?;
+        let op = catalog::find(CHANGE_PLACE).ok_or_else(|| crate::bad_request("the operation to change place is gone"))?;
+        // The same handler used for a user-requested move enforces the
+        // safe boundary and checks the approved source sequence again.
+        PLACEMENT_APPROVAL.scope(d.id, run(st, op, input, realm, root)).await
+    }
+    .await;
+    let result = match submitted {
+        // Do not send input to the session yet: it can start another turn
+        // and interfere with the approved safe-boundary command.
+        Ok(_) => return Ok(()),
+        Err(e) => format!("The user allowed the move, but the request was refused: {e:#}"),
+    };
+    // Preserve a previously queued command if the response failed after
+    // enqueue. Its worker outcome still owns the notice in that case.
+    sqlx::query(
+        "UPDATE decisions SET context = json_set(context, '$.placement_result', ?) \
+         WHERE id = ? AND json_extract(context, '$.placement_command_id') IS NULL AND json_extract(context, '$.placement_result') IS NULL",
+    )
+    .bind(&result)
+    .bind(d.id)
+    .execute(&st.store.pool)
+    .await?;
+    Ok(())
+}
+
 /// Your answer to an approval card (`agentop:…`).
 pub async fn decided(st: &HeadState, d: &c6_api::Decision, option: Option<&str>) -> anyhow::Result<()> {
     let c = &d.context;
@@ -894,6 +1180,9 @@ pub async fn decided(st: &HeadState, d: &c6_api::Decision, option: Option<&str>)
         (c["realm"].as_str().unwrap_or_default(), c["root"].as_str().unwrap_or_default(), c["session"].as_str().unwrap_or_default());
     let allow = option == Some("Allow");
     let op_name = c["op"].as_str().unwrap_or_default();
+    if op_name == CHANGE_PLACE {
+        return decide_placement(st, d, allow).await;
+    }
     if op_name == "docs.archive_many" {
         if allow {
             let ids: Vec<String> = serde_json::from_value(c["input"]["body"]["ids"].clone())?;
@@ -958,12 +1247,16 @@ pub async fn decided(st: &HeadState, d: &c6_api::Decision, option: Option<&str>)
             text.push_str(&format!(" You may now run {op_name} on it; call it again."));
         }
     }
+    tell_session(st, session, d.id, text).await;
+    Ok(())
+}
+
+async fn tell_session(st: &HeadState, session: &str, decision: i64, text: String) {
     if !session.is_empty()
         && let Err(e) = crate::sessions::send_input(st, session, &c6_api::SendMessage { text, ..Default::default() }).await
     {
-        tracing::warn!(decision = d.id, "telling the session: {e:#}");
+        tracing::warn!(decision, "telling the session: {e:#}");
     }
-    Ok(())
 }
 
 /// Operations matching words, with how an agent may use each.
@@ -984,13 +1277,14 @@ fn find_text(query: &str) -> String {
         return format!("No operations match {query:?}; try other words.");
     }
     for (i, op) in found.iter().enumerate() {
-        let how = match class(op) {
-            Class::Read => "reads",
-            Class::Make => "makes something: free",
-            Class::Change => "changes: free on what this session made, else the user is asked once",
-            Class::Delete => "deletes: free on what this session made, else the user is asked each time",
-            Class::Outside => "acts in the user's name outside carbon6: they're asked each time",
-            Class::Never => "the user's alone",
+        let how = match (op.name, class(op)) {
+            (CHANGE_PLACE, _) => "changes place: asks the user each time for the exact request, even for this session",
+            (_, Class::Read) => "reads",
+            (_, Class::Make) => "makes something: free",
+            (_, Class::Change) => "changes: free on what this session made, else the user is asked once",
+            (_, Class::Delete) => "deletes: free on what this session made, else the user is asked each time",
+            (_, Class::Outside) => "acts in the user's name outside carbon6: they're asked each time",
+            (_, Class::Never) => "the user's alone",
         };
         if i == 0 {
             out.push_str(&format!("{} ({how}):\n{}\n\n", op.name, serde_json::to_string(&catalog::describe(op)).unwrap_or_default()));
@@ -1045,6 +1339,7 @@ mod tests {
         assert_eq!(c("projects.add"), Class::Make);
         assert_eq!(c("projects.work"), Class::Change);
         assert_eq!(c("docs.archive_many"), Class::Make);
+        assert_eq!(c(CHANGE_PLACE), Class::Change);
         assert_eq!(c("work.edit"), Class::Change);
         assert_eq!(c("work.todos.remove"), Class::Delete);
         assert_eq!(c("work.list"), Class::Read);
@@ -1074,6 +1369,193 @@ mod tests {
         assert_eq!(kind_needed(catalog::find("calendar.events").unwrap()), Some("event"));
         assert_eq!(kind_needed(catalog::find("chat.messages").unwrap()), Some("chat"));
         assert_eq!(kind_needed(catalog::find("work.add").unwrap()), None);
+    }
+
+    #[tokio::test]
+    async fn place_requires_fresh_exact_consent_even_with_a_grant() {
+        use c6_proto::session_event::Kind;
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        let worker: c6_core::WorkerId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        for (id, root, realm) in [
+            ("root", None, "home"),
+            ("asking-child", Some("root"), "home"),
+            ("sibling", Some("root"), "home"),
+            ("foreign-child", Some("root"), "other-realm"),
+        ] {
+            sqlx::query(
+                "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, root_id, realm) \
+                         VALUES (?, '00000000-0000-0000-0000-000000000001', ?, '/old', '', '', 'idle', 0, 0, ?, ?)",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(root)
+            .bind(realm)
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        }
+        let start = c6_proto::SessionEvent {
+            seq: 1,
+            ts_ms: 1,
+            kind: Some(Kind::Started(c6_proto::SessionStarted { cwd: "/old".into(), ..Default::default() })),
+        };
+        st.store.ingest(worker, "root", &[start]).await.unwrap().unwrap();
+        sqlx::query("INSERT INTO workers (id, name, hostname, os, arch, cert_serial, enrolled_at) VALUES (?, 'test', '', '', '', '', 0)")
+            .bind(worker.to_string())
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let _guard = st.registry.attach(worker, now_ms(), tx, vec!["same_worker_placement_v1".into()], "worker");
+
+        let op = catalog::find(CHANGE_PLACE).unwrap();
+        let args =
+            json!({"id": "root", "body": {"kind": "folder", "expected_place_seq": 1, "cwd": "/new"}, "reason": "Investigate the patch"});
+        assert!(call(st, op, json!({"id": "sibling", "body": args["body"]}), "home", "root", "asking-child").await.is_err());
+        assert!(call(st, op, args.clone(), "other-realm", "root", "asking-child").await.is_err());
+        assert!(call_for(st, "foreign-child", CHANGE_PLACE, args.clone()).await.is_err());
+        let mut stale = args.clone();
+        stale["body"]["expected_place_seq"] = json!(99);
+        assert!(call_for(st, "root", CHANGE_PLACE, stale).await.is_err());
+        grant(st, "home", "session:root", "root").await.unwrap();
+
+        let ask = |session| call_for(st, session, CHANGE_PLACE, args.clone());
+        let read = |id| crate::decisions::get(st, id);
+        let allow = |id| async move {
+            crate::decisions::answer(st, id, &c6_api::DecisionAnswer { option: Some("Allow".into()), ..Default::default() }, "test")
+                .await
+                .unwrap()
+        };
+        let self_id = ask("root").await.unwrap()["asked"].as_i64().unwrap();
+        let denied_id = ask("asking-child").await.unwrap()["asked"].as_i64().unwrap();
+        let denied = read(denied_id).await.unwrap().unwrap();
+        assert_eq!(denied.title, "asking-child asks to change place: Investigate the patch");
+        assert_eq!(
+            denied.context["input"],
+            json!({"id": "root", "body": {
+                "kind": "folder", "expected_place_seq": 1, "cwd": "/new", "copy_scratch": false
+            }})
+        );
+        assert_eq!(denied.context["source_place_seq"], 1);
+        assert!(denied.context["placement_consumed"].is_null());
+        crate::decisions::answer(st, denied_id, &c6_api::DecisionAnswer { option: Some("Not now".into()), ..Default::default() }, "test")
+            .await
+            .unwrap();
+        assert!(decided(st, &denied, Some("Allow")).await.is_err(), "a denial cannot be replayed as an allowance");
+
+        let expired_id = ask("asking-child").await.unwrap()["asked"].as_i64().unwrap();
+        let before_expiry = read(expired_id).await.unwrap().unwrap();
+        sqlx::query("UPDATE decisions SET deadline = 1 WHERE id = ?").bind(expired_id).execute(&st.store.pool).await.unwrap();
+        // Even a stale reader who saw the card before it expired cannot submit the move.
+        assert!(decided(st, &before_expiry, Some("Allow")).await.is_err());
+        crate::decisions::sweep(st).await;
+        let expired = read(expired_id).await.unwrap().unwrap();
+        assert_eq!(expired.state, "expired");
+        assert!(expired.context["placement_result"].as_str().unwrap().contains("expired"));
+
+        for completed in [false, true] {
+            let id = ask("asking-child").await.unwrap()["asked"].as_i64().unwrap();
+            let before = read(id).await.unwrap().unwrap();
+            let d = allow(id).await;
+            let command_id = d.context["placement_command_id"].as_str().unwrap();
+            assert_eq!(d.context["placement_consumed"], true);
+            assert!(d.context["placement_consumed_at"].as_i64().is_some());
+            assert!(d.context["placement_result"].is_null(), "enqueue alone does not mean the move happened");
+            assert!(decided(st, &before, Some("Allow")).await.is_err());
+            let commands = st.store.pending_commands(worker, 0).await.unwrap();
+            let mut moves = commands.iter().filter_map(|c| {
+                let cmd = c6_proto::decode_stored_command(&c.data).unwrap();
+                match cmd.kind {
+                    Some(c6_proto::session_command::Kind::ChangePlace(p)) => Some((cmd.command_id, cmd.session_id, p)),
+                    _ => None,
+                }
+            });
+            let (queued_id, target, request) = moves.next().unwrap();
+            assert!(moves.next().is_none());
+            assert_eq!((queued_id.as_str(), target.as_str()), (command_id, "root"));
+            assert_eq!((request.expected_place_seq, request.cwd.as_str(), request.copy_scratch), (1, "/new", false));
+
+            if completed {
+                let changed = c6_proto::SessionEvent {
+                    seq: 2,
+                    ts_ms: 2,
+                    kind: Some(Kind::PlaceChanged(c6_proto::PlaceChanged {
+                        command_id: command_id.into(),
+                        to: Some(c6_proto::SessionPlace { cwd: "/new".into(), ..Default::default() }),
+                        ..Default::default()
+                    })),
+                };
+                st.store.ingest(worker, "root", std::slice::from_ref(&changed)).await.unwrap().unwrap();
+                st.store.ingest(worker, "root", &[changed]).await.unwrap().unwrap();
+            } else {
+                st.store.reject_command(worker, command_id, "move blocked").await.unwrap().unwrap();
+                assert!(st.store.reject_command(worker, command_id, "replay").await.unwrap().is_none());
+            }
+            // The committed worker outcome survives independently of any
+            // post-commit delivery hook. A resumed sweep delivers it once.
+            let settled = read(id).await.unwrap().unwrap();
+            let result = settled.context["placement_result"].as_str().unwrap();
+            assert!(result.contains(command_id));
+            assert!(result.contains(if completed { "Placement completed" } else { "move blocked" }));
+            sweep_placement_notices(st).await.unwrap();
+            sqlx::query("UPDATE decisions SET context = json_remove(context, '$.placement_notified') WHERE id = ?")
+                .bind(id)
+                .execute(&st.store.pool)
+                .await
+                .unwrap();
+            sweep_placement_notices(st).await.unwrap();
+            let notices: Vec<(String, String)> = sqlx::query_as("SELECT session_id, text FROM commands WHERE id = ?")
+                .bind(format!("placement-decision:{id}"))
+                .fetch_all(&st.store.pool)
+                .await
+                .unwrap();
+            assert_eq!(notices, vec![("asking-child".into(), format!("Placement decision #{id}: {result}"))]);
+        }
+
+        // Simulate a head that committed the Allow claim, but stopped
+        // before it could link a placement command or record a refusal.
+        let mut current = args.clone();
+        current["body"]["expected_place_seq"] = json!(2);
+        let interrupted_id = call_for(st, "asking-child", CHANGE_PLACE, current).await.unwrap()["asked"].as_i64().unwrap();
+        sqlx::query(
+            "UPDATE decisions SET context = json_set(context, '$.placement_consumed', json('true'), '$.placement_consumed_at', ?) WHERE id = ?",
+        )
+        .bind(now_ms() - PLACE_SUBMISSION_MS - 1)
+        .bind(interrupted_id)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        sweep_placement_notices(st).await.unwrap();
+        sweep_placement_notices(st).await.unwrap();
+        let interrupted = read(interrupted_id).await.unwrap().unwrap();
+        assert_eq!(interrupted.context["placement_result"], PLACE_SUBMISSION_INTERRUPTED);
+        assert!(interrupted.context["placement_command_id"].is_null());
+        let notices: Vec<(String, String)> = sqlx::query_as("SELECT session_id, text FROM commands WHERE id = ?")
+            .bind(format!("placement-decision:{interrupted_id}"))
+            .fetch_all(&st.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(notices, vec![("asking-child".into(), format!("Placement decision #{interrupted_id}: {PLACE_SUBMISSION_INTERRUPTED}"))]);
+        let late = crate::store::NewCommand { id: "late-placement", session_id: "root", worker_id: worker, data: Vec::new(), text: None };
+        assert!(PLACEMENT_APPROVAL.scope(interrupted_id, st.store.enqueue_placement_command(&late)).await.is_err());
+        assert!(!st.store.pending_commands(worker, 0).await.unwrap().iter().any(|c| c.id == late.id));
+
+        // Our own older card is not rebased onto the new source. The backend
+        // rejects it before enqueue, and this refusal also consumes approval.
+        let stale = allow(self_id).await;
+        assert!(stale.context["placement_command_id"].is_null());
+        assert!(stale.context["placement_result"].as_str().unwrap().contains("place changed"));
     }
 
     /// Asked in your words, find puts the operation you mean first.

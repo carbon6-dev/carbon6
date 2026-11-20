@@ -662,6 +662,9 @@ pub async fn sweep(st: &HeadState) {
         }
         let _ = record(st, id, "expired", &json!({"option": option}), "", "its deadline").await;
     }
+    if let Err(e) = crate::agent_ops::sweep_placement_notices(st).await {
+        warn!("delivering placement decision notices: {e:#}");
+    }
     // A snoozed one whose time came since the last sweep waits on you again
     // (a little overlap: a ping too many is harmless, one missed isn't).
     let woke: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM decisions WHERE state = 'snoozed' AND snooze_until > ? AND snooze_until <= ?")

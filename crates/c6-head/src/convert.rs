@@ -167,6 +167,22 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             message: api::citations::clean(&n.message).into_owned(),
             priority: n.priority.clone(),
         },
+        Kind::PlaceChanged(p) => {
+            let place = |s: &c6_proto::SessionPlace| api::SessionPlace {
+                cwd: s.cwd.clone(),
+                repo: s.repo.clone(),
+                worktree_branch: s.worktree_branch.clone(),
+                repo_root: s.repo_root.clone(),
+            };
+            api::EventKind::PlaceChanged {
+                command_id: p.command_id.clone(),
+                from: place(p.from.as_ref()?),
+                to: place(p.to.as_ref()?),
+                copied_paths: p.copied_paths.clone(),
+                uncommitted_files: p.uncommitted_files,
+                setup_log: p.setup_log.clone(),
+            }
+        }
         Kind::Memory(m) => api::EventKind::Memory { op: m.op.clone(), id: m.id.clone(), scope: m.scope.clone(), text: m.text.clone() },
         Kind::Output(o) => {
             api::EventKind::Output { name: o.name.clone(), title: o.title.clone(), mime: o.mime.clone(), size: o.data.len() as u64 }

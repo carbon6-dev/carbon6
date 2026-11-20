@@ -634,12 +634,26 @@ mod tests {
         let identity = crate::Identity { meta, key_pem: String::new(), cert_pem: String::new(), ca_pem: String::new() };
         let worker = Worker::open(dir.path(), identity).await.unwrap();
         worker.overrides.lock().unwrap().kit_jobs = Some(true);
-        assert_eq!(crate::capabilities(&worker, false, true), vec!["queue_ops", "send_now", "user_input_prompt_v1", "kits"]);
-        assert_eq!(crate::capabilities(&worker, false, false), vec!["queue_ops", "send_now", "user_input_prompt_v1"]);
+        assert_eq!(
+            crate::capabilities(&worker, false, true),
+            vec!["queue_ops", "send_now", "user_input_prompt_v1", "same_worker_placement_v1", "kits"]
+        );
+        assert_eq!(
+            crate::capabilities(&worker, false, false),
+            vec!["queue_ops", "send_now", "user_input_prompt_v1", "same_worker_placement_v1"]
+        );
         worker.overrides.lock().unwrap().kit_jobs = Some(false);
         assert_eq!(
             crate::capabilities(&worker, true, true),
-            vec!["claude_code", "claude_rewind", "claude_code_subagents_v1", "queue_ops", "send_now", "user_input_prompt_v1"]
+            vec![
+                "claude_code",
+                "claude_rewind",
+                "claude_code_subagents_v1",
+                "queue_ops",
+                "send_now",
+                "user_input_prompt_v1",
+                "same_worker_placement_v1"
+            ]
         );
         let e = handle(&worker, "kit.job", json!({"spec": {}, "command": []})).await.unwrap_err();
         assert!(e.to_string().contains("C6_KIT_JOBS=off"), "{e}");

@@ -34,6 +34,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: c6_agent::BASE_PROMPT,
     },
     Prompt { name: "session.side_chat", description: "Added for side chats.", default: SIDE_CHAT_NOTE },
+    Prompt {
+        name: "session.place_changed",
+        description: "Told to the agent after a placement change. Substitutions: {{from}}, {{to}}.",
+        default: "The session's working directory moved from {{from}} to {{to}}. Continue the same conversation in the new directory.",
+    },
     Prompt { name: "session.subagent", description: "Added to a subagent's task.", default: c6_agent::SUBAGENT_NOTE },
     Prompt {
         name: "session.subagent_resume",

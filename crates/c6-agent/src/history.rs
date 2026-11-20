@@ -34,6 +34,9 @@ pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
             }
             // Simple compaction: the summary replaces everything before it.
             Some(session_event::Kind::Compaction(c)) => msgs = vec![Message::user_text(compacted_context(&c.summary))],
+            Some(session_event::Kind::PlaceChanged(p)) if !p.notice.is_empty() => {
+                push_user_block(&mut msgs, Block::Text(p.notice.clone()));
+            }
             _ => {}
         }
     }
@@ -198,8 +201,8 @@ pub fn user_text(text: &str, attachments: &[c6_proto::Attachment]) -> String {
 }
 
 /// The events that still count: a `Rewound` drops the events of its own
-/// session from its `to_seq` on. Each session's part of the list starts at
-/// its `Started` event (a side chat's list begins with its parents' events,
+/// session from its `to_seq` on, except for placement changes. Each session's
+/// part of the list starts at its `Started` event (a side chat's list begins with its parents' events,
 /// whose seqs overlap its own).
 pub fn effective_events(events: &[SessionEvent]) -> Vec<SessionEvent> {
     let mut kept: Vec<SessionEvent> = Vec::with_capacity(events.len());
@@ -212,7 +215,10 @@ pub fn effective_events(events: &[SessionEvent]) -> Vec<SessionEvent> {
             }
             Some(session_event::Kind::Rewound(r)) => {
                 let cut = kept[segment..].iter().position(|e| e.seq >= r.to_seq).map_or(kept.len(), |p| segment + p);
-                kept.truncate(cut);
+                // Placement is not rolled back with the conversation. Keep
+                // the facts the model needs about where it will run next.
+                let places: Vec<_> = kept.drain(cut..).filter(|e| matches!(e.kind, Some(session_event::Kind::PlaceChanged(_)))).collect();
+                kept.extend(places);
             }
             _ => kept.push(ev.clone()),
         }
@@ -289,6 +295,9 @@ pub fn transcript_text(events: &[SessionEvent]) -> String {
             }
             Some(session_event::Kind::ToolResult(r)) => out.push_str(&format!("[tool result]\n{}\n", clip(&r.output, 2000))),
             Some(session_event::Kind::Compaction(c)) => out = format!("## Summary of the earlier conversation\n{}\n", c.summary),
+            Some(session_event::Kind::PlaceChanged(p)) if !p.notice.is_empty() => {
+                out.push_str(&format!("\n## Session placement\n{}\n", p.notice));
+            }
             _ => {}
         }
     }
@@ -975,6 +984,136 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, ["parent one", "parent two", "mine one", "mine again"]);
+    }
+
+    fn placement_events(kinds: impl IntoIterator<Item = session_event::Kind>) -> Vec<SessionEvent> {
+        kinds.into_iter().enumerate().map(|(i, kind)| SessionEvent { seq: i as u64 + 1, ..ev(kind) }).collect()
+    }
+
+    fn placement_user(text: &str) -> session_event::Kind {
+        session_event::Kind::User(UserMessage { text: text.into(), human_origin: true, ..Default::default() })
+    }
+
+    fn move_place(from: &str, to: &str, notice: &str) -> session_event::Kind {
+        let place = |cwd: &str| Some(c6_proto::SessionPlace { cwd: cwd.into(), ..Default::default() });
+        session_event::Kind::PlaceChanged(c6_proto::PlaceChanged {
+            from: place(from),
+            to: place(to),
+            system_prompt: format!("Working directory: {to}"),
+            notice: notice.into(),
+            ..Default::default()
+        })
+    }
+
+    fn placement_rewind(to_seq: u64) -> session_event::Kind {
+        session_event::Kind::Rewound(c6_proto::Rewound { to_seq, ..Default::default() })
+    }
+
+    #[test]
+    fn a_move_keeps_conversation_and_replays_the_edited_notice_verbatim() {
+        let notice = "I moved the scratch files.\nContinue in /new.";
+        let events = placement_events([
+            placement_user("keep working on this"),
+            session_event::Kind::Assistant(AssistantMessage {
+                blocks: vec![block_to_proto(&Block::Text("I've made a start".into())).unwrap()],
+                ..Default::default()
+            }),
+            move_place("/old", "/new", notice),
+            move_place("/new", "/quiet", ""),
+            placement_user("carry on"),
+        ]);
+        let history = history_from_events(&events);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].blocks, [Block::Text("keep working on this".into())]);
+        assert_eq!(history[1].role, Role::Assistant);
+        assert_eq!(history[1].blocks, [Block::Text("I've made a start".into())]);
+        assert_eq!(history[2].role, Role::User);
+        assert_eq!(history[2].blocks, [Block::Text(notice.into()), Block::Text("carry on".into())]);
+
+        let transcript = transcript_text(&events);
+        assert!(transcript.contains(&format!("\n## Session placement\n{notice}\n")));
+        assert_eq!(transcript.matches("## Session placement").count(), 1, "a blank notice stays silent");
+    }
+
+    #[test]
+    fn rewinding_across_a_move_keeps_its_notice_and_current_place_facts() {
+        let notice = "Continue in /new";
+        let events = placement_events([
+            session_event::Kind::Started(Default::default()),
+            placement_user("keep this"),
+            placement_user("rewind this"),
+            move_place("/old", "/new", notice),
+            placement_user("also rewind this"),
+            placement_rewind(3),
+            placement_user("replacement"),
+        ]);
+        let effective = effective_events(&events);
+        assert_eq!(effective.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2, 4, 7]);
+        let Some(session_event::Kind::PlaceChanged(place)) = &effective[2].kind else { panic!("missing move") };
+        assert_eq!(place.to.as_ref().unwrap().cwd, "/new");
+        assert_eq!(place.system_prompt, "Working directory: /new");
+        let history = history_from_events(&events);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].blocks, [Block::Text("keep this".into()), Block::Text(notice.into()), Block::Text("replacement".into())]);
+        let handoff = handoff_context(&events, "carbon6", HANDOFF_BUDGET);
+        assert!(handoff.contains(notice));
+        assert!(!handoff.contains("rewind this"));
+    }
+
+    #[test]
+    fn multiple_moves_and_rewinds_keep_each_notice_once_in_order() {
+        let events = placement_events([
+            placement_user("keep this"),
+            placement_user("drop first"),
+            move_place("/one", "/two", "Moved to /two"),
+            placement_rewind(2),
+            placement_user("drop second"),
+            move_place("/two", "/three", "Moved to /three"),
+            placement_rewind(5),
+            placement_rewind(2),
+            placement_user("keep this too"),
+        ]);
+        assert_eq!(effective_events(&events).iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 3, 6, 9]);
+        let history = history_from_events(&events);
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].blocks,
+            [
+                Block::Text("keep this".into()),
+                Block::Text("Moved to /two".into()),
+                Block::Text("Moved to /three".into()),
+                Block::Text("keep this too".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn compaction_replaces_earlier_notices_but_rewind_can_remove_the_compaction() {
+        let summary = "Earlier work summarized";
+        let mut events = placement_events([
+            placement_user("earlier conversation"),
+            move_place("/one", "/two", "First move"),
+            session_event::Kind::Compaction(c6_proto::Compaction { summary: summary.into(), ..Default::default() }),
+            move_place("/two", "/three", "Second move"),
+        ]);
+        let history = history_from_events(&events);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].blocks, [Block::Text(compacted_context(summary)), Block::Text("Second move".into())]);
+        let transcript = transcript_text(&events);
+        assert!(transcript.contains(summary) && transcript.contains("Second move"));
+        assert!(!transcript.contains("First move") && !transcript.contains("\nearlier conversation\n"));
+        assert_eq!(effective_events(&events).iter().filter(|e| matches!(e.kind, Some(session_event::Kind::PlaceChanged(_)))).count(), 2);
+
+        events.push(SessionEvent { seq: 5, ..ev(placement_rewind(3)) });
+        let history = history_from_events(&events);
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].blocks,
+            [Block::Text("earlier conversation".into()), Block::Text("First move".into()), Block::Text("Second move".into())]
+        );
+        let transcript = transcript_text(&events);
+        assert!(!transcript.contains(summary));
+        assert!(transcript.contains("First move") && transcript.contains("Second move"));
     }
 
     #[test]

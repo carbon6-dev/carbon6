@@ -598,6 +598,46 @@ pub async fn session(id: String) -> Result<SessionDetail, String> {
     json(Request::get(&format!("/api/v1/sessions/{id}")).send().await).await
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+pub(crate) struct Placement {
+    pub seq: u64,
+    pub cwd: String,
+    pub worktree_branch: String,
+    pub repo_root: String,
+    pub copied_paths: Vec<String>,
+    pub uncommitted_files: u32,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PlacementAction {
+    Folder { cwd: String, copy_scratch: bool },
+    Worktree { options: c6_api::starts::WorktreeOptions },
+    LeaveWorktree { merge: bool },
+    Back { place_seq: u64 },
+}
+
+#[derive(Serialize)]
+struct PlacementRequest {
+    expected_place_seq: u64,
+    #[serde(flatten)]
+    action: PlacementAction,
+}
+
+pub(crate) async fn placements(id: String) -> Result<Vec<Placement>, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/placement")).send().await).await
+}
+
+pub(crate) async fn change_placement(id: String, expected_place_seq: u64, action: PlacementAction) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct Accepted {
+        command_id: String,
+    }
+    let accepted: Accepted =
+        send_json(Request::post(&format!("/api/v1/sessions/{id}/placement")), &PlacementRequest { expected_place_seq, action }).await?;
+    Ok(accepted.command_id)
+}
+
 /// `switch`: (connection, model, effort) to switch the session to from this
 /// message; an empty effort is the model's default.
 pub async fn send_message(
