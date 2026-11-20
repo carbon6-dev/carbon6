@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use c6_core::{WorkerId, now_ms, protocol_compatible};
 use c6_proto::{
-    EnrollRequest, EnrollResponse, EventAck, HeadMsg, Hello, Pong, PtyFrame, SessionCursor, Welcome, WorkerMsg,
-    enrollment_server::Enrollment, head_msg, pty_frame, worker_hub_server::WorkerHub, worker_msg,
+    EnrollRequest, EnrollResponse, EventAck, HeadMsg, Hello, Pong, PtyFrame, Welcome, WorkerMsg, enrollment_server::Enrollment, head_msg,
+    pty_frame, worker_hub_server::WorkerHub, worker_msg,
 };
 use futures::Stream;
 use tokio::sync::mpsc;
@@ -180,15 +180,14 @@ impl WorkerHub for HubSvc {
         }
         retry_sqlite_busy(|| st.store.worker_attached(worker_id, hostname, os, arch, version, now_ms())).await.map_err(attach_error)?;
 
-        let session_ids: Vec<String> = hello.sessions.iter().map(|c| c.session_id.clone()).collect();
-        let acks = retry_sqlite_busy(|| st.store.session_positions(worker_id, &session_ids)).await.map_err(attach_error)?;
+        let acks = retry_sqlite_busy(|| st.store.session_positions_for_epochs(worker_id, &hello.sessions)).await.map_err(attach_error)?;
         let (tx, rx) = mpsc::channel(OUTBOUND_CAPACITY);
         let welcome = Welcome {
             protocol_version: c6_core::PROTOCOL_VERSION,
             head_version: c6_core::build().into(),
             worker_id: worker_id.to_string(),
             worker_name: row.name.clone(),
-            acks: acks.into_iter().map(|(session_id, seq)| SessionCursor { session_id, seq }).collect(),
+            acks,
         };
         tx.send(Ok(head(head_msg::Msg::Welcome(welcome)))).await.ok();
 
@@ -358,7 +357,8 @@ async fn ordered_work(
                 // publication, notifications, and triggers run only afterward.
                 match retry_sqlite_busy(|| ingest_batch(&st, worker_id, &batch)).await {
                     Ok(Some(seq)) => {
-                        let _ = tx.try_send(Ok(head(head_msg::Msg::Ack(EventAck { session_id, seq }))));
+                        let _ =
+                            tx.try_send(Ok(head(head_msg::Msg::Ack(EventAck { session_id, seq, ownership_epoch: batch.ownership_epoch }))));
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -429,6 +429,19 @@ async fn deliver_pending(
         }
         for row in rows {
             let mut cmd = c6_proto::decode_stored_command(&row.data)?;
+            cmd.ownership_epoch = row.ownership_epoch as u64;
+            if cmd.ownership_epoch != 0 && !capabilities.iter().any(|c| c == c6_proto::SESSION_MOVE_CAPABILITY) {
+                // A downgraded worker ignores the epoch field. Leave the
+                // command pending for a capable connection to replay.
+                *delivered = row.seq;
+                continue;
+            }
+            // Recheck after selecting this page. A command already sent is
+            // still subject to the worker's durable freeze/epoch fence.
+            if !st.store.session_routable(&cmd.session_id, worker_id, row.ownership_epoch).await.map_err(command_read_error)? {
+                *delivered = row.seq;
+                continue;
+            }
             // Use this stream's Hello, not a replacement in the registry.
             let compatibility = match sessions::prepare_worker_subagents(capabilities, &mut cmd) {
                 Ok(()) if matches!(cmd.kind, Some(c6_proto::session_command::Kind::Input(_))) => {
@@ -445,7 +458,12 @@ async fn deliver_pending(
                 sessions::on_rejected(
                     st,
                     worker_id,
-                    c6_proto::CommandRejected { command_id: cmd.command_id, session_id: cmd.session_id, reason: error.to_string() },
+                    c6_proto::CommandRejected {
+                        command_id: cmd.command_id,
+                        session_id: cmd.session_id,
+                        reason: error.to_string(),
+                        ownership_epoch: cmd.ownership_epoch,
+                    },
                 )
                 .await?;
                 *delivered = row.seq;
@@ -559,6 +577,7 @@ mod tests {
         for seq in 1..=2 {
             send(worker_msg::Msg::Events(SessionEventBatch {
                 session_id: "session".into(),
+                ownership_epoch: 0,
                 events: vec![SessionEvent {
                     seq,
                     kind: Some(session_event::Kind::User(UserMessage { text: format!("event {seq}"), ..Default::default() })),
@@ -607,6 +626,11 @@ mod tests {
         .to_string();
         for capable in [false, true] {
             let worker = WorkerId::new();
+            sqlx::query("UPDATE sessions SET worker_id = ? WHERE id = 'session'")
+                .bind(worker.to_string())
+                .execute(&st.store.pool)
+                .await
+                .unwrap();
             let mut capabilities = vec!["claude_code".into()];
             if capable {
                 capabilities.push("claude_code_subagents_v1".into());
@@ -626,7 +650,8 @@ mod tests {
                     session_command::Kind::Create(spec)
                 };
                 let data =
-                    c6_proto::SessionCommand { command_id: id.clone(), session_id: "session".into(), kind: Some(kind) }.encode_to_vec();
+                    c6_proto::SessionCommand { command_id: id.clone(), session_id: "session".into(), kind: Some(kind), ownership_epoch: 0 }
+                        .encode_to_vec();
                 saved.push(data.clone());
                 st.store
                     .enqueue_command(&crate::store::NewCommand { id: &id, session_id: "session", worker_id: worker, data, text: None })
@@ -683,7 +708,9 @@ mod tests {
             ("set", session_command::Kind::SetSubagentModel(c6_proto::SetSubagentModel { model: Some(target.clone()) }), None),
             ("input", session_command::Kind::Input(UserInput { text: "continue".into(), ..Default::default() }), Some("continue")),
         ] {
-            let data = c6_proto::SessionCommand { command_id: id.into(), session_id: "session".into(), kind: Some(kind) }.encode_to_vec();
+            let data =
+                c6_proto::SessionCommand { command_id: id.into(), session_id: "session".into(), kind: Some(kind), ownership_epoch: 0 }
+                    .encode_to_vec();
             st.store.enqueue_command(&crate::store::NewCommand { id, session_id: "session", worker_id: worker, data, text }).await.unwrap();
         }
         let (tx, mut rx) = mpsc::channel(8);
@@ -704,6 +731,7 @@ mod tests {
         let command = c6_proto::SessionCommand {
             command_id: "upgraded".into(),
             session_id: "session".into(),
+            ownership_epoch: 0,
             kind: Some(session_command::Kind::Create(c6_proto::CreateSession {
                 subagent_target: Some(target.clone()),
                 ..Default::default()
@@ -741,6 +769,7 @@ mod tests {
         let input = c6_proto::SessionCommand {
             command_id: "after-create".into(),
             session_id: "session".into(),
+            ownership_epoch: 0,
             kind: Some(session_command::Kind::Input(UserInput { text: "do not run".into(), ..Default::default() })),
         };
         st.store
@@ -772,6 +801,11 @@ mod tests {
         let st = &head.state;
         for capable in [false, true] {
             let worker = WorkerId::new();
+            sqlx::query("UPDATE sessions SET worker_id = ? WHERE id = 'session'")
+                .bind(worker.to_string())
+                .execute(&st.store.pool)
+                .await
+                .unwrap();
             let mut capabilities = vec!["queue_ops".into(), "send_now".into()];
             if capable {
                 capabilities.push("user_input_prompt_v1".into());
@@ -792,6 +826,7 @@ mod tests {
                         command_id: id.clone(),
                         session_id: "session".into(),
                         kind: Some(session_command::Kind::Input(input)),
+                        ownership_epoch: 0,
                     }
                     .encode_to_vec()
                 };

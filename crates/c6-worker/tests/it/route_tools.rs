@@ -299,6 +299,7 @@ async fn legacy_subagents_keep_hosted_search_after_reload_and_restore() {
             .handle(SessionCommand {
                 session_id: id.into(),
                 command_id: format!("input-{id}"),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Input(c6_proto::UserInput { text: "continue".into(), ..Default::default() })),
             })
             .await

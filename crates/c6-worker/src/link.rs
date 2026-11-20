@@ -132,13 +132,23 @@ impl HeadLink {
         self.local.get().is_some() || self.outbound.lock().unwrap().is_some()
     }
 
+    /// Legacy epoch-zero rejection.
+    #[allow(dead_code)]
+    pub(crate) fn reject_command(&self, session_id: &str, command_id: &str, reason: &str) {
+        self.reject_owned(session_id, command_id, reason, 0);
+    }
+
     /// Best effort now; the journal's failed receipt repeats this rejection
     /// when the head redelivers after a disconnect.
-    pub(crate) fn reject_command(&self, session_id: &str, command_id: &str, reason: &str) {
+    pub(crate) fn reject_owned(&self, session_id: &str, command_id: &str, reason: &str, ownership_epoch: u64) {
         let tx = self.outbound.lock().unwrap().clone();
         if let Some(tx) = tx {
-            let rejected =
-                c6_proto::CommandRejected { session_id: session_id.into(), command_id: command_id.into(), reason: reason.into() };
+            let rejected = c6_proto::CommandRejected {
+                session_id: session_id.into(),
+                command_id: command_id.into(),
+                reason: reason.into(),
+                ownership_epoch,
+            };
             let _ = tx.try_send(WorkerMsg { msg: Some(worker_msg::Msg::Rejected(rejected)) });
         }
     }
@@ -467,12 +477,13 @@ impl c6_llm::ModelClient for LinkedClient {
 }
 
 /// Appends `ev`, merging it into the previous event when both are text for
-/// the same stream (same session, kind, turn and place in the log, or tool
-/// call).
+/// the same stream (same session incarnation, kind, turn and place in the
+/// log, or tool call).
 fn push_merged(pending: &mut Vec<EphemeralEvent>, ev: EphemeralEvent) {
     use ephemeral_event::Kind;
     if let Some(last) = pending.last_mut()
         && last.session_id == ev.session_id
+        && last.ownership_epoch == ev.ownership_epoch
     {
         match (&mut last.kind, ev.kind.as_ref()) {
             (Some(Kind::Text(a)), Some(Kind::Text(b))) | (Some(Kind::Thinking(a)), Some(Kind::Thinking(b)))
@@ -501,6 +512,7 @@ mod tests {
         EphemeralEvent {
             session_id: session.into(),
             kind: Some(ephemeral_event::Kind::Text(TextDelta { turn, text: t.into(), ..Default::default() })),
+            ownership_epoch: 0,
         }
     }
 
@@ -515,6 +527,7 @@ mod tests {
             EphemeralEvent {
                 session_id: "b".into(),
                 kind: Some(ephemeral_event::Kind::Activity(SessionActivity { running: true, ..Default::default() })),
+                ownership_epoch: 0,
             },
         );
         push_merged(&mut v, text("b", 1, "y"));

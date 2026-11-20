@@ -10,9 +10,12 @@
 //! CA download (a device fetches it before it trusts the CA) and the
 //! ChatGPT OAuth callback, which OpenAI requires on `http://127.0.0.1`.
 
-use std::net::IpAddr;
+use std::io;
+use std::net::{IpAddr, Shutdown};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -28,13 +31,18 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::HeadConfig;
 use crate::ui_ca::UiCa;
+
+const UI_DRAIN: Duration = Duration::from_secs(2);
 
 /// The UI's certificate and the name it is for.
 pub struct UiTls {
@@ -213,39 +221,135 @@ pub(crate) async fn serve_listener(
         None => app,
     };
     let acceptor = tls.map(|(a, _)| a);
+    let mut connections = JoinSet::new();
     loop {
         let (stream, _) = tokio::select! {
-            _ = shutdown.cancelled() => return Ok(()),
+            biased;
+            _ = shutdown.cancelled() => break,
+            Some(r) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(e) = r { warn!("UI connection task: {e}"); }
+                continue;
+            }
             r = listener.get().accept() => match r {
                 Ok(c) => c,
                 Err(e) => { warn!("accepting a UI connection: {e}"); continue; }
             },
         };
         let (acceptor, secure_app, plain_app) = (acceptor.clone(), secure_app.clone(), plain_app.clone());
-        tokio::spawn(async move {
-            let mut first = [0u8; 1];
-            let is_tls = acceptor.is_some()
-                && matches!(tokio::time::timeout(Duration::from_secs(10), stream.peek(&mut first)).await, Ok(Ok(1)))
-                && first[0] == 0x16; // TLS handshake record
-            let served = match acceptor {
-                Some(acceptor) if is_tls => match acceptor.accept(stream).await {
-                    Ok(s) => serve_conn(TokioIo::new(s), secure_app).await,
-                    Err(_) => return, // e.g. a client that does not trust the certificate
-                },
-                _ => serve_conn(TokioIo::new(stream), plain_app).await,
-            };
-            if let Err(e) = served {
+        let shutdown = shutdown.clone();
+        connections.spawn(async move {
+            if let Err(e) = serve_ui_socket(stream, acceptor, secure_app, plain_app, shutdown).await {
                 tracing::debug!("UI connection: {e}");
             }
         });
     }
+    drop(listener);
+    if tokio::time::timeout(UI_DRAIN, async { while connections.join_next().await.is_some() {} }).await.is_err() {
+        connections.shutdown().await;
+    }
+    Ok(())
 }
 
-async fn serve_conn<I>(io: TokioIo<I>, app: Router) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+async fn serve_ui_socket(
+    stream: TcpStream,
+    acceptor: Option<TlsAcceptor>,
+    secure_app: Router,
+    plain_app: Router,
+    shutdown: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let stream = stream.into_std()?;
+    let _close = CloseSocket(stream.try_clone()?);
+    let stream = TcpStream::from_std(stream)?;
+    let (hold, closed) = oneshot::channel();
+    let served = if let Some(acceptor) = acceptor {
+        let mut first = [0u8; 1];
+        let peek = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(()),
+            r = tokio::time::timeout(Duration::from_secs(10), stream.peek(&mut first)) => r,
+        };
+        if matches!(peek, Ok(Ok(1))) && first[0] == 0x16 {
+            let tls = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return Ok(()),
+                r = acceptor.accept(stream) => r?,
+            };
+            serve_conn(tls, secure_app, &shutdown, hold).await
+        } else {
+            serve_conn(stream, plain_app, &shutdown, hold).await
+        }
+    } else {
+        serve_conn(stream, plain_app, &shutdown, hold).await
+    };
+    // Hyper can hand the I/O to an upgrade and return before it closes.
+    // Keep the socket guard alive until the actual transport is dropped.
+    let _ = closed.await;
+    served
+}
+
+async fn serve_conn<I>(
+    io: I,
+    app: Router,
+    shutdown: &CancellationToken,
+    hold: oneshot::Sender<()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
-    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    auto::Builder::new(TokioExecutor::new()).serve_connection_with_upgrades(io, TowerToHyperService::new(app)).await
+    let builder = auto::Builder::new(TokioExecutor::new());
+    let mut conn =
+        std::pin::pin!(builder.serve_connection_with_upgrades(TokioIo::new(TrackedIo { io, _hold: hold }), TowerToHyperService::new(app)));
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
+        }
+        r = conn.as_mut() => r,
+    }
+}
+
+/// Closing the duplicate descriptor alone would leave an upgraded socket
+/// open. Shutdown both directions when a connection task is dropped.
+struct CloseSocket(std::net::TcpStream);
+
+impl Drop for CloseSocket {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(Shutdown::Both);
+    }
+}
+
+struct TrackedIo<I> {
+    io: I,
+    _hold: oneshot::Sender<()>,
+}
+
+impl<I: AsyncRead + Unpin> AsyncRead for TrackedIo<I> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<I: AsyncWrite + Unpin> AsyncWrite for TrackedIo<I> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, bufs: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
 }
 
 /// Plain HTTP when HTTPS is on: redirect, except the OAuth callback and
@@ -260,6 +364,61 @@ async fn to_https(State(base): State<Arc<String>>, req: Request, next: Next) -> 
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn shutdown_closes_accepted_http_and_upgraded_sockets() {
+        use axum::extract::ws::WebSocketUpgrade;
+        use axum::routing::get;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = super::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = super::CancellationToken::new();
+        let upgraded = super::Arc::new(tokio::sync::Notify::new());
+        let ready = upgraded.clone();
+        let app = super::Router::new().route("/", get(|| async { "ok" })).route(
+            "/ws",
+            get(move |ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    upgraded.notify_one();
+                    // The handler does not cooperate with shutdown; the
+                    // listener must still close the upgraded transport.
+                    let _ = socket.recv().await;
+                })
+            }),
+        );
+        let server = tokio::spawn(super::serve(listener, app, None, None, stop.clone()));
+
+        async fn response(socket: &mut BufReader<super::TcpStream>, request: &[u8]) -> String {
+            socket.write_all(request).await.unwrap();
+            let mut headers = String::new();
+            loop {
+                let start = headers.len();
+                assert_ne!(socket.read_line(&mut headers).await.unwrap(), 0, "response ended before its headers");
+                if &headers[start..] == "\r\n" {
+                    return headers;
+                }
+            }
+        }
+
+        let mut http = BufReader::new(super::TcpStream::connect(addr).await.unwrap());
+        let headers = response(&mut http, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(headers.starts_with("HTTP/1.1 200"));
+        let mut body = [0; 2];
+        http.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"ok");
+
+        let mut ws = BufReader::new(super::TcpStream::connect(addr).await.unwrap());
+        let headers = response(&mut ws, b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").await;
+        assert!(headers.starts_with("HTTP/1.1 101"));
+        c6_testkit::within("the upgrade handler to take the socket", ready.notified()).await;
+
+        stop.cancel();
+        c6_testkit::within("the UI listener and its connections to shut down", server).await.unwrap().unwrap();
+        for mut socket in [http, ws] {
+            let n = c6_testkit::within("shutdown to close the accepted socket", socket.read(&mut body)).await.unwrap();
+            assert_eq!(n, 0);
+        }
+    }
     use reqwest::StatusCode;
 
     #[test]

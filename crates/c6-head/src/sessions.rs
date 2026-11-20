@@ -51,7 +51,6 @@ pub const ROUTES: &str = "routes";
 pub struct LiveHub {
     channels: Mutex<HashMap<String, broadcast::Sender<api::StreamMsg>>>,
     /// Session → owning worker, to vet ephemeral events cheaply.
-    owners: Mutex<HashMap<String, WorkerId>>,
     /// Last restore per session, to rate-limit them.
     restores: Mutex<HashMap<String, std::time::Instant>>,
 }
@@ -205,6 +204,7 @@ async fn create_linked_with_origin(
     let row = SessionRow {
         id: Uuid::now_v7().to_string(),
         worker_id: worker_id.to_string(),
+        ownership_epoch: 0,
         title,
         cwd,
         connection_id,
@@ -368,6 +368,7 @@ async fn create_assistant_with_origin(
     let row = SessionRow {
         id: Uuid::now_v7().to_string(),
         worker_id: head_id.to_string(),
+        ownership_epoch: 0,
         title: default_title(Some(prompt)),
         cwd: String::new(),
         connection_id: connection_id.clone(),
@@ -475,6 +476,7 @@ async fn create_side_chat_with_origin(
     let row = SessionRow {
         id: Uuid::now_v7().to_string(),
         worker_id: parent.worker_id.clone(),
+        ownership_epoch: 0,
         title: default_title(Some(prompt)),
         cwd,
         connection_id: req.connection_id.clone(),
@@ -814,8 +816,12 @@ async fn insert(
     let labels = row.head_labels();
     let realm = row.realm.clone();
     let create_id = Uuid::now_v7().to_string();
-    let create =
-        SessionCommand { command_id: create_id.clone(), session_id: session_id.clone(), kind: Some(session_command::Kind::Create(spec)) };
+    let create = SessionCommand {
+        command_id: create_id.clone(),
+        session_id: session_id.clone(),
+        kind: Some(session_command::Kind::Create(spec)),
+        ownership_epoch: 0,
+    };
     let mut commands = vec![NewCommand { id: &create_id, session_id: &session_id, worker_id, data: create.encode_to_vec(), text: None }];
     let text = first.as_ref().map(|input| input.text.clone());
     if let Some(mut input) = first {
@@ -829,7 +835,6 @@ async fn insert(
         });
     }
     let colour = st.store.create_session(&row, &commands, brief.is_some()).await?;
-    st.hub.owners.lock().unwrap().insert(session_id.clone(), worker_id);
     match brief {
         Some(brief) => hand_over_later(st, worker_id, create, &realm, brief).await,
         None => st.registry.deliver(worker_id),
@@ -917,8 +922,13 @@ fn default_title(prompt: Option<&str>) -> String {
 
 /// An input (which may also switch the model or carry attachments).
 fn input_command(command_id: &str, session_id: &str, input: UserInput) -> Vec<u8> {
-    SessionCommand { command_id: command_id.to_owned(), session_id: session_id.to_owned(), kind: Some(session_command::Kind::Input(input)) }
-        .encode_to_vec()
+    SessionCommand {
+        command_id: command_id.to_owned(),
+        session_id: session_id.to_owned(),
+        kind: Some(session_command::Kind::Input(input)),
+        ownership_epoch: 0,
+    }
+    .encode_to_vec()
 }
 
 /// Only an explicitly upgraded worker can decode prompt at tag 16. Older
@@ -1135,6 +1145,7 @@ pub async fn set_subagent_model(st: &HeadState, session_id: &str, req: &api::Set
         command_id: id.clone(),
         session_id: session_id.to_owned(),
         kind: Some(session_command::Kind::SetSubagentModel(c6_proto::SetSubagentModel { model: spec })),
+        ownership_epoch: 0,
     }
     .encode_to_vec();
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: None }).await?;
@@ -1342,7 +1353,7 @@ async fn send_input_with(
     // Send now to a connected worker that doesn't know it (an older one):
     // as before, the turn stops and this starts the next.
     if req.send_now && !sends_now(st, worker_id) {
-        interrupt_on(st, worker_id, session_id, String::new());
+        interrupt_on(st, &session, String::new()).await?;
     }
     let data = input_command(&id, session_id, input);
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&shown) }).await?;
@@ -1366,6 +1377,13 @@ fn takes_input(session: &SessionRow) -> anyhow::Result<()> {
 /// A connected worker that cannot edit or cancel its queued inputs (an
 /// older one): 409, naming what to do. The head's own worker (assistant
 /// sessions) is never "older" than the head: it is the head.
+async fn queue_owner_gate(st: &HeadState, session: &SessionRow, worker_id: WorkerId) -> anyhow::Result<()> {
+    if !st.store.session_routable(&session.id, worker_id, session.ownership_epoch).await? {
+        return Err(conflict("the session's worker is changing"));
+    }
+    queue_gate(st, worker_id, &session.worker_name)
+}
+
 fn queue_gate(st: &HeadState, worker_id: WorkerId, worker_name: &str) -> anyhow::Result<()> {
     if st.assistant.head_id() == Some(worker_id) {
         return Ok(());
@@ -1420,7 +1438,7 @@ pub async fn edit_queued(
     let worker_id: WorkerId = session.worker_id.parse()?;
     // A connected worker says whether it can edit or cancel its queued
     // inputs; one that is away gets asked and says so then (503).
-    queue_gate(st, worker_id, &session.worker_name)?;
+    queue_owner_gate(st, &session, worker_id).await?;
     // The change the worker makes to its inbox, if the input is there.
     let new_input = {
         // @memex: attachments were the old text's: the new text's, attached
@@ -1447,7 +1465,7 @@ pub async fn edit_queued(
                 let mut wire_input = new_input.clone();
                 prepare_worker_input(&live.capabilities, &mut wire_input);
                 let data = base64::engine::general_purpose::STANDARD.encode(wire_input.encode_to_vec());
-                serde_json::json!({ "session_id": session_id, "command_id": command_id, "op": "update", "data": data })
+                serde_json::json!({ "session_id": session_id, "ownership_epoch": session.ownership_epoch, "command_id": command_id, "op": "update", "data": data })
             },
             std::time::Duration::from_secs(5),
         )
@@ -1488,13 +1506,13 @@ pub async fn cancel_queued(st: &HeadState, session_id: &str, command_id: &str) -
         return Err(not_found("no such queued input"));
     }
     let worker_id: WorkerId = session.worker_id.parse()?;
-    queue_gate(st, worker_id, &session.worker_name)?;
+    queue_owner_gate(st, &session, worker_id).await?;
     let call = st
         .registry
         .call(
             worker_id,
             "session.queue_op",
-            serde_json::json!({ "session_id": session_id, "command_id": command_id, "op": "cancel" }),
+            serde_json::json!({ "session_id": session_id, "ownership_epoch": session.ownership_epoch, "command_id": command_id, "op": "cancel" }),
             std::time::Duration::from_secs(5),
         )
         .await;
@@ -1538,13 +1556,13 @@ pub async fn take_back_message(st: &HeadState, session_id: &str, command_id: &st
     if st.assistant.head_id() == Some(worker_id) {
         return Err(conflict("this session's worker cannot confirm message withdrawal"));
     }
-    queue_gate(st, worker_id, &session.worker_name)?;
+    queue_owner_gate(st, &session, worker_id).await?;
     let reply = st
         .registry
         .call(
             worker_id,
             "session.queue_op",
-            json!({ "session_id": session_id, "command_id": command_id, "op": "cancel" }),
+            json!({ "session_id": session_id, "ownership_epoch": session.ownership_epoch, "command_id": command_id, "op": "cancel" }),
             std::time::Duration::from_secs(5),
         )
         .await
@@ -1576,7 +1594,7 @@ pub async fn pull_queued(st: &HeadState, session_id: &str, command_id: &str) -> 
     // The head's own worker (assistant sessions) is never asked: its
     // connection answers none of the head's RPCs.
     let head_worker = st.assistant.head_id() == Some(worker_id);
-    queue_gate(st, worker_id, &session.worker_name)?;
+    queue_owner_gate(st, &session, worker_id).await?;
     let rows = st.store.pending_tail(session_id, command_id).await?.ok_or_else(|| not_found("no such queued input"))?;
     // The anchor first: if it is on its way, nothing is pulled.
     for row in &rows {
@@ -1586,7 +1604,7 @@ pub async fn pull_queued(st: &HeadState, session_id: &str, command_id: &str) -> 
                 .call(
                     worker_id,
                     "session.queue_op",
-                    serde_json::json!({ "session_id": session_id, "command_id": row.id, "op": "cancel" }),
+                    serde_json::json!({ "session_id": session_id, "ownership_epoch": session.ownership_epoch, "command_id": row.id, "op": "cancel" }),
                     std::time::Duration::from_secs(5),
                 )
                 .await;
@@ -1888,11 +1906,18 @@ pub(crate) enum PlacementRequest {
         expected_place_seq: u64,
         place_seq: u64,
     },
+    Worker {
+        expected_place_seq: u64,
+        worker: String,
+        #[serde(default)]
+        clone: bool,
+    },
 }
 
 #[derive(serde::Serialize)]
 pub(crate) struct Placement {
     seq: u64,
+    worker_id: String,
     cwd: String,
     worktree_branch: String,
     repo_root: String,
@@ -1904,28 +1929,45 @@ pub(crate) struct Placement {
 /// conversation rewind must neither undo placement nor erase its history.
 pub(crate) async fn placements(st: &HeadState, session_id: &str) -> anyhow::Result<Vec<Placement>> {
     let events = st.store.events_after(session_id, 0, i64::MAX).await?;
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    let mut worker = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            Some(session_event::Kind::PlaceChanged(p)) => p.from.as_ref().filter(|s| !s.worker_id.is_empty()).map(|s| s.worker_id.clone()),
+            _ => None,
+        })
+        .unwrap_or(session.worker_id);
     Ok(events
         .into_iter()
-        .rev()
         .filter_map(|event| match event.kind {
             Some(session_event::Kind::Started(s)) => Some(Placement {
                 seq: event.seq,
+                worker_id: worker.clone(),
                 cwd: s.cwd,
                 worktree_branch: s.worktree_branch,
                 repo_root: s.repo_root,
                 copied_paths: Vec::new(),
                 uncommitted_files: 0,
             }),
-            Some(session_event::Kind::PlaceChanged(p)) => p.to.map(|s| Placement {
-                seq: event.seq,
-                cwd: s.cwd,
-                worktree_branch: s.worktree_branch,
-                repo_root: s.repo_root,
-                copied_paths: p.copied_paths,
-                uncommitted_files: p.uncommitted_files,
+            Some(session_event::Kind::PlaceChanged(p)) => p.to.map(|s| {
+                if !s.worker_id.is_empty() {
+                    worker.clone_from(&s.worker_id);
+                }
+                Placement {
+                    seq: event.seq,
+                    worker_id: worker.clone(),
+                    cwd: s.cwd,
+                    worktree_branch: s.worktree_branch,
+                    repo_root: s.repo_root,
+                    copied_paths: p.copied_paths,
+                    uncommitted_files: p.uncommitted_files,
+                }
             }),
             _ => None,
         })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
         .collect())
 }
 
@@ -1939,6 +1981,48 @@ pub(crate) async fn change_place(st: &HeadState, session: &SessionRow, req: &Pla
         return Err(forbidden("the session's realm may not use this worker"));
     }
     let live = st.registry.get(worker_id).ok_or_else(|| conflict("worker is not connected"))?;
+    let destination = match req {
+        PlacementRequest::Worker { expected_place_seq, worker, clone } => Some((*expected_place_seq, worker.clone(), *clone, None)),
+        PlacementRequest::Back { expected_place_seq, place_seq } => {
+            let earlier = placements(st, &session.id)
+                .await?
+                .into_iter()
+                .skip(1)
+                .find(|p| p.seq == *place_seq)
+                .ok_or_else(|| bad_request("choose an earlier place from this session's placement history"))?;
+            (earlier.worker_id != session.worker_id).then_some((*expected_place_seq, earlier.worker_id, false, Some(earlier.cwd)))
+        }
+        _ => None,
+    };
+    if let Some((expected, target, clone, previous)) = destination {
+        if matches!(worker.role.as_str(), "head" | "memex") {
+            return Err(bad_request("only sessions on ordinary workers can move between workers"));
+        }
+        let target_id: WorkerId = target.parse().map_err(|_| bad_request("choose a destination worker"))?;
+        let target_worker = st.store.worker(target_id).await?.ok_or_else(|| not_found("no such destination worker"))?;
+        if matches!(target_worker.role.as_str(), "head" | "memex") {
+            return Err(bad_request("choose a session worker, not the head or memex"));
+        }
+        if !crate::realms::available(&target_worker.realms, &session.realm) || target_worker.revoked_at.is_some() {
+            return Err(forbidden("the session's realm may not use the destination worker"));
+        }
+        let target_live = st.registry.get(target_id).ok_or_else(|| conflict("destination worker is not connected"))?;
+        if !live.capabilities.iter().any(|c| c == c6_proto::SESSION_MOVE_CAPABILITY)
+            || !target_live.capabilities.iter().any(|c| c == c6_proto::SESSION_MOVE_CAPABILITY)
+        {
+            return Err(conflict("both workers must support fenced session moves"));
+        }
+        return crate::session_moves::start(
+            st,
+            &session.id,
+            worker_id,
+            target_id,
+            expected,
+            serde_json::json!({"clone": clone, "previous_cwd": previous,
+                "notice_template": crate::prompts::get(st, "session.place_changed", &session.realm).await}),
+        )
+        .await;
+    }
     if !live.capabilities.iter().any(|c| c == "same_worker_placement_v1") {
         return Err(conflict("this worker does not support changing place"));
     }
@@ -1959,6 +2043,7 @@ pub(crate) async fn change_place(st: &HeadState, session: &SessionRow, req: &Pla
         ..Default::default()
     };
     match req {
+        PlacementRequest::Worker { .. } => unreachable!("worker move handled above"),
         PlacementRequest::Folder { expected_place_seq, cwd, copy_scratch } => {
             if cwd.is_empty() || cwd.len() > 4096 || cwd.contains('\0') {
                 return Err(bad_request("choose a destination folder"));
@@ -2003,9 +2088,13 @@ pub(crate) async fn change_place(st: &HeadState, session: &SessionRow, req: &Pla
         return Err(bad_request("choose an earlier place from this session's placement history"));
     }
     let id = Uuid::now_v7().to_string();
-    let data =
-        SessionCommand { command_id: id.clone(), session_id: session.id.clone(), kind: Some(session_command::Kind::ChangePlace(change)) }
-            .encode_to_vec();
+    let data = SessionCommand {
+        command_id: id.clone(),
+        session_id: session.id.clone(),
+        kind: Some(session_command::Kind::ChangePlace(change)),
+        ownership_epoch: 0,
+    }
+    .encode_to_vec();
     if !st.store.enqueue_placement_command(&NewCommand { id: &id, session_id: &session.id, worker_id, data, text: None }).await? {
         return Err(conflict("wait for the session's pending commands before changing place"));
     }
@@ -2051,6 +2140,7 @@ pub async fn rewind(st: &HeadState, session_id: &str, req: &api::RewindRequest) 
         command_id: id.clone(),
         session_id: session_id.to_owned(),
         kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: req.to_seq, restore_files: req.restore_files })),
+        ownership_epoch: 0,
     }
     .encode_to_vec();
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: None }).await?;
@@ -2115,7 +2205,7 @@ async fn model_switch(
 /// connected and running the turn.
 pub async fn interrupt(st: &HeadState, session_id: &str) -> anyhow::Result<bool> {
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
-    Ok(interrupt_on(st, session.worker_id.parse()?, session_id, String::new()))
+    interrupt_on(st, &session, String::new()).await
 }
 
 /// Send now for a message already with the agent (`command_id`): it gets it
@@ -2123,16 +2213,26 @@ pub async fn interrupt(st: &HeadState, session_id: &str) -> anyhow::Result<bool>
 /// worker takes it as one.
 pub async fn send_queued_now(st: &HeadState, session_id: &str, command_id: &str) -> anyhow::Result<bool> {
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
-    Ok(interrupt_on(st, session.worker_id.parse()?, session_id, command_id.to_owned()))
+    interrupt_on(st, &session, command_id.to_owned()).await
 }
 
-fn interrupt_on(st: &HeadState, worker_id: WorkerId, session_id: &str, send_now: String) -> bool {
+async fn send_control(st: &HeadState, session: &SessionRow, mut cmd: SessionCommand) -> anyhow::Result<bool> {
+    let worker_id = session.worker_id.parse()?;
+    if !st.store.session_routable(&session.id, worker_id, session.ownership_epoch).await? {
+        return Err(crate::conflict("the session's worker is changing"));
+    }
+    cmd.ownership_epoch = session.ownership_epoch as u64;
+    Ok(st.registry.send_command(worker_id, cmd))
+}
+
+async fn interrupt_on(st: &HeadState, session: &SessionRow, send_now: String) -> anyhow::Result<bool> {
     let cmd = SessionCommand {
         command_id: Uuid::now_v7().to_string(),
-        session_id: session_id.to_owned(),
+        session_id: session.id.clone(),
         kind: Some(session_command::Kind::Interrupt(c6_proto::Interrupt { send_now })),
+        ..Default::default()
     };
-    st.registry.send_command(worker_id, cmd)
+    send_control(st, session, cmd).await
 }
 
 /// The worker takes Send now itself (`UserInput.send_now`), or isn't
@@ -2150,8 +2250,9 @@ pub async fn decide(st: &HeadState, session_id: &str, call_id: &str, allow: bool
         command_id: Uuid::now_v7().to_string(),
         session_id: session_id.to_owned(),
         kind: Some(session_command::Kind::Approve(c6_proto::Approve { call_id: call_id.to_owned(), allow })),
+        ownership_epoch: 0,
     };
-    Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
+    send_control(st, &session, cmd).await
 }
 
 /// Answers the assistant's question `call_id` in a conversation. Whether
@@ -2167,13 +2268,14 @@ pub async fn answer_question(
     let cmd = SessionCommand {
         command_id: Uuid::now_v7().to_string(),
         session_id: session_id.to_owned(),
+        ownership_epoch: 0,
         kind: Some(session_command::Kind::Answer(c6_proto::Answer {
             call_id: call_id.to_owned(),
             values_json: serde_json::Value::Object(values).to_string(),
             cancelled,
         })),
     };
-    Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
+    send_control(st, &session, cmd).await
 }
 
 /// Where a new session runs: the connection, model, effort and subagent
@@ -2422,6 +2524,7 @@ pub async fn release_notices(st: &HeadState, session_id: &str) -> anyhow::Result
     let cmd = SessionCommand {
         command_id: Uuid::now_v7().to_string(),
         session_id: session_id.to_owned(),
+        ownership_epoch: 0,
         kind: Some(session_command::Kind::ReleaseNotices(c6_proto::ReleaseNotices {
             limits: Some(c6_proto::NoticeLimits {
                 notice_quiet_seconds: limits.notice_quiet_seconds,
@@ -2432,7 +2535,7 @@ pub async fn release_notices(st: &HeadState, session_id: &str) -> anyhow::Result
             }),
         })),
     };
-    Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
+    send_control(st, &session, cmd).await
 }
 
 /// Stops a session's background task (one of Claude Code's too: its
@@ -2443,8 +2546,9 @@ pub async fn stop_task(st: &HeadState, session_id: &str, task_id: &str) -> anyho
         command_id: Uuid::now_v7().to_string(),
         session_id: session_id.to_owned(),
         kind: Some(session_command::Kind::StopTask(c6_proto::StopTask { task_id: task_id.to_owned() })),
+        ownership_epoch: 0,
     };
-    Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
+    send_control(st, &session, cmd).await
 }
 
 pub async fn publish_queue(st: &HeadState, session_id: &str) {
@@ -2481,7 +2585,7 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, mut batch: SessionEvent
             u.task_card_origin = origin.task_card;
         }
     }
-    let Some(ing) = st.store.ingest(worker_id, &batch.session_id, &batch.events).await? else {
+    let Some(ing) = st.store.ingest_at_epoch(worker_id, &batch.session_id, batch.ownership_epoch, &batch.events).await? else {
         debug!(session = %batch.session_id, worker = %worker_id, "events for unknown session ignored");
         return Ok(None);
     };
@@ -2664,17 +2768,8 @@ async fn export_turns(st: &HeadState, worker_id: WorkerId, session_id: &str, end
 }
 
 pub async fn on_ephemeral(st: &HeadState, worker_id: WorkerId, ev: EphemeralEvent) {
-    let owner = st.hub.owners.lock().unwrap().get(&ev.session_id).copied();
-    let owner = match owner {
-        Some(o) => Some(o),
-        None => match st.store.session(&ev.session_id).await {
-            Ok(Some(s)) => s.worker_id.parse().ok().inspect(|o| {
-                st.hub.owners.lock().unwrap().insert(ev.session_id.clone(), *o);
-            }),
-            _ => None,
-        },
-    };
-    if owner != Some(worker_id) {
+    let Ok(epoch) = i64::try_from(ev.ownership_epoch) else { return };
+    if !st.store.session_routable(&ev.session_id, worker_id, epoch).await.unwrap_or(false) {
         return;
     }
     match &ev.kind {
@@ -2690,17 +2785,21 @@ pub async fn on_ephemeral(st: &HeadState, worker_id: WorkerId, ev: EphemeralEven
 }
 
 pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected) -> anyhow::Result<()> {
+    let Ok(epoch) = i64::try_from(r.ownership_epoch) else { return Ok(()) };
+    if !st.store.session_routable(&r.session_id, worker_id, epoch).await? {
+        return Ok(());
+    }
     // The worker lost (or trimmed) this session: send it the log, then the
     // input again. At most once a minute per session, so a worker that
     // cannot restore does not loop.
     if r.reason.contains("unknown session") && st.hub.may_restore(&r.session_id) {
-        match restore(st, worker_id, &r.session_id, &r.command_id).await {
+        match restore(st, worker_id, epoch, &r.session_id, &r.command_id).await {
             Ok(true) => return Ok(()),
             Ok(false) => {}
             Err(e) => warn!(session = %r.session_id, "restoring session: {e:#}"),
         }
     }
-    if let Some(session_id) = st.store.reject_command(worker_id, &r.command_id, &r.reason).await? {
+    if let Some(session_id) = st.store.reject_command_at_epoch(worker_id, &r.command_id, Some(&r.session_id), epoch, &r.reason).await? {
         warn!(session = %session_id, reason = %r.reason, "worker rejected command");
         crate::remote::rejected(st, &session_id, &r.command_id, &r.reason).await;
         publish_queue(st, &session_id).await;
@@ -2714,9 +2813,9 @@ pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected
 }
 
 /// Queues a `Restore` and a fresh copy of the rejected input, in that order.
-async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_id: &str) -> anyhow::Result<bool> {
+async fn restore(st: &HeadState, worker_id: WorkerId, epoch: i64, session_id: &str, command_id: &str) -> anyhow::Result<bool> {
     let Some(session) = st.store.session(session_id).await? else { return Ok(false) };
-    if session.status == "failed" || session.observed || session.worker_id != worker_id.to_string() {
+    if session.status == "failed" || session.observed || session.worker_id != worker_id.to_string() || session.ownership_epoch != epoch {
         return Ok(false);
     }
     let Some((text, _created_at, data)) = st.store.pending_input(command_id).await? else { return Ok(false) };
@@ -2772,16 +2871,22 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
         command_id: restore_id.clone(),
         session_id: session_id.to_owned(),
         kind: Some(session_command::Kind::Restore(c6_proto::Restore { spec: Some(spec), events })),
+        ownership_epoch: 0,
     };
     let input_id = Uuid::now_v7().to_string();
     let data = input_command(&input_id, session_id, input);
-    st.store
+    let replaced = st
+        .store
         .replace_with_restore(
             command_id,
             &NewCommand { id: &restore_id, session_id, worker_id, data: cmd.encode_to_vec(), text: None },
             &NewCommand { id: &input_id, session_id, worker_id, data, text: Some(&text) },
+            epoch,
         )
         .await?;
+    if !replaced {
+        return Ok(false);
+    }
     // A parent's call waiting on that input waits on its copy.
     st.store.rename_delegation(command_id, &input_id).await?;
     warn!(session = %session_id, "worker no longer had this session; restoring it from the head's log");
@@ -3303,7 +3408,10 @@ mod input_compatibility_tests {
         let Some(session_event::Kind::NoticeQueued(queued)) = &mut update.kind else { unreachable!() };
         queued.reason = "paused: spending limit".into();
         events.push(update.clone());
-        assert_eq!(ingest(st, worker, SessionEventBatch { session_id: "session".into(), events }).await.unwrap(), Some(9));
+        assert_eq!(
+            ingest(st, worker, SessionEventBatch { session_id: "session".into(), events, ownership_epoch: 0 }).await.unwrap(),
+            Some(9)
+        );
         let stored = st.store.events_after("session", 0, 10).await.unwrap();
         assert_eq!(stored[0], historical, "replayed history must remain legacy/neutral");
         assert_eq!(stored[7], notice, "user command provenance must not be copied onto a notice");
@@ -3442,7 +3550,7 @@ mod input_compatibility_tests {
         assert!(pending_of(st, "session", "take").await.unwrap().is_none());
         assert!(pending_of(st, "session", "recover").await.unwrap().is_some(), "taking back one input cannot pull its tail");
         // This is the path used when the worker rejects an unknown session.
-        assert!(restore(st, worker, "session", "recover").await.unwrap());
+        assert!(restore(st, worker, 0, "session", "recover").await.unwrap());
         let pending = st.store.pending_commands(worker, 0).await.unwrap();
         assert_eq!(pending.len(), 2);
         assert!(matches!(c6_proto::decode_stored_command(&pending[0].data).unwrap().kind, Some(session_command::Kind::Restore(_))));

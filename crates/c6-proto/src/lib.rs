@@ -10,6 +10,9 @@ pub mod v1 {
 pub use compat::decode_stored_command;
 pub use v1::*;
 
+/// Hello capability required to send a nonzero session ownership epoch.
+pub const SESSION_MOVE_CAPABILITY: &str = "session_move_v1";
+
 #[cfg(test)]
 mod tests {
     use super::*;

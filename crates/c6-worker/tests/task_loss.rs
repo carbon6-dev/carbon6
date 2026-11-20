@@ -42,6 +42,7 @@ async fn message(manager: &SessionManager, id: &str) {
         .handle(SessionCommand {
             session_id: SID.into(),
             command_id: id.into(),
+            ownership_epoch: 0,
             kind: Some(session_command::Kind::Input(UserInput { from_session_id: "sender".into(), ..Default::default() })),
         })
         .await
@@ -241,6 +242,7 @@ async fn reloading_a_reported_child_does_not_queue_a_duplicate_notice_after_call
         .handle(SessionCommand {
             session_id: REUSED_CALL_CHILD.into(),
             command_id: "load-child-a".into(),
+            ownership_epoch: 0,
             kind: Some(session_command::Kind::SetSubagentModel(c6_proto::SetSubagentModel::default())),
         })
         .await
@@ -317,6 +319,7 @@ async fn handed_child_report_falls_back_when_the_parent_cannot_record_its_result
         .handle(SessionCommand {
             session_id: sid.into(),
             command_id: "run-task".into(),
+            ownership_epoch: 0,
             kind: Some(session_command::Kind::Input(UserInput { text: "Run one task".into(), ..Default::default() })),
         })
         .await

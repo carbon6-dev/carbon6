@@ -71,6 +71,7 @@ impl Fixture {
         let row = SessionRow {
             id: id.into(),
             worker_id: self.worker.to_string(),
+            ownership_epoch: 0,
             title: "withdrawal fixture".into(),
             cwd: String::new(),
             connection_id: String::new(),
@@ -125,6 +126,7 @@ impl Fixture {
         let data = SessionCommand {
             command_id: command.into(),
             session_id: session.into(),
+            ownership_epoch: 0,
             kind: Some(session_command::Kind::Input(UserInput { text: "same text".into(), ..Default::default() })),
         }
         .encode_to_vec();
@@ -170,7 +172,7 @@ async fn cancellation(rx: &mut Inbox, session: &str, command: &str) -> RpcReques
     assert_eq!(req.method, "session.queue_op");
     assert_eq!(
         serde_json::from_slice::<Value>(&req.params_json).unwrap(),
-        json!({"session_id": session, "command_id": command, "op": "cancel"})
+        json!({"session_id": session, "command_id": command, "op": "cancel", "ownership_epoch": 0})
     );
     req
 }
@@ -406,6 +408,7 @@ async fn take_back_validates_same_session_and_input_command_identity() {
             data: SessionCommand {
                 command_id: "not-an-input".into(),
                 session_id: "s".into(),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Interrupt(Default::default())),
             }
             .encode_to_vec(),

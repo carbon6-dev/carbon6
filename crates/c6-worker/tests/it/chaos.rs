@@ -163,6 +163,7 @@ async fn journal_failure_preserves_inputs_waiting_for_the_next_boundary() {
         .handle(c6_proto::SessionCommand {
             session_id: id.clone(),
             command_id: "queued-before-failure".into(),
+            ownership_epoch: 0,
             kind: Some(c6_proto::session_command::Kind::Input(c6_proto::UserInput {
                 text: "Do not drop this queued input".into(),
                 ..Default::default()
@@ -223,6 +224,7 @@ async fn journal_failure_keeps_a_notice_whose_queue_marker_could_not_be_written(
         .handle(c6_proto::SessionCommand {
             session_id: id.clone(),
             command_id: "notice-with-no-marker".into(),
+            ownership_epoch: 0,
             kind: Some(c6_proto::session_command::Kind::Input(c6_proto::UserInput {
                 text: "This notice must survive its failed queue write".into(),
                 from_session_id: "sender".into(),

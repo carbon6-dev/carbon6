@@ -69,6 +69,7 @@ mod search;
 mod secrets;
 mod series;
 mod session;
+mod session_moves;
 mod side_chat;
 mod subagent_models;
 mod subagents;

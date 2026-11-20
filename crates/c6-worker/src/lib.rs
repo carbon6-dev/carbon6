@@ -17,6 +17,8 @@ pub mod journal;
 pub mod link;
 mod mcp_bridge;
 pub mod mentions;
+mod move_files;
+mod move_sessions;
 mod notice_guard;
 mod place_files;
 pub mod policy;
@@ -85,6 +87,7 @@ pub struct Worker {
     /// The live connection to the head, for opening extra streams.
     channel: Mutex<Option<tonic::transport::Channel>>,
     extension: Mutex<Option<Arc<dyn Extension>>>,
+    move_gates: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Updating to a release the head says is out (docs/updates.md).
     pub update: update::Updating,
     /// Settings tests give this worker (never the process's environment,
@@ -133,6 +136,7 @@ impl Worker {
             sessions,
             terminals: pty::Terminals::default(),
             channel: Mutex::new(None),
+            move_gates: Mutex::default(),
             extension: Mutex::new(None),
             update: Default::default(),
             overrides: Default::default(),

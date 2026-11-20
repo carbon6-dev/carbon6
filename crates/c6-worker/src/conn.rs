@@ -135,15 +135,19 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
     // It runs kit jobs for the head (docs/knowledge.md §6.2), unless told not to.
     let offers_kits = worker.runs_kit_jobs();
     let kits = offers_kits && c6_tools::kits::runtime().await.is_some();
+    let mut capabilities = crate::capabilities(worker, crate::claude_code::find_claude().is_some(), kits);
+    capabilities.push(c6_proto::SESSION_MOVE_CAPABILITY.into());
     let hello = Hello {
         protocol_version: c6_core::PROTOCOL_VERSION,
         version: c6_core::build().into(),
         hostname: crate::hostname(),
         os: c6_core::host_os().into(),
         arch: c6_core::host_arch().into(),
-        capabilities: crate::capabilities(worker, crate::claude_code::find_claude().is_some(), kits),
+        capabilities,
         sessions: match worker.journal.unacked().await {
-            Ok(cursors) => cursors.into_iter().map(|c| SessionCursor { session_id: c.session_id, seq: c.last_seq }).collect(),
+            Ok(cursors) => {
+                cursors.into_iter().map(|c| SessionCursor { session_id: c.session_id, seq: c.last_seq, ownership_epoch: c.epoch }).collect()
+            }
             Err(e) => return Ended::Retry(e.context("reading journal")),
         },
     };
@@ -159,7 +163,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
         Ok(Ok(Some(HeadMsg { msg: Some(head_msg::Msg::Welcome(w)) }))) => {
             info!(worker = %w.worker_id, name = %w.worker_name, head = %w.head_version, "attached to head");
             for ack in &w.acks {
-                if let Err(e) = worker.journal.set_acked(&ack.session_id, ack.seq).await {
+                if let Err(e) = worker.journal.set_acked_owned(&ack.session_id, ack.seq, ack.ownership_epoch).await {
                     return Ended::Retry(e.context("recording acks"));
                 }
             }
@@ -194,6 +198,28 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                     },
                 };
                 let (command_id, session_id) = (cmd.command_id.clone(), cmd.session_id.clone());
+                let ownership_epoch = cmd.ownership_epoch;
+                // The manager can recover a lost cache via Restore before checking
+                // ownership. No other command can install a new incarnation.
+                if !matches!(&cmd.kind, Some(session_command::Kind::Restore(_)))
+                    && let Err(reason) = worker.journal.check_ownership(&session_id, ownership_epoch).await
+                {
+                    // A lost cache has neither an ownership row nor a session.
+                    // Let the head recover its current owner as for legacy cache loss.
+                    let reason = if ownership_epoch != 0
+                        && matches!(&cmd.kind, Some(session_command::Kind::Input(_)))
+                        && matches!(worker.journal.ownership(&session_id).await, Ok((0, false, _)))
+                        && matches!(worker.journal.has_session(&session_id).await, Ok(false))
+                    {
+                        "unknown session on this worker".into()
+                    } else {
+                        format!("{reason:#}")
+                    };
+                    if reject_command(&tx, command_id, session_id, ownership_epoch, reason).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let result = match cmd.kind {
                     Some(session_command::Kind::ChangePlace(place)) => {
                         // Put the move in the mailbox before dispatching the next command,
@@ -206,7 +232,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                                         _ = stop.cancelled() => {},
                                         _ = async {
                                             if let Err(reason) = result.await {
-                                                let _ = reject_command(&tx, command_id, session_id, reason).await;
+                                                let _ = reject_command(&tx, command_id, session_id, ownership_epoch, reason).await;
                                             }
                                         } => {},
                                     }
@@ -220,7 +246,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                     _ => worker.sessions.handle(cmd).await,
                 };
                 if let Err(reason) = result
-                    && reject_command(&tx, command_id, session_id, reason).await.is_err()
+                    && reject_command(&tx, command_id, session_id, ownership_epoch, reason).await.is_err()
                 {
                     return;
                 }
@@ -268,7 +294,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                         }
                         head_msg::Msg::Welcome(_) => warn!("unexpected second Welcome"),
                         head_msg::Msg::Ack(a) => {
-                            if let Err(e) = worker.journal.set_acked(&a.session_id, a.seq).await {
+                            if let Err(e) = worker.journal.set_acked_owned(&a.session_id, a.seq, a.ownership_epoch).await {
                                 warn!("recording ack: {e:#}");
                             }
                         }
@@ -305,17 +331,18 @@ async fn reject_command(
     tx: &mpsc::Sender<WorkerMsg>,
     command_id: String,
     session_id: String,
+    ownership_epoch: u64,
     reason: String,
 ) -> Result<(), mpsc::error::SendError<WorkerMsg>> {
     warn!(session = %session_id, %reason, "command rejected");
-    let rejected = CommandRejected { command_id, session_id, reason };
+    let rejected = CommandRejected { command_id, session_id, reason, ownership_epoch };
     tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Rejected(rejected)) }).await
 }
 
 /// Streams journaled events the head has not acknowledged, in seq order per
 /// session, starting from the head's acked position.
 async fn upload(journal: Arc<Journal>, tx: mpsc::Sender<WorkerMsg>, stop: CancellationToken) {
-    let mut sent: HashMap<String, u64> = HashMap::new();
+    let mut sent: HashMap<String, (u64, u64)> = HashMap::new(); // (epoch, seq)
     loop {
         let mut progressed = false;
         let cursors = match journal.unacked().await {
@@ -326,11 +353,14 @@ async fn upload(journal: Arc<Journal>, tx: mpsc::Sender<WorkerMsg>, stop: Cancel
             }
         };
         for c in cursors {
-            let from = sent.get(&c.session_id).copied().unwrap_or(0).max(c.acked_seq);
+            let from = match sent.get(&c.session_id) {
+                Some(&(epoch, seq)) if epoch == c.epoch => seq.max(c.acked_seq),
+                _ => c.acked_seq,
+            };
             if c.last_seq <= from {
                 continue;
             }
-            let events = match journal.events_after(&c.session_id, from, UPLOAD_BATCH).await {
+            let events = match journal.events_after_owned(&c.session_id, from, UPLOAD_BATCH, c.epoch).await {
                 Ok(e) if !e.is_empty() => e,
                 Ok(_) => continue,
                 Err(e) => {
@@ -338,13 +368,13 @@ async fn upload(journal: Arc<Journal>, tx: mpsc::Sender<WorkerMsg>, stop: Cancel
                     continue;
                 }
             };
-            let batch = upload_batch(c.session_id.clone(), events, UPLOAD_BYTES);
+            let batch = upload_batch(c.session_id.clone(), c.epoch, events, UPLOAD_BYTES);
             let last = batch.events.last().map(|e| e.seq).unwrap_or(from);
             tokio::select! {
                 _ = stop.cancelled() => return,
                 r = tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Events(batch)) }) => if r.is_err() { return },
             }
-            sent.insert(c.session_id, last);
+            sent.insert(c.session_id, (c.epoch, last));
             progressed = true;
         }
         if !progressed {
@@ -356,10 +386,10 @@ async fn upload(journal: Arc<Journal>, tx: mpsc::Sender<WorkerMsg>, stop: Cancel
     }
 }
 
-fn upload_batch(session_id: String, mut events: Vec<SessionEvent>, max_bytes: usize) -> SessionEventBatch {
+fn upload_batch(session_id: String, ownership_epoch: u64, mut events: Vec<SessionEvent>, max_bytes: usize) -> SessionEventBatch {
     use prost::encoding::{encoded_len_varint, key_len, message};
 
-    let mut batch = SessionEventBatch { session_id, events: Vec::new() };
+    let mut batch = SessionEventBatch { session_id, events: Vec::new(), ownership_epoch };
     let mut batch_len = batch.encoded_len();
     let fitting = events
         .iter()
@@ -416,16 +446,16 @@ mod tests {
             })
             .collect();
         let wire_len = |batch| WorkerMsg { msg: Some(worker_msg::Msg::Events(batch)) }.encoded_len();
-        let two_events = wire_len(SessionEventBatch { session_id: session_id.clone(), events: events[..2].to_vec() });
+        let two_events = wire_len(SessionEventBatch { session_id: session_id.clone(), events: events[..2].to_vec(), ownership_epoch: 0 });
 
-        let batch = upload_batch(session_id.clone(), events.clone(), two_events);
+        let batch = upload_batch(session_id.clone(), 0, events.clone(), two_events);
         assert_eq!(batch.events, events[..2]);
         assert_eq!(wire_len(batch), two_events);
-        let batch = upload_batch(session_id.clone(), events.clone(), two_events - 1);
+        let batch = upload_batch(session_id.clone(), 0, events.clone(), two_events - 1);
         assert_eq!(batch.events, events[..1]);
         assert!(wire_len(batch) < two_events);
         let first = events[..1].to_vec();
-        let batch = upload_batch(session_id, events, 1);
+        let batch = upload_batch(session_id, 0, events, 1);
         assert_eq!(batch.events, first, "a single event still goes out above the batch target");
     }
 }

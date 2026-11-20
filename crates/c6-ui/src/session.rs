@@ -1926,7 +1926,22 @@ fn LocationChip(
     }
 }
 
-/// Same-worker changes use the placement dialog; the model uses the composer.
+fn placement_chip(
+    label: &'static str,
+    value: String,
+    title: String,
+    eligible: Memo<(bool, bool)>,
+    placement: ChipDisclosure,
+    cross: bool,
+) -> impl IntoView {
+    move || {
+        let (same, other) = eligible.get();
+        let action = (same || (cross && other)).then_some(placement);
+        view! { <LocationChip label value=value.clone() title=title.clone() action /> }
+    }
+}
+
+/// Place changes use the placement dialog; the model uses the composer.
 #[component]
 pub(crate) fn SessionLocation(chrome: SessionChrome) -> impl IntoView {
     let live = api::live();
@@ -1945,29 +1960,26 @@ pub(crate) fn SessionLocation(chrome: SessionChrome) -> impl IntoView {
         }),
     };
     let eligible = Memo::new(move |_| {
-        let Some(d) = chrome.detail.get().and_then(Result::ok) else { return false };
+        let Some(d) = chrome.detail.get().and_then(Result::ok) else { return (false, false) };
         let s = live.session(&d.session.id).unwrap_or(d.session);
+        if !chrome.latest.get() || !can_change_place(&s) || chrome.running.get() || chrome.background.get() != 0 {
+            return (false, false);
+        }
         let connection = chrome.connection.get();
         let connection = if connection.is_empty() { s.connection_id.as_str() } else { &connection };
         let own_loop =
             connections.get().and_then(Result::ok).is_some_and(|cs| cs.iter().any(|c| c.id == connection && c.kind != "claude_code"));
-        let worker_ready = live.workers.with(|workers| {
-            workers.iter().any(|w| {
-                w.id == s.worker_id
-                    && w.status == c6_api::WorkerStatus::Online
-                    && w.capabilities.iter().any(|c| c == "same_worker_placement_v1")
-            })
-        });
         let external_mcp = chrome.events.with(|events| events.first().is_some_and(|e| {
             matches!(&e.kind, EventKind::Started { tools, .. } if tools.iter().any(|t| t.starts_with("mcp__") && !t.starts_with("mcp__carbon6__")))
         }));
-        own_loop
-            && worker_ready
-            && !external_mcp
-            && chrome.latest.get()
-            && can_change_place(&s)
-            && !chrome.running.get()
-            && chrome.background.get() == 0
+        live.workers.with(|workers| {
+            workers.iter().find(|w| w.id == s.worker_id && w.status == c6_api::WorkerStatus::Online).map_or((false, false), |w| {
+                (
+                    own_loop && !external_mcp && w.capabilities.iter().any(|c| c == "same_worker_placement_v1"),
+                    move_worker_ready(w, &s.realm),
+                )
+            })
+        })
     });
     view! {
         {move || chrome.detail.get().and_then(Result::ok).map(|d| {
@@ -1978,17 +1990,9 @@ pub(crate) fn SessionLocation(chrome: SessionChrome) -> impl IntoView {
             let model_fallback = if s.model.is_empty() { "Default model".to_owned() } else { s.model };
             view! {
                 <div class="flex min-w-0 shrink-0 flex-wrap items-center gap-1 border-b border-zinc-200 px-2 py-1 dark:border-zinc-800" role="group" aria-label="Session location">
-                    <LocationChip label=if s.on_head { "Runs on" } else { "Worker" } title=worker.clone() value=worker />
-                    {move || {
-                        let action = eligible.get().then_some(placement);
-                        let title = if action.is_some() { format!("Change folder: {path}") } else { path.clone() };
-                        view! { <LocationChip label="Folder" value=folder.clone() title action /> }
-                    }}
-                    {worktree.map(|(branch, path)| move || {
-                        let action = eligible.get().then_some(placement);
-                        let title = format!("{branch}: {path}");
-                        view! { <LocationChip label="Worktree" title value=branch.clone() action /> }
-                    })}
+                    {placement_chip(if s.on_head { "Runs on" } else { "Worker" }, worker.clone(), worker, eligible, placement, true)}
+                    {placement_chip("Folder", folder, path, eligible, placement, false)}
+                    {worktree.map(|(branch, path)| placement_chip("Worktree", branch, path, eligible, placement, false))}
                     {move || {
                         let current = chrome.model_label.get();
                         let value = if current.is_empty() { model_fallback.clone() } else { current };
@@ -2000,6 +2004,14 @@ pub(crate) fn SessionLocation(chrome: SessionChrome) -> impl IntoView {
         })}
         <PlacementDialog chrome id open=place_open picking=picking_folder eligible pop=place_pop />
     }
+}
+
+fn move_worker_ready(w: &c6_api::Worker, realm: &str) -> bool {
+    w.status == c6_api::WorkerStatus::Online
+        && w.role != "memex"
+        && w.role != "head"
+        && (w.realms.is_empty() || w.realms.iter().any(|r| r == realm))
+        && w.capabilities.iter().any(|c| c == "session_move_v1")
 }
 
 fn can_change_place(s: &Session) -> bool {
@@ -2023,6 +2035,13 @@ fn can_change_place(s: &Session) -> bool {
 enum PendingPlacement {
     Submitting,
     Awaiting(String),
+    Moved,
+}
+
+impl PendingPlacement {
+    fn busy(p: &Option<Self>) -> bool {
+        matches!(p, Some(Self::Submitting | Self::Awaiting(_)))
+    }
 }
 
 fn placement_outcome(command: &str, events: &[Event], queued: &[QueuedInput]) -> Option<Result<(), String>> {
@@ -2038,7 +2057,7 @@ fn PlacementDialog(
     id: String,
     open: RwSignal<bool>,
     picking: RwSignal<bool>,
-    eligible: Memo<bool>,
+    eligible: Memo<(bool, bool)>,
     pop: StoredValue<String>,
 ) -> impl IntoView {
     let id = StoredValue::new(id);
@@ -2059,12 +2078,12 @@ fn PlacementDialog(
         async move { if open { api::placements(id).await } else { Ok(Vec::new()) } }
     });
     let target = RwSignal::new(String::new());
+    let worker = RwSignal::new(String::new());
     let action = RwSignal::new(String::new());
     let option = RwSignal::new(false);
     let branch = RwSignal::new(String::new());
     let pending = RwSignal::new(None::<PendingPlacement>);
     let error = RwSignal::new(None::<String>);
-    let moved = RwSignal::new(false);
     Effect::new(move || {
         let Some(PendingPlacement::Awaiting(command)) = pending.get() else { return };
         let outcome = chrome.events.with(|events| chrome.queued.with(|queued| placement_outcome(&command, events, queued)));
@@ -2080,7 +2099,7 @@ fn PlacementDialog(
                     target.set(String::new());
                     option.set(false);
                     branch.set(String::new());
-                    moved.set(true);
+                    pending.set(Some(PendingPlacement::Moved));
                 }
                 Err(reason) => {
                     error.set(Some(reason));
@@ -2089,11 +2108,11 @@ fn PlacementDialog(
             }
         }
     });
-    let submit = Callback::new(move |action: api::PlacementAction| {
-        if pending.with_untracked(Option::is_some) || !eligible.get_untracked() {
+    let submit = Callback::new(move |(seq, action, cross): (u64, api::PlacementAction, bool)| {
+        let (same, other) = eligible.get_untracked();
+        if pending.with_untracked(PendingPlacement::busy) || !(if cross { other } else { same }) {
             return;
         }
-        let Some(seq) = places.get_untracked().and_then(Result::ok).and_then(|rows| rows.first().map(|p| p.seq)) else { return };
         if latest_place.get_untracked().is_some_and(|latest| seq < latest) {
             error.set(Some("The session's place has changed. Refreshing its placement history; please try again.".into()));
             places.refetch();
@@ -2101,12 +2120,44 @@ fn PlacementDialog(
         }
         pending.set(Some(PendingPlacement::Submitting));
         error.set(None);
-        moved.set(false);
         let id = id.get_value();
         spawn_local(async move {
-            match api::change_placement(id, seq, action).await {
+            match api::change_placement(&id, seq, action).await {
                 Ok(command) => {
-                    pending.try_set(Some(PendingPlacement::Awaiting(command)));
+                    pending.try_set(Some(PendingPlacement::Awaiting(command.clone())));
+                    if cross {
+                        let awaiting = || {
+                            pending.try_with_untracked(|p| matches!(p, Some(PendingPlacement::Awaiting(c)) if c == &command)) == Some(true)
+                        };
+                        let mut failures = 0;
+                        while awaiting() {
+                            gloo_timers::future::sleep(std::time::Duration::from_secs(1)).await;
+                            if !awaiting() {
+                                break;
+                            }
+                            let reason = match api::move_status(&id, &command).await {
+                                Ok(status) => match status["state"].as_str() {
+                                    Some("done") => break, // Only PlaceChanged confirms success.
+                                    Some("failed" | "rolling_back") => status["error"].as_str().unwrap_or("The worker move failed.").into(),
+                                    _ => {
+                                        failures = 0;
+                                        continue;
+                                    }
+                                },
+                                Err(_) if failures < 4 => {
+                                    failures += 1;
+                                    continue;
+                                }
+                                Err(e) => format!("Could not check whether the session moved: {e}"),
+                            };
+                            if awaiting() {
+                                error.set(Some(reason));
+                                pending.set(None);
+                                places.refetch();
+                            }
+                            break;
+                        }
+                    }
                 }
                 Err(reason) => {
                     pending.try_set(None);
@@ -2118,7 +2169,7 @@ fn PlacementDialog(
             }
         });
     });
-    let busy = move || pending.with(Option::is_some) || !eligible.get();
+    let live = api::live();
     view! {
         <Show when=move || open.get()>
             {move || if picking.get() {
@@ -2134,28 +2185,35 @@ fn PlacementDialog(
             } else {
                 view! {
                     <PlacementFrame open pop>
-                        <p class="text-sm text-muted">"Change where this session works on the same worker. The conversation stays here."</p>
                         {move || pending.with(|p| p.as_ref().map(|p| {
                             let text = match p {
                                 PendingPlacement::Submitting => "Requesting placement change…",
                                 PendingPlacement::Awaiting(_) => "Waiting for the worker to confirm the new place…",
+                                PendingPlacement::Moved => "The session moved.",
                             };
                             view! { <p role="status" class="text-sm text-muted">{text}</p> }
                         }))}
-                        {move || moved.get().then(|| view! { <p role="status" class="text-sm text-emerald-700 dark:text-emerald-400">"The session moved."</p> })}
                         {move || error.get().map(|reason| view! { <ErrorBox message=reason /> })}
-                        {move || (!eligible.get() && pending.with(Option::is_none)).then(|| view! {
-                            <p class="text-sm text-muted">"Changing place requires an idle, local session on an online worker that supports placement changes."</p>
-                        })}
                         <Suspense fallback=|| view! { <p role="status" class="text-sm text-muted">"Loading placement history…"</p> }>
                             {move || places.get().map(|result| match result {
                                 Ok(rows) if rows.is_empty() => view! { <p class="text-sm text-muted">"The session's starting place is not available yet."</p> }.into_any(),
                                 Ok(rows) => {
                                     let mut rows = rows.into_iter();
                                     let current = rows.next().expect("non-empty placement history");
+                                    let seq = current.seq;
                                     let in_worktree = !current.worktree_branch.is_empty();
                                     let scratch = !in_worktree && scratch_place(&id.get_value(), &current.cwd);
                                     let cwd = StoredValue::new(current.cwd.clone());
+                                    let source = StoredValue::new(current.worker_id.clone());
+                                    let targets = Memo::new(move |_| {
+                                        let Some(detail) = chrome.detail.get().and_then(Result::ok) else { return Vec::new() };
+                                        live.workers.with(|ws| ws.iter().filter_map(|w| {
+                                            let id = w.id.to_string();
+                                            (move_worker_ready(w, &detail.session.realm) && source.with_value(|s| *s != id))
+                                                .then(|| (id, w.name.clone()))
+                                        }).collect::<Vec<_>>())
+                                    });
+                                    let ready = move |id: &str| targets.with(|ws| ws.iter().any(|(w, _)| w == id));
                                     let previous = StoredValue::new(rows.collect::<Vec<_>>());
                                     let destination = move |choice: &str| {
                                         let seq = choice.parse::<u64>().ok()?;
@@ -2166,23 +2224,55 @@ fn PlacementDialog(
                                     } else {
                                         &[("folder", "Move to a folder"), ("worktree", "Create a Git worktree")]
                                     };
+                                    let request = move || {
+                                        use api::PlacementAction as A;
+                                        let (same, cross) = eligible.get();
+                                        action.with(|choice| Some(match choice.as_str() {
+                                            "folder" if same && !in_worktree && target.with(|path| !path.is_empty() && cwd.with_value(|cwd| path != cwd)) =>
+                                                (A::Folder { cwd: target.get(), copy_scratch: scratch && option.get() }, false),
+                                            "worktree" if same && !in_worktree => (A::Worktree { options: c6_api::starts::WorktreeOptions {
+                                                branch: branch.with(|b| b.trim().to_owned()), ..Default::default()
+                                            } }, false),
+                                            "leave" if same && in_worktree => (A::LeaveWorktree { merge: option.get() }, false),
+                                            "worker" if cross && worker.with(|w| ready(w)) => (A::Worker { worker: worker.get(), clone: option.get() }, true),
+                                            _ => {
+                                                let place = destination(choice)?;
+                                                let other = source.with_value(|s| *s != place.worker_id);
+                                                if !(if other { cross && ready(&place.worker_id) } else { same }) { return None; }
+                                                (A::Back { place_seq: place.seq }, other)
+                                            }
+                                        }))
+                                    };
                                     view! {
                                         <div class="space-y-3">
-                                            <div class="min-w-0 text-xs text-muted">"Current place: " <PlacementSummary place=current /></div>
-                                            <fieldset disabled=busy class="space-y-3 disabled:opacity-60">
+                                            <p class="break-all text-xs text-muted">"Current place: " <span class="font-mono">{placed_at(&current)}</span></p>
+                                            <fieldset disabled=move || pending.with(PendingPlacement::busy) || eligible.get() == (false, false) class="space-y-3 disabled:opacity-60">
                                                 <label class="block text-xs text-muted">"Action"
                                                     <select class=INPUT prop:value=move || action.get() on:change=move |ev| {
                                                         action.set(event_target_value(&ev));
                                                         option.set(false);
+                                                        worker.set(String::new());
                                                     }>
                                                         <option value="">"Choose a change…"</option>
-                                                        {actions.iter().map(|&(key, label)| view! { <option value=key>{label}</option> }).collect_view()}
+                                                        {actions.iter().map(|&(key, label)| view! { <option value=key disabled=move || !eligible.get().0>{label}</option> }).collect_view()}
+                                                        <option value="worker" disabled=move || !eligible.get().1>"Move to another worker"</option>
                                                         <optgroup label="Move back" hidden=previous.with_value(Vec::is_empty)>
                                                             {previous.with_value(|places| places.iter().map(|p| {
-                                                                let label = if p.worktree_branch.is_empty() { p.cwd.clone() } else { format!("{} ({})", p.cwd, p.worktree_branch) };
-                                                                view! { <option value=p.seq.to_string()>{label}</option> }
+                                                                view! { <option value=p.seq.to_string()>{placed_at(p)}</option> }
                                                             }).collect_view())}
                                                         </optgroup>
+                                                    </select>
+                                                </label>
+                                                <label class="block text-xs text-muted" hidden=move || !action.with(|s| s == "worker")>"Worker"
+                                                    <select class=INPUT prop:value=move || worker.get() on:change=move |ev| {
+                                                        worker.set(event_target_value(&ev));
+                                                        option.set(false);
+                                                    }>
+                                                        <option value="">{move || if targets.with(Vec::is_empty) { "No eligible workers online" } else { "Choose a worker…" }}</option>
+                                                        {move || targets.get().into_iter().map(|(id, name)| {
+                                                            let selected = worker.with_untracked(|w| *w == id);
+                                                            view! { <option value=id prop:selected=selected>{name}</option> }
+                                                        }).collect_view()}
                                                     </select>
                                                 </label>
                                                 <div class="space-y-2" hidden=move || !action.with(|s| s == "folder")>
@@ -2198,41 +2288,27 @@ fn PlacementDialog(
                                                 <p class="text-xs text-muted" hidden=move || !action.with(|s| s == "leave")>
                                                     "Return to the main checkout. The worktree and branch remain available for Move back."
                                                 </p>
-                                                <label class="space-x-2" hidden=move || !action.with(|s| s == "leave" || (scratch && s == "folder"))>
+                                                <label class="block space-x-2 text-sm" hidden=move || !action.with(|s| s == "leave" || s == "worker" || (scratch && s == "folder"))>
                                                     <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || option.get()
                                                         on:change=move |ev| option.set(event_target_checked(&ev)) />
-                                                    {move || if action.with(|s| s == "leave") { "Merge the branch first (fast-forward only)" }
-                                                        else { "Copy scratch files without overwriting (otherwise leave them in scratch)" }}
+                                                    <span>{move || action.with(|s| match s.as_str() {
+                                                        "leave" => "Merge the branch first (fast-forward only)",
+                                                        "worker" => "Clone repository if no matching repository exists",
+                                                        _ => "Copy scratch files without overwriting (otherwise leave them in scratch)",
+                                                    })}</span>
                                                 </label>
                                                 {move || action.with(|s| destination(s)).map(|place| view! {
-                                                    <p class="text-xs text-muted">"Previous places are not backups. The destination is checked again before moving."</p>
-                                                    <PlacementSummary place />
+                                                    <p class="text-xs text-muted">{if source.with_value(|s| *s != place.worker_id) {
+                                                        "Moving back to another worker creates a fresh workspace. The old folder stays untouched."
+                                                    } else { "Previous places are not backups. The destination is checked again before moving." }}</p>
+                                                    <p class="break-all font-mono text-xs text-muted">{placed_at(&place)}</p>
                                                 })}
                                                 <button type="button" class=BUTTON
-                                                    disabled=move || action.with(|s| match s.as_str() {
-                                                        "folder" => in_worktree || target.with(|path| path.is_empty() || cwd.with_value(|cwd| path == cwd)),
-                                                        "worktree" => in_worktree,
-                                                        "leave" => !in_worktree,
-                                                        _ => destination(s).is_none(),
-                                                    })
-                                                    on:click=move |_| {
-                                                        let choice = action.get_untracked();
-                                                        let request = match choice.as_str() {
-                                                            "folder" => api::PlacementAction::Folder { cwd: target.get_untracked(), copy_scratch: scratch && option.get_untracked() },
-                                                            "worktree" => api::PlacementAction::Worktree { options: c6_api::starts::WorktreeOptions {
-                                                                branch: branch.get_untracked().trim().to_owned(), ..Default::default()
-                                                            } },
-                                                            "leave" => api::PlacementAction::LeaveWorktree { merge: option.get_untracked() },
-                                                            _ => {
-                                                                let Some(place) = destination(&choice) else { return };
-                                                                api::PlacementAction::Back { place_seq: place.seq }
-                                                            }
-                                                        };
-                                                        submit.run(request);
-                                                    }>
+                                                    disabled=move || request().is_none()
+                                                    on:click=move |_| { if let Some((action, cross)) = untrack(request) { submit.run((seq, action, cross)); } }>
                                                     {move || action.with(|s| match s.as_str() {
                                                         "folder" => "Move to folder", "worktree" => "Create and enter worktree", "leave" => "Leave worktree",
-                                                        "" => "Change place", _ => "Move back",
+                                                        "" => "Change place", "worker" => "Move to worker", _ => "Move back",
                                                     })}
                                                 </button>
                                             </fieldset>
@@ -2252,24 +2328,16 @@ fn PlacementDialog(
     }
 }
 
-#[component]
-fn PlacementSummary(place: api::Placement) -> impl IntoView {
-    let mut label = place.cwd;
-    if !place.worktree_branch.is_empty() {
-        label.push_str(&format!(" · worktree {}", place.worktree_branch));
-        if !place.repo_root.is_empty() {
-            label.push_str(&format!(" · {}", place.repo_root));
+fn placed_at(place: &api::Placement) -> String {
+    untrack(|| {
+        let name = api::live().worker_name(&place.worker_id);
+        let worker = if name == "unknown" { &place.worker_id } else { &name };
+        if place.worktree_branch.is_empty() {
+            format!("{worker} · {}", place.cwd)
+        } else {
+            format!("{worker} · {} · {}", place.cwd, place.worktree_branch)
         }
-    }
-    if place.uncommitted_files > 0 {
-        label.push_str(&format!(" · {} uncommitted files carried", place.uncommitted_files));
-    }
-    if !place.copied_paths.is_empty() {
-        label.push_str(&format!(" · {} files copied (paths in transcript)", place.copied_paths.len()));
-    }
-    view! {
-        <span class="break-all font-mono text-xs text-muted">{label}</span>
-    }
+    })
 }
 
 #[component]
@@ -5278,7 +5346,20 @@ fn render_event(
         EventKind::Notice { title, message, priority } => notice_line(title, message, priority),
         EventKind::PlaceChanged { from, to, copied_paths, uncommitted_files, setup_log, .. } => {
             let branch = if to.worktree_branch.is_empty() { String::new() } else { format!("; branch {}", to.worktree_branch) };
-            let message = format!("Moved from {} to {}{branch}; {} files copied, {uncommitted_files} uncommitted files carried", from.cwd, to.cwd, copied_paths.len());
+            let cross_worker = !from.worker_id.is_empty() && !to.worker_id.is_empty() && from.worker_id != to.worker_id;
+            let location = |place: &c6_api::SessionPlace| {
+                if !cross_worker {
+                    return place.cwd.clone();
+                }
+                let name = use_context::<api::LiveFeed>().and_then(|live| {
+                    live.workers.with_untracked(|workers| {
+                        workers.iter().find(|worker| worker.id.to_string() == place.worker_id && !worker.name.is_empty()).map(|worker| worker.name.clone())
+                    })
+                });
+                let worker = name.as_deref().unwrap_or(&place.worker_id);
+                format!("{worker} · {}", place.cwd)
+            };
+            let message = format!("Moved from {} to {}{branch}; {} files copied, {uncommitted_files} uncommitted files carried", location(from), location(to), copied_paths.len());
             view! { <div>
                 {notice_line("Place changed", &message, "low")}
                 {(!setup_log.is_empty()).then(|| view! { <details class="ml-5 text-xs text-muted"><summary>"Worktree setup"</summary><pre class="whitespace-pre-wrap">{setup_log.clone()}</pre></details> })}
@@ -8690,6 +8771,19 @@ mod tests {
     const HEAD: &str = "00000000-0000-0000-0000-0000000000ff";
 
     #[test]
+    fn move_worker_requires_online_realm_access_and_capability() {
+        let mut w = worker(W, "online");
+        assert!(!move_worker_ready(&w, "team"));
+        w.capabilities.push("session_move_v1".into());
+        assert!(move_worker_ready(&w, "team"));
+        w.realms.push("team".into());
+        assert!(!move_worker_ready(&w, "other"));
+        assert!(move_worker_ready(&w, "team"));
+        w.status = c6_api::WorkerStatus::Offline;
+        assert!(!move_worker_ready(&w, "team"));
+    }
+
+    #[test]
     fn location_labels_distinguish_scratch_remote_home_folder_and_worktree() {
         let mut s = session(W, false);
         let scratch = Started { cwd: "/state/scratch/s".into(), branch: String::new(), repo: String::new() };
@@ -8734,6 +8828,11 @@ mod tests {
                 view! { <LocationChip label="Folder" value="app".to_owned() title="Change folder".to_owned() action=Some(dialog) /> }
                     .to_html();
             assert!(folder.contains("aria-haspopup=\"dialog\"") && folder.contains("aria-expanded=\"true\""), "{folder}");
+
+            let cross_only = Memo::new(|_| (false, true));
+            let chip = |label, cross| placement_chip(label, "value".into(), String::new(), cross_only, dialog, cross).to_html();
+            assert!(chip("Worker", true).contains("<button"));
+            assert!(!chip("Folder", false).contains("<button"));
         });
     }
 
@@ -8758,15 +8857,20 @@ mod tests {
 
     #[test]
     fn accepted_placement_waits_for_its_own_commit_or_worker_refusal() {
-        let place =
-            c6_api::SessionPlace { cwd: "/repo".into(), repo: String::new(), worktree_branch: String::new(), repo_root: String::new() };
+        let place = c6_api::SessionPlace {
+            worker_id: W.into(),
+            cwd: "/repo".into(),
+            repo: String::new(),
+            worktree_branch: String::new(),
+            repo_root: String::new(),
+        };
         let changed = Event {
             seq: 2,
             ts: 0,
             kind: EventKind::PlaceChanged {
                 command_id: "committed".into(),
-                from: place.clone(),
-                to: place,
+                from: Box::new(place.clone()),
+                to: Box::new(place),
                 copied_paths: Vec::new(),
                 uncommitted_files: 0,
                 setup_log: String::new(),

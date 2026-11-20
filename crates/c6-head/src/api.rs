@@ -92,6 +92,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
         .route("/api/v1/sessions/{id}/placement", get(session_placement).post(change_session_placement))
+        .route("/api/v1/sessions/{id}/moves/{move_id}", get(session_move_status))
         .route("/api/v1/sessions/{id}/attachments/{seq}/{index}", get(attachment))
         .route("/api/v1/sessions/{id}/export", get(export_session))
         .route("/api/v1/sessions/{id}/outputs/{seq}", get(output))
@@ -2231,6 +2232,19 @@ async fn change_session_placement(
     let session = visible_session(&st, &caller, &id).await?;
     let command_id = crate::sessions::change_place(&st, &session, &request).await?;
     Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "command_id": command_id }))))
+}
+
+async fn session_move_status(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, move_id)): Path<(String, String)>,
+) -> ApiResult<Json<crate::session_moves::MoveStatus>> {
+    let session = visible_session(&st, &caller, &id).await?;
+    let status = crate::session_moves::status(&st, &move_id)
+        .await?
+        .filter(|s| s.session_id == session.id)
+        .ok_or_else(|| crate::not_found("no such session move"))?;
+    Ok(Json(status))
 }
 
 async fn task_snapshot(State(st): State<Arc<HeadState>>, Path((id, task)): Path<(String, String)>) -> ApiResult<Json<api::TaskSnapshot>> {
@@ -5281,6 +5295,7 @@ mod tests {
                     data: SessionCommand {
                         command_id: id.into(),
                         session_id: "draft-lab".into(),
+                        ownership_epoch: 0,
                         kind: Some(session_command::Kind::Input(UserInput {
                             text: "draft".into(),
                             attachments: files,

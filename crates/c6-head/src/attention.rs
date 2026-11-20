@@ -728,10 +728,14 @@ mod tests {
                     ..Default::default()
                 }),
             )];
-            assert_eq!(crate::sessions::ingest(st, worker, SessionEventBatch { session_id: id.into(), events }).await.unwrap(), Some(1));
+            assert_eq!(
+                crate::sessions::ingest(st, worker, SessionEventBatch { session_id: id.into(), events, ownership_epoch: 0 }).await.unwrap(),
+                Some(1)
+            );
         }
         let held = SessionEventBatch {
             session_id: "grandchild".into(),
+            ownership_epoch: 0,
             events: vec![event(
                 2,
                 Kind::Approval(Approval {
@@ -770,6 +774,7 @@ mod tests {
             worker,
             SessionEventBatch {
                 session_id: "child".into(),
+                ownership_epoch: 0,
                 events: vec![event(
                     2,
                     Kind::Question(Question {
@@ -830,6 +835,7 @@ mod tests {
             worker,
             SessionEventBatch {
                 session_id: "grandchild".into(),
+                ownership_epoch: 0,
                 events: vec![event(3, Kind::Approval(Approval { call_id: "push".into(), state: "denied".into(), ..Default::default() }))],
             },
         )
@@ -843,6 +849,7 @@ mod tests {
             worker,
             SessionEventBatch {
                 session_id: "grandchild".into(),
+                ownership_epoch: 0,
                 events: vec![event(
                     4,
                     Kind::Notice(c6_proto::Notice { title: "Delivery barrier".into(), message: "done".into(), ..Default::default() }),

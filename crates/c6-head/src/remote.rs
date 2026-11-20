@@ -131,6 +131,7 @@ async fn delivery_failed(st: &HeadState, session_id: &str, report: &str, error: 
             let data = SessionCommand {
                 command_id: id.clone(),
                 session_id: session_id.into(),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Input(c6_proto::UserInput { text: text.clone(), ..Default::default() })),
             }
             .encode_to_vec();
@@ -338,6 +339,7 @@ async fn send(st: &HeadState, parent_id: &str, id: &str, inputs: &[String], ende
     let cmd = SessionCommand {
         command_id: id.to_owned(),
         session_id: parent_id.to_owned(),
+        ownership_epoch: 0,
         kind: Some(session_command::Kind::DelegationEnded(ended)),
     };
     st.store

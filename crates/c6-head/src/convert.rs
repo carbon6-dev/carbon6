@@ -169,6 +169,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
         },
         Kind::PlaceChanged(p) => {
             let place = |s: &c6_proto::SessionPlace| api::SessionPlace {
+                worker_id: s.worker_id.clone(),
                 cwd: s.cwd.clone(),
                 repo: s.repo.clone(),
                 worktree_branch: s.worktree_branch.clone(),
@@ -176,8 +177,8 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             };
             api::EventKind::PlaceChanged {
                 command_id: p.command_id.clone(),
-                from: place(p.from.as_ref()?),
-                to: place(p.to.as_ref()?),
+                from: Box::new(place(p.from.as_ref()?)),
+                to: Box::new(place(p.to.as_ref()?)),
                 copied_paths: p.copied_paths.clone(),
                 uncommitted_files: p.uncommitted_files,
                 setup_log: p.setup_log.clone(),

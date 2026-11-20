@@ -266,8 +266,12 @@ impl EventSink for Sink {
         let mut seq = self.seq.lock().await;
         *seq += 1;
         let ev = SessionEvent { seq: *seq, ts_ms: now_ms(), kind: Some(kind) };
-        crate::sessions::ingest(&self.st, self.head_id, SessionEventBatch { session_id: self.session_id.clone(), events: vec![ev] })
-            .await?;
+        crate::sessions::ingest(
+            &self.st,
+            self.head_id,
+            SessionEventBatch { session_id: self.session_id.clone(), events: vec![ev], ownership_epoch: 0 },
+        )
+        .await?;
         self.logged.store(*seq + 1, std::sync::atomic::Ordering::SeqCst);
         Ok(*seq)
     }
@@ -502,6 +506,7 @@ impl Actor {
                     command_id: cmd.command_id,
                     session_id: cmd.session_id,
                     reason: "assistant conversations cannot do that".into(),
+                    ownership_epoch: cmd.ownership_epoch,
                 };
                 crate::sessions::on_rejected(&self.st, self.sink.head_id, reject).await?;
             }

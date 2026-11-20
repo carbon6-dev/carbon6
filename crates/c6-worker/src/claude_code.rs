@@ -34,21 +34,32 @@ pub(crate) fn replace_test_bin(bin: Option<PathBuf>) -> Option<PathBuf> {
     std::mem::replace(&mut *tests::BIN.lock().unwrap(), bin)
 }
 
+fn absolute_claude_bin(path: PathBuf) -> Option<PathBuf> {
+    // Launchers change their working directory to the session workspace.
+    // Anchor discovery to the worker's cwd without resolving symlinks.
+    std::path::absolute(path).ok()
+}
+
 /// The `claude` binary: `$C6_CLAUDE_BIN`, then `PATH`, then the usual
-/// install locations (services often run without the user's PATH).
+/// install locations (services often run without the user's PATH). Returns
+/// an absolute path so probing and launching use the same executable.
 pub fn find_claude() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(p) = tests::BIN.lock().unwrap().clone() {
-        return Some(p);
+        return absolute_claude_bin(p);
     }
     if let Some(p) = std::env::var_os("C6_CLAUDE_BIN").map(PathBuf::from) {
-        return p.is_file().then_some(p);
+        return absolute_claude_bin(p).filter(|p| p.is_file());
     }
     let on_path =
         std::env::var_os("PATH").into_iter().flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).map(|d| d.join("claude"));
     let home = dirs::home_dir();
     let usual = home.iter().flat_map(|h| [h.join(".local/bin/claude"), h.join(".claude/local/claude")]);
-    on_path.chain(usual).chain([PathBuf::from("/opt/homebrew/bin/claude"), PathBuf::from("/usr/local/bin/claude")]).find(|p| p.is_file())
+    on_path
+        .chain(usual)
+        .chain([PathBuf::from("/opt/homebrew/bin/claude"), PathBuf::from("/usr/local/bin/claude")])
+        .filter_map(absolute_claude_bin)
+        .find(|p| p.is_file())
 }
 
 /// What Claude Code's own subagents are mirrored into: sessions of their
@@ -60,6 +71,8 @@ pub struct Observer {
     pub link: Arc<crate::link::HeadLink>,
     /// The session running Claude Code, as it was created.
     pub session_id: String,
+    /// The incarnation that launched this process; never refreshed in place.
+    pub ownership_epoch: u64,
     pub spec: CreateSession,
     pub started: SessionStarted,
 }
@@ -1774,7 +1787,7 @@ impl Process {
     async fn track(&self) -> anyhow::Result<()> {
         if let Some(observer) = &self.mapper.observer {
             let pgid = self.pgid.ok_or_else(|| anyhow::anyhow!("Claude Code process group is unknown"))?;
-            observer.journal.track_claude_process(&observer.session_id, pgid.as_raw()).await?;
+            observer.journal.track_claude_process_owned(&observer.session_id, pgid.as_raw(), observer.ownership_epoch).await?;
         }
         Ok(())
     }
@@ -3060,7 +3073,7 @@ impl Process {
                             // need not be shown, so counters can repeat after a
                             // worker restart. A crash before this write leaves
                             // no trusted cutoff and must use fresh history.
-                            obs.journal.record_claude_turn(&obs.session_id, seq, &self.boundary).await?;
+                            obs.journal.record_claude_turn_owned(&obs.session_id, seq, &self.boundary, obs.ownership_epoch).await?;
                         }
                     }
                     self.stop_mark = mark;
@@ -4073,6 +4086,13 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn relative_claude_bin_is_anchored_to_worker_cwd() {
+        let relative = PathBuf::from("relative-claude-install/bin/claude");
+        let expected = std::env::current_dir().unwrap().join(&relative);
+        assert_eq!(absolute_claude_bin(relative), Some(expected));
+    }
+
+    #[test]
     fn sdk_notice_uses_structured_task_labels_not_summary_prose_or_ids() {
         let labels = HashMap::from([("sdk-id".into(), ("Run checks".into(), "local_bash".into()))]);
         let event = serde_json::json!({"task_id": "sdk-id", "status": "failed", "summary": "## Actual result\nOne failed."});
@@ -4263,6 +4283,7 @@ pub(crate) mod tests {
             journal: Arc::new(crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap()),
             link: Arc::default(),
             session_id: "carbon6-session".into(),
+            ownership_epoch: 0,
             spec: CreateSession::default(),
             started: SessionStarted::default(),
         });
@@ -4502,6 +4523,7 @@ pub(crate) mod tests {
                 journal: journal.clone(),
                 link: Arc::default(),
                 session_id: "carbon6-session".into(),
+                ownership_epoch: 0,
                 spec: CreateSession::default(),
                 started: SessionStarted::default(),
             };
@@ -4654,6 +4676,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}
             journal: Arc::new(crate::journal::Journal::open(&dir.join("journal.db")).await.unwrap()),
             link: Arc::default(),
             session_id: "0199-main".into(),
+            ownership_epoch: 0,
             spec: CreateSession::default(),
             started: SessionStarted { cwd: dir.display().to_string(), tool_profile: PROFILE.into(), ..Default::default() },
         })

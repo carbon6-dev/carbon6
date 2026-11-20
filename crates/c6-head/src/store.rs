@@ -540,6 +540,7 @@ impl Store {
 pub struct SessionRow {
     pub id: String,
     pub worker_id: String,
+    pub ownership_epoch: i64,
     pub title: String,
     pub cwd: String,
     pub connection_id: String,
@@ -637,6 +638,7 @@ pub struct CommandRow {
     pub id: String,
     pub session_id: String,
     pub worker_id: String,
+    pub ownership_epoch: i64,
     pub data: Vec<u8>,
     pub text: Option<String>,
     pub created_at: i64,
@@ -656,6 +658,24 @@ pub struct Ingested {
     pub done_commands: Vec<String>,
     /// Commands now with the agent (`InputDelivered`).
     pub delivered_commands: Vec<String>,
+}
+
+async fn project_place_changed(
+    tx: &mut sqlx::SqliteConnection,
+    session_id: &str,
+    seq: u64,
+    changed: &c6_proto::PlaceChanged,
+) -> anyhow::Result<bool> {
+    let Some(place) = &changed.to else { return Ok(false) };
+    sqlx::query("UPDATE sessions SET cwd = ?, folder = ?, repo = ? WHERE id = ?")
+        .bind(&place.cwd)
+        .bind(&place.cwd)
+        .bind(&place.repo)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+    crate::agent_ops::finish_placement_command(tx, session_id, &changed.command_id, Ok((seq, &place.cwd))).await?;
+    Ok(true)
 }
 
 impl Store {
@@ -1146,19 +1166,46 @@ impl Store {
     }
 
     /// Last durable seq for each of `ids` that belongs to `worker_id`.
+    #[cfg(test)]
     pub async fn session_positions(&self, worker_id: WorkerId, ids: &[String]) -> anyhow::Result<Vec<(String, u64)>> {
+        let cursors = ids.iter().map(|id| c6_proto::SessionCursor { session_id: id.clone(), ..Default::default() }).collect::<Vec<_>>();
+        Ok(self.session_positions_for_epochs(worker_id, &cursors).await?.into_iter().map(|c| (c.session_id, c.seq)).collect())
+    }
+
+    pub(crate) async fn session_positions_for_epochs(
+        &self,
+        worker_id: WorkerId,
+        cursors: &[c6_proto::SessionCursor],
+    ) -> anyhow::Result<Vec<c6_proto::SessionCursor>> {
         let mut out = Vec::new();
-        for id in ids {
-            if let Some(row) = sqlx::query("SELECT last_seq FROM sessions WHERE id = ? AND worker_id = ?")
-                .bind(id)
-                .bind(worker_id.to_string())
-                .fetch_optional(&self.pool)
-                .await?
+        for cursor in cursors {
+            let Ok(epoch) = i64::try_from(cursor.ownership_epoch) else { continue };
+            if let Some(last_seq) =
+                sqlx::query_scalar::<_, i64>("SELECT last_seq FROM sessions WHERE id = ? AND worker_id = ? AND ownership_epoch = ?")
+                    .bind(&cursor.session_id)
+                    .bind(worker_id.to_string())
+                    .bind(epoch)
+                    .fetch_optional(&self.pool)
+                    .await?
             {
-                out.push((id.clone(), row.get::<i64, _>("last_seq") as u64));
+                out.push(c6_proto::SessionCursor { seq: last_seq as u64, ..cursor.clone() });
             }
         }
         Ok(out)
+    }
+
+    /// Normal worker controls must not bypass a move's delivery gate. This is
+    /// advisory for messages already sent; the worker fences those locally.
+    pub(crate) async fn session_routable(&self, session_id: &str, worker_id: WorkerId, ownership_epoch: i64) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sessions s WHERE s.id = ? AND s.worker_id = ? AND s.ownership_epoch = ? \
+             AND NOT EXISTS(SELECT 1 FROM session_moves m WHERE m.session_id = s.id AND m.state NOT IN ('done', 'failed')))",
+        )
+        .bind(session_id)
+        .bind(worker_id.to_string())
+        .bind(ownership_epoch)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     /// Stores the next contiguous events of a worker's session; duplicates
@@ -1170,17 +1217,27 @@ impl Store {
         session_id: &str,
         events: &[c6_proto::SessionEvent],
     ) -> anyhow::Result<Option<Ingested>> {
+        self.ingest_at_epoch(worker_id, session_id, 0, events).await
+    }
+
+    pub(crate) async fn ingest_at_epoch(
+        &self,
+        worker_id: WorkerId,
+        session_id: &str,
+        ownership_epoch: u64,
+        events: &[c6_proto::SessionEvent],
+    ) -> anyhow::Result<Option<Ingested>> {
         use c6_proto::session_event::Kind;
         use prost::Message;
 
+        let Ok(epoch) = i64::try_from(ownership_epoch) else { return Ok(None) };
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let mut row = sqlx::query("SELECT last_seq, status, remote_template FROM sessions WHERE id = ? AND worker_id = ?")
+        let mut row = sqlx::query("SELECT worker_id, ownership_epoch, last_seq, status, remote_template FROM sessions WHERE id = ?")
             .bind(session_id)
-            .bind(worker_id.to_string())
             .fetch_optional(&mut *tx)
             .await?;
-        if row.is_none() && create_subagent_session(&mut tx, worker_id, session_id, events).await? {
-            row = sqlx::query("SELECT last_seq, status, remote_template FROM sessions WHERE id = ?")
+        if row.is_none() && epoch == 0 && create_subagent_session(&mut tx, worker_id, session_id, events).await? {
+            row = sqlx::query("SELECT worker_id, ownership_epoch, last_seq, status, remote_template FROM sessions WHERE id = ?")
                 .bind(session_id)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -1188,6 +1245,9 @@ impl Store {
         let Some(row) = row else {
             return Ok(None);
         };
+        if row.get::<String, _>("worker_id") != worker_id.to_string() || row.get::<i64, _>("ownership_epoch") != epoch {
+            return Ok(None);
+        }
         let mut last = row.get::<i64, _>("last_seq") as u64;
         let mut status: String = row.get("status");
         let remote = !row.get::<String, _>("remote_template").is_empty();
@@ -1262,15 +1322,7 @@ impl Store {
                 }
                 Some(Kind::Rewound(r)) => done.push(r.command_id.clone()),
                 Some(Kind::PlaceChanged(p)) => {
-                    if let Some(place) = &p.to {
-                        sqlx::query("UPDATE sessions SET cwd = ?, folder = ?, repo = ? WHERE id = ?")
-                            .bind(&place.cwd)
-                            .bind(&place.cwd)
-                            .bind(&place.repo)
-                            .bind(session_id)
-                            .execute(&mut *tx)
-                            .await?;
-                        crate::agent_ops::finish_placement_command(&mut tx, session_id, &p.command_id, Ok((ev.seq, &place.cwd))).await?;
+                    if project_place_changed(&mut tx, session_id, ev.seq, p).await? {
                         done.push(p.command_id.clone());
                     }
                 }
@@ -1339,14 +1391,65 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
             for id in &done {
-                sqlx::query("UPDATE commands SET state = 'done' WHERE id = ?").bind(id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE commands SET state = 'done' WHERE id = ? AND session_id = ? AND worker_id = ? AND ownership_epoch = ?")
+                    .bind(id)
+                    .bind(session_id)
+                    .bind(worker_id.to_string())
+                    .bind(epoch)
+                    .execute(&mut *tx)
+                    .await?;
             }
             for id in &delivered {
-                sqlx::query("UPDATE commands SET with_agent = 1 WHERE id = ? AND state = 'pending'").bind(id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE commands SET with_agent = 1 WHERE id = ? AND state = 'pending' AND session_id = ? AND worker_id = ? AND ownership_epoch = ?")
+                    .bind(id).bind(session_id).bind(worker_id.to_string()).bind(epoch).execute(&mut *tx).await?;
             }
         }
         tx.commit().await?;
         Ok(Some(Ingested { last_seq: last, events: stored, done_commands: done, delivered_commands: delivered }))
+    }
+
+    /// Append the single head-authored placement event after the caller's
+    /// ownership CAS, inside the same transaction. No publication before commit.
+    pub(crate) async fn append_move_place_in(
+        tx: &mut sqlx::SqliteConnection,
+        session_id: &str,
+        target_worker: WorkerId,
+        target_epoch: i64,
+        frozen_seq: i64,
+        event: &c6_proto::SessionEvent,
+    ) -> anyhow::Result<()> {
+        use prost::Message;
+
+        let Some(c6_proto::session_event::Kind::PlaceChanged(place)) = &event.kind else { anyhow::bail!("expected PlaceChanged") };
+        anyhow::ensure!(
+            i64::try_from(event.seq).ok().and_then(|seq| seq.checked_sub(1)) == Some(frozen_seq),
+            "unexpected move event sequence"
+        );
+        anyhow::ensure!(i64::try_from(place.ownership_epoch).ok() == Some(target_epoch), "unexpected move event epoch");
+        anyhow::ensure!(place.to.as_ref().is_some_and(|to| to.worker_id == target_worker.to_string()), "unexpected move destination");
+        let updated = sqlx::query(
+            "UPDATE sessions SET last_seq = ?, updated_at = ? WHERE id = ? AND worker_id = ? AND ownership_epoch = ? AND last_seq = ?",
+        )
+        .bind(event.seq as i64)
+        .bind(event.ts_ms)
+        .bind(session_id)
+        .bind(target_worker.to_string())
+        .bind(target_epoch)
+        .bind(frozen_seq)
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(updated.rows_affected() == 1, "move event lost its ownership fence");
+        sqlx::query("INSERT INTO events (session_id, seq, ts, data) VALUES (?, ?, ?, ?)")
+            .bind(session_id)
+            .bind(event.seq as i64)
+            .bind(event.ts_ms)
+            .bind(event.encode_to_vec())
+            .execute(&mut *tx)
+            .await?;
+        crate::search::index_event(tx, session_id, event).await?;
+        crate::analytics::mark(tx, session_id, event).await?;
+        project_place_changed(tx, session_id, event.seq, place).await?;
+        Ok(())
     }
 
     /// The events of the turn that ends at `end_seq`, from its TurnStarted.
@@ -1533,9 +1636,9 @@ pub struct NewCommand<'a> {
 /// it stays behind them), else pending.
 async fn insert_command(tx: &mut sqlx::SqliteConnection, c: &NewCommand<'_>, held: bool) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO commands (id, session_id, worker_id, data, text, created_at, state, enqueued_after_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, \
+        "INSERT INTO commands (id, session_id, worker_id, data, text, created_at, state, enqueued_after_seq, ownership_epoch) VALUES (?1, ?2, ?3, ?4, ?5, ?6, \
          CASE WHEN ?7 OR EXISTS (SELECT 1 FROM commands WHERE session_id = ?2 AND state = 'held') THEN 'held' ELSE 'pending' END, \
-         COALESCE((SELECT last_seq FROM sessions WHERE id = ?2), 0))",
+         COALESCE((SELECT last_seq FROM sessions WHERE id = ?2), 0), COALESCE((SELECT ownership_epoch FROM sessions WHERE id = ?2), 0))",
     )
     .bind(c.id)
     .bind(c.session_id)
@@ -1545,8 +1648,17 @@ async fn insert_command(tx: &mut sqlx::SqliteConnection, c: &NewCommand<'_>, hel
     .bind(c6_core::now_ms())
     .bind(held)
     .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(command_insert_error)?;
     Ok(())
+}
+
+fn command_insert_error(error: sqlx::Error) -> anyhow::Error {
+    match error.as_database_error().map(|db| db.message()) {
+        Some("session is moving") => crate::conflict("the session is moving; try again after it settles"),
+        Some("session command has stale owner") => crate::conflict("the session's worker changed; refresh and try again"),
+        _ => error.into(),
+    }
 }
 
 impl Store {
@@ -1598,8 +1710,15 @@ impl Store {
 
     pub(crate) async fn enqueue_placement_command(&self, c: &NewCommand<'_>) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let idle: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ? AND worker_id = ? AND status = 'idle' AND archived = 0) AND NOT EXISTS(SELECT 1 FROM commands WHERE session_id = ? AND state IN ('pending', 'held'))")
-            .bind(c.session_id).bind(c.worker_id.to_string()).bind(c.session_id).fetch_one(&mut *tx).await?;
+        let idle: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1 AND worker_id = ?2 AND status = 'idle' AND archived = 0) \
+            AND NOT EXISTS(SELECT 1 FROM commands WHERE session_id = ?1 AND state IN ('pending', 'held')) \
+            AND NOT EXISTS(SELECT 1 FROM session_moves WHERE session_id = ?1 AND state NOT IN ('done', 'failed'))",
+        )
+        .bind(c.session_id)
+        .bind(c.worker_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
         if idle {
             crate::agent_ops::link_placement_command(&mut tx, c.session_id, c.id).await?;
             insert_command(&mut tx, c, false).await?;
@@ -1653,7 +1772,8 @@ impl Store {
         let mut held: Vec<CommandRow> = sqlx::query_as("DELETE FROM commands WHERE session_id = ? AND state = 'held' RETURNING *")
             .bind(session_id)
             .fetch_all(&mut *tx)
-            .await?;
+            .await
+            .map_err(command_insert_error)?;
         held.sort_by_key(|c| c.seq);
         for c in &held {
             let data = match create {
@@ -1661,7 +1781,7 @@ impl Store {
                 _ => &c.data,
             };
             sqlx::query(
-                "INSERT INTO commands (id, session_id, worker_id, data, text, created_at, enqueued_after_seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO commands (id, session_id, worker_id, data, text, created_at, enqueued_after_seq, ownership_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&c.id)
             .bind(&c.session_id)
@@ -1670,6 +1790,7 @@ impl Store {
             .bind(&c.text)
             .bind(c.created_at)
             .bind(c.enqueued_after_seq)
+            .bind(c.ownership_epoch)
             .execute(&mut *tx)
             .await?;
         }
@@ -1698,7 +1819,9 @@ impl Store {
 
     /// Pending commands for a worker after `after_seq`, in delivery order.
     pub async fn pending_commands(&self, worker_id: WorkerId, after_seq: i64) -> anyhow::Result<Vec<CommandRow>> {
-        Ok(sqlx::query_as("SELECT * FROM commands WHERE worker_id = ? AND state = 'pending' AND seq > ? ORDER BY seq LIMIT 500")
+        Ok(sqlx::query_as("SELECT c.* FROM commands c WHERE c.worker_id = ? AND c.state = 'pending' AND c.seq > ? \
+            AND NOT EXISTS(SELECT 1 FROM sessions s WHERE s.id = c.session_id AND (s.worker_id <> c.worker_id OR s.ownership_epoch <> c.ownership_epoch)) \
+            AND NOT EXISTS(SELECT 1 FROM session_moves m WHERE m.session_id = c.session_id AND m.state NOT IN ('done', 'failed')) ORDER BY c.seq LIMIT 500")
             .bind(worker_id.to_string())
             .bind(after_seq)
             .fetch_all(&self.pool)
@@ -1739,15 +1862,34 @@ impl Store {
 
     /// Marks a pending command rejected. A rejected `Create` fails the
     /// session and everything queued behind it. Returns the session id.
+    #[cfg(test)]
     pub async fn reject_command(&self, worker_id: WorkerId, id: &str, reason: &str) -> anyhow::Result<Option<String>> {
+        self.reject_command_at_epoch(worker_id, id, None, 0, reason).await
+    }
+
+    pub(crate) async fn reject_command_at_epoch(
+        &self,
+        worker_id: WorkerId,
+        id: &str,
+        session_id: Option<&str>,
+        ownership_epoch: i64,
+        reason: &str,
+    ) -> anyhow::Result<Option<String>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let Some(row) =
-            sqlx::query("UPDATE commands SET state = 'rejected', error = ? WHERE id = ? AND worker_id = ? AND state = 'pending' RETURNING session_id, data")
-                .bind(reason)
-                .bind(id)
-                .bind(worker_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?
+        let Some(row) = sqlx::query(
+            "UPDATE commands SET state = 'rejected', error = ?1 \
+            WHERE id = ?2 AND worker_id = ?3 AND ownership_epoch = ?4 AND (?5 IS NULL OR session_id = ?5) AND state = 'pending' \
+            AND EXISTS (SELECT 1 FROM sessions s WHERE s.id = commands.session_id AND s.worker_id = ?3 AND s.ownership_epoch = ?4) \
+            AND NOT EXISTS (SELECT 1 FROM session_moves m WHERE m.session_id = commands.session_id AND m.state NOT IN ('done', 'failed')) \
+            RETURNING session_id, data",
+        )
+        .bind(reason)
+        .bind(id)
+        .bind(worker_id.to_string())
+        .bind(ownership_epoch)
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?
         else {
             return Ok(None);
         };
@@ -1884,13 +2026,25 @@ impl Store {
     }
 
     /// Retires a rejected input and queues a restore followed by a copy of it.
-    pub async fn replace_with_restore(&self, old_id: &str, restore: &NewCommand<'_>, input: &NewCommand<'_>) -> anyhow::Result<()> {
+    pub async fn replace_with_restore(
+        &self,
+        old_id: &str,
+        restore: &NewCommand<'_>,
+        input: &NewCommand<'_>,
+        epoch: i64,
+    ) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("UPDATE commands SET state = 'done' WHERE id = ?").bind(old_id).execute(&mut *tx).await?;
+        let retired = sqlx::query("UPDATE commands SET state = 'done' WHERE id = ?1 AND session_id = ?2 AND worker_id = ?3 AND ownership_epoch = ?4 AND state = 'pending' \
+            AND EXISTS (SELECT 1 FROM sessions WHERE id = ?2 AND worker_id = ?3 AND ownership_epoch = ?4) \
+            AND NOT EXISTS (SELECT 1 FROM session_moves WHERE session_id = ?2 AND state NOT IN ('done', 'failed'))")
+            .bind(old_id).bind(restore.session_id).bind(restore.worker_id.to_string()).bind(epoch).execute(&mut *tx).await?;
+        if retired.rows_affected() != 1 {
+            return Ok(false);
+        }
         insert_command(&mut tx, restore, false).await?;
         insert_command(&mut tx, input, false).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Clears rejected inputs from a session's queue (the user dismissed them).
@@ -2016,7 +2170,7 @@ pub(crate) mod tests {
             payload.extend_from_slice(&[0x80, 0x01, 0x01]); // bool human_origin = 16
         }
         let mut data =
-            c6_proto::SessionCommand { command_id: command_id.into(), session_id: session_id.into(), kind: None }.encode_to_vec();
+            c6_proto::SessionCommand { command_id: command_id.into(), session_id: session_id.into(), ..Default::default() }.encode_to_vec();
         prost::encoding::bytes::encode(11, &payload, &mut data);
         data
     }
@@ -2078,6 +2232,7 @@ pub(crate) mod tests {
         SessionRow {
             id: id.into(),
             worker_id: worker_id.to_string(),
+            ownership_epoch: 0,
             title: "t".into(),
             cwd: String::new(),
             connection_id: "c".into(),
@@ -2131,6 +2286,67 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn move_fences_appends_acks_commands_and_rejections_by_owner_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let a = WorkerId::new();
+        let b = WorkerId::new();
+        store.create_session(&session("s", a), &[], false).await.unwrap();
+        store.ingest(a, "s", &[input_event(1, "first")]).await.unwrap().unwrap();
+        store.enqueue_command(&command("old", "s", a, None)).await.unwrap();
+
+        // Simulate the routing gates and adoption, including a later move
+        // back to A. A's old worker ID alone must confer no authority.
+        sqlx::query("INSERT INTO session_moves (id,session_id,source_worker_id,target_worker_id,source_epoch,target_epoch,state,request_json,created_at,updated_at) \
+            VALUES ('move','s',?,?,0,1,'requested','{}',1,1)")
+            .bind(a.to_string()).bind(b.to_string()).execute(&store.pool).await.unwrap();
+        let err = store.enqueue_command(&command("blocked", "s", a, None)).await.unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<crate::UserError>(), Some(crate::UserError::Conflict(message)) if message.contains("session is moving"))
+        );
+        assert!(!store.enqueue_placement_command(&command("placement", "s", a, None)).await.unwrap());
+        assert!(!store.session_routable("s", a, 0).await.unwrap());
+        assert!(store.pending_commands(a, 0).await.unwrap().is_empty());
+        assert!(store.ingest_at_epoch(a, "s", 0, &[]).await.unwrap().is_some(), "source can drain before CAS");
+        assert!(store.ingest_at_epoch(b, "s", 1, &[input_event(2, "bad")]).await.unwrap().is_none());
+
+        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("UPDATE sessions SET ownership_epoch = 2 WHERE id = 's'").execute(&mut *tx).await.unwrap();
+        let place = c6_proto::SessionEvent {
+            seq: 2,
+            ts_ms: 2,
+            kind: Some(c6_proto::session_event::Kind::PlaceChanged(c6_proto::PlaceChanged {
+                to: Some(c6_proto::SessionPlace { worker_id: a.to_string(), cwd: "/new".into(), ..Default::default() }),
+                ownership_epoch: 2,
+                ..Default::default()
+            })),
+        };
+        Store::append_move_place_in(&mut tx, "s", a, 2, 1, &place).await.unwrap();
+        sqlx::query("UPDATE session_moves SET state = 'done' WHERE id = 'move'").execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(store.session("s").await.unwrap().unwrap().cwd, "/new");
+        assert!(store.pending_commands(a, 0).await.unwrap().is_empty(), "old pending row did not follow the session back");
+        let stale_turn = c6_proto::SessionEvent {
+            seq: 3,
+            ts_ms: 3,
+            kind: Some(c6_proto::session_event::Kind::TurnStarted(c6_proto::TurnStarted { turn: 1, ..Default::default() })),
+        };
+        assert!(store.ingest(a, "s", &[stale_turn]).await.unwrap().is_none());
+        assert!(store.ingest_at_epoch(b, "s", 2, &[input_event(3, "wrong-worker")]).await.unwrap().is_none());
+        assert_eq!(store.last_seq("s").await.unwrap(), 2);
+        assert_eq!(store.session("s").await.unwrap().unwrap().status, "starting", "stale turn cannot mark the session running");
+        store.enqueue_command(&command("new", "s", a, Some("new"))).await.unwrap();
+        assert_eq!(store.pending_commands(a, 0).await.unwrap()[0].ownership_epoch, 2);
+        assert!(store.reject_command_at_epoch(a, "new", Some("s"), 0, "stale").await.unwrap().is_none());
+        assert_eq!(store.ingest_at_epoch(a, "s", 2, &[input_event(3, "new")]).await.unwrap().unwrap().last_seq, 3);
+        let cursor = c6_proto::SessionCursor { session_id: "s".into(), seq: 1, ownership_epoch: 2 };
+        let stale = c6_proto::SessionCursor { ownership_epoch: 0, ..cursor.clone() };
+        let acks = store.session_positions_for_epochs(a, &[stale, cursor]).await.unwrap();
+        assert_eq!(acks.len(), 1);
+        assert_eq!((acks[0].ownership_epoch, acks[0].seq), (2, 3));
+    }
+
+    #[tokio::test]
     async fn task_card_provenance_is_durable_scoped_and_not_inferred_from_old_commands() {
         use c6_proto::{SessionCommand, TaskCardOrigin, UserInput, session_command};
         use prost::Message;
@@ -2144,6 +2360,7 @@ pub(crate) mod tests {
             let data = SessionCommand {
                 command_id: id.into(),
                 session_id: "s".into(),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Input(UserInput {
                     text: "Start session: task card #1".into(),
                     command: "card-answer".into(),
@@ -2159,8 +2376,13 @@ pub(crate) mod tests {
             let data = if legacy {
                 legacy_input_command(id, "s", input)
             } else {
-                SessionCommand { command_id: id.into(), session_id: "s".into(), kind: Some(session_command::Kind::Input(input)) }
-                    .encode_to_vec()
+                SessionCommand {
+                    command_id: id.into(),
+                    session_id: "s".into(),
+                    kind: Some(session_command::Kind::Input(input)),
+                    ownership_epoch: 0,
+                }
+                .encode_to_vec()
             };
             store.enqueue_command(&NewCommand { id, session_id: "s", worker_id: worker, data, text: Some("person") }).await.unwrap();
         }
@@ -2248,6 +2470,7 @@ pub(crate) mod tests {
             data: SessionCommand {
                 command_id: id.into(),
                 session_id: "a".into(),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Input(UserInput { text: text.into(), ..Default::default() })),
             }
             .encode_to_vec(),
@@ -2260,6 +2483,7 @@ pub(crate) mod tests {
             data: SessionCommand {
                 command_id: "rewind".into(),
                 session_id: "a".into(),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Rewind(Rewind { to_seq: 3, restore_files: false })),
             }
             .encode_to_vec(),
@@ -2303,7 +2527,7 @@ pub(crate) mod tests {
             let data = if id == "malformed" {
                 vec![0xff]
             } else {
-                SessionCommand { command_id: id.into(), session_id: id.into(), kind }.encode_to_vec()
+                SessionCommand { command_id: id.into(), session_id: id.into(), kind, ownership_epoch: 0 }.encode_to_vec()
             };
             let queued_id = format!("{id}-input");
             store
@@ -2344,6 +2568,7 @@ pub(crate) mod tests {
             cmd.data = SessionCommand {
                 command_id: id.into(),
                 session_id: "s".into(),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Input(UserInput { attachments: files.clone(), ..Default::default() })),
             }
             .encode_to_vec();
@@ -2583,6 +2808,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
         let worker = WorkerId::new();
+        store.create_session(&session("target", worker), &[], false).await.unwrap();
         let input = |id: &'static str, from: &str| NewCommand {
             id,
             session_id: "target",
@@ -2590,6 +2816,7 @@ pub(crate) mod tests {
             data: SessionCommand {
                 command_id: id.into(),
                 session_id: "target".into(),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Input(UserInput { from_session_id: from.into(), ..Default::default() })),
             }
             .encode_to_vec(),
@@ -2620,7 +2847,7 @@ pub(crate) mod tests {
             data: SessionCommand { kind: Some(session_command::Kind::Restore(Default::default())), ..Default::default() }.encode_to_vec(),
             text: None,
         };
-        store.replace_with_restore("pending", &restore, &input("replay", "alice")).await.unwrap();
+        assert!(store.replace_with_restore("pending", &restore, &input("replay", "alice"), 0).await.unwrap());
         let sent = store.recent_session_messages(1_000).await.unwrap();
         assert_eq!(sent["alice"], [1_000, 1_001, 1_002]);
         assert_eq!(sent["bob"], [1_003]);

@@ -45,6 +45,7 @@ message SessionPlace {
   string repo = 2;
   string worktree_branch = 3;
   string repo_root = 4;
+  string worker_id = 5;
 }
 
 message PlaceChanged {
@@ -58,6 +59,10 @@ message PlaceChanged {
   repeated string tools = 8;
   string tool_profile = 9;
   string setup_log = 10;
+  uint64 ownership_epoch = 11;
+  // Effective native conversation selected after any confirmed rewind. A
+  // transferred transcript must be resumed, never seeded as a new session.
+  string native_resume_id = 12;
 }
 
 // One of your messages reached the agent while it was working: it is in
@@ -509,6 +514,7 @@ message EphemeralEvent {
     SecretCard secret = 6;
     RateLimit rate_limit = 7;
   }
+  uint64 ownership_epoch = 8;
 }
 
 // A plan's limits as the model's runtime reported them (Claude Code's
@@ -556,17 +562,20 @@ message SessionActivity {
 message SessionCursor {
   string session_id = 1;
   uint64 seq = 2;
+  uint64 ownership_epoch = 3;
 }
 
 message SessionEventBatch {
   string session_id = 1;
   repeated SessionEvent events = 2;
+  uint64 ownership_epoch = 3;
 }
 
 // Cumulative: every event with seq <= `seq` is durable on the head.
 message EventAck {
   string session_id = 1;
   uint64 seq = 2;
+  uint64 ownership_epoch = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +586,8 @@ message EventAck {
 message SessionCommand {
   string command_id = 1;
   string session_id = 2;
+  // Zero is the initial owner incarnation and the legacy wire default.
+  uint64 ownership_epoch = 22;
   oneof kind {
     CreateSession create = 10;
     UserInput input = 11;
@@ -921,6 +932,7 @@ message CommandRejected {
   string command_id = 1;
   string session_id = 2;
   string reason = 3;
+  uint64 ownership_epoch = 4;
 }
 
 // ---------------------------------------------------------------------------

@@ -372,6 +372,7 @@ async fn head_records_old_worker_origins_without_rewriting_legacy_and_limits_rew
     let row = c6_head::store::SessionRow {
         id: "origin-fixture".into(),
         worker_id: worker_id.to_string(),
+        ownership_epoch: 0,
         title: "Origin fixture".into(),
         cwd: String::new(),
         connection_id: String::new(),
@@ -433,9 +434,13 @@ async fn head_records_old_worker_origins_without_rewriting_legacy_and_limits_rew
     head.state.store.ingest(worker_id, &row.id, &events[..3]).await.unwrap().unwrap();
     let mut live = head.state.hub.subscribe(&row.id);
     assert_eq!(
-        c6_head::sessions::ingest(&head.state, worker_id, SessionEventBatch { session_id: row.id.clone(), events: events.clone() })
-            .await
-            .unwrap(),
+        c6_head::sessions::ingest(
+            &head.state,
+            worker_id,
+            SessionEventBatch { session_id: row.id.clone(), events: events.clone(), ownership_epoch: 0 },
+        )
+        .await
+        .unwrap(),
         Some(11)
     );
     let saved = head.state.store.events_after(&row.id, 0, i64::MAX).await.unwrap();
@@ -548,7 +553,7 @@ async fn assistant_restart_closes_abandoned_turns_without_replaying_tools() {
     c6_head::sessions::ingest(
         &head.state,
         head.state.assistant.head_id().unwrap(),
-        SessionEventBatch { session_id: waiting.id.clone(), events: wait_events.clone() },
+        SessionEventBatch { session_id: waiting.id.clone(), events: wait_events.clone(), ownership_epoch: 0 },
     )
     .await
     .unwrap();

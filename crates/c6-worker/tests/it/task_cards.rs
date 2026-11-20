@@ -393,6 +393,7 @@ impl Cards {
         c6_proto::SessionCommand {
             command_id: command_id.clone(),
             session_id: session.to_owned(),
+            ownership_epoch: 0,
             kind: Some(c6_proto::session_command::Kind::Input(c6_proto::UserInput {
                 text: text.clone(),
                 command: command.clone(),
@@ -766,7 +767,7 @@ async fn old_workers_receive_task_card_answers_as_ordinary_inputs() {
         msg: Some(c6_proto::worker_msg::Msg::Hello(c6_proto::Hello {
             protocol_version: c6_core::PROTOCOL_VERSION,
             capabilities: Vec::new(),
-            sessions: vec![c6_proto::SessionCursor { session_id: session.id.clone(), seq: events.last().unwrap().seq }],
+            sessions: vec![c6_proto::SessionCursor { session_id: session.id.clone(), seq: events.last().unwrap().seq, ownership_epoch: 0 }],
             ..Default::default()
         })),
     })
@@ -804,6 +805,7 @@ async fn old_workers_receive_task_card_answers_as_ordinary_inputs() {
             t.worker.identity.meta.worker_id,
             c6_proto::SessionEventBatch {
                 session_id: session.id.clone(),
+                ownership_epoch: 0,
                 events: vec![c6_proto::SessionEvent {
                     seq: seq + i as u64,
                     ts_ms: c6_core::now_ms(),

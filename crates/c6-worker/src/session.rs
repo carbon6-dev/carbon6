@@ -30,6 +30,7 @@ pub struct SessionManager {
     /// The worker's state directory (checkpoint repositories live here).
     state_dir: PathBuf,
     actors: Arc<Mutex<HashMap<String, Handle>>>,
+    loads: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Delegations running per top-level session (for its limit).
     working: Arc<Mutex<HashMap<String, usize>>>,
     /// The MCP server that gives Claude Code sessions carbon6's subagents
@@ -200,6 +201,11 @@ impl TaskLossCause {
 }
 
 pub(crate) enum ActorMsg {
+    FreezeMove {
+        move_id: String,
+        epoch: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     ChangePlace(String, c6_proto::ChangePlace, tokio::sync::oneshot::Sender<Result<(), String>>),
     /// An up-front refusal still needs a durable Error for the Rewind panel.
     RewindRefused {
@@ -314,6 +320,7 @@ impl SessionManager {
             worktrees,
             state_dir,
             actors: Arc::default(),
+            loads: Arc::default(),
             working: Arc::default(),
             bridge: Arc::default(),
             remote_waits: Arc::default(),
@@ -459,6 +466,150 @@ impl SessionManager {
         self.state_dir.join("claude")
     }
 
+    /// Raw history is authoritative for runtime/placement, even across rewind.
+    pub(crate) async fn move_snapshot(&self, session: &str) -> anyhow::Result<(CreateSession, Vec<SessionEvent>, SessionStarted)> {
+        self.journal.check_move_history_size(session, crate::move_files::MAX_BYTES).await?;
+        let (mut spec, events) =
+            self.journal.load_session(session).await?.ok_or_else(|| anyhow::anyhow!("session is not cached on this worker"))?;
+        if let Some(model) = events.iter().rev().find_map(|event| match &event.kind {
+            Some(session_event::Kind::ModelSwitched(switched)) => switched.model.clone(),
+            _ => None,
+        }) {
+            spec.model = Some(model);
+        }
+        let started = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                Some(session_event::Kind::Started(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("session has no starting event"))?;
+        let runtime = runtime_of(started, &events);
+        Ok((spec, events, runtime))
+    }
+
+    pub(crate) async fn freeze_for_move(&self, session: &str, epoch: u64, move_id: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.journal.move_aborted(session, epoch, move_id).await?, "this move was aborted");
+        let (owned, blocked, previous) = self.journal.ownership(session).await?;
+        anyhow::ensure!(owned == epoch, "stale session ownership generation");
+        if blocked {
+            anyhow::ensure!(previous == move_id, "session is fenced by another move");
+            return Ok(());
+        }
+        let actor = self.actor(session).await?.ok_or_else(|| anyhow::anyhow!("unknown session on source worker"))?;
+        let (reply, result) = tokio::sync::oneshot::channel();
+        actor
+            .send(ActorMsg::FreezeMove { move_id: move_id.to_owned(), epoch, reply })
+            .map_err(|_| anyhow::anyhow!("session stopped before releasing ownership"))?;
+        result.await.map_err(|_| anyhow::anyhow!("source release was interrupted"))?.map_err(anyhow::Error::msg)?;
+        let mut actors = self.actors.lock().unwrap();
+        if actors.get(session).is_some_and(|handle| handle.tx.same_channel(&actor)) {
+            actors.remove(session);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn assert_move_inactive(&self, session: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.actors.lock().unwrap().get(session).is_some_and(|a| !a.tx.is_closed()),
+            "destination already has a running actor for this session"
+        );
+        Ok(())
+    }
+
+    fn load_gate(&self, session: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.loads.lock().unwrap().entry(session.to_owned()).or_default().clone()
+    }
+
+    pub(crate) async fn import_move(
+        &self,
+        session: &str,
+        spec: &CreateSession,
+        events: &[SessionEvent],
+        epoch: u64,
+        move_id: &str,
+    ) -> anyhow::Result<()> {
+        let _loading = self.load_gate(session).lock_owned().await;
+        self.assert_move_inactive(session).await?;
+        self.journal.import_owned(session, spec, events, epoch, move_id).await
+    }
+
+    pub(crate) async fn activate_move(&self, session: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(self.actor(session).await?.is_some(), "adopted session history is missing");
+        Ok(())
+    }
+
+    /// Probe the same CLI the destination would launch, without opening a
+    /// conversation or touching the worker's Claude configuration.
+    pub(crate) async fn check_native_move_runtime() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use std::process::Stdio;
+
+        let bin = crate::claude_code::find_claude()
+            .context("destination Claude Code CLI is unavailable: install `claude` on the destination worker or set C6_CLAUDE_BIN")?;
+        let config = tempfile::tempdir().context("create temporary Claude CLI probe configuration")?;
+        let mut command = tokio::process::Command::new(&bin);
+        command
+            .arg("--version")
+            .env("CLAUDE_CONFIG_DIR", config.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), command.status())
+            .await
+            .context("destination Claude Code CLI is unavailable: `claude --version` timed out")?
+            .with_context(|| format!("destination Claude Code CLI is unavailable: cannot run {} --version", bin.display()))?;
+        anyhow::ensure!(status.success(), "destination Claude Code CLI is unavailable: `claude --version` ended with {status}");
+        Ok(())
+    }
+
+    pub(crate) async fn prepare_move_event(
+        &self,
+        session: &str,
+        spec: &CreateSession,
+        events: &[SessionEvent],
+        mut change: c6_proto::PlaceChanged,
+    ) -> anyhow::Result<SessionEvent> {
+        let from = change.from.as_ref().ok_or_else(|| anyhow::anyhow!("move has no source place"))?;
+        let to = change.to.as_ref().ok_or_else(|| anyhow::anyhow!("move has no destination place"))?;
+        let cwd = Path::new(&to.cwd);
+        let (system_prompt, tools, tool_profile) = if events.iter().rev().find_map(|e| match &e.kind {
+            Some(session_event::Kind::ModelSwitched(h)) => h.handoff.as_ref().map(|h| h.tool_profile.as_str()),
+            Some(session_event::Kind::Started(s)) => Some(s.tool_profile.as_str()),
+            _ => None,
+        }) == Some(crate::claude_code::PROFILE)
+        {
+            Self::check_native_move_runtime().await?;
+            (crate::claude_code::SYSTEM_PROMPT.to_owned(), Vec::new(), crate::claude_code::PROFILE.to_owned())
+        } else {
+            let mut preparing = spec.clone();
+            preparing.hooks_json.clear();
+            // Preparing an inactive destination cannot borrow the old owner's
+            // credentials or run arbitrary external hooks/MCP servers.
+            preparing.secrets_json = "[]".into();
+            let home = dirs::home_dir().unwrap_or_default().display().to_string();
+            let labels = session_labels(&spec.labels, &to.repo, &to.cwd, &home, &spawn_model(spec), "");
+            let date = time::OffsetDateTime::now_utc().date().to_string();
+            let base = build_system_prompt(&spec.base_prompt, cwd, &date);
+            let built = own_runtime(&self.link, session, &preparing, cwd, &labels, base, "resume").await;
+            anyhow::ensure!(built.errors.is_empty(), "destination tool preparation failed: {}", built.errors.join("; "));
+            (built.prompt, built.tools.iter().map(|t| t.spec().name).collect(), built.profile.as_str().to_owned())
+        };
+        change.notice = change
+            .notice
+            .replace("{{from}}", &format!("{} on {}", from.cwd, from.worker_id))
+            .replace("{{to}}", &format!("{} on {}", to.cwd, to.worker_id));
+        change.system_prompt = system_prompt;
+        change.tools = tools;
+        change.tool_profile = tool_profile;
+        Ok(SessionEvent {
+            seq: events.last().map_or(1, |e| e.seq + 1),
+            ts_ms: c6_core::now_ms(),
+            kind: Some(session_event::Kind::PlaceChanged(change)),
+        })
+    }
+
     /// Queue edits bypass the actor's normal input expansion path. Prepare
     /// their files before acquiring the inbox lock; immutable filenames keep
     /// an edit racing delivery from changing a file already given to the agent.
@@ -497,6 +648,7 @@ impl SessionManager {
         crate::claude_code::sweep_orphans(&self.claude_dir()).await;
         let mut cut_short = Vec::new();
         for (session_id, last_seq, turn) in self.journal.open_turns().await? {
+            let epoch = self.journal.ownership(&session_id).await?.0;
             warn!(session = %session_id, turn, "closing turn interrupted by worker restart");
             // A subagent the turn was waiting on: its call gets what it did.
             let mut seq = last_seq;
@@ -509,14 +661,14 @@ impl SessionManager {
             for result in lost {
                 seq += 1;
                 let ev = SessionEvent { seq, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::ToolResult(result)) };
-                self.journal.append(&session_id, &ev).await?;
+                self.journal.append_owned(&session_id, &ev, epoch).await?;
             }
             let ev = SessionEvent {
                 seq: seq + 1,
                 ts_ms: c6_core::now_ms(),
                 kind: Some(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::WorkerRestarted as i32 })),
             };
-            self.journal.append(&session_id, &ev).await?;
+            self.journal.append_owned(&session_id, &ev, epoch).await?;
         }
         // Turns the restart cut short go on (docs/restarts.md §4): the agent
         // carries on from its log. (One whose Claude Code process was held
@@ -553,7 +705,7 @@ impl SessionManager {
         // it above. Restore its actor too, so its hourly timer is armed
         // without waiting for another command from the head. Only scan
         // recently active sessions; dormant notices wait for explicit use.
-        for session_id in self.journal.recent_session_ids(c6_core::now_ms() - NOTICE_RECOVERY_WINDOW_MS).await? {
+        for session_id in self.journal.recent_unblocked_session_ids(c6_core::now_ms() - NOTICE_RECOVERY_WINDOW_MS).await? {
             let events = self.journal.events_after(&session_id, 0, u32::MAX).await?;
             if notices_of(&events).2.iter().any(|(_, wake)| *wake)
                 && let Err(e) = self.actor(&session_id).await
@@ -643,6 +795,20 @@ impl SessionManager {
     /// Applies a command from the head. `Err` is a rejection reason for the head.
     pub async fn handle(&self, cmd: SessionCommand) -> Result<(), String> {
         let internal = |e: anyhow::Error| format!("worker error: {e:#}");
+        // The current owner's journal may have been lost. A head-authorized
+        // Restore is the only normal command allowed to install a newer
+        // incarnation, and must not reuse an earlier worker cache silently.
+        if let Some(session_command::Kind::Restore(restore)) = &cmd.kind {
+            let (epoch, blocked, receipt) = self.journal.ownership(&cmd.session_id).await.map_err(internal)?;
+            if cmd.ownership_epoch > epoch {
+                let spec = restore.spec.as_ref().ok_or("restore without a session spec")?;
+                self.import_move(&cmd.session_id, spec, &restore.events, cmd.ownership_epoch, &cmd.command_id).await.map_err(internal)?;
+                self.journal.activate_ownership(&cmd.session_id, cmd.ownership_epoch, &cmd.command_id).await.map_err(internal)?;
+            } else if cmd.ownership_epoch == epoch && blocked && receipt == cmd.command_id {
+                self.journal.activate_ownership(&cmd.session_id, cmd.ownership_epoch, &cmd.command_id).await.map_err(internal)?;
+            }
+        }
+        self.journal.check_ownership(&cmd.session_id, cmd.ownership_epoch).await.map_err(internal)?;
         match cmd.kind {
             Some(session_command::Kind::Create(spec)) => {
                 if self.journal.has_session(&cmd.session_id).await.map_err(internal)? {
@@ -719,7 +885,12 @@ impl SessionManager {
                             }
                             if !self
                                 .journal
-                                .authorize_claude_rewind_retry(&cmd.session_id, &pending.command_id, &cmd.command_id)
+                                .authorize_claude_rewind_retry_owned(
+                                    &cmd.session_id,
+                                    &pending.command_id,
+                                    &cmd.command_id,
+                                    cmd.ownership_epoch,
+                                )
                                 .await
                                 .map_err(internal)?
                             {
@@ -742,7 +913,7 @@ impl SessionManager {
                             // or interrupting a live turn. Restart must observe the
                             // intent before any further model input.
                             self.journal
-                                .prepare_claude_rewind(
+                                .prepare_claude_rewind_owned(
                                     &cmd.session_id,
                                     &crate::claude_code::Reset {
                                         command_id: cmd.command_id.clone(),
@@ -756,6 +927,7 @@ impl SessionManager {
                                         failure: String::new(),
                                         retries: Vec::new(),
                                     },
+                                    cmd.ownership_epoch,
                                 )
                                 .await
                                 .map_err(internal)?;
@@ -1033,7 +1205,9 @@ impl SessionManager {
         }
         info!(session = %session_id, cwd = %cwd.display(), %profile, "session created");
         let conv = Conversation { history: history_from_events(&seed_events(&spec)), context_tokens: 0 };
-        self.spawn(session_id, spec, started, conv, next_seq, 0, Some(session_tools)).await.map_err(|e| format!("worker error: {e:#}"))?;
+        self.spawn(session_id, spec, started, conv, next_seq, 0, Some(session_tools), 0)
+            .await
+            .map_err(|e| format!("worker error: {e:#}"))?;
         Ok(())
     }
 
@@ -1179,10 +1353,13 @@ impl SessionManager {
     }
 
     async fn load_with_task_loss(&self, session_id: &str, cause: TaskLossCause) -> anyhow::Result<Option<Handle>> {
+        let _loading = self.load_gate(session_id).lock_owned().await;
+        let (_, blocked, _) = self.journal.ownership(session_id).await?;
+        anyhow::ensure!(!blocked, "session ownership is released or awaiting adoption");
         if let Some(a) = self.actors.lock().unwrap().get(session_id).filter(|a| !a.tx.is_closed()) {
             return Ok(Some(a.clone()));
         }
-        let Some((spec, mut events)) = self.journal.load_session(session_id).await? else { return Ok(None) };
+        let Some((spec, mut events, epoch)) = self.journal.load_session_owned(session_id).await? else { return Ok(None) };
         let started = events.iter().find_map(|e| match &e.kind {
             Some(session_event::Kind::Started(s)) => Some(s.clone()),
             _ => None,
@@ -1202,7 +1379,7 @@ impl SessionManager {
             warn!(session = %session_id, turn, "closing a turn left open by a failed turn");
             let kind = session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 });
             let event = SessionEvent { seq: next_seq, ts_ms: c6_core::now_ms(), kind: Some(kind) };
-            self.journal.append(session_id, &event).await?;
+            self.journal.append_owned(session_id, &event, epoch).await?;
             events.push(event);
             next_seq += 1;
         }
@@ -1218,7 +1395,7 @@ impl SessionManager {
                 ts_ms: c6_core::now_ms(),
                 kind: Some(session_event::Kind::SubagentReported(local_report_boundary(session_id))),
             };
-            self.journal.append(session_id, &event).await?;
+            self.journal.append_owned(session_id, &event, epoch).await?;
             events.push(event);
             next_seq += 1;
         }
@@ -1228,7 +1405,7 @@ impl SessionManager {
         crate::attachments::restore(&self.state_dir, session_id, &mut spec.seed, !started.ssh_target.is_empty()).await;
         crate::attachments::restore(&self.state_dir, session_id, &mut events, !started.ssh_target.is_empty()).await;
         let conv = conversation_from_log(&mut spec, &events);
-        let handle = self.spawn(session_id, spec, started, conv, next_seq, turns, None).await?;
+        let handle = self.spawn(session_id, spec, started, conv, next_seq, turns, None, epoch).await?;
         let tx = handle.tx.clone();
         // Recover held tasks; otherwise report an open task whose outcome
         // is missing. A lazy load need not mean the worker restarted.
@@ -1298,7 +1475,7 @@ impl SessionManager {
             )
             .await?;
         let conv = Conversation { history: Vec::new(), context_tokens: 0 };
-        Ok(self.spawn(session_id, spec, started, conv, 3, 0, Some(tools)).await?.tx)
+        Ok(self.spawn(session_id, spec, started, conv, 3, 0, Some(tools), 0).await?.tx)
     }
 
     /// The shared tool state of a subagent's parent, starting the parent's
@@ -1349,13 +1526,16 @@ impl SessionManager {
         next_seq: u64,
         turns: u64,
         tools: Option<Vec<Arc<dyn Tool>>>,
+        epoch: u64,
     ) -> anyhow::Result<Handle> {
         let (tx, rx) = mpsc::unbounded_channel();
         let delegation = spec.delegation.clone();
         // A subagent's secrets and head calls go by its tree's top-level
         // session (its row always exists on the head).
         let on_behalf_of = delegation.as_ref().map_or(session_id, |d| d.root_session_id.as_str()).to_owned();
-        let writer = Arc::new(Writer::new(session_id.to_owned(), self.journal.clone(), self.link.clone(), next_seq));
+        let mut writer = Writer::new(session_id.to_owned(), self.journal.clone(), self.link.clone(), next_seq);
+        writer.ownership_epoch = epoch;
+        let writer = Arc::new(writer);
         // On an SSH target, what runs on the worker (hooks, MCP servers)
         // runs in a local folder of the session's.
         let remote = !started.ssh_target.is_empty();
@@ -1546,6 +1726,7 @@ impl SessionManager {
         };
         let handle =
             Handle { tx, tools: actor.session_tools.clone(), running: actor.running_flag.clone(), claude_code, inbox: actor.inbox.clone() };
+        self.journal.check_ownership(session_id, epoch).await?;
         tokio::spawn(actor.supervise(rx));
         self.actors.lock().unwrap().insert(session_id.to_owned(), handle.clone());
         Ok(handle)
@@ -1727,7 +1908,11 @@ fn runtime_left(before: &[SessionEvent], h: &c6_proto::Handoff) -> String {
 /// last handoff started, which a new conversation begins with the
 /// handoff's transcript; created on Claude Code, its own id, with a side
 /// chat's context in front.
-fn claude_conversation(session_id: &str, spec: &CreateSession, events: &[SessionEvent]) -> crate::claude_code::ClaudeConversation {
+pub(crate) fn claude_conversation(
+    session_id: &str,
+    spec: &CreateSession,
+    events: &[SessionEvent],
+) -> crate::claude_code::ClaudeConversation {
     let turns_since = |from: usize| events[from..].iter().any(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_))));
     match events.iter().rposition(|e| handoff_of(e).is_some()) {
         Some(h) => {
@@ -1759,8 +1944,9 @@ fn claude_conversation(session_id: &str, spec: &CreateSession, events: &[Session
 }
 
 /// Apply the worker's durable CLI branch selection as well as public history.
-/// Missing local chain metadata is safe: rewinds then use kept-history seeding.
-async fn journal_claude_conversation(
+/// A moved transcript is pinned by public history, even without local chain
+/// metadata. Later unmapped rewinds still use kept-history seeding.
+pub(crate) async fn journal_claude_conversation(
     journal: &Journal,
     session_id: &str,
     spec: &CreateSession,
@@ -1768,12 +1954,23 @@ async fn journal_claude_conversation(
 ) -> anyhow::Result<crate::claude_code::ClaudeConversation> {
     let mut conversation = claude_conversation(session_id, spec, events);
     let handoff_seq = events.iter().rev().find(|e| handoff_of(e).is_some()).map_or(0, |e| e.seq);
-    let mut since = handoff_seq;
+    let mut anchor = handoff_seq;
+    if let Some((seq, resume_id)) = events.iter().rev().find_map(|e| match &e.kind {
+        Some(session_event::Kind::PlaceChanged(place)) if e.seq > handoff_seq && !place.native_resume_id.is_empty() => {
+            Some((e.seq, &place.native_resume_id))
+        }
+        _ => None,
+    }) {
+        anchor = seq;
+        conversation.id.clone_from(resume_id);
+        conversation.resume = true;
+    }
+    let mut since = anchor;
     let rewound_seq = events.iter().rev().find(|e| matches!(e.kind, Some(session_event::Kind::Rewound(_)))).map_or(0, |e| e.seq);
     let mut reset_found = false;
     if let Some((reset, applied)) = journal.claude_rewind(session_id).await? {
         anyhow::ensure!(applied != 0, "Claude Code rewind is not confirmed; retry Rewind before sending more input");
-        if applied > handoff_seq && applied >= rewound_seq {
+        if applied > anchor && applied >= rewound_seq {
             reset_found = true;
             since = applied;
             conversation.id = reset.session_id;
@@ -1789,7 +1986,7 @@ async fn journal_claude_conversation(
     // A pre-upgrade rewind, or a replacement worker without the old journal:
     // there is no trustworthy Claude branch mapping. Never resume the original
     // session. Fresh kept-history seeding is the only safe reconstruction.
-    if rewound_seq > handoff_seq && !reset_found {
+    if rewound_seq > anchor && !reset_found {
         since = rewound_seq;
         conversation.id = uuid::Uuid::now_v7().to_string();
         conversation.resume = false;
@@ -3523,7 +3720,7 @@ impl Actor {
                                     };
                                     reset.untouched = false;
                                     reset.previous = None;
-                                    self.journal.prepare_claude_rewind(&self.writer.session_id, &reset).await
+                                    self.journal.prepare_claude_rewind_owned(&self.writer.session_id, &reset, self.writer.ownership_epoch).await
                                 }.await;
                                 if let Err(e) = transition { error!("starting Rewind interruption: {e:#}"); return; }
                             }
@@ -3547,6 +3744,19 @@ impl Actor {
                             self.change_place(&command_id, place).await
                         };
                         let _ = reply.send(result.map_err(|e| format!("{e:#}")));
+                    }
+                    Some(ActorMsg::FreezeMove { move_id, epoch, reply }) => {
+                        let result = if running.is_some() || rewind_blocked || adoption_blocked
+                            || !self.inbox.lock().unwrap().queue.is_empty() || !self.deferred.is_empty()
+                            || !self.rewinds.is_empty() || !rx.is_empty()
+                        {
+                            Err(anyhow::anyhow!("Wait for the current turn and queued work before moving workers"))
+                        } else {
+                            self.freeze_move(&move_id, epoch).await
+                        };
+                        let released = result.is_ok();
+                        let _ = reply.send(result.map_err(|e| format!("{e:#}")));
+                        if released { return; }
                     }
                 },
                 _ = tokio::time::sleep_until(self.local_report_retry_at.unwrap_or_else(tokio::time::Instant::now)), if self.local_report_retry_at.is_some() => {
@@ -4282,6 +4492,35 @@ impl Actor {
 
     /// Prepare a local workspace, commit the event, then install it in this
     /// actor before anything else can start a turn.
+    async fn freeze_move(&mut self, move_id: &str, epoch: u64) -> anyhow::Result<()> {
+        let sid = self.writer.session_id.clone();
+        anyhow::ensure!(
+            self.spec.delegation.is_none() && self.spec.depth == 0 && self.started.ssh_target.is_empty(),
+            "only top-level local sessions can move between workers"
+        );
+        anyhow::ensure!(
+            self.spec.mcp_servers_json.trim().is_empty() || self.spec.mcp_servers_json.trim() == "[]",
+            "moving sessions with configured MCP servers is not supported"
+        );
+        anyhow::ensure!(
+            !self.session_tools.background.list().iter().any(|t| t.running),
+            "stop or wait for running background tasks before moving workers"
+        );
+        let events = self.journal.events_after(&sid, 0, u32::MAX).await?;
+        self.manager.rewind_preflight(&sid, &events, 0, true).await?;
+        // Native Claude remains alive between turns. Releasing a session must
+        // stop that process (including its keeper/descendants), not just drop
+        // the actor. This does not reset or fork its native conversation.
+        if let Some(mut process) = self.claude.take() {
+            anyhow::ensure!(process.take_unsent().is_empty(), "native Claude still owns unsent inputs");
+            process.stop_for_rewind().await?;
+        }
+        crate::claude_code::stop_held_for_rewind(&self.manager.claude_dir().join("held"), &sid, &self.journal).await?;
+        crate::claude_code::confirm_stopped(&self.journal, &sid, std::time::Duration::from_secs(3)).await?;
+        self.journal.block_ownership(&sid, epoch, move_id).await?;
+        Ok(())
+    }
+
     async fn change_place(&mut self, command_id: &str, request: c6_proto::ChangePlace) -> anyhow::Result<()> {
         let sid = self.writer.session_id.clone();
         anyhow::ensure!(
@@ -4313,7 +4552,18 @@ impl Actor {
         self.manager.rewind_preflight(&sid, &events, 0, true).await?;
         // Do not start arbitrary external hooks during preparation. Apply the
         // same policy and tool configuration in the new directory after commit.
+        let place_worker = events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                Some(session_event::Kind::PlaceChanged(p)) => {
+                    p.to.as_ref().filter(|p| !p.worker_id.is_empty()).map(|p| p.worker_id.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
         let from = c6_proto::SessionPlace {
+            worker_id: place_worker.clone(),
             cwd: self.started.cwd.clone(),
             repo: self.started.repo.clone(),
             repo_root: self.started.repo_root.clone(),
@@ -4339,6 +4589,7 @@ impl Actor {
                 .await
                 .map_err(anyhow::Error::msg)?;
                 let to = c6_proto::SessionPlace {
+                    worker_id: place_worker.clone(),
                     cwd: made.made.cwd.display().to_string(),
                     repo: from.repo.clone(),
                     repo_root: made.made.root.clone(),
@@ -4361,6 +4612,7 @@ impl Actor {
                     .find(|e| e.seq == request.previous_place_seq)
                     .and_then(|e| match &e.kind {
                         Some(session_event::Kind::Started(s)) => Some(c6_proto::SessionPlace {
+                            worker_id: place_worker.clone(),
                             cwd: s.cwd.clone(),
                             repo: s.repo.clone(),
                             repo_root: s.repo_root.clone(),
@@ -4373,6 +4625,7 @@ impl Actor {
             }
             _ => anyhow::bail!("This worker does not support that placement action"),
         };
+        to.worker_id = place_worker;
         let cwd = crate::expand_home(&to.cwd);
         anyhow::ensure!(cwd.is_absolute(), "Choose an absolute folder on this worker");
         let cwd = cwd.canonicalize()?;
@@ -4409,6 +4662,8 @@ impl Actor {
         }
         let notice = request.notice_template.replace("{{from}}", &from.cwd).replace("{{to}}", &to.cwd);
         let place = c6_proto::PlaceChanged {
+            ownership_epoch: self.writer.ownership_epoch,
+            native_resume_id: String::new(),
             command_id: command_id.to_owned(),
             from: Some(from),
             to: Some(to),
@@ -4532,11 +4787,14 @@ impl Actor {
             ts_ms: c6_core::now_ms(),
             kind: Some(session_event::Kind::Error(ErrorEvent { message: message.clone() })),
         };
-        let (blocked, rejected) = self.journal.fail_claude_rewind(&self.writer.session_id, command_id, &event, retries).await?;
+        let (blocked, rejected) = self
+            .journal
+            .fail_claude_rewind_owned(&self.writer.session_id, command_id, &event, retries, self.writer.ownership_epoch)
+            .await?;
         *next += 1;
         self.writer.logged.store(*next, std::sync::atomic::Ordering::SeqCst);
         for id in rejected {
-            self.link.reject_command(&self.writer.session_id, &id, &message);
+            self.link.reject_owned(&self.writer.session_id, &id, &message, self.writer.ownership_epoch);
         }
         Ok(blocked)
     }
@@ -4562,14 +4820,14 @@ impl Actor {
         };
         // Intent is durable before touching the old process. A crash or a
         // failed initialization cannot let the next actor resume old history.
-        self.journal.prepare_claude_rewind(sid, &reset).await?;
+        self.journal.prepare_claude_rewind_owned(sid, &reset, self.writer.ownership_epoch).await?;
         self.manager.rewind_preflight(sid, events, to_seq, restore_files).await?;
         // This write is the irreversible boundary, including on crash. Never
         // clear a legacy intent (whose phase is unknown) as if untouched.
         reset.untouched = false;
         reset.previous = None;
         reset.failure.clear();
-        self.journal.prepare_claude_rewind(sid, &reset).await?;
+        self.journal.prepare_claude_rewind_owned(sid, &reset, self.writer.ownership_epoch).await?;
         self.session_tools.background.cancel_shell_contexts();
         let effective = c6_agent::effective_events(events);
         let known_kept: HashSet<_> = effective
@@ -4590,7 +4848,7 @@ impl Actor {
             .extend(self.journal.shell_writer_sources(sid).await?.into_iter().filter(|source| !known_kept.contains(source.as_str())));
         reset.withdrawn.sort();
         reset.withdrawn.dedup();
-        self.journal.prepare_claude_rewind(sid, &reset).await?;
+        self.journal.prepare_claude_rewind_owned(sid, &reset, self.writer.ownership_epoch).await?;
         if let Some(mut p) = self.claude.take() {
             // InputDelivered means written to the CLI, not a confirmed User
             // receipt. A stopped turn can leave these owned by Process rather
@@ -4629,7 +4887,7 @@ impl Actor {
         );
         reset.withdrawn.sort();
         reset.withdrawn.dedup();
-        self.journal.prepare_claude_rewind(sid, &reset).await?;
+        self.journal.prepare_claude_rewind_owned(sid, &reset, self.writer.ownership_epoch).await?;
         // carbon6 tasks may be remote, where cancellation cannot be confirmed
         // while disconnected. Do not pretend their work stopped. Native CLI
         // tasks and mirrored subagents have already stopped with the process.
@@ -4733,6 +4991,7 @@ impl Actor {
             journal: self.journal.clone(),
             link: self.link.clone(),
             session_id: sid.clone(),
+            ownership_epoch: self.writer.ownership_epoch,
             spec: self.spec.clone(),
             started: self.started.clone(),
         });
@@ -4759,7 +5018,7 @@ impl Actor {
                 reset.session_id = uuid::Uuid::now_v7().to_string();
                 launch.conversation = reset.session_id.clone();
             }
-            self.journal.prepare_claude_rewind(sid, &reset).await?;
+            self.journal.prepare_claude_rewind_owned(sid, &reset, self.writer.ownership_epoch).await?;
             // Until ready confirms the actual fork ID this runtime must not
             // survive a worker restart or be ordinarily adopted. Startup
             // rejects an interrupted destructive attempt; the next quiet
@@ -4784,7 +5043,7 @@ impl Actor {
             match p.ready(&reset.session_id).await {
                 Ok(confirmed_id) => {
                     reset.session_id = confirmed_id;
-                    self.journal.prepare_claude_rewind(sid, &reset).await?;
+                    self.journal.prepare_claude_rewind_owned(sid, &reset, self.writer.ownership_epoch).await?;
                     self.claude = Some(p);
                     return Ok(());
                 }
@@ -4868,6 +5127,7 @@ impl Actor {
             journal: self.journal.clone(),
             link: self.link.clone(),
             session_id: self.writer.session_id.clone(),
+            ownership_epoch: self.writer.ownership_epoch,
             spec: self.spec.clone(),
             started: self.started.clone(),
         });
@@ -5130,6 +5390,7 @@ impl Actor {
             journal: self.journal.clone(),
             link: self.link.clone(),
             session_id: self.writer.session_id.clone(),
+            ownership_epoch: self.writer.ownership_epoch,
             spec: self.spec.clone(),
             started: self.started.clone(),
         });
@@ -5380,6 +5641,17 @@ async fn claude_turn(
     // none: the first turn may have failed before Claude Code saved it).
     let preamble = (p.needs_preamble() || (promoted && !conversation.resume)).then_some(conversation.preamble.as_deref()).flatten();
     let mut end = p.turn_admitted(turn, inputs.clone(), false, preamble, model, sink, &feed, &more, cancel, admission).await?;
+    if end.no_conversation && journal.ownership(session).await?.0 != 0 {
+        // A transferred conversation was positively copied before adoption.
+        // Falling back to --session-id would silently discard its native
+        // history if Claude rejects that transcript on the destination.
+        sink.append(session_event::Kind::Error(ErrorEvent {
+            message: "Claude Code could not resume the transferred conversation; it was not replaced with a new conversation.".into(),
+        }))
+        .await?;
+        sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
+        return Ok(None);
+    }
     if end.no_conversation
         && let Some(bin) = &bin
     {
@@ -6100,6 +6372,7 @@ pub(crate) struct Writer {
     pub journal: Arc<Journal>,
     pub link: Arc<HeadLink>,
     pub next_seq: tokio::sync::Mutex<u64>,
+    ownership_epoch: u64,
     /// `next_seq` as of the last append, read without waiting on one: what
     /// streamed text is stamped with.
     logged: std::sync::atomic::AtomicU64,
@@ -6113,6 +6386,7 @@ impl Writer {
             journal,
             link,
             next_seq: tokio::sync::Mutex::new(next_seq),
+            ownership_epoch: 0,
             logged: std::sync::atomic::AtomicU64::new(next_seq),
         }
     }
@@ -6125,10 +6399,11 @@ impl EventSink for Writer {
         // Streamed text first: it must not arrive after what it streamed.
         self.link.flush_ephemeral();
         let ev = SessionEvent { seq: *next, ts_ms: c6_core::now_ms(), kind: Some(kind) };
+        self.journal.check_ownership(&self.session_id, self.ownership_epoch).await?;
         let count = if matches!(&ev.kind, Some(session_event::Kind::Rewound(_))) {
-            self.journal.append_rewind(&self.session_id, &ev).await?
+            self.journal.append_rewind_owned(&self.session_id, &ev, self.ownership_epoch).await?
         } else {
-            self.journal.append(&self.session_id, &ev).await?;
+            self.journal.append_owned(&self.session_id, &ev, self.ownership_epoch).await?;
             1
         };
         *next += count;
@@ -6138,6 +6413,7 @@ impl EventSink for Writer {
 
     async fn start_turn(&self, turn: u64, inputs: &[PendingInput]) -> anyhow::Result<()> {
         let mut next = self.next_seq.lock().await;
+        self.journal.check_ownership(&self.session_id, self.ownership_epoch).await?;
         self.link.flush_ephemeral();
         let kinds = inputs
             .iter()
@@ -6147,7 +6423,7 @@ impl EventSink for Writer {
             .enumerate()
             .map(|(offset, kind)| SessionEvent { seq: *next + offset as u64, ts_ms: c6_core::now_ms(), kind: Some(kind) })
             .collect();
-        self.journal.append_turn(&self.session_id, &events).await?;
+        self.journal.append_turn_owned(&self.session_id, &events, self.ownership_epoch).await?;
         *next += events.len() as u64;
         self.logged.store(*next, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -6159,7 +6435,11 @@ impl EventSink for Writer {
         if let ephemeral_event::Kind::Text(d) | ephemeral_event::Kind::Thinking(d) = &mut kind {
             d.seq = self.logged.load(std::sync::atomic::Ordering::SeqCst);
         }
-        self.link.ephemeral(EphemeralEvent { session_id: self.session_id.clone(), kind: Some(kind) });
+        self.link.ephemeral(EphemeralEvent {
+            session_id: self.session_id.clone(),
+            kind: Some(kind),
+            ownership_epoch: self.ownership_epoch,
+        });
     }
 }
 
@@ -8396,6 +8676,34 @@ mod handoff_tests {
     }
 
     #[tokio::test]
+    async fn claude_move_pins_the_rewound_branch_without_source_journal_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let spec = CreateSession::default();
+        let started = ev(1, session_event::Kind::Started(SessionStarted::default()));
+        journal.create_session("s", &spec, &started).await.unwrap();
+        let mut events = vec![
+            started,
+            user(2, "kept"),
+            user(3, "withdrawn"),
+            ev(4, session_event::Kind::Rewound(Rewound { command_id: "r".into(), to_seq: 3, ..Default::default() })),
+            ev(
+                5,
+                session_event::Kind::PlaceChanged(c6_proto::PlaceChanged { native_resume_id: "moved-fork".into(), ..Default::default() }),
+            ),
+        ];
+        let moved = journal_claude_conversation(&journal, "s", &spec, &events).await.unwrap();
+        assert_eq!(moved.id, "moved-fork");
+        assert!(moved.resume);
+
+        events.push(user(6, "new input"));
+        events.push(ev(7, session_event::Kind::Rewound(Rewound { command_id: "r2".into(), to_seq: 6, ..Default::default() })));
+        let later = journal_claude_conversation(&journal, "s", &spec, &events).await.unwrap();
+        assert_ne!(later.id, moved.id);
+        assert!(!later.resume, "an unmapped rewind after the move must not resume the transferred branch");
+    }
+
+    #[tokio::test]
     async fn fresh_reset_applies_prior_rewinds_before_a_historical_cutoff() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
@@ -8551,6 +8859,7 @@ mod handoff_tests {
         let request = |id: &str, path: &Path| c6_proto::SessionCommand {
             command_id: id.into(),
             session_id: "s".into(),
+            ownership_epoch: 0,
             kind: Some(session_command::Kind::ChangePlace(c6_proto::ChangePlace {
                 expected_place_seq: 1,
                 cwd: path.display().to_string(),
@@ -8815,6 +9124,7 @@ for line in sys.stdin:
         let command = || SessionCommand {
             session_id: "s".into(),
             command_id: "after-rewind".into(),
+            ownership_epoch: 0,
             kind: Some(session_command::Kind::Input(c6_proto::UserInput {
                 text: "display-only".into(),
                 prompt: "model-only".into(),
@@ -8898,6 +9208,7 @@ for line in sys.stdin:
             .handle(SessionCommand {
                 session_id: "s".into(),
                 command_id: "queued".into(),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Input(c6_proto::UserInput {
                     text: "must wait".into(),
                     human_origin: true,
@@ -8910,6 +9221,7 @@ for line in sys.stdin:
             .handle(SessionCommand {
                 session_id: "s".into(),
                 command_id: "failed".into(),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: 2, restore_files: false })),
             })
             .await
@@ -9128,6 +9440,7 @@ for line in sys.stdin:
         let rewind = || SessionCommand {
             session_id: "s".into(),
             command_id: "rewind-after-stop".into(),
+            ownership_epoch: 0,
             kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: 3, restore_files: true })),
         };
         let mut refused = rewind();
@@ -9287,6 +9600,7 @@ for line in sys.stdin:
         let command = |id: &str, to_seq, restore_files| SessionCommand {
             session_id: "s".into(),
             command_id: id.into(),
+            ownership_epoch: 0,
             kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq, restore_files })),
         };
         for (id, to_seq, files) in [("changed-target", 3, false), ("changed-files", 2, true)] {
@@ -9463,6 +9777,7 @@ for line in sys.stdin:
             session_id: "root".into(),
             command_id: id.into(),
             kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: 4, restore_files })),
+            ownership_epoch: 0,
         };
         let result = manager.handle(command("restore-refused", true)).await;
         if claude_ancestor {
@@ -9581,6 +9896,7 @@ for line in sys.stdin:
             .handle(SessionCommand {
                 session_id: "root".into(),
                 command_id: "late-restore".into(),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: 4, restore_files: true })),
             })
             .await
@@ -9596,6 +9912,7 @@ for line in sys.stdin:
             .handle(SessionCommand {
                 session_id: "root".into(),
                 command_id: "queued-input".into(),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Input(c6_proto::UserInput {
                     text: "preserve this queued input".into(),
                     human_origin: true,
@@ -9677,6 +9994,7 @@ for line in sys.stdin:
             .handle(SessionCommand {
                 session_id: "root".into(),
                 command_id: "running-input".into(),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Input(c6_proto::UserInput {
                     text: "wait for credentials".into(),
                     human_origin: true,
@@ -9700,6 +10018,7 @@ for line in sys.stdin:
             session_id: "root".into(),
             command_id: id.into(),
             kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: 4, restore_files })),
+            ownership_epoch: 0,
         };
         manager.handle(command("queued-conversation", false)).await.unwrap();
         let root = manager.actors.lock().unwrap().get("root").unwrap().clone();
@@ -9779,6 +10098,7 @@ for line in sys.stdin:
             .handle(SessionCommand {
                 session_id: "root".into(),
                 command_id: "decode-file-restore".into(),
+                ownership_epoch: 0,
                 kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: 4, restore_files: true })),
             })
             .await

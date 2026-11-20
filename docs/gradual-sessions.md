@@ -10,8 +10,8 @@ its first working directory. Deliver this in four independently verified steps:
 3. Between-worker transfers, preserving the conversation and work.
 4. Agent-requested changes with one-time user consent.
 
-This document describes the intended contract, not a claim that all four steps
-are implemented. A release must explicitly report its implemented subset.
+This document describes the implementation and its limits, not release
+qualification. A release must report its verified subset.
 
 ### Implemented subset and refusals
 
@@ -22,11 +22,14 @@ catalog operations share the same checked command path. Agent changes always
 require a fresh approval for the exact request, even when the agent already
 owns the session or holds a general write grant.
 
-Cross-worker moves, native Claude Code moves, SSH transitions, delegated or
-observed sessions, and moves with configured MCP servers are **not supported**
-by this implementation. The worker chip does not offer a migration action.
-Worker and realm capabilities are checked again by the command path; an old or
-offline worker cannot silently fall back to an unsafe move.
+The Worker chip offers cross-worker moves for idle, unarchived, top-level
+local sessions, including native Claude Code. Both workers must be online,
+serve the session's realm, and advertise fenced move support. The command path
+rechecks eligibility; it does not fall back to an unfenced move. SSH placement
+changes, delegated and observed sessions, and sessions with configured MCP
+servers are unsupported. Same-worker changes still do not support Claude Code.
+Native moves require an executable Claude CLI on the destination, checked
+before freezing the source and again before preparing the placement receipt.
 
 Scratch copies retain their source, refuse symlinks/special files and existing
 destination files, and are limited to 200,000,000 bytes, 4,096 entries, and 32
@@ -35,16 +38,16 @@ Worktree entry carries staged, unstaged, and non-ignored untracked changes;
 ignored files remain in the source checkout. Binary, conflicted, or changed
 submodule patches are refused. Setup output is retained on the placement event.
 Leaving keeps the worktree and branch. Optional merging is fast-forward only
-and requires both checkouts clean. Git preparation and the event journal are
-not one filesystem transaction: a crash can leave a prepared worktree, and a
-successful merge followed by a journal failure can leave the source branch
-advanced while the session still reports its old place. Neither case deletes
-the original files or changes the authoritative session place without an event.
+and requires both checkouts clean. A durable transactional intent for
+same-worker Git operations remains deferred. Git preparation and the event
+journal are not one filesystem transaction: a crash can leave a prepared
+worktree; a successful merge followed by a journal failure can advance the
+source branch while the session still reports its old place. Neither case
+deletes the original files or changes the authoritative place without an event.
 
-Placement worktrees use cleanup `off`: retained places are not yet integrated
-with archival cleanup. Move back is a new move, not a filesystem rollback; a
-recorded worktree's repository, registration, path, and branch are revalidated.
-Rewind across a move keeps placement and files in place and reports that fact.
+Placement worktrees use cleanup `off`, and retained places are not integrated
+with archival cleanup. Rewind across a move keeps placement and files in place
+and reports that fact.
 
 ## Creation and presentation
 
@@ -78,18 +81,18 @@ Prepare the destination without changing session routing. Persist the successful
 placement and its previous place, append a `PlaceChanged` transcript event, then
 resume on the new place. Failed preparation leaves the old place authoritative.
 Protocol additions use new field tags and never renumber existing ones. The
-event records source/destination, branch, copied files, and uncommitted-file count
-without leaking file contents. A short agent notice comes from the editable
+event records the source and destination, copied paths, worktree details, and
+an uncommitted-file count where applicable, without file contents. A short
+agent notice comes from the editable
 `session.place_changed` prompt, not hard-coded agent instructions.
 
 Previous places are retained for Move back, not treated as automatic backups.
-Revalidate each old destination before reuse. Do not remove the old scratch or
-worktree on a move: retain it until archival under the existing cleanup policy.
-Inspection of the existing worker finds scratch creation but no scratch pruning:
-do not invent automatic deletion as part of minimal creation. Worktree archival
-already has remembered `off`/`ask`/`auto` cleanup with dirty/unpushed safety checks
-(`docs/dev-starts.md` §5). Extending archival cleanup to retained places must apply
-those same checks, not recursively delete arbitrary recorded folders.
+Moving does not remove the old scratch or worktree, and archiving does not walk
+placement history to clean up retained directories. There is no automatic
+scratch pruning. Ordinary worktree archival has remembered `off`/`ask`/`auto`
+cleanup with dirty/unpushed safety checks (`docs/dev-starts.md` §5); any future
+cleanup of retained places must apply those same checks, not recursively delete
+arbitrary recorded folders.
 
 ## Same worker
 
@@ -106,66 +109,103 @@ explain unsupported cases. Leave the original checkout intact on failure.
 
 Leaving a worktree returns to the recorded main checkout, keeps its branch, and
 offers an explicit merge-first option. A failed merge does not switch place.
-Do not delete a branch or worktree as a side effect of leaving it.
+Do not delete a branch or worktree as a side effect of leaving it. Same-worker
+Move back is unchanged: it reuses the recorded directory after validation (for
+worktrees, including repository, registration, path, and branch). It does not
+roll files back or copy the current workspace over the earlier one.
 
 ## Another worker
 
-This step remains unimplemented. Do not implement it by changing `worker_id`
-and sending `Restore`: a prior destination journal can make Restore a no-op,
-and queued commands still carry the old worker ID. The required foundation is
-a durable move ID and state machine: fence routing and all command/report
-queues; freeze the source actor and its processes durably; confirm the head's
-event high-water mark; stage an inactive destination; atomically compare and
-swap ownership; then activate with retryable receipts. Recovery must either
-finish the same activation or safely abort before ownership changes. Returning
-to an earlier worker also needs token-aware journal incarnation replacement.
-The worker RPC message limit is smaller than the 200 MB transfer cap, so file
-transfer must use bounded chunks rather than one large protobuf payload.
+### Ownership and recovery
 
-For carbon6's own loop, resume using the head's durable event history, as the
-existing resume path already does. Ensure the source stops owning the session
-before the destination accepts commands; it must keep no background process.
+The head records a durable move ID and a new ownership epoch. Its sweeper
+advances `requested` → `released` → `transferred` → `adopted` → `done`:
 
-Claude Code must retain its native conversation identity. Transfer its JSONL
-transcript to the destination's configured Claude projects directory under the
-encoding of the **new** cwd; preserve the resume id and use `--resume`, reusing
-the existing handoff logic. A summary-only handoff is not an acceptable substitute
-for a native transcript move. Respect `CLAUDE_CONFIG_DIR`, including in tests;
-never inspect or modify the user's live projects directory.
+1. `requested`: Admit against the placement the caller saw, with an idle
+   session and no pending commands or other move. Inspect the source and
+   preflight the destination before freezing. Release stops the source actor
+   and any idle native Claude process, persists a worker fence, and returns the
+   last event sequence. Running turns, queued work, and running background
+   tasks are refused, not migrated.
+2. `released`: Wait for the head's durable event high-water mark to match the
+   frozen source, then transfer the snapshot. A source that advances beyond its
+   freeze watermark cannot be adopted.
+3. `transferred`: Prepare the new workspace and import the session spec and
+   journal as a blocked destination incarnation. A newer epoch can replace a
+   stale journal from an earlier visit to that worker; this is not a `Restore`
+   sent after changing `worker_id`.
+4. `adopted`: In one head transaction, compare and swap worker and epoch at
+   the frozen watermark, recheck realm access, and append exactly one
+   `PlaceChanged` event. Retry destination activation for the same move ID and
+   epoch if interrupted. After adoption there is no rollback to the source;
+   if the destination is offline, the move waits for it to reconnect.
+5. `done`: Activation has been acknowledged and normal command delivery resumes
+   at the destination.
 
-Scratch transfer goes through the head with a 200 MB total cap, bounded reads,
-path validation, and a copied-file manifest. Reject traversal, special files,
-symlink escapes, and oversize transfers before activating the destination.
-Temporary transfer artifacts must be cleaned after success or failure.
+Ownership checks at the head and in the worker journal fence stale commands and
+reports. A refusal before adoption goes through `rolling_back` to `failed`:
+source routing remains authoritative, but commands remain gated until a
+possibly frozen source acknowledges abort. Cleanup of transfer staging is
+retryable and can wait for an offline worker. It does not delete retained
+workspaces or a reusable repository cache.
 
-For repositories, match a destination repository by normalized remote URL using
-the worker's known folders/repos. If none matches, explain that fact before
-moving anything; offer an explicit clone into the worker's usual repository
-location rather than guessing a directory. Transfer the branch (push when
-authorized, otherwise a bundle) and the tracked/untracked patch. Verify the base
-commit and patch applicability before switching. Do not silently reset an
-existing checkout or push to a remote without the requested authorization.
+### What transfers
 
-Checkpoints remain part of the same conversation. Rewinding across a move changes
-conversation history only, and explicitly says that files stayed where they are.
-Placement must not inherit the model-handoff restriction that forbids rewinding
-across some runtime changes.
+- **Workspace:** The manifest and checksummed chunks travel through the head
+  over the existing worker link. Chunks are at most 256 KiB; the whole artifact
+  (files, session metadata and history, plus any repository or native transcript
+  data) is capped at 200 MB (200,000,000 bytes), with separate entry and metadata
+  bounds. A scratch or ordinary folder snapshot goes into a fresh managed
+  directory. Traversal, symlinks, special files, and conflicting paths are
+  refused rather than followed or overwritten.
+- **Git:** Preflight matches the normalized source remote against known folders
+  from the destination journal and its managed repository cache; it does not
+  scan the filesystem for repositories. Ambiguous matches are refused. If
+  nothing matches, the Worker dialog offers an explicit clone opt-in. An
+  authorized clone with a supported URL populates a reusable bare seed under
+  the destination worker's state directory. The move itself never pushes.
+  It carries the current branch and its reachable commits (including unpushed
+  commits) in a bundle, separate staged and unstaged patches, and non-ignored
+  untracked files. The destination verifies the bundle and expected commit and
+  checks patch applicability in a fresh standalone checkout, not a linked
+  worktree. It does not reset an existing checkout. Ignored files and other
+  local branches are not copied. Detached HEADs, unsupported or missing
+  remotes, custom Git filters, conflicts, tracked binary changes, Git symlinks,
+  submodules, and assume-unchanged or skip-worktree index entries are not
+  supported. Refusing the latter prevents Git from silently hiding local edits.
+- **Conversation:** The same session ID, history, and checkpoints follow the
+  move. Carbon6's own loop resumes from the durable journal. For native Claude
+  Code, the worker copies the exact JSONL for the journal-selected resume ID
+  into the project directory encoded from the new cwd and continues with
+  `--resume` and that same ID. It honors the worker's `CLAUDE_CONFIG_DIR`
+  (default `~/.claude`); tests must use an isolated config directory. No scan
+  of other projects, overwrite of an unrelated transcript, or summary fallback
+  substitutes for a missing or unusable native transcript.
+  Config/project directories and transcripts must have trusted ownership and
+  must not grant write access to other users; shared writable paths and
+  symlinked config/project directories are refused (apart from macOS's standard
+  `/tmp` and `/var` aliases). These checks cover POSIX permissions, not extended
+  filesystem ACLs.
 
-SSH addition/removal must use the same validated transaction where supported by
-the existing remote runtime. Until native transcript, file, and process ownership
-transfer are supported for SSH, reject such changes explicitly; continuing to
-support SSH at creation is not support for moving an existing session over SSH.
+**Move back across workers creates a fresh snapshot on the previous worker
+from the session's current files**, subject to the same transfer limits. The
+recorded previous folder can help match the repo, but it is not reused as the
+workspace. Both earlier directories—the old folder on that worker and the
+just-departed source—are retained. Back does not authorize a new clone.
+
+Rewind changes conversation history, not placement or files, and reports that
+files stayed in place. Supporting SSH at creation does not support adding,
+removing, or migrating an existing SSH placement.
 
 ## Agent consent
 
-Expose a realm-checked catalog operation such as `sessions.move`, classified as
-a consent-requiring change rather than a read or silent write. The agent supplies
-the requested destination and reason. Open a one-time card: “‹session› asks to
-move to rust-dev-02: needs a GPU”. Allow authorizes only the exact proposal and
-executes it at the next safe boundary; reject/revoke or a changed proposal must
-not move the session. Return completion or refusal to the requesting agent as a
-notice. Guidance belongs in editable `session.carbon6` (or an editable dedicated
-prompt), never a hard-coded instruction string.
+The realm-checked `sessions.place.change` catalog operation requires one-time
+consent for the exact request. The agent supplies the destination, the current
+placement sequence, and optionally a reason. Allow submits the approved request
+once through the same checked path as a direct user move; it does not override
+idle or placement checks. Not now or expiry changes nothing, and a changed
+proposal requires a new approval. The requesting agent receives the outcome as
+a notice. Guidance belongs in editable prompts, not hard-coded instructions.
 
 ## Verification
 

@@ -404,3 +404,12 @@ carbon6.v1.NoticeLimits 2 uint32 notice_max_wait_seconds
 carbon6.v1.NoticeLimits 3 uint32 notice_no_progress_limit
 carbon6.v1.NoticeLimits 4 uint32 notice_failure_relaunch_limit
 carbon6.v1.NoticeLimits 5 uint64 notice_tokens_per_hour
+carbon6.v1.SessionPlace 5 string worker_id
+carbon6.v1.PlaceChanged 11 uint64 ownership_epoch
+carbon6.v1.PlaceChanged 12 string native_resume_id
+carbon6.v1.EphemeralEvent 8 uint64 ownership_epoch
+carbon6.v1.SessionCursor 3 uint64 ownership_epoch
+carbon6.v1.SessionEventBatch 3 uint64 ownership_epoch
+carbon6.v1.EventAck 3 uint64 ownership_epoch
+carbon6.v1.SessionCommand 22 uint64 ownership_epoch
+carbon6.v1.CommandRejected 4 uint64 ownership_epoch

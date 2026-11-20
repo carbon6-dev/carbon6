@@ -12,6 +12,13 @@ use tokio_util::sync::CancellationToken;
 pub type HeadTx = mpsc::Sender<Result<HeadMsg, tonic::Status>>;
 type RpcWaiters = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>;
 
+struct PendingRpc(RpcWaiters, u64);
+impl Drop for PendingRpc {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().remove(&self.1);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LiveWorker {
     pub conn_id: u64,
@@ -66,6 +73,10 @@ impl ConnGuard<'_> {
 
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
+        // Requests belong to this exact connection, not merely its worker
+        // UUID. Wake coordinators on disconnect/replacement rather than
+        // retaining their senders until an unrelated response timeout.
+        self.rpc_waiters.lock().unwrap().clear();
         let removed = {
             let mut conns = self.registry.conns.lock().unwrap();
             match conns.get(&self.worker_id) {
@@ -140,28 +151,39 @@ impl Registry {
     ) -> Result<serde_json::Value, String> {
         let live = self.get(worker_id).ok_or("worker is not connected")?;
         let params = params(&live);
+        if (method.starts_with("move.") || (method == "session.queue_op" && params["ownership_epoch"].as_u64().unwrap_or(0) != 0))
+            && !live.capabilities.iter().any(|c| c == c6_proto::SESSION_MOVE_CAPABILITY)
+        {
+            return Err("worker does not support session ownership fencing".into());
+        }
         let (tx, waiters) = (live.tx, live.rpc_waiters);
         let id = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let (done, wait) = oneshot::channel();
         waiters.lock().unwrap().insert(id, done);
+        let _pending = PendingRpc(waiters.clone(), id);
         let req = c6_proto::RpcRequest { id, method: method.to_owned(), params_json: serde_json::to_vec(&params).unwrap_or_default() };
-        if tx.send(Ok(HeadMsg { msg: Some(head_msg::Msg::RpcRequest(req)) })).await.is_err() {
-            waiters.lock().unwrap().remove(&id);
-            return Err("worker disconnected".into());
-        }
-        match tokio::time::timeout(timeout, wait).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => Err("worker disconnected".into()),
-            Err(_) => {
-                waiters.lock().unwrap().remove(&id);
-                Err("worker did not respond in time".into())
+        let result = tokio::time::timeout(timeout, async {
+            if tx.send(Ok(HeadMsg { msg: Some(head_msg::Msg::RpcRequest(req)) })).await.is_err() {
+                return Err("worker disconnected".into());
             }
+            wait.await.unwrap_or_else(|_| Err("worker disconnected".into()))
+        })
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => Err("worker did not respond in time".into()),
         }
     }
 
     /// Sends a non-durable command now; false if the worker is not connected.
     pub fn send_command(&self, worker_id: WorkerId, cmd: SessionCommand) -> bool {
-        let tx = self.conns.lock().unwrap().get(&worker_id).map(|c| c.tx.clone());
+        let tx = self
+            .conns
+            .lock()
+            .unwrap()
+            .get(&worker_id)
+            .filter(|live| cmd.ownership_epoch == 0 || live.capabilities.iter().any(|c| c == c6_proto::SESSION_MOVE_CAPABILITY))
+            .map(|c| c.tx.clone());
         tx.is_some_and(|tx| tx.try_send(Ok(HeadMsg { msg: Some(head_msg::Msg::Command(cmd)) })).is_ok())
     }
 

@@ -88,6 +88,16 @@ const MAX_LIST: usize = 5000;
 const MAX_DIFF: usize = 4 * 1024 * 1024;
 
 pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow::Result<Value> {
+    if method.starts_with("move.") {
+        // Extensions can hold a lifecycle boundary in isolated fault tests;
+        // production workers have no extension installed.
+        if let Some(extension) = worker.extension()
+            && let Some(result) = extension.handle(method, params.clone()).await
+        {
+            return result;
+        }
+        return crate::move_sessions::handle(worker, method, params).await;
+    }
     match method {
         "fs.list" => fs_list(serde_json::from_value(params)?).await,
         "fs.read" => fs_read(serde_json::from_value(params)?).await,
@@ -175,6 +185,7 @@ async fn session_queue_op(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Val
     use prost::Message;
     let b64 = base64::engine::general_purpose::STANDARD;
     let session_id = p["session_id"].as_str().context("session_id required")?.to_owned();
+    worker.journal.check_ownership(&session_id, p["ownership_epoch"].as_u64().unwrap_or(0)).await?;
     let command_id = p["command_id"].as_str().context("command_id required")?.to_owned();
     let op = p["op"].as_str().context("op required")?;
     let input = match op {

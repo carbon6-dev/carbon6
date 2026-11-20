@@ -115,6 +115,7 @@ pub async fn append(st: &HeadState, from: WorkerId, p: &Value) -> anyhow::Result
         let row = SessionRow {
             id: id.clone(),
             worker_id: from.to_string(),
+            ownership_epoch: 0,
             title: if title.is_empty() {
                 format!("Imported from {}", if source == "codex" { "Codex" } else { "Claude Code" })
             } else {

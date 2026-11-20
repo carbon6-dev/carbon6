@@ -45,6 +45,7 @@ async fn send_once(worker: &Worker, sid: &str, command_id: &str, text: &str, mod
         .handle(SessionCommand {
             session_id: sid.into(),
             command_id: command_id.into(),
+            ownership_epoch: 0,
             kind: Some(session_command::Kind::Input(UserInput { text: text.into(), human_origin: true, model, ..Default::default() })),
         })
         .await

@@ -67,6 +67,7 @@ impl Env {
         let row = SessionRow {
             id: id.into(),
             worker_id: c6_core::WorkerId::new().to_string(),
+            ownership_epoch: 0,
             title: id.into(),
             cwd: String::new(),
             connection_id: String::new(),

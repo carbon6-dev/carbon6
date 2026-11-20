@@ -65,6 +65,7 @@ pub mod schema;
 pub mod search;
 pub mod secrets;
 pub mod series;
+mod session_moves;
 pub mod sessions;
 pub mod slack;
 pub mod starts;
@@ -432,6 +433,7 @@ async fn start_bound(
     workflows::spawn(state.clone());
     memex::spawn(state.clone());
     decisions::spawn_sweeper(state.clone());
+    tasks.spawn(session_moves::run_sweeper(state.clone()));
     attention::spawn(state.clone());
     // Nudges about work left open (docs/work.md §7).
     work::spawn_sweeper(state.clone());

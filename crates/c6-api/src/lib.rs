@@ -2450,6 +2450,8 @@ mod message_origin_tests {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionPlace {
+    #[serde(default)]
+    pub worker_id: String,
     pub cwd: String,
     pub repo: String,
     pub worktree_branch: String,
@@ -2463,8 +2465,8 @@ pub enum EventKind {
     /// Placement survives conversation rewind; the paths are historical facts.
     PlaceChanged {
         command_id: String,
-        from: SessionPlace,
-        to: SessionPlace,
+        from: Box<SessionPlace>,
+        to: Box<SessionPlace>,
         copied_paths: Vec<String>,
         uncommitted_files: u32,
         #[serde(default)]

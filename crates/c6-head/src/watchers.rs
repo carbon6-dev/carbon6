@@ -283,6 +283,7 @@ async fn state_for(st: &HeadState, d: &WatcherDef, key: &str, realm: &str, watch
     let row = SessionRow {
         id: uuid::Uuid::now_v7().to_string(),
         worker_id: head_id.to_string(),
+        ownership_epoch: 0,
         title: title.clone(),
         cwd: String::new(),
         connection_id: connection_id.clone(),
@@ -358,7 +359,7 @@ async fn append(st: &HeadState, session_id: &str, kinds: Vec<Kind>) -> anyhow::R
             SessionEvent { seq, ts_ms: now_ms(), kind: Some(k) }
         })
         .collect();
-    crate::sessions::ingest(st, head, SessionEventBatch { session_id: session_id.to_owned(), events }).await?;
+    crate::sessions::ingest(st, head, SessionEventBatch { session_id: session_id.to_owned(), events, ownership_epoch: 0 }).await?;
     Ok(seq)
 }
 

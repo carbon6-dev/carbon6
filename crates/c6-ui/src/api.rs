@@ -201,18 +201,18 @@ fn placed(r: RequestBuilder) -> RequestBuilder {
 
 /// The realm a session is in (for links from before realms had pages).
 pub async fn locate_session(id: &str) -> Result<String, String> {
-    let v: serde_json::Value = json(Request::get(&format!("/api/v1/locate/sessions/{}", enc(id))).send().await).await?;
+    let v: serde_json::Value = get_json(format!("/api/v1/locate/sessions/{}", enc(id))).await?;
     v["realm"].as_str().map(str::to_owned).ok_or_else(|| "no realm".into())
 }
 
 /// What waits on you in each realm (for the switcher).
-pub async fn elsewhere() -> Result<Vec<c6_api::RealmWaiting>, String> {
-    json(Request::get("/api/v1/elsewhere").send().await).await
+pub fn elsewhere() -> LocalBoxFuture<'static, Result<Vec<c6_api::RealmWaiting>, String>> {
+    get_json("/api/v1/elsewhere")
 }
 
 /// What needs you here, and how many wait in each other realm.
-pub async fn attention() -> Result<c6_api::Attention, String> {
-    json(Request::get("/api/v1/attention").send().await).await
+pub fn attention() -> LocalBoxFuture<'static, Result<c6_api::Attention, String>> {
+    get_json("/api/v1/attention")
 }
 
 /// You've seen these worth-a-look items (none: all of them).
@@ -274,12 +274,12 @@ fn in_realm(sep: char) -> String {
 }
 
 /// Importing sessions from Claude Code and Codex (docs/imports.md).
-pub async fn session_imports() -> Result<c6_api::SessionImports, String> {
-    json(Request::get("/api/v1/settings/session_imports").send().await).await
+pub fn session_imports() -> LocalBoxFuture<'static, Result<c6_api::SessionImports, String>> {
+    get_json("/api/v1/settings/session_imports")
 }
 
-pub async fn codex_limits() -> Result<c6_api::CodexLimitsSettings, String> {
-    json(Request::get("/api/v1/settings/codex_limits").send().await).await
+pub fn codex_limits() -> LocalBoxFuture<'static, Result<c6_api::CodexLimitsSettings, String>> {
+    get_json("/api/v1/settings/codex_limits")
 }
 
 pub async fn set_codex_limits(s: c6_api::CodexLimitsSettings) -> Result<(), String> {
@@ -291,13 +291,13 @@ pub async fn set_session_imports(s: c6_api::SessionImports) -> Result<(), String
 }
 
 /// What was imported: sessions by source and realm.
-pub async fn imports() -> Result<serde_json::Value, String> {
-    json(Request::get("/api/v1/imports").send().await).await
+pub fn imports() -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json("/api/v1/imports")
 }
 
 /// The realms (it reloads when they change: track `realms_changed`).
-pub async fn realms() -> Result<Vec<c6_api::Realm>, String> {
-    json(Request::get("/api/v1/realms").send().await).await
+pub fn realms() -> LocalBoxFuture<'static, Result<Vec<c6_api::Realm>, String>> {
+    get_json("/api/v1/realms")
 }
 
 pub async fn create_realm(r: c6_api::RealmIn) -> Result<c6_api::Realm, String> {
@@ -320,19 +320,19 @@ pub async fn delete_realm(id: String) -> Result<(), String> {
 
 // --- The realm explorer (docs/explorer.md) -----------------------------------
 
-pub async fn explorer_map() -> Result<serde_json::Value, String> {
-    json(Request::get("/api/v1/explorer/map").send().await).await
+pub fn explorer_map() -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json("/api/v1/explorer/map")
 }
 
 /// A settings list as a realm uses it: each entry with where it comes from
 /// (`root`, `realm`, `app:<name>`).
-pub async fn effective_list(realm: String, key: String) -> Result<Vec<serde_json::Value>, String> {
-    json(Request::get(&format!("/api/v1/realms/{}/effective/{}", enc(&realm), enc(&key))).send().await).await
+pub fn effective_list(realm: String, key: String) -> LocalBoxFuture<'static, Result<Vec<serde_json::Value>, String>> {
+    get_json(format!("/api/v1/realms/{}/effective/{}", enc(&realm), enc(&key)))
 }
 
 /// Whether this realm sets a per-realm setting itself (else root's applies).
 pub async fn own_setting(name: &'static str) -> Result<bool, String> {
-    let v: serde_json::Value = json(Request::get(&format!("/api/v1/settings/own/{name}")).send().await).await?;
+    let v: serde_json::Value = get_json(format!("/api/v1/settings/own/{name}")).await?;
     Ok(v["own"] == true)
 }
 
@@ -341,40 +341,40 @@ pub async fn drop_own_setting(name: &'static str) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/settings/own/{name}")).send().await).await
 }
 
-pub async fn realm_summary(realm: String) -> Result<c6_api::RealmSummary, String> {
-    json(Request::get(&format!("/api/v1/realms/{}/summary", enc(&realm))).send().await).await
+pub fn realm_summary(realm: String) -> LocalBoxFuture<'static, Result<c6_api::RealmSummary, String>> {
+    get_json(format!("/api/v1/realms/{}/summary", enc(&realm)))
 }
 
-pub async fn realm_activity(realm: String, since: i64) -> Result<Vec<c6_api::ExRef>, String> {
-    json(Request::get(&format!("/api/v1/realms/{}/activity?since={since}&limit=60", enc(&realm))).send().await).await
+pub fn realm_activity(realm: String, since: i64) -> LocalBoxFuture<'static, Result<Vec<c6_api::ExRef>, String>> {
+    get_json(format!("/api/v1/realms/{}/activity?since={since}&limit=60", enc(&realm)))
 }
 
-pub async fn realm_list(realm: String, section: String, q: String) -> Result<Vec<c6_api::ExRef>, String> {
-    json(Request::get(&format!("/api/v1/realms/{}/list?section={}&q={}", enc(&realm), enc(&section), enc(&q))).send().await).await
+pub fn realm_list(realm: String, section: String, q: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::ExRef>, String>> {
+    get_json(format!("/api/v1/realms/{}/list?section={}&q={}", enc(&realm), enc(&section), enc(&q)))
 }
 
-pub async fn realm_search(realm: String, q: String) -> Result<Vec<c6_api::ExGroup>, String> {
-    json(Request::get(&format!("/api/v1/realms/{}/search?q={}", enc(&realm), enc(&q))).send().await).await
+pub fn realm_search(realm: String, q: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::ExGroup>, String>> {
+    get_json(format!("/api/v1/realms/{}/search?q={}", enc(&realm), enc(&q)))
 }
 
-pub async fn realm_neighborhood(realm: String, kind: String, id: String) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/realms/{}/neighborhood?kind={}&id={}", enc(&realm), enc(&kind), enc(&id))).send().await).await
+pub fn realm_neighborhood(realm: String, kind: String, id: String) -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json(format!("/api/v1/realms/{}/neighborhood?kind={}&id={}", enc(&realm), enc(&kind), enc(&id)))
 }
 
-pub async fn realm_object(realm: String, kind: String, id: String) -> Result<c6_api::ExObject, String> {
-    json(Request::get(&format!("/api/v1/realms/{}/object?kind={}&id={}", enc(&realm), enc(&kind), enc(&id))).send().await).await
+pub fn realm_object(realm: String, kind: String, id: String) -> LocalBoxFuture<'static, Result<c6_api::ExObject, String>> {
+    get_json(format!("/api/v1/realms/{}/object?kind={}&id={}", enc(&realm), enc(&kind), enc(&id)))
 }
 
-pub async fn packages() -> Result<Vec<c6_api::PackageInfo>, String> {
-    json(Request::get("/api/v1/packages").send().await).await
+pub fn packages() -> LocalBoxFuture<'static, Result<Vec<c6_api::PackageInfo>, String>> {
+    get_json("/api/v1/packages")
 }
 
 pub async fn add_package(p: c6_api::PackageIn) -> Result<c6_api::PackageInfo, String> {
     send_json(Request::post("/api/v1/packages"), &p).await
 }
 
-pub async fn installs() -> Result<Vec<c6_api::Install>, String> {
-    json(Request::get("/api/v1/installs").send().await).await
+pub fn installs() -> LocalBoxFuture<'static, Result<Vec<c6_api::Install>, String>> {
+    get_json("/api/v1/installs")
 }
 
 pub async fn install_package(i: c6_api::InstallIn) -> Result<c6_api::Install, String> {
@@ -403,8 +403,8 @@ pub fn export_url(realm: &str, instance: &str, fork: &str, data: bool) -> String
 }
 
 /// The accounts connected for an app's OAuth providers.
-pub async fn app_accounts(realm: &str, instance: &str) -> Result<Vec<c6_api::OAuthAccount>, String> {
-    json(Request::get(&format!("/api/v1/apps/{}/{}/accounts", enc(realm), enc(instance))).send().await).await
+pub fn app_accounts(realm: &str, instance: &str) -> LocalBoxFuture<'static, Result<Vec<c6_api::OAuthAccount>, String>> {
+    get_json(format!("/api/v1/apps/{}/{}/accounts", enc(realm), enc(instance)))
 }
 
 /// Starts connecting an account: where to send you.
@@ -422,8 +422,8 @@ pub async fn remove_account(realm: &str, instance: &str, id: &str) -> Result<(),
 }
 
 /// An app instance's operations (docs/apps.md §7).
-pub async fn operations(realm: &str, instance: &str) -> Result<Vec<c6_api::Operation>, String> {
-    json(Request::get(&format!("/api/v1/apps/{}/{}/operations", enc(realm), enc(instance))).send().await).await
+pub fn operations(realm: &str, instance: &str) -> LocalBoxFuture<'static, Result<Vec<c6_api::Operation>, String>> {
+    get_json(format!("/api/v1/apps/{}/{}/operations", enc(realm), enc(instance)))
 }
 
 pub async fn call_operation(realm: &str, instance: &str, name: &str, input: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -438,8 +438,8 @@ pub async fn set_install_settings(id: i64, values: serde_json::Value) -> Result<
     send_json(Request::put(&format!("/api/v1/installs/{id}/settings")), &values).await
 }
 
-pub async fn grants() -> Result<Vec<c6_api::Grant>, String> {
-    json(Request::get("/api/v1/grants").send().await).await
+pub fn grants() -> LocalBoxFuture<'static, Result<Vec<c6_api::Grant>, String>> {
+    get_json("/api/v1/grants")
 }
 
 pub async fn create_grant(g: c6_api::GrantIn) -> Result<c6_api::Grant, String> {
@@ -450,8 +450,8 @@ pub async fn revoke_grant(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/grants/{}", enc(&id))).send().await).await
 }
 
-pub async fn grant_uses(id: String) -> Result<Vec<c6_api::GrantUse>, String> {
-    json(Request::get(&format!("/api/v1/grants/{}/uses", enc(&id))).send().await).await
+pub fn grant_uses(id: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::GrantUse>, String>> {
+    get_json(format!("/api/v1/grants/{}/uses", enc(&id)))
 }
 
 /// Which realms a worker ("workers") or connection ("connections") serves.
@@ -482,7 +482,7 @@ pub async fn start_plan(q: c6_api::starts::StartQuery) -> Result<c6_api::starts:
         enc(&q.worker),
         enc(&q.text.chars().take(200).collect::<String>())
     );
-    json(Request::get(&url).send().await).await
+    get_json(url).await
 }
 
 async fn check(resp: Result<Response, gloo_net::Error>) -> Result<Response, String> {
@@ -497,11 +497,16 @@ async fn check(resp: Result<Response, gloo_net::Error>) -> Result<Response, Stri
     Err(msg)
 }
 
-// Keep response decoding out of every endpoint/resource's poll state. The
-// body remains lazy and dropping the returned future still drops the decode.
-#[inline(never)]
 fn json<T: DeserializeOwned + 'static>(req: Result<Response, gloo_net::Error>) -> LocalBoxFuture<'static, Result<T, String>> {
-    Box::pin(async move { serde_json::from_str(&response_text(req).await?).map_err(|e| e.to_string()) })
+    parse_json(response_text(req))
+}
+
+// Keep response decoding out of every endpoint/resource's poll state.
+#[inline(never)]
+fn parse_json<T: DeserializeOwned + 'static>(
+    text: LocalBoxFuture<'static, Result<String, String>>,
+) -> LocalBoxFuture<'static, Result<T, String>> {
+    Box::pin(async move { serde_json::from_str(&text.await?).map_err(|e| e.to_string()) })
 }
 
 // HTTP checking and body-read polling do not depend on T. Keep them shared
@@ -510,6 +515,16 @@ fn json<T: DeserializeOwned + 'static>(req: Result<Response, gloo_net::Error>) -
 #[inline(never)]
 fn response_text(req: Result<Response, gloo_net::Error>) -> LocalBoxFuture<'static, Result<String, String>> {
     Box::pin(async move { check(req).await?.text().await.map_err(|e| e.to_string()) })
+}
+
+// A plain GET shares its fetch and body-read state across all response types.
+#[inline(never)]
+fn get_text(url: String) -> LocalBoxFuture<'static, Result<String, String>> {
+    Box::pin(async move { check(Request::get(&url).send().await).await?.text().await.map_err(|e| e.to_string()) })
+}
+
+fn get_json<T: DeserializeOwned + 'static>(url: impl Into<String>) -> LocalBoxFuture<'static, Result<T, String>> {
+    parse_json(get_text(url.into()))
 }
 
 async fn send_json<T: DeserializeOwned + 'static>(req: RequestBuilder, body: &impl Serialize) -> Result<T, String> {
@@ -533,13 +548,13 @@ pub async fn delete_worker(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/workers/{id}")).send().await).await
 }
 
-pub async fn connections() -> Result<Vec<Connection>, String> {
-    json(Request::get("/api/v1/connections").send().await).await
+pub fn connections() -> LocalBoxFuture<'static, Result<Vec<Connection>, String>> {
+    get_json("/api/v1/connections")
 }
 
 /// Plan limits per connection, as last seen.
-pub async fn quotas() -> Result<Vec<c6_api::ConnectionQuota>, String> {
-    json(Request::get("/api/v1/connections/quotas").send().await).await
+pub fn quotas() -> LocalBoxFuture<'static, Result<Vec<c6_api::ConnectionQuota>, String>> {
+    get_json("/api/v1/connections/quotas")
 }
 
 pub async fn create_connection(req: CreateConnection) -> Result<Connection, String> {
@@ -569,14 +584,14 @@ pub async fn delete_connection(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/connections/{id}")).send().await).await
 }
 
-pub async fn models(connection_id: String) -> Result<Vec<String>, String> {
-    json(Request::get(&format!("/api/v1/connections/{connection_id}/models")).send().await).await
+pub fn models(connection_id: String) -> LocalBoxFuture<'static, Result<Vec<String>, String>> {
+    get_json(format!("/api/v1/connections/{connection_id}/models"))
 }
 
 /// The saved connection's Test button must contact the provider even when
 /// a picker already has a successful list cached.
-pub async fn check_models(connection_id: String) -> Result<Vec<String>, String> {
-    json(Request::get(&format!("/api/v1/connections/{connection_id}/models?fresh=true")).send().await).await
+pub fn check_models(connection_id: String) -> LocalBoxFuture<'static, Result<Vec<String>, String>> {
+    get_json(format!("/api/v1/connections/{connection_id}/models?fresh=true"))
 }
 
 pub async fn create_session(req: CreateSession) -> Result<Session, String> {
@@ -591,21 +606,19 @@ pub async fn create_side_chat(parent: String, req: c6_api::CreateSideChat) -> Re
 /// (or back to `at`).
 pub async fn session_events_before(id: String, before: u64, limit: u64, at: Option<u64>) -> Result<Vec<c6_api::Event>, String> {
     let at = at.map(|a| format!("&at={a}")).unwrap_or_default();
-    json(Request::get(&format!("/api/v1/sessions/{id}/events?before={before}&limit={limit}{at}")).send().await).await
+    get_json(format!("/api/v1/sessions/{id}/events?before={before}&limit={limit}{at}")).await
 }
 
-pub async fn session(id: String) -> Result<SessionDetail, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}")).send().await).await
+pub fn session(id: String) -> LocalBoxFuture<'static, Result<SessionDetail, String>> {
+    get_json(format!("/api/v1/sessions/{id}"))
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub(crate) struct Placement {
     pub seq: u64,
+    pub worker_id: String,
     pub cwd: String,
     pub worktree_branch: String,
-    pub repo_root: String,
-    pub copied_paths: Vec<String>,
-    pub uncommitted_files: u32,
 }
 
 #[derive(Serialize)]
@@ -615,6 +628,7 @@ pub(crate) enum PlacementAction {
     Worktree { options: c6_api::starts::WorktreeOptions },
     LeaveWorktree { merge: bool },
     Back { place_seq: u64 },
+    Worker { worker: String, clone: bool },
 }
 
 #[derive(Serialize)]
@@ -624,11 +638,15 @@ struct PlacementRequest {
     action: PlacementAction,
 }
 
-pub(crate) async fn placements(id: String) -> Result<Vec<Placement>, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}/placement")).send().await).await
+pub(crate) fn placements(id: String) -> LocalBoxFuture<'static, Result<Vec<Placement>, String>> {
+    get_json(format!("/api/v1/sessions/{id}/placement"))
 }
 
-pub(crate) async fn change_placement(id: String, expected_place_seq: u64, action: PlacementAction) -> Result<String, String> {
+pub(crate) fn move_status(id: &str, command: &str) -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json(format!("/api/v1/sessions/{id}/moves/{command}"))
+}
+
+pub(crate) async fn change_placement(id: &str, expected_place_seq: u64, action: PlacementAction) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct Accepted {
         command_id: String,
@@ -686,15 +704,15 @@ pub async fn send_queued_now(id: String, command_id: String) -> Result<(), Strin
 }
 
 /// Original attachment bytes, recovered before withdrawing a waiting input.
-pub async fn message_draft(id: String, command_id: String) -> Result<Vec<c6_api::AttachmentUpload>, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}/messages/{}/draft", enc(&command_id))).send().await).await
+pub fn message_draft(id: String, command_id: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::AttachmentUpload>, String>> {
+    get_json(format!("/api/v1/sessions/{id}/messages/{}/draft", enc(&command_id)))
 }
 
 /// Docs made by this session or its subagents, with reasons to keep each.
 pub use c6_api::docs_archive::ArchiveDocCandidate as SessionArchiveDoc;
 
-pub async fn session_archive_docs(id: String) -> Result<Vec<SessionArchiveDoc>, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}/archive-docs")).send().await).await
+pub fn session_archive_docs(id: String) -> LocalBoxFuture<'static, Result<Vec<SessionArchiveDoc>, String>> {
+    get_json(format!("/api/v1/sessions/{id}/archive-docs"))
 }
 
 /// One request archives the session and exactly these docs; others stay as they are.
@@ -769,34 +787,34 @@ pub fn enc(s: &str) -> String {
     js_sys::encode_uri_component(s).as_string().unwrap_or_default()
 }
 
-pub async fn fs_list(worker: String, path: String, hidden: bool) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/workers/{worker}/fs/list?path={}&hidden={hidden}", enc(&path))).send().await).await
+pub fn fs_list(worker: String, path: String, hidden: bool) -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json(format!("/api/v1/workers/{worker}/fs/list?path={}&hidden={hidden}", enc(&path)))
 }
 
 /// A folder on the head's own disk (its home folder when `path` is empty).
-pub async fn head_fs_list(path: String, hidden: bool) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/head/fs/list?path={}&hidden={hidden}", enc(&path))).send().await).await
+pub fn head_fs_list(path: String, hidden: bool) -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json(format!("/api/v1/head/fs/list?path={}&hidden={hidden}", enc(&path)))
 }
 
 /// A text file on the head's own disk.
-pub async fn head_fs_read(path: String) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/head/fs/read?path={}", enc(&path))).send().await).await
+pub fn head_fs_read(path: String) -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json(format!("/api/v1/head/fs/read?path={}", enc(&path)))
 }
 
-pub async fn fs_read(worker: String, path: String) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/workers/{worker}/fs/read?path={}", enc(&path))).send().await).await
+pub fn fs_read(worker: String, path: String) -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json(format!("/api/v1/workers/{worker}/fs/read?path={}", enc(&path)))
 }
 
 pub fn fs_download_url(worker: &str, path: &str) -> String {
     url(&format!("/api/v1/workers/{worker}/fs/download?path={}", enc(path)))
 }
 
-pub async fn git_status(worker: String, path: String) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/workers/{worker}/git/status?path={}", enc(&path))).send().await).await
+pub fn git_status(worker: String, path: String) -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json(format!("/api/v1/workers/{worker}/git/status?path={}", enc(&path)))
 }
 
-pub async fn git_diff(worker: String, path: String) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/workers/{worker}/git/diff?path={}", enc(&path))).send().await).await
+pub fn git_diff(worker: String, path: String) -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json(format!("/api/v1/workers/{worker}/git/diff?path={}", enc(&path)))
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -806,8 +824,8 @@ pub struct TerminalInfo {
     pub exited: Option<i32>,
 }
 
-pub async fn terminals(worker: String) -> Result<Vec<TerminalInfo>, String> {
-    json(Request::get(&format!("/api/v1/workers/{worker}/terminals")).send().await).await
+pub fn terminals(worker: String) -> LocalBoxFuture<'static, Result<Vec<TerminalInfo>, String>> {
+    get_json(format!("/api/v1/workers/{worker}/terminals"))
 }
 
 /// A terminal on a worker, or (`ssh`) on an SSH target through it.
@@ -819,29 +837,29 @@ pub async fn close_terminal(worker: String, id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/workers/{worker}/terminals/{id}")).send().await).await
 }
 
-pub async fn children(id: String) -> Result<Vec<Session>, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}/children")).send().await).await
+pub fn children(id: String) -> LocalBoxFuture<'static, Result<Vec<Session>, String>> {
+    get_json(format!("/api/v1/sessions/{id}/children"))
 }
 
 /// Everything below a session (side chats and subagents, at any depth).
-pub async fn descendants(id: String) -> Result<Vec<Session>, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}/children?tree=1")).send().await).await
+pub fn descendants(id: String) -> LocalBoxFuture<'static, Result<Vec<Session>, String>> {
+    get_json(format!("/api/v1/sessions/{id}/children?tree=1"))
 }
 
 pub async fn get_setting(name: &'static str) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/settings/{name}{}", in_realm('?'))).send().await).await
+    get_json(format!("/api/v1/settings/{name}{}", in_realm('?'))).await
 }
 
-pub async fn transcript_settings() -> Result<c6_api::TranscriptSettings, String> {
-    json(Request::get("/api/v1/settings/transcript").send().await).await
+pub fn transcript_settings() -> LocalBoxFuture<'static, Result<c6_api::TranscriptSettings, String>> {
+    get_json("/api/v1/settings/transcript")
 }
 
 pub async fn put_transcript_settings(settings: c6_api::TranscriptSettings) -> Result<(), String> {
     empty(Request::put("/api/v1/settings/transcript").json(&settings).map_err(|e| e.to_string())?.send().await).await
 }
 
-pub async fn session_bar_settings() -> Result<c6_api::SessionBarSettings, String> {
-    json(Request::get("/api/v1/settings/session_bar").send().await).await
+pub fn session_bar_settings() -> LocalBoxFuture<'static, Result<c6_api::SessionBarSettings, String>> {
+    get_json("/api/v1/settings/session_bar")
 }
 
 pub async fn put_session_bar_settings(settings: c6_api::SessionBarSettings) -> Result<(), String> {
@@ -850,22 +868,22 @@ pub async fn put_session_bar_settings(settings: c6_api::SessionBarSettings) -> R
 
 /// A settings list's own entries in `realm` (the console, choosing which
 /// realm's rules it edits; "root": the defaults every realm inherits).
-pub async fn get_setting_in(name: &'static str, realm: String) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/settings/{name}?realm={}", enc(&realm))).send().await).await
+pub fn get_setting_in(name: &'static str, realm: String) -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json(format!("/api/v1/settings/{name}?realm={}", enc(&realm)))
 }
 
 pub async fn analytics(days: u32, labels: Vec<String>, by: String) -> Result<c6_api::AnalyticsReport, String> {
     let (labels, by) = (js_sys::encode_uri_component(&labels.join(",")), js_sys::encode_uri_component(&by));
-    json(Request::get(&format!("/api/v1/analytics?days={days}&labels={labels}&by={by}")).send().await).await
+    get_json(format!("/api/v1/analytics?days={days}&labels={labels}&by={by}")).await
 }
 
 pub async fn usage(days: u32, labels: Vec<String>) -> Result<c6_api::UsageReport, String> {
     let labels = js_sys::encode_uri_component(&labels.join(","));
-    json(Request::get(&format!("/api/v1/usage?days={days}&labels={labels}")).send().await).await
+    get_json(format!("/api/v1/usage?days={days}&labels={labels}")).await
 }
 
-pub async fn prompts() -> Result<Vec<c6_api::PromptInfo>, String> {
-    json(Request::get("/api/v1/settings/prompts").send().await).await
+pub fn prompts() -> LocalBoxFuture<'static, Result<Vec<c6_api::PromptInfo>, String>> {
+    get_json("/api/v1/settings/prompts")
 }
 
 pub async fn set_prompt(name: String, body: String) -> Result<(), String> {
@@ -877,26 +895,26 @@ pub async fn set_prompt(name: String, body: String) -> Result<(), String> {
 
 /// The version the head runs.
 pub async fn version() -> Result<String, String> {
-    let v: serde_json::Value = json(Request::get("/api/v1/version").send().await).await?;
+    let v: serde_json::Value = get_json("/api/v1/version").await?;
     Ok(v["version"].as_str().unwrap_or_default().to_owned())
 }
 
 /// Updating carbon6 from GitHub releases (docs/updates.md).
-pub async fn updates() -> Result<c6_api::Updates, String> {
-    json(Request::get("/api/v1/system/updates").send().await).await
+pub fn updates() -> LocalBoxFuture<'static, Result<c6_api::Updates, String>> {
+    get_json("/api/v1/system/updates")
 }
 
 /// The activity panel: model calls, sessions running, connectors' syncs.
-pub async fn activity() -> Result<serde_json::Value, String> {
-    json(Request::get("/api/v1/system/activity").send().await).await
+pub fn activity() -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json("/api/v1/system/activity")
 }
 
-pub async fn activity_counts() -> Result<serde_json::Value, String> {
-    json(Request::get("/api/v1/system/activity/counts").send().await).await
+pub fn activity_counts() -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json("/api/v1/system/activity/counts")
 }
 
-pub async fn activity_call(id: u64) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/system/activity/calls/{id}")).send().await).await
+pub fn activity_call(id: u64) -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json(format!("/api/v1/system/activity/calls/{id}"))
 }
 
 pub async fn check_updates() -> Result<c6_api::Updates, String> {
@@ -917,16 +935,16 @@ pub async fn set_update_settings(s: c6_api::UpdateSettings) -> Result<(), String
     empty(Request::put("/api/v1/settings/updates").json(&s).map_err(|e| e.to_string())?.send().await).await
 }
 
-pub async fn upgrades() -> Result<Vec<c6_api::Upgrade>, String> {
-    json(Request::get("/api/v1/system/upgrades").send().await).await
+pub fn upgrades() -> LocalBoxFuture<'static, Result<Vec<c6_api::Upgrade>, String>> {
+    get_json("/api/v1/system/upgrades")
 }
 
-pub async fn backups() -> Result<c6_api::BackupStatus, String> {
-    json(Request::get("/api/v1/system/backups").send().await).await
+pub fn backups() -> LocalBoxFuture<'static, Result<c6_api::BackupStatus, String>> {
+    get_json("/api/v1/system/backups")
 }
 
-pub async fn backup_settings() -> Result<c6_api::BackupSettings, String> {
-    json(Request::get("/api/v1/system/backups/settings").send().await).await
+pub fn backup_settings() -> LocalBoxFuture<'static, Result<c6_api::BackupSettings, String>> {
+    get_json("/api/v1/system/backups/settings")
 }
 
 pub async fn put_backup_settings(s: c6_api::BackupSettings) -> Result<(), String> {
@@ -952,8 +970,8 @@ pub async fn test_backups() -> Result<c6_api::BackupStatus, String> {
 
 // --- Watchers (docs/watchers.md) ---
 
-pub async fn watchers() -> Result<Vec<c6_api::watchers::Watcher>, String> {
-    json(Request::get("/api/v1/watchers").send().await).await
+pub fn watchers() -> LocalBoxFuture<'static, Result<Vec<c6_api::watchers::Watcher>, String>> {
+    get_json("/api/v1/watchers")
 }
 
 pub async fn put_watcher(d: c6_api::watchers::WatcherDef) -> Result<c6_api::watchers::WatcherDef, String> {
@@ -975,36 +993,36 @@ pub async fn run_watcher(name: String) -> Result<(), String> {
     .await
 }
 
-pub async fn watcher_findings() -> Result<Vec<c6_api::watchers::Finding>, String> {
-    json(Request::get("/api/v1/watchers/findings?limit=50").send().await).await
+pub fn watcher_findings() -> LocalBoxFuture<'static, Result<Vec<c6_api::watchers::Finding>, String>> {
+    get_json("/api/v1/watchers/findings?limit=50")
 }
 
-pub async fn session_watch(id: String) -> Result<c6_api::watchers::SessionWatch, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}/watch")).send().await).await
+pub fn session_watch(id: String) -> LocalBoxFuture<'static, Result<c6_api::watchers::SessionWatch, String>> {
+    get_json(format!("/api/v1/sessions/{id}/watch"))
 }
 
-pub async fn upgrade_backups() -> Result<c6_api::UpgradeBackups, String> {
-    json(Request::get("/api/v1/system/upgrades/backups").send().await).await
+pub fn upgrade_backups() -> LocalBoxFuture<'static, Result<c6_api::UpgradeBackups, String>> {
+    get_json("/api/v1/system/upgrades/backups")
 }
 
 pub async fn put_upgrade_backups(b: c6_api::UpgradeBackups) -> Result<(), String> {
     empty(Request::put("/api/v1/system/upgrades/backups").json(&b).map_err(|e| e.to_string())?.send().await).await
 }
 
-pub async fn hosts() -> Result<Vec<c6_api::HostStatus>, String> {
-    json(Request::get("/api/v1/hosts").send().await).await
+pub fn hosts() -> LocalBoxFuture<'static, Result<Vec<c6_api::HostStatus>, String>> {
+    get_json("/api/v1/hosts")
 }
 
 pub async fn check_host(name: String) -> Result<c6_api::HostCheck, String> {
     json(Request::post(&format!("/api/v1/hosts/{}/check", js_sys::encode_uri_component(&name))).send().await).await
 }
 
-pub async fn workflows() -> Result<Vec<c6_api::Workflow>, String> {
-    json(Request::get("/api/v1/settings/workflows").send().await).await
+pub fn workflows() -> LocalBoxFuture<'static, Result<Vec<c6_api::Workflow>, String>> {
+    get_json("/api/v1/settings/workflows")
 }
 
-pub async fn workflow_runs() -> Result<Vec<c6_api::WorkflowRun>, String> {
-    json(Request::get("/api/v1/workflows/runs?limit=15").send().await).await
+pub fn workflow_runs() -> LocalBoxFuture<'static, Result<Vec<c6_api::WorkflowRun>, String>> {
+    get_json("/api/v1/workflows/runs?limit=15")
 }
 
 pub async fn run_workflow(name: String, input: String) -> Result<c6_api::WorkflowRun, String> {
@@ -1024,12 +1042,12 @@ pub async fn decide_workflow_step(run: String, step: String, allow: bool) -> Res
     .await
 }
 
-pub async fn push_key() -> Result<c6_api::PushKey, String> {
-    json(Request::get("/api/v1/push/key").send().await).await
+pub fn push_key() -> LocalBoxFuture<'static, Result<c6_api::PushKey, String>> {
+    get_json("/api/v1/push/key")
 }
 
-pub async fn push_devices() -> Result<Vec<c6_api::PushDevice>, String> {
-    json(Request::get("/api/v1/push/subscriptions").send().await).await
+pub fn push_devices() -> LocalBoxFuture<'static, Result<Vec<c6_api::PushDevice>, String>> {
+    get_json("/api/v1/push/subscriptions")
 }
 
 pub async fn push_subscribe(s: c6_api::PushSubscription) -> Result<c6_api::PushDevice, String> {
@@ -1040,8 +1058,8 @@ pub async fn push_unsubscribe(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/push/subscriptions/{id}")).send().await).await
 }
 
-pub async fn memex_status() -> Result<c6_api::MemexStatus, String> {
-    json(Request::get("/api/v1/memex/status").send().await).await
+pub fn memex_status() -> LocalBoxFuture<'static, Result<c6_api::MemexStatus, String>> {
+    get_json("/api/v1/memex/status")
 }
 
 pub async fn memex_search(q: String, kinds: Vec<String>) -> Result<Vec<c6_api::MemexHit>, String> {
@@ -1050,12 +1068,12 @@ pub async fn memex_search(q: String, kinds: Vec<String>) -> Result<Vec<c6_api::M
         js_sys::encode_uri_component(&q),
         js_sys::encode_uri_component(&kinds.join(","))
     );
-    json(Request::get(&url).send().await).await
+    get_json(url).await
 }
 
 /// An item (`{"item": …}`) or a thing (`{"thing": …}`).
-pub async fn memex_get(id: String) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/memex/get?id={}", js_sys::encode_uri_component(&id))).send().await).await
+pub fn memex_get(id: String) -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json(format!("/api/v1/memex/get?id={}", js_sys::encode_uri_component(&id)))
 }
 
 pub async fn memex_note(text: String, about: Vec<String>) -> Result<serde_json::Value, String> {
@@ -1087,8 +1105,8 @@ pub async fn rpc_as<T: serde::de::DeserializeOwned>(method: &str, params: serde_
 }
 
 /// Slack (docs/slack.md): the realm's setup and workspaces.
-pub async fn slack_setup() -> Result<c6_api::SlackSetup, String> {
-    json(Request::get("/api/v1/slack").send().await).await
+pub fn slack_setup() -> LocalBoxFuture<'static, Result<c6_api::SlackSetup, String>> {
+    get_json("/api/v1/slack")
 }
 
 pub async fn slack_client(client_id: String, client_secret: Option<String>) -> Result<(), String> {
@@ -1115,7 +1133,7 @@ pub async fn slack_remove(id: String) -> Result<(), String> {
 }
 
 pub async fn google_client() -> Result<c6_api::GoogleClient, String> {
-    json(Request::get(&format!("/api/v1/google/client{}", in_realm('?'))).send().await).await
+    get_json(format!("/api/v1/google/client{}", in_realm('?'))).await
 }
 
 pub async fn set_google_client(client_id: String, client_secret: Option<String>) -> Result<(), String> {
@@ -1134,7 +1152,7 @@ pub async fn google_install() -> Result<Vec<c6_api::Install>, String> {
 }
 
 pub async fn google_accounts() -> Result<Vec<c6_api::GoogleAccount>, String> {
-    json(Request::get(&format!("/api/v1/google/accounts{}", in_realm('?'))).send().await).await
+    get_json(format!("/api/v1/google/accounts{}", in_realm('?'))).await
 }
 
 pub async fn google_remove(id: String) -> Result<(), String> {
@@ -1145,12 +1163,12 @@ pub async fn memex_upload(u: c6_api::MemexUpload) -> Result<serde_json::Value, S
     send_json(Request::post("/api/v1/memex/upload"), &u).await
 }
 
-pub async fn memex_trails() -> Result<Vec<c6_api::MemexTrail>, String> {
-    json(Request::get("/api/v1/memex/trails").send().await).await
+pub fn memex_trails() -> LocalBoxFuture<'static, Result<Vec<c6_api::MemexTrail>, String>> {
+    get_json("/api/v1/memex/trails")
 }
 
-pub async fn memex_trail(id: String) -> Result<c6_api::MemexTrail, String> {
-    json(Request::get(&format!("/api/v1/memex/trails/{}", js_sys::encode_uri_component(&id))).send().await).await
+pub fn memex_trail(id: String) -> LocalBoxFuture<'static, Result<c6_api::MemexTrail, String>> {
+    get_json(format!("/api/v1/memex/trails/{}", js_sys::encode_uri_component(&id)))
 }
 
 pub async fn memex_trail_append(trail: String, target: String, comment: String) -> Result<serde_json::Value, String> {
@@ -1170,8 +1188,8 @@ pub async fn memex_scan() -> Result<serde_json::Value, String> {
 }
 
 /// Whether Ask can run on Claude Code here (docs/ask.md §3).
-pub async fn ask_claude() -> Result<c6_api::AskClaude, String> {
-    json(Request::get("/api/v1/assistant/claude").send().await).await
+pub fn ask_claude() -> LocalBoxFuture<'static, Result<c6_api::AskClaude, String>> {
+    get_json("/api/v1/assistant/claude")
 }
 
 /// What @ offers in an Ask conversation, or in session `session`'s message
@@ -1239,8 +1257,8 @@ pub async fn test_connection(
 
 // --- Sign-in ------------------------------------------------------------------
 
-pub async fn auth_status() -> Result<c6_api::AuthStatus, String> {
-    json(Request::get("/api/v1/auth/status").send().await).await
+pub fn auth_status() -> LocalBoxFuture<'static, Result<c6_api::AuthStatus, String>> {
+    get_json("/api/v1/auth/status")
 }
 
 pub async fn redeem_link(token: String) -> Result<(), String> {
@@ -1263,24 +1281,24 @@ pub async fn passkey_register(name: String, credential: serde_json::Value) -> Re
     send_json(Request::post("/api/v1/auth/passkeys/register/finish"), &c6_api::RegisterPasskey { name, credential }).await
 }
 
-pub async fn passkeys() -> Result<Vec<c6_api::Passkey>, String> {
-    json(Request::get("/api/v1/auth/passkeys").send().await).await
+pub fn passkeys() -> LocalBoxFuture<'static, Result<Vec<c6_api::Passkey>, String>> {
+    get_json("/api/v1/auth/passkeys")
 }
 
 pub async fn delete_passkey(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/auth/passkeys/{id}")).send().await).await
 }
 
-pub async fn auth_sessions() -> Result<Vec<c6_api::AuthSession>, String> {
-    json(Request::get("/api/v1/auth/sessions").send().await).await
+pub fn auth_sessions() -> LocalBoxFuture<'static, Result<Vec<c6_api::AuthSession>, String>> {
+    get_json("/api/v1/auth/sessions")
 }
 
 pub async fn delete_auth_session(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/auth/sessions/{id}")).send().await).await
 }
 
-pub async fn api_tokens() -> Result<Vec<c6_api::ApiToken>, String> {
-    json(Request::get("/api/v1/auth/tokens").send().await).await
+pub fn api_tokens() -> LocalBoxFuture<'static, Result<Vec<c6_api::ApiToken>, String>> {
+    get_json("/api/v1/auth/tokens")
 }
 
 pub async fn create_api_token(name: String, realm: Option<String>) -> Result<c6_api::ApiToken, String> {
@@ -1377,8 +1395,8 @@ pub async fn set_labels(id: String, labels: Vec<String>) -> Result<Session, Stri
 }
 
 /// What applies to a session (commands, agents, skills, hooks) and why not.
-pub async fn session_config(id: String) -> Result<c6_api::EffectiveConfig, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}/config")).send().await).await
+pub fn session_config(id: String) -> LocalBoxFuture<'static, Result<c6_api::EffectiveConfig, String>> {
+    get_json(format!("/api/v1/sessions/{id}/config"))
 }
 
 /// Stops a session's background task.
@@ -1392,13 +1410,13 @@ pub async fn stop_task(id: String, task: String) -> Result<(), String> {
 }
 
 /// A read-only snapshot of a task's streams, independent of the model's read cursor.
-pub async fn task_snapshot(session: String, task: String) -> Result<c6_api::TaskSnapshot, String> {
-    json(Request::get(&format!("/api/v1/sessions/{}/tasks/{}", enc(&session), enc(&task))).send().await).await
+pub fn task_snapshot(session: String, task: String) -> LocalBoxFuture<'static, Result<c6_api::TaskSnapshot, String>> {
+    get_json(format!("/api/v1/sessions/{}/tasks/{}", enc(&session), enc(&task)))
 }
 
 /// The realm you look at's secrets (its own and root's), or every realm's.
 pub async fn secrets() -> Result<Vec<c6_api::SecretInfo>, String> {
-    json(Request::get(&format!("/api/v1/settings/secrets{}", in_realm('?'))).send().await).await
+    get_json(format!("/api/v1/settings/secrets{}", in_realm('?'))).await
 }
 
 /// Sets a secret in this page's realm (root's, in the console).
@@ -1412,13 +1430,13 @@ pub async fn delete_secret(name: String, realm: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/settings/secrets/{name}{q}")).send().await).await
 }
 
-pub async fn templates() -> Result<Vec<c6_api::Template>, String> {
-    json(Request::get("/api/v1/settings/templates").send().await).await
+pub fn templates() -> LocalBoxFuture<'static, Result<Vec<c6_api::Template>, String>> {
+    get_json("/api/v1/settings/templates")
 }
 
 /// Every template you can run, with its realm.
-pub async fn all_templates() -> Result<Vec<c6_api::RealmTemplate>, String> {
-    json(Request::get("/api/v1/templates").send().await).await
+pub fn all_templates() -> LocalBoxFuture<'static, Result<Vec<c6_api::RealmTemplate>, String>> {
+    get_json("/api/v1/templates")
 }
 
 pub async fn run_template(name: String, input: String, realm: Option<String>) -> Result<c6_api::TemplateRun, String> {
@@ -1426,7 +1444,7 @@ pub async fn run_template(name: String, input: String, realm: Option<String>) ->
 }
 
 pub async fn automations() -> Result<Vec<c6_api::Automation>, String> {
-    json(Request::get(&format!("/api/v1/automations{}", in_realm('?'))).send().await).await
+    get_json(format!("/api/v1/automations{}", in_realm('?'))).await
 }
 
 pub async fn create_automation(e: c6_api::AutomationEdit) -> Result<c6_api::Automation, String> {
@@ -1445,16 +1463,16 @@ pub async fn run_automation(id: String) -> Result<c6_api::TemplateRun, String> {
     json(Request::post(&format!("/api/v1/automations/{id}/run")).send().await).await
 }
 
-pub async fn automation_runs(id: String) -> Result<Vec<c6_api::AutomationRun>, String> {
-    json(Request::get(&format!("/api/v1/automations/{id}/runs?limit=20")).send().await).await
+pub fn automation_runs(id: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::AutomationRun>, String>> {
+    get_json(format!("/api/v1/automations/{id}/runs?limit=20"))
 }
 
 pub async fn rotate_automation(id: String) -> Result<c6_api::Automation, String> {
     json(Request::post(&format!("/api/v1/automations/{id}/rotate")).send().await).await
 }
 
-pub async fn memories() -> Result<Vec<c6_api::Memory>, String> {
-    json(Request::get("/api/v1/memories").send().await).await
+pub fn memories() -> LocalBoxFuture<'static, Result<Vec<c6_api::Memory>, String>> {
+    get_json("/api/v1/memories")
 }
 
 pub async fn save_memory(m: c6_api::Memory) -> Result<c6_api::Memory, String> {
@@ -1507,8 +1525,8 @@ pub async fn answer(
     .await
 }
 
-pub async fn decisions(state: String) -> Result<Vec<c6_api::Decision>, String> {
-    json(Request::get(&format!("/api/v1/decisions?state={state}")).send().await).await
+pub fn decisions(state: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::Decision>, String>> {
+    get_json(format!("/api/v1/decisions?state={state}"))
 }
 
 /// What you'd likely type next in a session (docs/suggestions.md); None when there's none.
@@ -1521,7 +1539,7 @@ pub async fn session_suggestion(id: String) -> Result<Option<c6_api::Suggestion>
 }
 
 pub async fn suggestion_settings() -> Result<c6_api::SuggestionSettings, String> {
-    json(Request::get(&format!("/api/v1/settings/suggestions{}", in_realm('?'))).send().await).await
+    get_json(format!("/api/v1/settings/suggestions{}", in_realm('?'))).await
 }
 
 pub async fn set_suggestion_settings(s: c6_api::SuggestionSettings) -> Result<(), String> {
@@ -1529,8 +1547,8 @@ pub async fn set_suggestion_settings(s: c6_api::SuggestionSettings) -> Result<()
 }
 
 /// Whether a session shows a catch-up card, and folds its finished turns.
-pub async fn session_view(id: String) -> Result<c6_api::SessionViewSettings, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}/view")).send().await).await
+pub fn session_view(id: String) -> LocalBoxFuture<'static, Result<c6_api::SessionViewSettings, String>> {
+    get_json(format!("/api/v1/sessions/{id}/view"))
 }
 
 pub async fn set_session_view(id: String, v: c6_api::SessionViewSettings) -> Result<(), String> {
@@ -1554,7 +1572,7 @@ pub async fn catchup(id: String, since: Option<u64>, looked_at: Option<i64>, sum
 /// lines).
 pub async fn timeline(id: String, hour: Option<i64>) -> Result<Vec<c6_api::TimelineTurn>, String> {
     let hour = hour.map(|h| format!("?hour={h}")).unwrap_or_default();
-    json(Request::get(&format!("/api/v1/sessions/{id}/timeline{hour}")).send().await).await
+    get_json(format!("/api/v1/sessions/{id}/timeline{hour}")).await
 }
 
 /// A suggestion was shown, or (`accepted`) taken.
@@ -1577,21 +1595,21 @@ pub async fn session_viewed(id: String) -> bool {
 }
 
 /// The sessions you viewed lately in this realm, newest first.
-pub async fn recent_sessions() -> Result<Vec<c6_api::RecentView>, String> {
-    json(Request::get("/api/v1/sessions/recent").send().await).await
+pub fn recent_sessions() -> LocalBoxFuture<'static, Result<Vec<c6_api::RecentView>, String>> {
+    get_json("/api/v1/sessions/recent")
 }
 
 /// A session's open decisions (not its approvals and questions: those are in its log).
-pub async fn session_decisions(id: String) -> Result<Vec<c6_api::Decision>, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}/decisions")).send().await).await
+pub fn session_decisions(id: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::Decision>, String>> {
+    get_json(format!("/api/v1/sessions/{id}/decisions"))
 }
 
-pub async fn session_waiting(id: String) -> Result<Vec<c6_api::AttentionItem>, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}/waiting")).send().await).await
+pub fn session_waiting(id: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::AttentionItem>, String>> {
+    get_json(format!("/api/v1/sessions/{id}/waiting"))
 }
 
 pub async fn decision_count() -> Result<i64, String> {
-    let v: serde_json::Value = json(Request::get("/api/v1/decisions/count").send().await).await?;
+    let v: serde_json::Value = get_json("/api/v1/decisions/count").await?;
     Ok(v["open"].as_i64().unwrap_or(0))
 }
 
@@ -1610,8 +1628,8 @@ pub async fn decision_session(id: i64) -> Result<c6_api::Session, String> {
     send_json(Request::post(&format!("/api/v1/decisions/{id}/session")), &serde_json::json!({})).await
 }
 
-pub async fn decision_discussion(id: i64) -> Result<c6_api::DecisionDiscussion, String> {
-    json(Request::get(&format!("/api/v1/decisions/{id}/discussion")).send().await).await
+pub fn decision_discussion(id: i64) -> LocalBoxFuture<'static, Result<c6_api::DecisionDiscussion, String>> {
+    get_json(format!("/api/v1/decisions/{id}/discussion"))
 }
 
 pub async fn discuss_decision(id: i64, text: String) -> Result<c6_api::DecisionDiscussion, String> {
@@ -1625,12 +1643,12 @@ pub async fn decision_discussion_session(id: i64, text: String) -> Result<c6_api
 // --- Collections (docs/os.md §4.1) ---------------------------------------------
 
 pub async fn collections() -> Result<Vec<c6_api::Collection>, String> {
-    json(Request::get(&format!("/api/v1/collections{}", in_realm('?'))).send().await).await
+    get_json(format!("/api/v1/collections{}", in_realm('?'))).await
 }
 
 /// The views of the realm you are looking at (home's when "All realms").
 pub async fn views() -> Result<Vec<c6_api::View>, String> {
-    json(Request::get(&format!("/api/v1/views{}", in_realm('?'))).send().await).await
+    get_json(format!("/api/v1/views{}", in_realm('?'))).await
 }
 
 pub async fn view_act(name: String, a: c6_api::ViewAct) -> Result<serde_json::Value, String> {
@@ -1641,7 +1659,7 @@ pub async fn view_act(name: String, a: c6_api::ViewAct) -> Result<serde_json::Va
 /// the query (`before=…`, `from=…&to=…`, `kind=video`).
 pub async fn view_items(name: String, q: String) -> Result<Vec<c6_api::ViewItem>, String> {
     let realm = in_realm('&');
-    json(Request::get(&format!("/api/v1/views/{}/items?{q}{realm}", enc(&name))).send().await).await
+    get_json(format!("/api/v1/views/{}/items?{q}{realm}", enc(&name))).await
 }
 
 /// An item's picture in a view.
@@ -1650,7 +1668,7 @@ pub fn view_thumb(name: &str, id: &str) -> String {
 }
 
 pub async fn series() -> Result<Vec<c6_api::Series>, String> {
-    json(Request::get(&format!("/api/v1/series{}", in_realm('?'))).send().await).await
+    get_json(format!("/api/v1/series{}", in_realm('?'))).await
 }
 
 pub async fn create_series(s: c6_api::SeriesIn) -> Result<c6_api::Series, String> {
@@ -1666,7 +1684,7 @@ pub async fn query_series(name: String, q: c6_api::SeriesQuery) -> Result<c6_api
 }
 
 pub async fn collection(name: String) -> Result<c6_api::Collection, String> {
-    json(Request::get(&format!("/api/v1/collections/{}{}", enc(&name), in_realm('?'))).send().await).await
+    get_json(format!("/api/v1/collections/{}{}", enc(&name), in_realm('?'))).await
 }
 
 /// A collection's data card (docs/apps.md §8).
@@ -1699,7 +1717,7 @@ pub async fn delete_record(name: String, id: String) -> Result<(), String> {
 }
 
 pub async fn record_history(name: String, id: String) -> Result<Vec<c6_api::RecordChange>, String> {
-    json(Request::get(&format!("/api/v1/collections/{}/records/{}/history{}", enc(&name), enc(&id), in_realm('?'))).send().await).await
+    get_json(format!("/api/v1/collections/{}/records/{}/history{}", enc(&name), enc(&id), in_realm('?'))).await
 }
 
 // --- Work (docs/work.md) ---------------------------------------------------
@@ -1710,23 +1728,23 @@ pub async fn set_mark(key: String, mark: String) -> Result<c6_api::marks::Marks,
     send_json(Request::put("/api/v1/marks"), &c6_api::marks::SetMark { key, mark }).await
 }
 
-pub async fn work_list(closed: bool) -> Result<Vec<WorkItem>, String> {
-    json(Request::get(&format!("/api/v1/work{}", if closed { "?closed=true" } else { "" })).send().await).await
+pub fn work_list(closed: bool) -> LocalBoxFuture<'static, Result<Vec<WorkItem>, String>> {
+    get_json(format!("/api/v1/work{}", if closed { "?closed=true" } else { "" }))
 }
 
 /// A task card's destinations, even when viewed from the all-realms console.
-pub async fn task_work_list(realm: String) -> Result<Vec<WorkItem>, String> {
-    json(Request::get(&format!("/api/v1/work?realm={}", enc(&realm))).send().await).await
+pub fn task_work_list(realm: String) -> LocalBoxFuture<'static, Result<Vec<WorkItem>, String>> {
+    get_json(format!("/api/v1/work?realm={}", enc(&realm)))
 }
 
-pub async fn work_get(id: String) -> Result<WorkItem, String> {
-    json(Request::get(&format!("/api/v1/work/{id}")).send().await).await
+pub fn work_get(id: String) -> LocalBoxFuture<'static, Result<WorkItem, String>> {
+    get_json(format!("/api/v1/work/{id}"))
 }
 
 /// The open work something belongs to (`session:<id>`, `request:<id>`, …).
 pub async fn work_of(reference: String) -> Result<Vec<WorkItem>, String> {
     let q = js_sys::encode_uri_component(&reference).as_string().unwrap_or_default();
-    json(Request::get(&format!("/api/v1/work/of?ref={q}")).send().await).await
+    get_json(format!("/api/v1/work/of?ref={q}")).await
 }
 
 pub async fn work_add(title: String, done_when: String, attach: Vec<WorkRef>) -> Result<WorkItem, String> {
@@ -1765,7 +1783,7 @@ pub async fn work_proposals() -> Result<Vec<WorkProposal>, String> {
 
 /// The first message of a session that picks the work up again.
 pub async fn work_pickup(id: String) -> Result<String, String> {
-    let v: serde_json::Value = json(Request::get(&format!("/api/v1/work/{id}/pickup")).send().await).await?;
+    let v: serde_json::Value = get_json(format!("/api/v1/work/{id}/pickup")).await?;
     Ok(v["text"].as_str().unwrap_or_default().to_owned())
 }
 
@@ -1782,8 +1800,8 @@ pub async fn work_todo_remove(id: String, todo: String) -> Result<WorkItem, Stri
 }
 
 /// A session's first message for a to-do, and the session to start from.
-pub async fn work_todo_start(id: String, todo: String) -> Result<c6_api::work::TodoStart, String> {
-    json(Request::get(&format!("/api/v1/work/{id}/todos/{todo}/start")).send().await).await
+pub fn work_todo_start(id: String, todo: String) -> LocalBoxFuture<'static, Result<c6_api::work::TodoStart, String>> {
+    get_json(format!("/api/v1/work/{id}/todos/{todo}/start"))
 }
 
 /// The first message of one session for several to-dos, and where it
@@ -1793,8 +1811,8 @@ pub async fn work_todos_start(id: String, todos: Vec<String>) -> Result<c6_api::
 }
 
 /// The open task cards of a work's sessions.
-pub async fn work_cards(id: String) -> Result<Vec<c6_api::Decision>, String> {
-    json(Request::get(&format!("/api/v1/work/{id}/cards")).send().await).await
+pub fn work_cards(id: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::Decision>, String>> {
+    get_json(format!("/api/v1/work/{id}/cards"))
 }
 
 /// Keeps task cards as a work's to-dos; their ids, in order.
@@ -1835,8 +1853,8 @@ pub async fn session_todo(id: String, text: String, quote: Option<c6_api::work::
     send_json(Request::post(&format!("/api/v1/sessions/{id}/todos")), &c6_api::work::SessionTodo { text, quote }).await
 }
 
-pub async fn followups(id: String) -> Result<Vec<c6_api::work::Followup>, String> {
-    json(Request::get(&format!("/api/v1/sessions/{id}/followups")).send().await).await
+pub fn followups(id: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::work::Followup>, String>> {
+    get_json(format!("/api/v1/sessions/{id}/followups"))
 }
 
 pub async fn followup_add(id: String, text: String, quote: Option<c6_api::work::Quote>) -> Result<c6_api::work::Followup, String> {
@@ -1875,11 +1893,11 @@ pub async fn docs_list(q: &c6_api::docs::DocQuery) -> Result<Vec<c6_api::docs::D
             params.push(format!("{k}={}", enc(v)));
         }
     }
-    json(Request::get(&format!("/api/v1/docs?{}", params.join("&"))).send().await).await
+    get_json(format!("/api/v1/docs?{}", params.join("&"))).await
 }
 
-pub async fn doc_get(id: String) -> Result<c6_api::docs::Doc, String> {
-    json(Request::get(&format!("/api/v1/docs/{}", enc(&id))).send().await).await
+pub fn doc_get(id: String) -> LocalBoxFuture<'static, Result<c6_api::docs::Doc, String>> {
+    get_json(format!("/api/v1/docs/{}", enc(&id)))
 }
 
 pub async fn doc_create(n: &c6_api::docs::DocNew) -> Result<c6_api::docs::Doc, String> {
@@ -1905,12 +1923,12 @@ pub async fn doc_patch(id: String, p: &c6_api::docs::DocPatch) -> Result<c6_api:
 }
 
 /// A small read of a document (`view=outline|block|…`, as a query).
-pub async fn doc_read(id: &str, query: &str) -> Result<serde_json::Value, String> {
-    json(Request::get(&format!("/api/v1/docs/{}/read?{query}", enc(id))).send().await).await
+pub fn doc_read(id: &str, query: &str) -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json(format!("/api/v1/docs/{}/read?{query}", enc(id)))
 }
 
-pub async fn doc_history(id: String) -> Result<Vec<c6_api::docs::DocVersion>, String> {
-    json(Request::get(&format!("/api/v1/docs/{}/history", enc(&id))).send().await).await
+pub fn doc_history(id: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::docs::DocVersion>, String>> {
+    get_json(format!("/api/v1/docs/{}/history", enc(&id)))
 }
 
 pub async fn doc_restore(id: String, r: &c6_api::docs::DocRestore) -> Result<c6_api::docs::DocApplied, String> {
@@ -1921,12 +1939,12 @@ pub async fn doc_restore(id: String, r: &c6_api::docs::DocRestore) -> Result<c6_
 
 use c6_api::projects::{ProjectItem, ProjectNew, ProjectPatch};
 
-pub async fn projects_list(closed: bool) -> Result<Vec<ProjectItem>, String> {
-    json(Request::get(&format!("/api/v1/projects{}", if closed { "?closed=true" } else { "" })).send().await).await
+pub fn projects_list(closed: bool) -> LocalBoxFuture<'static, Result<Vec<ProjectItem>, String>> {
+    get_json(format!("/api/v1/projects{}", if closed { "?closed=true" } else { "" }))
 }
 
-pub async fn project_get(id: String) -> Result<ProjectItem, String> {
-    json(Request::get(&format!("/api/v1/projects/{}", enc(&id))).send().await).await
+pub fn project_get(id: String) -> LocalBoxFuture<'static, Result<ProjectItem, String>> {
+    get_json(format!("/api/v1/projects/{}", enc(&id)))
 }
 
 pub async fn project_add(n: &ProjectNew) -> Result<ProjectItem, String> {
@@ -1998,7 +2016,7 @@ pub async fn project_proposed(id: String, proposal: String, accept: bool) -> Res
 
 /// The project a session is a quick session of (docs/projects.md §3.1).
 pub async fn project_of_session(session: String) -> Result<Option<ProjectItem>, String> {
-    let list: Vec<ProjectItem> = json(Request::get(&format!("/api/v1/projects/of-session/{}", enc(&session))).send().await).await?;
+    let list: Vec<ProjectItem> = get_json(format!("/api/v1/projects/of-session/{}", enc(&session))).await?;
     Ok(list.into_iter().next())
 }
 
@@ -2013,8 +2031,8 @@ pub async fn project_session_promote(id: String, session: String) -> Result<Work
 }
 
 /// The realm's deck themes (docs/docs.md §5).
-pub async fn deck_themes() -> Result<Vec<c6_api::slides::DeckTheme>, String> {
-    json(Request::get("/api/v1/decks/themes").send().await).await
+pub fn deck_themes() -> LocalBoxFuture<'static, Result<Vec<c6_api::slides::DeckTheme>, String>> {
+    get_json("/api/v1/decks/themes")
 }
 
 pub async fn set_deck_themes(list: &[c6_api::slides::DeckTheme]) -> Result<(), String> {
@@ -2025,13 +2043,13 @@ pub async fn doc_export(id: String, format: String) -> Result<c6_api::docs::DocE
     send_json(Request::post(&format!("/api/v1/docs/{}/export", enc(&id))), &c6_api::docs::DocExportIn { format }).await
 }
 
-pub async fn doc_exports(id: String) -> Result<Vec<c6_api::docs::DocExport>, String> {
-    json(Request::get(&format!("/api/v1/docs/{}/exports", enc(&id))).send().await).await
+pub fn doc_exports(id: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::docs::DocExport>, String>> {
+    get_json(format!("/api/v1/docs/{}/exports", enc(&id)))
 }
 
 /// A document's Google file and the realm's Google accounts for documents.
-pub async fn doc_google(id: String) -> Result<c6_api::docs::DocGoogle, String> {
-    json(Request::get(&format!("/api/v1/docs/{}/google", enc(&id))).send().await).await
+pub fn doc_google(id: String) -> LocalBoxFuture<'static, Result<c6_api::docs::DocGoogle, String>> {
+    get_json(format!("/api/v1/docs/{}/google", enc(&id)))
 }
 
 pub async fn doc_to_google(id: String, g: c6_api::docs::GoogleExportIn) -> Result<c6_api::docs::GoogleFile, String> {
@@ -2047,7 +2065,7 @@ pub async fn docs_google_connect(back: String, settings: bool) -> Result<String,
 }
 
 pub async fn docs_google_accounts() -> Result<Vec<c6_api::OAuthAccount>, String> {
-    json(Request::get(&format!("/api/v1/docs/google/accounts{}", in_realm('?'))).send().await).await
+    get_json(format!("/api/v1/docs/google/accounts{}", in_realm('?'))).await
 }
 
 pub async fn docs_google_remove(id: String) -> Result<(), String> {
@@ -2059,16 +2077,16 @@ pub async fn doc_import(i: &c6_api::docs::DocImport) -> Result<c6_api::docs::Doc
 }
 
 /// The decks app's decks still to come in (docs/docs.md §13).
-pub async fn decks_bring_status() -> Result<serde_json::Value, String> {
-    json(Request::get("/api/v1/decks/bring-in").send().await).await
+pub fn decks_bring_status() -> LocalBoxFuture<'static, Result<serde_json::Value, String>> {
+    get_json("/api/v1/decks/bring-in")
 }
 
 pub async fn decks_bring_in() -> Result<serde_json::Value, String> {
     json(Request::post("/api/v1/decks/bring-in").send().await).await
 }
 
-pub async fn doc_threads(id: String) -> Result<Vec<c6_api::docs::DocThread>, String> {
-    json(Request::get(&format!("/api/v1/docs/{}/threads", enc(&id))).send().await).await
+pub fn doc_threads(id: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::docs::DocThread>, String>> {
+    get_json(format!("/api/v1/docs/{}/threads", enc(&id)))
 }
 
 pub async fn doc_thread_new(id: String, t: &c6_api::docs::ThreadNew) -> Result<c6_api::docs::DocThread, String> {
@@ -2104,6 +2122,16 @@ pub async fn doc_thread_resolve(id: String, thread: String) -> Result<c6_api::do
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_placement_sends_exact_selection_and_clone_consent() {
+        let request =
+            PlacementRequest { expected_place_seq: 23, action: PlacementAction::Worker { worker: "worker-id".into(), clone: false } };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"expected_place_seq": 23, "kind": "worker", "worker": "worker-id", "clone": false}),
+        );
+    }
 
     #[test]
     fn ordinary_live_frames_do_not_invalidate_reconnect_subscribers() {
