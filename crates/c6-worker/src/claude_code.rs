@@ -1534,12 +1534,22 @@ async fn stop_held_group(pg: Pid, keeper: Pid, dir: &Path, conversation: &str) -
 /// proves that an old group's writers (including orphaned children) are gone.
 /// Live groups and permission errors keep the durable barrier. Linux zombies
 /// do too; Darwin zombie-only groups require the extra proof in group_probe.
-#[cfg(not(target_os = "macos"))]
 pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str, wait: Duration) -> anyhow::Result<()> {
+    confirm_stopped_reaping(journal, session_id, wait, || {}).await
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn confirm_stopped_reaping(
+    journal: &crate::journal::Journal,
+    session_id: &str,
+    wait: Duration,
+    mut reap: impl FnMut(),
+) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         let mut pending = Vec::new();
         for pgid in journal.claude_processes(session_id).await? {
+            reap();
             let (result, detail) = group_probe_with_detail(Pid::from_raw(pgid));
             match result {
                 Err(nix::errno::Errno::ESRCH) => journal.untrack_claude_process(session_id, pgid).await?,
@@ -1566,7 +1576,12 @@ pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str
 }
 
 #[cfg(target_os = "macos")]
-pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str, wait: Duration) -> anyhow::Result<()> {
+async fn confirm_stopped_reaping(
+    journal: &crate::journal::Journal,
+    session_id: &str,
+    wait: Duration,
+    mut reap: impl FnMut(),
+) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         let groups = journal.claude_processes(session_id).await?;
@@ -1574,7 +1589,11 @@ pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str
             return Ok(());
         }
         for pgid in groups {
-            darwin_confirm_group_stopped(pgid, deadline, || darwin_group_observation(Pid::from_raw(pgid))).await?;
+            darwin_confirm_group_stopped(pgid, deadline, || {
+                reap();
+                darwin_group_observation(Pid::from_raw(pgid))
+            })
+            .await?;
             journal.untrack_claude_process(session_id, pgid).await?;
         }
     }
@@ -1722,18 +1741,34 @@ pub(crate) fn confirm_held_stopped(held: &Path, session: &str) -> anyhow::Result
 /// Stop all of this session's held runtimes before the durable PGID barrier.
 /// A reused or unidentifiable group is left alone and keeps that barrier shut.
 pub async fn stop_held_for_rewind(held: &Path, session: &str, journal: &crate::journal::Journal) -> anyhow::Result<()> {
-    stop_session_held(held, session, journal, false).await
+    stop_session_held(held, session, journal, false, || {}).await
 }
 
 /// A held CLI can be idle even though the worker never recorded its reply.
 /// A raw line can also have partially committed to multiple session logs,
 /// so rewinding its output cursor is not safe. Retire the runtime instead;
 /// the supervisor can then send a new, explicit continuation.
-pub(crate) async fn retire_after_journal_failure(held: &Path, session: &str, journal: &crate::journal::Journal) -> anyhow::Result<()> {
-    stop_session_held(held, session, journal, true).await
+pub(crate) async fn retire_after_journal_failure(
+    held: &Path,
+    session: &str,
+    journal: &crate::journal::Journal,
+    mut retained: Option<&mut Process>,
+) -> anyhow::Result<()> {
+    stop_session_held(held, session, journal, true, || {
+        if let Some(process) = retained.as_deref_mut() {
+            process.reap_exited_child();
+        }
+    })
+    .await
 }
 
-async fn stop_session_held(held: &Path, session: &str, journal: &crate::journal::Journal, retire: bool) -> anyhow::Result<()> {
+async fn stop_session_held(
+    held: &Path,
+    session: &str,
+    journal: &crate::journal::Journal,
+    retire: bool,
+    mut reap: impl FnMut(),
+) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(held) {
         Ok(entries) => Some(entries),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -1757,21 +1792,31 @@ async fn stop_session_held(held: &Path, session: &str, journal: &crate::journal:
             std::fs::write(dir.join("retiring"), [])?;
         }
         let pg = Pid::from_raw(meta.pgid);
-        match group_probe(pg) {
-            Err(nix::errno::Errno::ESRCH) => {}
-            Ok(()) => {
-                anyhow::ensure!(
-                    held_group_owned(&meta, &dir),
-                    "Cannot prove ownership of held Claude Code process group {}; stop confirmation is required",
-                    meta.pgid
-                );
-                stop_held_group(pg, Pid::from_raw(meta.keeper), &dir, &meta.conversation).await?;
+        let mut probe = || {
+            reap();
+            group_probe(pg)
+        };
+        let stop = match probe() {
+            Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Ok(()) if held_group_owned(&meta, &dir) => stop_held_group(pg, Pid::from_raw(meta.keeper), &dir, &meta.conversation).await,
+            Ok(()) => Err(anyhow::anyhow!(
+                "Cannot prove ownership of held Claude Code process group {}; stop confirmation is required",
+                meta.pgid
+            )),
+            Err(e) => Err(anyhow::anyhow!("Cannot inspect held Claude Code process group {}: {e}", meta.pgid)),
+        };
+        if let Err(error) = stop {
+            // An exiting group can lose its last identifiable member before
+            // the kernel confirms absence. Without ownership we can only
+            // observe; keep the record and journal barrier on any refusal.
+            wait_group_absence_until(tokio::time::Instant::now() + Duration::from_secs(1), &mut probe).await;
+            if probe() != Err(nix::errno::Errno::ESRCH) {
+                return Err(error);
             }
-            Err(e) => anyhow::bail!("Cannot inspect held Claude Code process group {}: {e}", meta.pgid),
         }
         stopped.push((dir, meta.output_root));
     }
-    confirm_stopped(journal, session, Duration::from_secs(3)).await?;
+    confirm_stopped_reaping(journal, session, Duration::from_secs(3), reap).await?;
     for (dir, output_root) in stopped {
         let _ = std::fs::remove_dir_all(dir);
         if let Some(root) = output_root {
@@ -2385,6 +2430,18 @@ impl Process {
             if v["type"] != "stream_event" {
                 let _ = std::fs::write(h.dir.join("offset"), end.to_string());
             }
+        }
+    }
+
+    /// Recovery keeps the runtime and its FIFO until the durable PGID fence
+    /// is clear. Reap an exited wrapper we started so its zombie does not
+    /// itself keep that fence closed. This never waits or sends a signal;
+    /// the caller still needs fresh confirmation for the whole group.
+    fn reap_exited_child(&mut self) {
+        if let Some(child) = &mut self.child
+            && let Err(error) = child.try_wait()
+        {
+            warn!(%error, "reaping the Claude Code child before recovery cleanup");
         }
     }
 
@@ -7933,6 +7990,154 @@ while True:
         unrelated.kill().await.unwrap();
         stop_held_for_rewind(&held, "s", &journal).await.unwrap();
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn journal_retirement_observes_an_unowned_held_group_disappearing() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let record = held.join("old");
+        let output_root = dir.path().join("output");
+        std::fs::create_dir_all(&record).unwrap();
+        std::fs::create_dir_all(&output_root).unwrap();
+        let journal = crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        // A gated stand-in for a PGID without recognizable ownership. The
+        // record cannot authorize a signal; the fixture exits on its own.
+        let bin = script(dir.path(), "unrelated", "#!/bin/sh\nprintf 'ready\\n'\nread -r release\n[ \"$release\" = quit ]\n");
+        let mut child = tokio::process::Command::new(bin)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pgid = child.id().unwrap() as i32;
+        let mut ready = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        assert_eq!(c6_testkit::within("stand-in readiness", ready.next_line()).await.unwrap().as_deref(), Some("ready"));
+        let meta = HeldMeta {
+            session: "s".into(),
+            conversation: "old".into(),
+            launch: Launch { conversation: "old".into(), ..Default::default() },
+            pgid,
+            keeper: pgid,
+            output_root: Some(output_root.clone()),
+            token: None,
+        };
+        std::fs::write(record.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        assert!(!held_group_owned(&meta, &record));
+
+        let mut retirement = std::pin::pin!(retire_after_journal_failure(&held, "s", &journal, None));
+        tokio::select! {
+            biased;
+            result = &mut retirement => panic!("cleanup ended before the unowned group could disappear: {result:?}"),
+            () = c6_testkit::eventually("held retirement marker", async || record.join("retiring").exists().then_some(())) => {}
+        }
+        assert!(child.try_wait().unwrap().is_none(), "cleanup must not signal the stand-in");
+        assert_eq!(journal.claude_processes("s").await.unwrap(), vec![pgid]);
+        assert!(record.join("meta.json").exists(), "a live group must keep the held record");
+        child.stdin.take().unwrap().write_all(b"quit\n").await.unwrap();
+        assert!(c6_testkit::within("stand-in to exit without a signal", child.wait()).await.unwrap().success());
+        c6_testkit::within("retirement to confirm whole-group absence", retirement).await.unwrap();
+        assert!(journal.claude_processes("s").await.unwrap().is_empty());
+        assert!(!record.exists());
+        assert!(!output_root.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn journal_retirement_reaps_a_retained_wrapper_before_confirming_absence() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let journal = crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let bin = script(dir.path(), "claude", "#!/bin/sh\nread -r release\n[ \"$release\" = quit ]\n");
+        let launch = Launch { conversation: "retained-wrapper".into(), ..Default::default() };
+        let mut p = Process::spawn_held(&held, "s", &bin, launch, false, dir.path(), "opus", Arc::default(), None, None).unwrap();
+        let record = p.held.as_ref().unwrap().dir.clone();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        let pg = p.pgid.unwrap();
+        c6_testkit::eventually("held fixture keeper readiness", async || keeper_holds_fifo(keeper, pg, &record).then_some(())).await;
+        // Simulate the loss of the keeper, retaining the actual wrapper
+        // Child and open FIFO exactly as the recovering actor does.
+        nix::sys::signal::kill(keeper, Signal::SIGKILL).unwrap();
+        c6_testkit::eventually("the independently reaped keeper to disappear", async || {
+            (nix::sys::signal::kill(keeper, None) == Err(nix::errno::Errno::ESRCH)).then_some(())
+        })
+        .await;
+        p.stdin.lock().await.as_mut().unwrap().write_all(b"quit\n").await.unwrap();
+        c6_testkit::eventually("the wrapper to exit without being reaped", async || held_leader_exited(pg).then_some(())).await;
+        let meta: HeldMeta = serde_json::from_slice(&std::fs::read(record.join("meta.json")).unwrap()).unwrap();
+        assert!(!held_group_owned(&meta, &record));
+        assert_eq!(group_probe(pg), Ok(()), "the unreaped wrapper keeps its Linux PGID alive");
+        assert!(retire_after_journal_failure(&held, "s", &journal, None).await.is_err());
+        assert!(record.exists());
+        assert_eq!(journal.claude_processes("s").await.unwrap(), vec![pg.as_raw()]);
+
+        retire_after_journal_failure(&held, "s", &journal, Some(&mut p)).await.unwrap();
+        assert!(p.child.is_some(), "reaping does not discard the owning runtime");
+        assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
+        assert!(!record.exists());
+        assert!(journal.claude_processes("s").await.unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn journal_retirement_reaps_a_wrapper_that_exits_during_the_attempt() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let journal = crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let bin = script(dir.path(), "claude", "#!/bin/sh\nread -r release\n[ \"$release\" = quit ]\n");
+        let launch = Launch { conversation: "exits-during-retirement".into(), ..Default::default() };
+        let mut p = Process::spawn_held(&held, "s", &bin, launch, false, dir.path(), "opus", Arc::default(), None, None).unwrap();
+        let record = p.held.as_ref().unwrap().dir.clone();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        let pg = p.pgid.unwrap();
+        let stdin = p.stdin.clone();
+        c6_testkit::eventually("held fixture keeper readiness", async || keeper_holds_fifo(keeper, pg, &record).then_some(())).await;
+        nix::sys::signal::kill(keeper, Signal::SIGKILL).unwrap();
+        c6_testkit::eventually("the independently reaped keeper to disappear", async || {
+            (nix::sys::signal::kill(keeper, None) == Err(nix::errno::Errno::ESRCH)).then_some(())
+        })
+        .await;
+        let mut member = tokio::process::Command::new("/bin/sh")
+            .args(["-c", r#"printf 'ready\n'; read -r release; [ "$release" = quit ]"#])
+            .process_group(pg.as_raw())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut ready = BufReader::new(member.stdout.take().unwrap()).lines();
+        assert_eq!(c6_testkit::within("remaining group member readiness", ready.next_line()).await.unwrap().as_deref(), Some("ready"));
+        assert!(!held_leader_exited(pg));
+
+        let mut retirement = std::pin::pin!(retire_after_journal_failure(&held, "s", &journal, Some(&mut p)));
+        tokio::select! {
+            biased;
+            result = &mut retirement => panic!("retirement ended with a live group member: {result:?}"),
+            () = async {
+                c6_testkit::eventually("held retirement marker", async || record.join("retiring").exists().then_some(())).await;
+                stdin.lock().await.as_mut().unwrap().write_all(b"quit\n").await.unwrap();
+                c6_testkit::eventually("this retirement attempt to reap the wrapper", async || {
+                    (nix::sys::signal::kill(pg, None) == Err(nix::errno::Errno::ESRCH)).then_some(())
+                }).await;
+                assert_eq!(group_probe(pg), Ok(()), "reaping the wrapper does not prove whole-group absence");
+                assert_eq!(journal.claude_processes("s").await.unwrap(), vec![pg.as_raw()]);
+                assert!(record.exists());
+                member.stdin.take().unwrap().write_all(b"quit\n").await.unwrap();
+                assert!(member.wait().await.unwrap().success());
+            } => {}
+        }
+        c6_testkit::within("the same attempt to confirm whole-group absence", retirement).await.unwrap();
+        assert!(!record.exists());
+        assert!(journal.claude_processes("s").await.unwrap().is_empty());
     }
 
     #[tokio::test]

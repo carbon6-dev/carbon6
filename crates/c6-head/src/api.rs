@@ -110,6 +110,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/tasks/{task}", get(task_snapshot))
         .route("/api/v1/sessions/{id}/tasks/{task}/stop", post(stop_task))
         .route("/api/v1/sessions/{id}/notices/deliver", post(deliver_notices))
+        .route("/api/v1/sessions/{id}/recovery", post(session_recovery_action))
         .route("/api/v1/sessions/{id}/approvals/{call_id}", post(decide_approval))
         .route("/api/v1/settings/policies", get(get_policies).put(put_policies))
         .route("/api/v1/settings/routes", get(get_routes).put(put_routes))
@@ -1935,6 +1936,9 @@ async fn put_subagent_limits(State(st): State<Arc<HeadState>>, Json(l): Json<api
     if !(1..=1440).contains(&l.claude_code_idle_minutes) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "an idle Claude Code process stays up 1 to 1440 minutes".into()));
     }
+    if !(1..=3600).contains(&l.session_recovery_seconds) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "automatic journal recovery lasts 1 to 3600 seconds".into()));
+    }
     if !(1..=32).contains(&l.max_message_hops) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "a chain of session messages is 1 to 32 long".into()));
     }
@@ -2404,6 +2408,20 @@ async fn deliver_notices(State(st): State<Arc<HeadState>>, Path(id): Path<String
     } else {
         Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
     }
+}
+
+async fn session_recovery_action(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(req): Json<api::SessionRecoveryRequest>,
+) -> ApiResult<StatusCode> {
+    let session = visible_session(&st, &caller, &id).await?;
+    if !matches!(req.action.as_str(), "retry" | "restart") || uuid::Uuid::parse_str(&req.incident).is_err() {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "invalid recovery incident or action".into()));
+    }
+    crate::sessions::recovery_action(&st, &session, req).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn stop_task(State(st): State<Arc<HeadState>>, Path((id, task)): Path<(String, String)>) -> ApiResult<StatusCode> {
@@ -3553,9 +3571,24 @@ async fn stream_socket(st: Arc<HeadState>, session_id: String, q: StreamQuery, m
     if !catch_up(&st, &session_id, &mut last, &mut socket).await || !send(&mut socket, &api::StreamMsg::Synced).await {
         return;
     }
+    let mut showing_recovery = false;
+    if let Some(status) = crate::sessions::recovery_status(&st, &session_id).await {
+        showing_recovery = true;
+        if !send(&mut socket, &api::StreamMsg::Recovery { status: Some(status) }).await {
+            return;
+        }
+    }
+    let mut recovery_lease = tokio::time::interval(Duration::from_secs(15));
     loop {
         tokio::select! {
             _ = st.shutdown.cancelled() => return,
+            _ = recovery_lease.tick(), if showing_recovery => {
+                // A worker can go away without sending an explicit clear.
+                if crate::sessions::recovery_status(&st, &session_id).await.is_none() {
+                    showing_recovery = false;
+                    if !send(&mut socket, &api::StreamMsg::Recovery { status: None }).await { return }
+                }
+            }
             msg = live.recv() => match msg {
                 Ok(api::StreamMsg::Event { event }) => {
                     if event.seq <= last { continue }
@@ -3566,9 +3599,20 @@ async fn stream_socket(st: Arc<HeadState>, session_id: String, q: StreamQuery, m
                     last = event.seq;
                     if !send(&mut socket, &api::StreamMsg::Event { event }).await { return }
                 }
+                Ok(api::StreamMsg::Recovery { .. }) => {
+                    // Use the current state, not a stale broadcast from catch-up.
+                    let status = crate::sessions::recovery_status(&st, &session_id).await;
+                    showing_recovery = status.is_some();
+                    if !send(&mut socket, &api::StreamMsg::Recovery { status }).await { return }
+                }
                 Ok(other) => if !send(&mut socket, &other).await { return },
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     if !catch_up(&st, &session_id, &mut last, &mut socket).await { return }
+                    let status = crate::sessions::recovery_status(&st, &session_id).await;
+                    if showing_recovery || status.is_some() {
+                        showing_recovery = status.is_some();
+                        if !send(&mut socket, &api::StreamMsg::Recovery { status }).await { return }
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             },

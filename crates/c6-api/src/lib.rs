@@ -2131,6 +2131,9 @@ pub struct SubagentLimits {
     /// up, in minutes.
     #[serde(default = "default_claude_code_idle_minutes")]
     pub claude_code_idle_minutes: u32,
+    /// Stop retrying automatically after this many seconds of journal recovery.
+    #[serde(default = "default_session_recovery_seconds")]
+    pub session_recovery_seconds: u32,
     /// Longest chain of messages between sessions (default 4). A send adds
     /// one to the last session message delivered; direct UI or HTTP API
     /// input resets the session's count to 0. Sends beyond this limit are refused.
@@ -2149,6 +2152,7 @@ pub const DEFAULT_NOTICE_NO_PROGRESS_LIMIT: u32 = 5;
 pub const DEFAULT_NOTICE_FAILURE_RELAUNCH_LIMIT: u32 = 3;
 pub const DEFAULT_NOTICE_TOKENS_PER_HOUR: u64 = 5_000_000;
 pub const DEFAULT_CLAUDE_CODE_IDLE_MINUTES: u32 = 15;
+pub const DEFAULT_SESSION_RECOVERY_SECONDS: u32 = 180;
 pub const DEFAULT_MAX_MESSAGE_HOPS: u32 = 4;
 pub const DEFAULT_MESSAGES_PER_HOUR: u32 = 30;
 
@@ -2184,6 +2188,10 @@ fn default_claude_code_idle_minutes() -> u32 {
     DEFAULT_CLAUDE_CODE_IDLE_MINUTES
 }
 
+fn default_session_recovery_seconds() -> u32 {
+    DEFAULT_SESSION_RECOVERY_SECONDS
+}
+
 fn default_subagent_depth() -> u32 {
     DEFAULT_SUBAGENT_DEPTH
 }
@@ -2203,6 +2211,7 @@ impl Default for SubagentLimits {
             notice_failure_relaunch_limit: DEFAULT_NOTICE_FAILURE_RELAUNCH_LIMIT,
             notice_tokens_per_hour: DEFAULT_NOTICE_TOKENS_PER_HOUR,
             claude_code_idle_minutes: DEFAULT_CLAUDE_CODE_IDLE_MINUTES,
+            session_recovery_seconds: DEFAULT_SESSION_RECOVERY_SECONDS,
             max_message_hops: DEFAULT_MAX_MESSAGE_HOPS,
             messages_per_hour: DEFAULT_MESSAGES_PER_HOUR,
         }
@@ -3206,6 +3215,20 @@ pub struct CatalogCall {
     pub confirmed: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionRecovery {
+    pub incident: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionRecoveryRequest {
+    pub incident: String,
+    pub action: String,
+}
+
 /// Messages on `WS /api/v1/sessions/{id}/stream`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -3241,6 +3264,10 @@ pub enum StreamMsg {
         /// failed model call again); empty: nothing to say.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         status: String,
+    },
+    /// Live recovery state; a null status clears a previous escalation.
+    Recovery {
+        status: Option<SessionRecovery>,
     },
     /// A secret an operation returned (a token, a code), for you only:
     /// shown live, never logged or given to the model.

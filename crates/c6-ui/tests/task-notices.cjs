@@ -6,7 +6,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { serve, fixture, settle, launchBrowser } = require('./motion.cjs');
+const { serve, fixture, settle, within, launchBrowser } = require('./motion.cjs');
 const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
 const before = process.env.BEFORE === '1';
 const phase = before ? 'before' : 'after';
@@ -110,6 +110,56 @@ async function check(browser, origin, engine, name, theme) {
   } finally { await f?.context.close(); }
 }
 
+async function recoveryCheck(browser, origin, engine, name, theme) {
+  let f, release, arrived;
+  const firstRequest = new Promise(resolve => { arrived = resolve; });
+  const actions = [];
+  const { width, height, tiles } = views[name];
+  const incident = '01a1ff5b-1944-76c1-a000-3abdc42efe0f';
+  const reason = 'Cannot prove ownership of held Claude Code process group 1315128; stop confirmation is required';
+  try {
+    f = await fixture(browser, origin, { width, height }, theme,
+      { choice: 'off', os: 'reduce', effective: 'off' }, () => {}, {}, {
+        layout: layout(tiles),
+        setup: async ({ context }) => context.route('**/api/v1/sessions/parent/recovery', async route => {
+          actions.push(route.request().postDataJSON());
+          if (actions.length === 1) {
+            const response = new Promise(resolve => { release = resolve; });
+            arrived();
+            await response;
+            return route.fulfill({ status: 409, json: { error: 'Recovery is still blocked by its ownership fence' } });
+          }
+          return route.fulfill({ status: 204 });
+        }),
+      });
+    const { page } = f;
+    f.stream({ type: 'recovery', status: { incident, reason } });
+    const banner = page.getByRole('status').filter({ hasText: 'Session recovery is stuck' });
+    await banner.waitFor();
+    assert((await banner.textContent()).includes(reason), 'the actual recovery refusal is visible');
+    const retry = banner.getByRole('button', { name: 'Retry', exact: true });
+    const restart = banner.getByRole('button', { name: 'Restart this session agent', exact: true });
+    await retry.click();
+    await within('the retry request to reach the private fixture', () => firstRequest);
+    await page.waitForFunction(() => [...document.querySelectorAll('[role=status] button')]
+      .filter(button => /^(Retry|Restart this session agent)$/.test(button.textContent)).every(button => button.disabled));
+    assert.deepEqual(actions, [{ incident, action: 'retry' }]);
+    release();
+    await banner.getByText('Recovery is still blocked by its ownership fence', { exact: false }).waitFor();
+    await restart.click();
+    await banner.getByText('Recovery requested.', { exact: true }).waitFor();
+    assert.deepEqual(actions, [{ incident, action: 'retry' }, { incident, action: 'restart' }]);
+    await banner.scrollIntoViewIfNeeded();
+    await settle(page);
+    assert(await banner.evaluate(el => el.scrollWidth <= el.clientWidth + 1), 'recovery reason fits the tile');
+    await page.screenshot({ path: path.join(shots, `recovery-${engine}-${theme}-${name}.png`) });
+    f.stream({ type: 'recovery', status: null });
+    await banner.waitFor({ state: 'hidden' });
+    assert.deepEqual(f.errors, [], 'no browser errors while reporting or clearing recovery');
+    console.log(`PASS recovery/${engine}/${theme}/${name}`);
+  } finally { release?.(); await f?.context.close(); }
+}
+
 (async () => {
   fs.mkdirSync(shots, { recursive: true });
   const { server, origin } = await serve();
@@ -118,7 +168,9 @@ async function check(browser, origin, engine, name, theme) {
       const browser = await launchBrowser(playwright, engine);
       try {
         for (const theme of (process.env.THEME || 'light,dark').split(',')) {
-          for (const name of (process.env.VIEWPORT || Object.keys(views).join(',')).split(',')) await check(browser, origin, engine, name, theme);
+          for (const name of (process.env.VIEWPORT || Object.keys(views).join(',')).split(',')) {
+            await (process.argv.includes('--recovery') ? recoveryCheck : check)(browser, origin, engine, name, theme);
+          }
         }
       } finally { await browser.close(); }
     }

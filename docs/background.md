@@ -258,6 +258,36 @@ Built 2026-11-03 (design: carbon6 doc "Claude Code sessions: default-deny tool w
 - **Readable transcript rows.** Optional `task_notice` metadata (`kind`, `title`, `session_id`, `status`, `markdown`) travels with the queued notice, its delivered `UserMessage`, and remote `DelegationEnded` reports. The closed row keeps its corner-arrow icon and one small line: for example, "Report from zmbp ops · finished" or "Background command finished: Run all checks". Long titles truncate rather than widen a tile; the full description remains in the summary's tooltip. Expanding shows the readable Markdown report first, a link to its session when present, then a separately folded "Raw text the agent received". The model's original text is unchanged. Labels never infer a sender by parsing that text. Older workers/events without metadata show "Background notice" and an explanation above the raw-text disclosure, not a claim that a person sent it. These are additive protocol/API fields; no database migration or historical rewrite is needed.
 - **On load** (`SessionManager::load`, `notices_of`), the actor restores pending notices by `command_id`. A `UserMessage` with that ID marks the notice as taken. This covers worker restarts and actors that stopped mid-turn. A Claude Code session's notice counts as taken once the CLI echoes it.
 - **A failed journal write keeps the actor's delivery ownership.** Its supervisor retains the mailbox, extracted but unrecorded inputs, the current background callback and notices whose first queue write failed. It retries those writes before taking more work; subagent handoffs remain unreceipted until the parent actually records the result or fallback notice. An unrecorded local callback cannot survive a simultaneous worker-process crash: there is no durable copy yet. Startup task loss says the worker restarted; ordinary session recovery does not invent a restart, and journal-failed child reports include the editable failure cause.
+- **Recovery replaces the connection, not the journal.** Before rebuilding a
+  failed actor, the worker closes its single pooled SQLite connection and
+  opens a fresh one with the same WAL/FULL options. It never deletes WAL or
+  shared-memory files, nor blindly repeats a write whose commit is uncertain.
+  Reload checks the durable receipts before delivering the retained notices.
+  See docs/restarts.md for the distinction between SQLite SHMSIZE and SHMMAP
+  errors and the limits of diagnosing the November 21 incident.
+- **Recovery cannot stay silently blocked.** `session_recovery_seconds` in
+  Agents' limits sets the automatic recovery budget recorded when the head
+  creates a session (default **180 seconds**, allowed **1–3600 seconds**).
+  Local subagents inherit their parent's recorded budget, including children
+  created after the setting changes; existing sessions are not updated.
+  Older sessions with no recorded value use the default. If the
+  actor is still unable to recover, the session shows **Session recovery is stuck**
+  with the reason, **Retry**, and **Restart this session agent**. The head
+  sends a user notification and, for a subagent, a failure notice to its
+  parent using the editable recovery prompt. This reporting/control lane
+  does not use the failing worker journal or the blocked actor mailbox.
+  Live status is scoped to the owning worker and epoch. Parent warnings use
+  a stable command ID; user-notification deduplication is live head state,
+  so restarting the head can repeat an alert for the same incident.
+  Retry attempts recovery once; Restart renews the bounded automatic
+  recovery window and rechecks retirement from scratch. Neither action
+  discards notices, bypasses ownership checks, or authorizes signaling an
+  unidentified process group. An attempt already retiring a process or
+  rebuilding state is allowed to finish safely; controls report busy until
+  it reaches the manual-action boundary. Held notices are delivered after recovery.
+  `task-notices.cjs --recovery` exercises the production UI's reason, both
+  actions, a refused retry, disabled in-flight controls, and clearing the
+  banner after recovery on a private mocked head.
 - **Later (step 4):** the head treats `NoticeQueued{command_id}` as a command applied, so it doesn't resend a session message the worker has already recorded.
 - **Waiting notices are shown.** The events API carries `NoticeQueued` (not drawn in the transcript), so the UI knows a notice no turn has taken yet. While the session is idle, a pill above the message box lists the waiting notices and why they are waiting: merging reports, a group threshold, or a guard pause. The display grace is separate from the scheduling window and only prevents promptly delivered notices from flashing in the pill. A guard pause also emits a user notification. **Deliver now** (**Continue** when paused) sends `ReleaseNotices` via `POST /api/v1/sessions/{id}/notices/deliver` and starts one turn with the held notices.
 - **Restart order.** Recovery first takes up held shell commands and held Claude Code processes that are still valid for the session's confirmed branch (docs/restarts.md). Tasks that cannot be taken up are recorded `lost`, and those ends go through the same path. A pending Rewind owns its old process cleanup instead of adopting it for ordinary work.

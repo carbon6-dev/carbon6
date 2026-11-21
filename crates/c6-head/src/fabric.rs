@@ -137,6 +137,9 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
     if let Some(what) = method.strip_prefix("session.") {
         let session_id = params["session_id"].as_str().ok_or_else(|| bad_request("session_id is required"))?.to_owned();
         let session = st.store.session(&session_id).await?.ok_or_else(|| bad_request("no such session"))?;
+        if what == "recovery_status" {
+            return crate::sessions::report_recovery(st, from, &session, &params).await;
+        }
         if session.worker_id != from.to_string() {
             return Err(bad_request("that session is not on this worker"));
         }

@@ -395,6 +395,7 @@ carbon6.v1.CreateSession 38 uint32 notice_max_wait_seconds
 carbon6.v1.CreateSession 39 uint32 notice_no_progress_limit
 carbon6.v1.CreateSession 40 uint32 notice_failure_relaunch_limit
 carbon6.v1.CreateSession 41 uint64 notice_tokens_per_hour
+carbon6.v1.CreateSession 42 uint32 session_recovery_seconds
 carbon6.v1.NoticeQueued 12 string reason
 carbon6.v1.SubagentSpawned 8 string group
 carbon6.v1.SubagentSpawned 9 string wake

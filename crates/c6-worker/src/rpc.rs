@@ -123,6 +123,14 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
             let task = params["task_id"].as_str().context("task_id required")?;
             Ok(worker.sessions.task_snapshot(session, task).unwrap_or(Value::Null))
         }
+        "session.recovery_action" => {
+            let session = params["session_id"].as_str().context("session_id required")?;
+            let epoch = params["ownership_epoch"].as_u64().context("ownership_epoch required")?;
+            let incident = params["incident"].as_str().context("incident required")?;
+            let action = params["action"].as_str().context("action required")?;
+            worker.sessions.recovery_action(session, epoch, incident, action)?;
+            Ok(Value::Null)
+        }
         "ssh.check" => ssh_check(params["target"].as_str().unwrap_or_default()).await,
         // A work item's place, when its work ends (docs/dev-starts.md §5).
         "worktree.end" => {

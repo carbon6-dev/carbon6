@@ -9,18 +9,23 @@ use c6_proto::{ModelSpec, SessionCommand, UserInput, session_command, session_ev
 use c6_testkit::eventually;
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 const WARMUP: &str = "Hold this warmup turn at the reply gate.";
 const ORIGINAL: &str = "Keep this exact request after the TurnStarted failure.";
 const SECOND: &str = "Keep this second request in the same original batch.";
+const UNOWNED: &str = "unowned-recovery-fixture";
 
 struct StopFakeCli(PathBuf);
 
 impl Drop for StopFakeCli {
     fn drop(&mut self) {
         for entry in std::fs::read_dir(&self.0).into_iter().flatten().flatten() {
+            if entry.file_name() == UNOWNED {
+                continue; // The stand-in is owned only by its child handle.
+            }
             if let Ok(data) = std::fs::read(entry.path().join("meta.json"))
                 && let Ok(meta) = serde_json::from_slice::<Value>(&data)
                 && let Some(pgid) = meta["pgid"].as_i64().filter(|p| *p > 1)
@@ -188,11 +193,47 @@ done
             .then_some(())
     })
     .await;
+
+    // Add an unowned group to the first cleanup. It stays live across one
+    // full attempt, then exits on its own during the next attempt. The actor
+    // must neither signal it nor launch a replacement before it has stopped.
+    let mut unowned = tokio::process::Command::new("/bin/sh")
+        .args(["-c", r#"printf 'ready\n'; read -r release; [ "$release" = quit ]"#])
+        .process_group(0)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut readiness = BufReader::new(unowned.stdout.take().unwrap()).lines();
+    assert_eq!(c6_testkit::within("unowned group readiness", readiness.next_line()).await.unwrap().as_deref(), Some("ready"));
+    let unowned_pgid = unowned.id().unwrap() as i32;
+    let unowned_record = held.join(UNOWNED);
+    std::fs::create_dir(&unowned_record).unwrap();
+    std::fs::write(
+        unowned_record.join("meta.json"),
+        serde_json::to_vec(&json!({"session": sid, "conversation": UNOWNED, "pgid": unowned_pgid, "keeper": unowned_pgid})).unwrap(),
+    )
+    .unwrap();
     release_reply(&gate).await;
+    let retiring = unowned_record.join("retiring");
+    eventually("the first attempt to encounter the unowned group", async || retiring.exists().then_some(())).await;
+    // This deliberately unadoptable, differently named record is test-only.
+    // Recreating the marker causes an observable edge on the next attempt.
+    std::fs::remove_file(&retiring).unwrap();
+    eventually("the supervisor to retry cleanup with the group still live", async || retiring.exists().then_some(())).await;
+    assert!(unowned.try_wait().unwrap().is_none(), "recovery must not signal a group without ownership");
+    assert!(worker.journal.claude_processes(sid).await.unwrap().contains(&unowned_pgid));
+    assert_eq!(std::fs::read_to_string(&starts).unwrap().lines().count(), 1, "the unowned group kept the replacement fenced");
+    unowned.stdin.take().unwrap().write_all(b"quit\n").await.unwrap();
+    assert!(c6_testkit::within("the unowned group to exit without signals", unowned.wait()).await.unwrap().success());
+
     let events = eventually("explicit recovery without another message", async || {
         let events: Vec<c6_api::Event> = http.get(format!("{api}/sessions/{sid}/events")).send().await.unwrap().json().await.unwrap();
         events.iter().any(|e| matches!(&e.kind, EventKind::Assistant { blocks, .. } if format!("{blocks:?}").contains("Reply from explicit recovery"))).then_some(events)
     }).await;
+    assert!(!unowned_record.exists(), "fresh absence clears the old held record");
+    assert!(!worker.journal.claude_processes(sid).await.unwrap().contains(&unowned_pgid));
     assert!(events.iter().any(|e| matches!(e.kind, EventKind::TurnEnded { reason: TurnEndReason::Error, .. })));
     assert_eq!(
         events
@@ -345,6 +386,67 @@ done
     assert!(
         matches!(new_inputs.as_slice(), [first, second, third] if first.ends_with(ORIGINAL) && *second == SECOND && *third == later),
         "{new_inputs:?}"
+    );
+
+    // A report arriving while the next CLI turn is held has no head command
+    // to redeliver in this test. Fail its queue write, then verify recovery
+    // delivers that same notice once without another user input.
+    let notice_report = "notice-arrived-during-held-turn";
+    let notice_id = "subagent:held-turn-report";
+    let before_notice = recovered.last().unwrap().seq;
+    let stdin_before_notice = inputs.len();
+    send_once(&worker, sid, "warmup-for-held-notice", WARMUP, None).await;
+    eventually("the running CLI to take the held-notice warmup", async || {
+        let captured = std::fs::read_to_string(&stdin).ok()?;
+        let line: Value = serde_json::from_str(captured.lines().nth(stdin_before_notice)?).ok()?;
+        (line["message"]["content"].as_str() == Some(WARMUP)).then_some(())
+    })
+    .await;
+    sqlx::query(
+        "CREATE TRIGGER fail_held_notice BEFORE INSERT ON events
+         WHEN instr(NEW.data, CAST('notice-arrived-during-held-turn' AS BLOB)) > 0
+         BEGIN SELECT RAISE(ABORT, 'injected held notice failure'); END",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let failed = worker
+        .sessions
+        .handle(SessionCommand {
+            session_id: sid.into(),
+            command_id: "held-turn-report".into(),
+            ownership_epoch: 0,
+            kind: Some(session_command::Kind::DelegationEnded(c6_proto::DelegationEnded {
+                child_session_id: "test-remote-child".into(),
+                reason: c6_proto::TurnEndReason::Completed as i32,
+                report: notice_report.into(),
+                wake: true,
+                ..Default::default()
+            })),
+        })
+        .await
+        .unwrap_err();
+    assert!(failed.contains("injected held notice failure"), "{failed}");
+    sqlx::query("DROP TRIGGER fail_held_notice").execute(&db).await.unwrap();
+
+    let notice_events = eventually("the retained notice to be sent and its turn to complete", async || {
+        let events = worker.journal.events_after(sid, before_notice, u32::MAX).await.unwrap();
+        let receipt = events.iter().position(|e| {
+            matches!(&e.kind, Some(session_event::Kind::User(user)) if user.command_id == notice_id && user.text.contains(notice_report))
+        })?;
+        events[receipt + 1..].iter().any(completed).then_some(events)
+    })
+    .await;
+    assert_eq!(
+        notice_events.iter().filter(|e| matches!(&e.kind, Some(session_event::Kind::User(user)) if user.command_id == notice_id)).count(),
+        1
+    );
+    assert_eq!(
+        cli_inputs(&stdin)
+            .iter()
+            .filter(|line| line["message"]["content"].as_str().is_some_and(|text| text.contains(notice_report)))
+            .count(),
+        1
     );
     stop.cancel();
     head.shutdown().await.unwrap();

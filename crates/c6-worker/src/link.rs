@@ -67,6 +67,17 @@ pub struct HeadLink {
     calls: Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>,
 }
 
+struct CallRegistration<'a> {
+    link: &'a HeadLink,
+    id: u64,
+}
+
+impl Drop for CallRegistration<'_> {
+    fn drop(&mut self) {
+        self.link.calls.lock().unwrap().remove(&self.id);
+    }
+}
+
 impl HeadLink {
     /// A link to the head in this process.
     pub fn local(head: Arc<dyn LocalHead>) -> Self {
@@ -110,17 +121,17 @@ impl HeadLink {
         }
         let tx = self.outbound.lock().unwrap().clone().ok_or_else(|| anyhow!("not connected to the head"))?;
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let call = c6_proto::HeadCall { id, method: method.to_owned(), params_json: serde_json::to_vec(&params)? };
         let (done, wait) = oneshot::channel();
         self.calls.lock().unwrap().insert(id, done);
-        let call = c6_proto::HeadCall { id, method: method.to_owned(), params_json: serde_json::to_vec(&params)? };
+        // A caller can cancel either the send or the reply wait. Replies and
+        // disconnects may have already removed the record when we drop it.
+        let _registration = CallRegistration { link: self, id };
         tx.send(WorkerMsg { msg: Some(worker_msg::Msg::HeadCall(call)) }).await.map_err(|_| anyhow!("head connection closed"))?;
         match tokio::time::timeout(CALL_TIMEOUT, wait).await {
             Ok(Ok(r)) => r.map_err(|e| anyhow!(e)),
             Ok(Err(_)) => bail!("head connection closed during {method}"),
-            Err(_) => {
-                self.calls.lock().unwrap().remove(&id);
-                bail!("no answer from the head to {method} in {}s", CALL_TIMEOUT.as_secs())
-            }
+            Err(_) => bail!("no answer from the head to {method} in {}s", CALL_TIMEOUT.as_secs()),
         }
     }
 
@@ -569,6 +580,25 @@ mod tests {
     use c6_proto::{SessionActivity, TextDelta};
 
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_head_call_removes_registration_during_send_and_reply_wait() {
+        for blocked_send in [true, false] {
+            let link = HeadLink::default();
+            let (tx, mut rx) = mpsc::channel(1);
+            if blocked_send {
+                tx.try_send(WorkerMsg::default()).unwrap();
+            }
+            link.connected(tx);
+            let mut call = Box::pin(link.call("test", serde_json::Value::Null));
+            assert!(futures::poll!(call.as_mut()).is_pending());
+            assert_eq!(link.calls.lock().unwrap().len(), 1);
+            assert_eq!(rx.try_recv().unwrap().msg.is_none(), blocked_send);
+            drop(call);
+            assert!(link.calls.lock().unwrap().is_empty());
+            assert!(rx.try_recv().is_err());
+        }
+    }
 
     fn text(session: &str, turn: u64, t: &str) -> EphemeralEvent {
         EphemeralEvent {

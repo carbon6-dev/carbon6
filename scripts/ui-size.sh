@@ -10,7 +10,12 @@ cd "$(dirname "$0")/.."
 # 2026-11-14: raised for the UI that landed since (126 UI commits: batch
 # starts, capture and Up next, session goals, browser Back, transcript times
 # and more), measured from the Linux release build.
-accepted_raw=10852038
+# 2026-11-21: the release with recovery status and guarded controls measures
+# 326,355 raw bytes and 1,319 Brotli bytes above their accepted baselines.
+# After simplifying the banner and
+# sharing JSON serialization, record the measured Linux release raw size;
+# the compressed build still fits its existing allowance below.
+accepted_raw=11178393
 # 2026-11-21: aliases add creation/switch controls and per-account transcript
 # metadata. After sharing Settings renderers, the measured Linux release is
 # 2,790,904 bytes Brotli (82,824 above the previous accepted build); raw WASM

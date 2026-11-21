@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use c6_api::{ContentBlock, Event, EventKind, QueuedInput, Session, SessionStatus, StreamMsg, TurnEndReason};
+use c6_api::{ContentBlock, Event, EventKind, QueuedInput, Session, SessionRecovery, SessionStatus, StreamMsg, TurnEndReason};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -349,6 +349,7 @@ pub(crate) struct Feed {
     queued: RwSignal<Vec<QueuedInput>>,
     composer: RwSignal<Option<ComposerDraft>>,
     activity: RwSignal<Option<bool>>,
+    recovery: RwSignal<Option<SessionRecovery>>,
     /// Secrets the assistant's operations returned, for you (shown while
     /// this page is open; never logged).
     secrets: RwSignal<Vec<SecretCard>>,
@@ -471,6 +472,7 @@ impl Feed {
             queued: RwSignal::new(Vec::new()),
             composer: RwSignal::new(None),
             activity: RwSignal::new(None),
+            recovery: RwSignal::new(None),
             secrets: RwSignal::new(Vec::new()),
             synced: RwSignal::new(false),
             stream_failed: RwSignal::new(false),
@@ -480,7 +482,7 @@ impl Feed {
             navigation: RwSignal::new(0),
             id: StoredValue::new(id.clone()),
         };
-        let Feed { events, streaming, queued, activity, secrets, synced, stream_failed, from, to, .. } = feed;
+        let Feed { events, streaming, queued, activity, recovery, secrets, synced, stream_failed, from, to, .. } = feed;
         // The replay arrives all at once (not an event at a time, each
         // drawn and scrolled to).
         let replay = StoredValue::new(Vec::<Event>::new());
@@ -525,8 +527,10 @@ impl Feed {
                     streaming.update(|s| s.status.clear());
                 }
             }
+            StreamMsg::Recovery { status } => recovery.set(status),
             StreamMsg::Queue { queued: q } => queued.set(q),
             StreamMsg::Synced => {
+                recovery.set(None);
                 let r = replay.try_update_value(std::mem::take).unwrap_or_default();
                 // Opened at a place: drawn from there, not to the end.
                 if !synced.get_untracked()
@@ -781,7 +785,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }
         });
     }
-    let Feed { events, queued, activity, .. } = feed;
+    let Feed { events, queued, activity, recovery, .. } = feed;
     let error = RwSignal::new(None::<String>);
 
     let own_session = {
@@ -790,7 +794,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     };
     let status = Memo::new(move |_| own_session.get().map_or(SessionStatus::Starting, |s| s.status));
     let archived = Signal::derive(move || own_session.get().is_some_and(|s| s.archived));
-    let running = move || status.get() == SessionStatus::Running || activity.get() == Some(true);
+    let running = move || recovery.with(Option::is_none) && (status.get() == SessionStatus::Running || activity.get() == Some(true));
 
     // Follow the bottom of the transcript unless the user scrolled up, or
     // came for a particular place (from search).
@@ -2951,7 +2955,7 @@ fn Transcript(
     #[prop(optional)] timeline: Option<crate::timeline::Timeline>,
     #[prop(optional)] chrome: Option<SessionChrome>,
 ) -> impl IntoView {
-    let Feed { events, usage, spawns, streaming, queued, secrets, from, to, .. } = feed;
+    let Feed { events, usage, spawns, streaming, queued, recovery, secrets, from, to, .. } = feed;
     let id = StoredValue::new(session.id.clone());
     let paths = {
         let session_id = session.id.clone();
@@ -3450,6 +3454,7 @@ fn Transcript(
             })}
             <Show when=move || to.get().is_none()>
                 <crate::decisions::SessionDecisions session=id.get_value() />
+                <RecoveryBanner recovery session_id=id.get_value() />
             </Show>
             {move || secrets.get().into_iter().map(|c| view! { <SecretCardView card=c on_dismiss=Callback::new(move |id: String| secrets.update(|s| s.retain(|x| x.call_id != id))) /> }).collect_view()}
             // Failed deliveries belong to the transcript, before the growing
@@ -3898,6 +3903,42 @@ fn waiting_notices(evs: &[Event], now: i64) -> Vec<WaitingNotice> {
             })
         })
         .collect()
+}
+
+#[component]
+fn RecoveryBanner(recovery: RwSignal<Option<SessionRecovery>>, session_id: String) -> impl IntoView {
+    let sending = RwSignal::new(false);
+    let result = RwSignal::new(String::new());
+    let id = StoredValue::new(session_id);
+    let action = move |action: &'static str| {
+        let Some(status) = recovery.get_untracked() else { return };
+        if sending.get_untracked() {
+            return;
+        }
+        sending.set(true);
+        result.set(String::new());
+        spawn_local(async move {
+            let message = match api::recover_session(id.get_value(), status.incident, action).await {
+                Ok(()) => "Recovery requested.".into(),
+                Err(error) => error,
+            };
+            let _ = result.try_set(message);
+            let _ = sending.try_set(false);
+        });
+    };
+    view! {
+        <div role="status" hidden=move || recovery.with(Option::is_none)
+            class="space-y-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+            <p class="font-medium">"Session recovery is stuck"</p>
+            <p class="break-words">{move || recovery.with(|s| s.as_ref().map(|s| s.reason.clone()).unwrap_or_default())}</p>
+            <p>"Queued messages and notices are held. Restart starts a fresh recovery cycle for this session only."</p>
+            <div class="flex flex-wrap gap-2">
+                <button class=UBTN disabled=move || sending.get() on:click=move |_| action("retry")>"Retry"</button>
+                <button class=UBTN disabled=move || sending.get() on:click=move |_| action("restart")>"Restart this session agent"</button>
+            </div>
+            <p>{move || result.get()}</p>
+        </div>
+    }
 }
 
 /// While the session is idle: the notices waiting for its agent, and a way

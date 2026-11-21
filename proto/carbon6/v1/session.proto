@@ -802,6 +802,8 @@ message CreateSession {
   uint32 notice_no_progress_limit = 39;
   uint32 notice_failure_relaunch_limit = 40;
   uint64 notice_tokens_per_hour = 41;
+  // Time allowed for automatic journal recovery. 0: use the default.
+  uint32 session_recovery_seconds = 42;
 }
 
 // How a new git worktree is made: the branch ({{id}} is the session's

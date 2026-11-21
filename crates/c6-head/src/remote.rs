@@ -331,6 +331,35 @@ pub async fn rejected(st: &HeadState, session_id: &str, command_id: &str, why: &
     }
 }
 
+/// Queue a recovery warning as a distinct report, not a completion of an
+/// earlier invocation. The child may still finish after the owner retries.
+pub(crate) async fn recovery_notice(
+    st: &HeadState,
+    child: &SessionRow,
+    parent: &str,
+    status: &c6_api::SessionRecovery,
+) -> anyhow::Result<()> {
+    let text = crate::prompts::get(st, "session.subagent_recovery_stuck", &child.realm)
+        .await
+        .replace("{{child}}", &child.id)
+        .replace("{{reason}}", &status.reason);
+    send(
+        st,
+        parent,
+        &format!("recovery:{}:{}", child.id, status.incident),
+        &[],
+        DelegationEnded {
+            child_session_id: child.id.clone(),
+            reason: TurnEndReason::Error as i32,
+            task_notice: Some(c6_worker::task_report_notice(&child.title, &child.id, TurnEndReason::Error, &text)),
+            digest: text,
+            wake: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 /// Queues `ended` for the parent: delivered when its worker is connected,
 /// and again until the parent's log says it got it.
 async fn send(st: &HeadState, parent_id: &str, id: &str, inputs: &[String], ended: DelegationEnded) -> anyhow::Result<()> {

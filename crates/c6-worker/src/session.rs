@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, build_system_prompt, history_from_events, run_turn};
@@ -66,6 +67,7 @@ type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 #[derive(Clone)]
 struct Handle {
     tx: mpsc::UnboundedSender<ActorMsg>,
+    recovery: Arc<RecoveryGate>,
     tools: Arc<SessionTools>,
     /// A turn is running.
     running: Arc<std::sync::atomic::AtomicBool>,
@@ -310,6 +312,157 @@ const NOTICE_RECOVERY_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const HANDOFF_REWIND: &str = "can only rewind to a message after the last switch between Claude Code and carbon6's agent: \
                               the other runtime's conversation cannot be taken back";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryAction {
+    Retry,
+    Restart,
+}
+
+/// Independent of the regular mailbox and the journal pool.
+#[derive(Default)]
+struct RecoveryGate {
+    epoch: u64,
+    request: Mutex<Option<RecoveryRequest>>,
+}
+
+struct RecoveryRequest {
+    incident: String,
+    ready: Option<tokio::sync::oneshot::Sender<RecoveryAction>>,
+}
+
+/// One escalation, across manual attempts. Drop closes the control lane and
+/// tells the independent reporter to clear the head's live status.
+struct RecoveryPause {
+    id: String,
+    gate: Arc<RecoveryGate>,
+    reason: tokio::sync::watch::Sender<Option<String>>,
+}
+
+impl RecoveryPause {
+    fn new(gate: Arc<RecoveryGate>, writer: &Writer, reason: &str) -> Self {
+        warn!(session = %writer.session_id, %reason, "automatic journal recovery exhausted");
+        let id = uuid::Uuid::now_v7().to_string();
+        *gate.request.lock().unwrap() = Some(RecoveryRequest { incident: id.clone(), ready: None });
+        let (updated, state) = tokio::sync::watch::channel(Some(reason.to_owned()));
+        tokio::spawn(report_recovery(writer.link.clone(), writer.session_id.clone(), gate.epoch, id.clone(), reason.to_owned(), state));
+        Self { id, gate, reason: updated }
+    }
+
+    async fn wait_action(&self) -> RecoveryAction {
+        let (ready, action) = tokio::sync::oneshot::channel();
+        self.gate.request.lock().unwrap().as_mut().expect("this incident is active").ready = Some(ready);
+        action.await.expect("the gate retains its sender until a user acts")
+    }
+}
+
+impl Drop for RecoveryPause {
+    fn drop(&mut self) {
+        let mut gate = self.gate.request.lock().unwrap();
+        if gate.as_ref().is_some_and(|request| request.incident == self.id) {
+            gate.take();
+        }
+        self.reason.send_replace(None);
+    }
+}
+
+async fn report_recovery(
+    link: Arc<HeadLink>,
+    session_id: String,
+    epoch: u64,
+    incident: String,
+    initial_reason: String,
+    mut state: tokio::sync::watch::Receiver<Option<String>>,
+) {
+    const CLEAR_BUDGET: Duration = Duration::from_secs(60);
+    // No journal writes, and never wait for the head in the supervisor.
+    // Refresh after a reconnect/head restart; the head deduplicates reminders.
+    let mut announced = false;
+    let mut last_reason = initial_reason;
+    let mut current = state.borrow_and_update().clone();
+    let mut clear_deadline = None;
+    loop {
+        if let Some(reason) = &current {
+            last_reason.clone_from(reason);
+        } else {
+            let deadline = clear_deadline.get_or_insert_with(|| tokio::time::Instant::now() + CLEAR_BUDGET);
+            if tokio::time::Instant::now() >= *deadline {
+                return;
+            }
+        }
+        // Even if the actor recovered, don't displace an unacknowledged
+        // warning with a clear: the head may not have queued the parent yet.
+        let reason = (current.is_some() || !announced).then_some(&last_reason);
+        let params = serde_json::json!({"session_id": session_id, "ownership_epoch": epoch, "incident": incident, "reason": reason});
+        let sent_clear = reason.is_none();
+        let call = async { link.is_connected() && link.call("session.recovery_status", params).await.is_ok() };
+        tokio::pin!(call);
+        let mut changed_in_flight = false;
+        let acked = loop {
+            if let Some(deadline) = clear_deadline {
+                // Preserve the in-flight warning if it can still be
+                // acknowledged. The same deadline bounds every later retry.
+                break tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => return,
+                    acked = &mut call => acked,
+                };
+            }
+            tokio::select! {
+                biased;
+                changed = state.changed() => {
+                    current = changed.ok().and_then(|()| state.borrow_and_update().clone());
+                    changed_in_flight = true;
+                    if let Some(reason) = &current {
+                        last_reason.clone_from(reason);
+                    } else {
+                        clear_deadline = Some(tokio::time::Instant::now() + CLEAR_BUDGET);
+                    }
+                }
+                acked = &mut call => break acked,
+            }
+        };
+        if acked {
+            if sent_clear {
+                return;
+            }
+            announced = true;
+            if current.is_none() {
+                continue; // acknowledge then send the clear immediately
+            }
+        }
+        if changed_in_flight {
+            continue;
+        }
+        if let Some(deadline) = clear_deadline {
+            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_secs(5))).await;
+        } else {
+            tokio::select! {
+                biased;
+                changed = state.changed() => current = changed.ok().and_then(|()| state.borrow_and_update().clone()),
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+            }
+        }
+    }
+}
+
+/// Honor the deadline even in an ongoing attempt, but never drop the attempt
+/// halfway through an owned stop or a journal/in-memory state transition.
+async fn recovery_at_deadline<T>(
+    deadline: tokio::time::Instant,
+    attempt: impl std::future::Future<Output = T>,
+    escalate: impl FnOnce(),
+) -> T {
+    tokio::pin!(attempt);
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => {
+            escalate();
+            attempt.await
+        }
+        result = &mut attempt => result,
+    }
+}
+
 impl SessionManager {
     pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>, worktrees: PathBuf) -> Self {
         let state_dir = worktrees.parent().map(Path::to_path_buf).unwrap_or_else(|| worktrees.clone());
@@ -325,6 +478,28 @@ impl SessionManager {
             bridge: Arc::default(),
             remote_waits: Arc::default(),
         }
+    }
+
+    pub(crate) fn recovery_action(&self, session: &str, epoch: u64, incident: &str, action: &str) -> anyhow::Result<()> {
+        let action = match action {
+            "retry" => RecoveryAction::Retry,
+            "restart" => RecoveryAction::Restart,
+            _ => anyhow::bail!("unknown recovery action"),
+        };
+        let actors = self.actors.lock().unwrap();
+        let handle = actors.get(session).filter(|h| !h.tx.is_closed() && h.recovery.epoch == epoch);
+        let handle = handle.ok_or_else(|| anyhow::anyhow!("this session's recovery is no longer active"))?;
+        let mut request = handle.recovery.request.lock().unwrap();
+        let request = request
+            .as_mut()
+            .filter(|request| request.incident == incident)
+            .ok_or_else(|| anyhow::anyhow!("this session's recovery is no longer waiting for an action"))?;
+        request
+            .ready
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("a recovery attempt is still in progress"))?
+            .send(action)
+            .map_err(|_| anyhow::anyhow!("this session's recovery is no longer active"))
     }
 
     /// Where the outcome of the remote subagent turn that `session`'s call
@@ -1724,10 +1899,17 @@ impl SessionManager {
             stopping: false,
             stopped_until: None,
         };
-        let handle =
-            Handle { tx, tools: actor.session_tools.clone(), running: actor.running_flag.clone(), claude_code, inbox: actor.inbox.clone() };
+        let recovery = Arc::new(RecoveryGate { epoch, ..Default::default() });
+        let handle = Handle {
+            tx,
+            recovery: recovery.clone(),
+            tools: actor.session_tools.clone(),
+            running: actor.running_flag.clone(),
+            claude_code,
+            inbox: actor.inbox.clone(),
+        };
         self.journal.check_ownership(session_id, epoch).await?;
-        tokio::spawn(actor.supervise(rx));
+        tokio::spawn(actor.supervise(rx, recovery));
         self.actors.lock().unwrap().insert(session_id.to_owned(), handle.clone());
         Ok(handle)
     }
@@ -2911,7 +3093,7 @@ impl Actor {
     /// Keep the mailbox and tool sinks alive while the journal is unavailable.
     /// In particular, background callbacks cannot be recovered by head input
     /// redelivery. The old turn must finish dropping before its cursor is reset.
-    async fn supervise(mut self, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
+    async fn supervise(mut self, mut rx: mpsc::UnboundedReceiver<ActorMsg>, gate: Arc<RecoveryGate>) {
         let mut running = None;
         loop {
             let mut recoverable = true;
@@ -2925,51 +3107,108 @@ impl Actor {
             if rx.is_closed() || !recoverable {
                 return;
             }
-            let mut backoff = std::time::Duration::from_millis(100);
-            let mut cli_retired = false;
-            loop {
-                // This is retry backoff, not a completion barrier. Persistent
-                // disk errors must neither spin nor drop the queued notices.
-                tokio::time::sleep(backoff).await;
-                let recovered = async {
-                    if self.runs_claude_code() && !cli_retired {
-                        // A held reader may already have advanced past the
-                        // line whose journal append failed. Re-adopting that
-                        // offset could silently omit the reply forever. Keep
-                        // the FIFO writer alive until ownership-checked cleanup
-                        // proves the old CLI cannot write, then explicitly
-                        // continue on a replacement process from the log.
-                        crate::claude_code::retire_after_journal_failure(
-                            &self.manager.claude_dir().join("held"),
-                            &self.writer.session_id,
-                            &self.journal,
-                        )
-                        .await?;
-                        self.claude.take();
-                        self.claude_stdin.lock().await.take();
-                        // Mirrored native children have no independent actor
-                        // to settle them once their owning CLI is retired.
-                        for (child, seq, turn) in self.journal.open_turns().await? {
-                            let Some((spec, _)) = self.journal.load_session(&child).await? else { continue };
-                            if !spec.delegation.as_ref().is_some_and(|d| d.observed && d.parent_session_id == self.writer.session_id) {
-                                continue;
-                            }
-                            let writer = Writer::new(child, self.journal.clone(), self.link.clone(), seq + 1);
-                            writer.append(session_event::Kind::Error(ErrorEvent { message: JOURNAL_FAILURE_DIAGNOSTIC.into() })).await?;
-                            writer.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
-                        }
-                        cli_retired = true;
-                    }
-                    self.reload_after_failure().await
-                }
-                .await;
-                match recovered {
-                    Ok(()) => break,
-                    Err(e) => warn!(session = %self.writer.session_id, "waiting to recover its journal: {e:#}"),
-                }
-                backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
-            }
+            self.recover_supervised(&gate).await;
         }
+    }
+
+    async fn recover_supervised(&mut self, gate: &Arc<RecoveryGate>) {
+        let seconds = self.spec.session_recovery_seconds;
+        let budget = Duration::from_secs(u64::from(if seconds == 0 { c6_api::DEFAULT_SESSION_RECOVERY_SECONDS } else { seconds }));
+        let mut deadline = Some(tokio::time::Instant::now() + budget);
+        let mut backoff = Duration::from_millis(100);
+        let mut cli_retired = false;
+        let mut pause = None::<RecoveryPause>;
+        let writer = self.writer.clone();
+        let mut reason = "A recovery attempt has not completed".to_owned();
+        loop {
+            let result = if let Some(until) = deadline {
+                let attempt = async {
+                    tokio::time::sleep_until(until.min(tokio::time::Instant::now() + backoff)).await;
+                    // A deadline during backoff must not start another retry.
+                    if tokio::time::Instant::now() >= until {
+                        return None;
+                    }
+                    Some(self.recover_once(&mut cli_retired).await)
+                };
+                recovery_at_deadline(until, attempt, || {
+                    pause.get_or_insert_with(|| RecoveryPause::new(gate.clone(), &writer, &reason));
+                })
+                .await
+            } else {
+                let paused = pause.as_ref().expect("manual action requires an escalation");
+                match paused.wait_action().await {
+                    RecoveryAction::Retry => Some(self.recover_once(&mut cli_retired).await),
+                    RecoveryAction::Restart => {
+                        // Recheck retirement from scratch, not from a previous
+                        // attempt's in-memory checkpoint. The actor, mailbox,
+                        // and journal stay; ownership barriers still apply.
+                        cli_retired = false;
+                        deadline = Some(tokio::time::Instant::now() + budget);
+                        backoff = Duration::ZERO;
+                        continue;
+                    }
+                }
+            };
+            match result {
+                Some(Ok(())) => return,
+                Some(Err(e)) => {
+                    warn!(session = %writer.session_id, "waiting to recover its journal: {e:#}");
+                    reason = format!("{e:#}").chars().take(1000).collect();
+                    if let Some(paused) = &pause {
+                        paused.reason.send_if_modified(|old| {
+                            if old.as_ref() == Some(&reason) {
+                                return false;
+                            }
+                            *old = Some(reason.clone());
+                            true
+                        });
+                    }
+                }
+                None => {}
+            }
+            if deadline.is_some_and(|until| tokio::time::Instant::now() >= until) {
+                // The attempt can observe the deadline before Tokio polls
+                // the timer ready. Always install the action lane before
+                // switching to the manual phase.
+                pause.get_or_insert_with(|| RecoveryPause::new(gate.clone(), &writer, &reason));
+                deadline = None;
+            }
+            backoff = (backoff * 2).clamp(Duration::from_millis(100), Duration::from_secs(30));
+        }
+    }
+
+    async fn recover_once(&mut self, cli_retired: &mut bool) -> anyhow::Result<()> {
+        self.journal.recover_connection().await?;
+        if self.runs_claude_code() && !*cli_retired {
+            // A held reader may already have advanced past the
+            // line whose journal append failed. Re-adopting that
+            // offset could silently omit the reply forever. Keep
+            // the FIFO writer alive until ownership-checked cleanup
+            // proves the old CLI cannot write, then explicitly
+            // continue on a replacement process from the log.
+            crate::claude_code::retire_after_journal_failure(
+                &self.manager.claude_dir().join("held"),
+                &self.writer.session_id,
+                &self.journal,
+                self.claude.as_mut(),
+            )
+            .await?;
+            self.claude.take();
+            self.claude_stdin.lock().await.take();
+            // Mirrored native children have no independent actor
+            // to settle them once their owning CLI is retired.
+            for (child, seq, turn) in self.journal.open_turns().await? {
+                let Some((spec, _)) = self.journal.load_session(&child).await? else { continue };
+                if !spec.delegation.as_ref().is_some_and(|d| d.observed && d.parent_session_id == self.writer.session_id) {
+                    continue;
+                }
+                let writer = Writer::new(child, self.journal.clone(), self.link.clone(), seq + 1);
+                writer.append(session_event::Kind::Error(ErrorEvent { message: JOURNAL_FAILURE_DIAGNOSTIC.into() })).await?;
+                writer.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
+            }
+            *cli_retired = true;
+        }
+        self.reload_after_failure().await
     }
 
     async fn reload_after_failure(&mut self) -> anyhow::Result<()> {
@@ -7436,7 +7675,14 @@ mod notice_tests {
         let (older_task, _) = tools.background.start_agent("earlier run", true);
         let (task, _) = tools.background.start_agent("failing run", true);
         let (tx, rx) = mpsc::unbounded_channel();
-        let handle = Handle { tx, tools: tools.clone(), running: Arc::default(), claude_code: Arc::default(), inbox: Arc::default() };
+        let handle = Handle {
+            tx,
+            recovery: Arc::default(),
+            tools: tools.clone(),
+            running: Arc::default(),
+            claude_code: Arc::default(),
+            inbox: Arc::default(),
+        };
         let link = |seq, task: &str| {
             ev(
                 seq,
@@ -7829,12 +8075,17 @@ mod notice_tests {
         barrier(manager, &format!("queued-{}-{}", reports.start, reports.end)).await;
     }
 
+    fn notice_turn_running(manager: &SessionManager) -> bool {
+        manager.actors.lock().unwrap().get("held").is_some_and(|actor| actor.running.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
     async fn assert_waiting(manager: &SessionManager, mock: &c6_testkit::MockLlm, count: usize) {
         assert_waiting_after(manager, mock, count, 0).await;
     }
 
     async fn assert_waiting_after(manager: &SessionManager, mock: &c6_testkit::MockLlm, count: usize, after: u64) {
         let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        assert!(!notice_turn_running(manager), "the actor must not start a turn while notices are held");
         assert_eq!(notices_of(&events).2.len(), count, "each report must remain durably pending while waiting");
         assert!(
             !events
@@ -7850,14 +8101,27 @@ mod notice_tests {
     }
 
     async fn completed_batch_after(manager: &SessionManager, mock: &c6_testkit::MockLlm, after: u64) -> (Vec<SessionEvent>, String) {
-        // Require delivery to start at the simulated deadline, before resuming
-        // real time for the mock's streaming timers.
-        logged(manager, |events| events.iter().any(|e| e.seq > after && matches!(&e.kind, Some(session_event::Kind::TurnStarted(_)))))
-            .await;
+        // Require the actor to admit the turn on the simulated clock, not
+        // the pre-turn checkpoint to finish on it. A contended checkpoint
+        // sleeps on Tokio time before TurnStarted can be recorded.
+        logged(manager, |events| {
+            notice_turn_running(manager)
+                || events.iter().any(|e| e.seq > after && matches!(&e.kind, Some(session_event::Kind::TurnStarted(_))))
+        })
+        .await;
         tokio::time::resume();
+        completed_batch_in_real_time_after(manager, mock, after).await
+    }
+
+    async fn completed_batch_in_real_time_after(
+        manager: &SessionManager,
+        mock: &c6_testkit::MockLlm,
+        after: u64,
+    ) -> (Vec<SessionEvent>, String) {
         let events =
             logged(manager, |events| events.iter().any(|e| e.seq > after && matches!(&e.kind, Some(session_event::Kind::TurnEnded(_)))))
                 .await;
+        assert!(events.iter().any(|e| e.seq > after && matches!(&e.kind, Some(session_event::Kind::TurnStarted(_)))));
         let ends: Vec<_> = events
             .iter()
             .filter(|e| e.seq > after)
@@ -7875,6 +8139,21 @@ mod notice_tests {
 
     async fn delivered(manager: &SessionManager, mock: &c6_testkit::MockLlm, count: usize) {
         let (events, request) = completed_batch(manager, mock).await;
+        assert_delivered(&events, &request, count);
+    }
+
+    async fn release_held_reports(manager: &SessionManager, mock: &c6_testkit::MockLlm, actor: &Handle, count: usize) {
+        // The recovery clock assertions are done. Explicit release does not
+        // test a merge timer, and the pre-turn checkpoint can need real time
+        // to retry a process scan while other tests spawn or reap children.
+        tokio::time::resume();
+        mock.push(c6_testkit::Reply::Text("Saw the complete batch.".into()));
+        actor.tx.send(ActorMsg::ReleaseNotices).unwrap();
+        let (events, request) = completed_batch_in_real_time_after(manager, mock, 0).await;
+        assert_delivered(&events, &request, count);
+    }
+
+    fn assert_delivered(events: &[SessionEvent], request: &str, count: usize) {
         let delivered: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.kind {
@@ -7893,6 +8172,223 @@ mod notice_tests {
             assert_eq!(metadata.session_id, "child");
             assert_eq!(metadata.markdown, text);
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_deadline_does_not_cancel_an_in_flight_attempt() {
+        let _clock = pause_clock();
+        let now = tokio::time::Instant::now();
+        let (finish, attempt) = tokio::sync::oneshot::channel::<()>();
+        let (escalate, mut escalated) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(recovery_at_deadline(now + SECOND, attempt, move || escalate.send(()).unwrap()));
+        tokio::time::advance(SECOND - TICK).await;
+        assert_eq!(escalated.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty));
+        tokio::time::advance(2 * TICK).await;
+        escalated.await.unwrap();
+        assert!(!join.is_finished());
+        finish.send(()).unwrap();
+        join.await.unwrap().unwrap();
+    }
+
+    fn enqueue_test_report(actor: &Handle, number: usize) -> tokio::sync::oneshot::Receiver<()> {
+        let (recorded, ack) = tokio::sync::oneshot::channel();
+        let text = format!("report #{number}.");
+        actor
+            .tx
+            .send(ActorMsg::ChildReport {
+                command_id: format!("subagent:{text}"),
+                task_notice: Some(crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, &text)),
+                text,
+                wake: false,
+                inline: None,
+                recorded,
+            })
+            .unwrap();
+        ack
+    }
+
+    #[tokio::test]
+    async fn shmsize_recovery_preserves_held_failed_and_later_notices() {
+        let (_dir, manager, mock) = idle_session().await;
+        let _clock = pause_clock();
+        enqueue_reports(&manager, 1..2, false).await;
+        manager.journal.inject_append_shmsize("report #2.").await;
+        let actor = manager.actors.lock().unwrap().get("held").unwrap().clone();
+        assert!(enqueue_test_report(&actor, 2).await.is_err(), "the real SHMSIZE error stopped the first append");
+        let queued_in_mailbox = enqueue_test_report(&actor, 3);
+        // Allow the first automatic attempt, which must replace the poisoned
+        // connection before reconstructing the backlog in this same actor.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100) + TICK).await;
+        barrier(&manager, "after-shmsize-recovery").await;
+        queued_in_mailbox.await.unwrap();
+        assert!(actor.recovery.request.lock().unwrap().is_none(), "one fresh connection made escalation unnecessary");
+        assert_waiting(&manager, &mock, 3).await;
+        release_held_reports(&manager, &mock, &actor, 3).await;
+    }
+
+    #[tokio::test]
+    async fn bounded_recovery_keeps_held_and_mailbox_notices_until_retry() {
+        let (dir, manager, mock) = idle_session().await;
+        let _clock = pause_clock();
+        enqueue_reports(&manager, 1..2, false).await;
+        let db = sqlx::SqlitePool::connect(&format!("sqlite:{}", dir.path().join("journal.db").display())).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER persistent_failure BEFORE INSERT ON events WHEN NEW.session_id = 'held' \
+                     BEGIN SELECT RAISE(ABORT, 'persistent journal fault'); END",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let actor = manager.actors.lock().unwrap().get("held").unwrap().clone();
+        assert!(enqueue_test_report(&actor, 2).await.is_err(), "the notice's first append failed");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(u64::from(c6_api::DEFAULT_SESSION_RECOVERY_SECONDS) - 1)).await;
+        assert!(actor.recovery.request.lock().unwrap().is_none());
+        tokio::time::advance(SECOND + TICK).await;
+
+        let deadline = std::time::Instant::now() + c6_testkit::wait::deadline();
+        let incident = loop {
+            if let Some(request) = actor.recovery.request.lock().unwrap().as_ref().filter(|r| r.ready.is_some()) {
+                break request.incident.clone();
+            }
+            assert!(std::time::Instant::now() < deadline, "recovery did not escalate at its deadline");
+            tokio::task::yield_now().await;
+        };
+        let mut queued_in_mailbox = enqueue_test_report(&actor, 3);
+        sqlx::query("DROP TRIGGER persistent_failure").execute(&db).await.unwrap();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        assert_eq!(queued_in_mailbox.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty));
+        assert!(manager.recovery_action("held", 1, &incident, "retry").is_err(), "misrouted epoch must not reach the actor");
+        assert!(manager.recovery_action("held", 0, "stale", "retry").is_err(), "stale controls must not restart a different incident");
+        manager.recovery_action("held", 0, &incident, "retry").unwrap();
+        barrier(&manager, "after-manual-retry").await;
+        queued_in_mailbox.try_recv().unwrap();
+        assert!(actor.recovery.request.lock().unwrap().is_none());
+        assert_waiting(&manager, &mock, 3).await;
+        release_held_reports(&manager, &mock, &actor, 3).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_control_rejects_requests_until_ready_and_while_busy() {
+        let (_dir, manager, _mock) = idle_session().await;
+        manager.actor("held").await.unwrap().unwrap();
+        let actor = manager.actors.lock().unwrap().get("held").unwrap().clone();
+        let writer = Writer::new("held".into(), manager.journal.clone(), Arc::new(HeadLink::default()), 2);
+        let pause = RecoveryPause::new(actor.recovery.clone(), &writer, "waiting for a safe stop");
+        let retry = || manager.recovery_action("held", 0, &pause.id, "retry");
+        assert!(retry().unwrap_err().to_string().contains("still in progress"));
+        let action = pause.wait_action();
+        tokio::pin!(action);
+        assert!(futures::poll!(&mut action).is_pending());
+        retry().unwrap();
+        assert!(retry().unwrap_err().to_string().contains("still in progress"));
+        assert_eq!(action.await, RecoveryAction::Retry);
+    }
+
+    #[tokio::test]
+    async fn recovery_report_retries_unacknowledged_warning_before_clear() {
+        struct ReportHead(mpsc::UnboundedSender<serde_json::Value>, std::sync::atomic::AtomicBool);
+        #[async_trait]
+        impl crate::link::LocalHead for ReportHead {
+            async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+                assert_eq!(method, "session.recovery_status");
+                self.0.send(params["reason"].clone()).unwrap();
+                if self.1.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    Err("head could not enqueue the parent's report".into())
+                } else {
+                    Ok(serde_json::Value::Null)
+                }
+            }
+            async fn credential(&self, _: &str) -> c6_proto::CredentialGrant {
+                unreachable!()
+            }
+        }
+        let _clock = pause_clock();
+        let (sent, mut calls) = mpsc::unbounded_channel();
+        let link = Arc::new(HeadLink::local(Arc::new(ReportHead(sent, true.into()))));
+        let reason = "worker journal unavailable".to_owned();
+        let (changes, state) = tokio::sync::watch::channel(Some(reason.clone()));
+        let task = tokio::spawn(report_recovery(link, "child".into(), 0, "incident".into(), reason.clone(), state));
+        assert_eq!(calls.recv().await.unwrap(), reason);
+        changes.send_replace(None);
+        assert_eq!(calls.recv().await.unwrap(), reason);
+        assert_eq!(calls.recv().await.unwrap(), serde_json::Value::Null);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_report_clear_deadline_cancels_blocked_outbound_send() {
+        let link = Arc::new(HeadLink::default());
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(c6_proto::WorkerMsg::default()).unwrap();
+        link.connected(tx);
+        let reason = "worker journal unavailable".to_owned();
+        let (changes, state) = tokio::sync::watch::channel(Some(reason.clone()));
+        let mut report = Box::pin(report_recovery(link.clone(), "child".into(), 0, "incident".into(), reason, state));
+        assert!(futures::poll!(report.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(120)).await;
+        assert!(futures::poll!(report.as_mut()).is_pending(), "no cleanup deadline while active");
+        changes.send_replace(None);
+        assert!(futures::poll!(report.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert!(futures::poll!(report.as_mut()).is_pending(), "keep trying within the cleanup budget");
+        tokio::time::advance(SECOND + TICK).await;
+        tokio::time::timeout(SECOND, report).await.expect("reporter must stop despite the full outbound queue");
+        assert!(rx.try_recv().unwrap().msg.is_none());
+        assert!(rx.try_recv().is_err(), "cancelling the send must not enqueue the warning later");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_report_clear_deadline_includes_pending_warning_and_local_clear() {
+        type PendingCall = (serde_json::Value, tokio::sync::oneshot::Receiver<()>);
+        struct ReportHead {
+            calls: mpsc::UnboundedSender<PendingCall>,
+            ack_warning: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        }
+        #[async_trait]
+        impl crate::link::LocalHead for ReportHead {
+            async fn call(&self, _: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+                let (in_flight, dropped) = tokio::sync::oneshot::channel();
+                self.calls.send((params["reason"].clone(), dropped)).unwrap();
+                let _in_flight = in_flight;
+                let ack_warning = self.ack_warning.lock().unwrap().take();
+                if let Some(ack) = ack_warning {
+                    ack.await.unwrap();
+                    Ok(serde_json::Value::Null)
+                } else {
+                    std::future::pending().await
+                }
+            }
+            async fn credential(&self, _: &str) -> c6_proto::CredentialGrant {
+                unreachable!()
+            }
+        }
+        let (sent, mut calls) = mpsc::unbounded_channel();
+        let (ack, ack_warning) = tokio::sync::oneshot::channel();
+        let link = Arc::new(HeadLink::local(Arc::new(ReportHead { calls: sent, ack_warning: Mutex::new(Some(ack_warning)) })));
+        let reason = "worker journal unavailable".to_owned();
+        let (changes, state) = tokio::sync::watch::channel(Some(reason.clone()));
+        let mut report = Box::pin(report_recovery(link, "child".into(), 0, "incident".into(), reason.clone(), state));
+        assert!(futures::poll!(report.as_mut()).is_pending());
+        let (warning, mut warning_dropped) = calls.try_recv().unwrap();
+        assert_eq!(warning, reason);
+        changes.send_replace(None);
+        assert!(futures::poll!(report.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(50)).await;
+        assert!(futures::poll!(report.as_mut()).is_pending());
+        assert_eq!(warning_dropped.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty));
+        assert!(calls.try_recv().is_err(), "a pending warning must not be displaced by a clear");
+        ack.send(()).unwrap();
+        assert!(futures::poll!(report.as_mut()).is_pending());
+        let (clear, mut clear_dropped) = calls.try_recv().unwrap();
+        assert!(clear.is_null());
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(futures::poll!(report.as_mut()).is_pending());
+        assert_eq!(clear_dropped.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty));
+        tokio::time::advance(SECOND + TICK).await;
+        tokio::time::timeout(SECOND, report).await.expect("the clear has only the rest of the original budget");
+        assert_eq!(clear_dropped.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed));
     }
 
     const GROUP_SIZE: usize = 5;
@@ -9386,6 +9882,7 @@ for line in sys.stdin:
             "resumed-child".into(),
             Handle {
                 tx,
+                recovery: Arc::default(),
                 tools: Arc::new(SessionTools::new(dir.path().into())),
                 running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 claude_code: Arc::default(),
@@ -9591,6 +10088,7 @@ for line in sys.stdin:
             "s".into(),
             Handle {
                 tx,
+                recovery: Arc::default(),
                 tools: Arc::new(SessionTools::new(dir.path().into())),
                 running: Arc::default(),
                 claude_code: Arc::default(),
@@ -9657,7 +10155,14 @@ for line in sys.stdin:
         let tools = Arc::new(SessionTools::new(dir.path().into()));
         let (task, _) = tools.background.start_agent("child background work", false);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let handle = Handle { tx, tools: tools.clone(), running: Arc::default(), claude_code: Arc::default(), inbox: Arc::default() };
+        let handle = Handle {
+            tx,
+            recovery: Arc::default(),
+            tools: tools.clone(),
+            running: Arc::default(),
+            claude_code: Arc::default(),
+            inbox: Arc::default(),
+        };
         manager.actors.lock().unwrap().insert("child".into(), handle.clone());
         let links = [rewind_child_link("child")];
         let error = manager.rewind_children_stopped(&links).await.unwrap_err().to_string();
@@ -9684,6 +10189,7 @@ for line in sys.stdin:
             "child".into(),
             Handle {
                 tx,
+                recovery: Arc::default(),
                 tools: Arc::new(SessionTools::new(dir.path().into())),
                 running: Arc::default(),
                 claude_code: Arc::default(),
@@ -9886,6 +10392,7 @@ for line in sys.stdin:
             "child".into(),
             Handle {
                 tx,
+                recovery: Arc::default(),
                 tools: Arc::new(SessionTools::new(work.path().into())),
                 running: Arc::default(),
                 claude_code: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -10088,6 +10595,7 @@ for line in sys.stdin:
             "child".into(),
             Handle {
                 tx,
+                recovery: Arc::default(),
                 tools: Arc::new(SessionTools::new(work.path().into())),
                 running: Arc::default(),
                 claude_code: Arc::default(),
@@ -10147,6 +10655,7 @@ for line in sys.stdin:
             "child".into(),
             Handle {
                 tx,
+                recovery: Arc::default(),
                 tools: Arc::new(SessionTools::new(dir.path().into())),
                 running: Arc::default(),
                 claude_code: Arc::new(std::sync::atomic::AtomicBool::new(true)),

@@ -68,6 +68,46 @@ carbon6's own loop (every connection except Claude Code) keeps each turn's steps
 
 The worker journal uses one pooled SQLite connection in WAL mode with `synchronous=FULL`. Local reads and writes queue for that connection (60-second acquisition timeout); write transactions begin with `BEGIN IMMEDIATE`, and SQLite has a 30-second busy timeout for an external writer. In a local 382 MB synthetic journal with 65,223 events, event inserts used the composite primary key and session updates used the session ID index. Across 200 warm insert/update/commit cycles, median latency was 0.11 ms and p95 was 0.20 ms. A separate warm replay of a 378 MB single-session fixture fetched and decoded in about 1.15 seconds. These are local measurements, not production guarantees: a large replay occupies the same connection while it fetches rows.
 
+SQLite extended error **4874 is `SQLITE_IOERR_SHMSIZE`**, not
+`SQLITE_IOERR_SHMMAP` (5386). In the bundled Unix VFS, SHMSIZE means that
+`fstat` on the WAL-index shared-memory file failed, or a write allocating a
+new shared-memory page failed. A failed `mmap` has its own SHMMAP code;
+memory pressure alone therefore does not establish the cause of 4874.
+The November 21, 2026 incident did not capture the underlying OS errno, so
+its precise filesystem cause remains unproven. Removing an open `-shm`
+file does not itself invalidate its open descriptor; truncating mapped
+shared memory can instead cause SIGBUS. Never delete or truncate a live
+journal's `-wal` or `-shm` files as a recovery procedure: the WAL may contain
+committed events that have not been checkpointed.
+See SQLite's [extended result codes](https://sqlite.org/rescode.html#ioerr_shmsize),
+the bundled `libsqlite3-sys` amalgamation's `unixShmMap`, and SQLite's
+[hot-journal warning](https://sqlite.org/howtocorrupt.html#_deleting_a_hot_journal).
+
+In-process journal recovery closes the pooled connection before rebuilding
+the actor. An exact-4874 fault regression reproduces a poisoned connection:
+SQLite rolls back its transaction, but SQLx still tracks a nonzero transaction
+depth, so another append fails with `InvalidSavePointStatement`. Replacing
+the connection permits a new append without replaying the failed write.
+This demonstrates a recovery failure mode, not the incident's missing OS errno.
+A new connection uses the original options; no failed SQL statement
+is automatically replayed. Durable event and command receipts decide what
+must still be delivered, including notices retained in the original mailbox.
+Closing a connection is not a substitute for resolving an ongoing filesystem
+failure, so automatic retries have a configurable time budget rather than an
+unlimited loop (see docs/background.md, §5).
+
+Held Claude Code cleanup distinguishes **authority to stop** from **proof of
+absence**. FIFO/launch identity authorizes stopping a live group; a fresh
+whole-group absence confirmation can retire a group even after that identity
+has disappeared. Recovery first polls the worker's own retained wrapper child
+with `try_wait`: on Linux an unreaped, exited wrapper can keep signal-zero
+group probes live while no member can prove ownership. Waiting to drop that
+child until after group-absence confirmation creates a circular wait.
+Reaping this child sends no signal and does not prove that descendants have
+stopped; the existing whole-group fence still must succeed. An inaccessible,
+reused, or otherwise unidentifiable live group is never signaled on the strength
+of saved metadata. It remains blocked and escalates for user attention.
+
 ## 5. Across connection types
 
 | Connection | Layer 1 | Carried across a restart |

@@ -1409,6 +1409,17 @@ pub async fn deliver_notices(id: String) -> Result<(), String> {
     empty(Request::post(&format!("/api/v1/sessions/{}/notices/deliver", enc(&id))).send().await).await
 }
 
+pub async fn recover_session(id: String, incident: String, action: &'static str) -> Result<(), String> {
+    empty(
+        Request::post(&format!("/api/v1/sessions/{}/recovery", enc(&id)))
+            .json(&serde_json::json!({"incident": incident, "action": action}))
+            .map_err(|e| e.to_string())?
+            .send()
+            .await,
+    )
+    .await
+}
+
 pub async fn stop_task(id: String, task: String) -> Result<(), String> {
     empty(Request::post(&format!("/api/v1/sessions/{id}/tasks/{task}/stop")).send().await).await
 }

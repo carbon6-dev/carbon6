@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use c6_api as api;
 use c6_core::{WorkerId, now_ms};
@@ -50,10 +51,29 @@ pub const ROUTES: &str = "routes";
 #[derive(Default)]
 pub struct LiveHub {
     channels: Mutex<HashMap<String, broadcast::Sender<api::StreamMsg>>>,
+    recovery: Mutex<RecoveryBook>,
     /// Session → owning worker, to vet ephemeral events cheaply.
     /// Last restore per session, to rate-limit them.
     restores: Mutex<HashMap<String, std::time::Instant>>,
 }
+
+struct RecoveryStatus {
+    status: api::SessionRecovery,
+    worker: WorkerId,
+    epoch: i64,
+    heard: Instant,
+    parent_reported: bool,
+}
+
+#[derive(Default)]
+struct RecoveryBook {
+    live: HashMap<String, RecoveryStatus>,
+    highest: HashMap<(String, WorkerId, i64), (String, Instant)>,
+    cleared: HashMap<(String, WorkerId, i64, String), Instant>,
+}
+
+const RECOVERY_STATUS_LEASE: Duration = Duration::from_secs(45);
+const RECOVERY_HISTORY_TTL: Duration = Duration::from_secs(300);
 
 impl LiveHub {
     fn may_restore(&self, session_id: &str) -> bool {
@@ -80,6 +100,20 @@ impl LiveHub {
             channels.remove(session_id); // no subscribers left
         }
     }
+}
+
+/// Do not replay an old owner's otherwise unexpired status after a move.
+pub(crate) async fn recovery_status(st: &HeadState, session_id: &str) -> Option<api::SessionRecovery> {
+    let (worker, epoch, status) = st
+        .hub
+        .recovery
+        .lock()
+        .unwrap()
+        .live
+        .get(session_id)
+        .filter(|s| s.heard.elapsed() < RECOVERY_STATUS_LEASE)
+        .map(|s| (s.worker, s.epoch, s.status.clone()))?;
+    st.store.session_routable(session_id, worker, epoch).await.ok()?.then_some(status)
 }
 
 pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<api::Session> {
@@ -420,6 +454,7 @@ async fn create_assistant_with_origin(
         notice_no_progress_limit: limits.notice_no_progress_limit,
         notice_failure_relaunch_limit: limits.notice_failure_relaunch_limit,
         notice_tokens_per_hour: limits.notice_tokens_per_hour,
+        session_recovery_seconds: limits.session_recovery_seconds,
         ..Default::default()
     };
     crate::naming::expect(st, &row.id).await?;
@@ -624,6 +659,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         notice_failure_relaunch_limit: limits.notice_failure_relaunch_limit,
         notice_tokens_per_hour: limits.notice_tokens_per_hour,
         claude_code_idle_minutes: limits.claude_code_idle_minutes,
+        session_recovery_seconds: limits.session_recovery_seconds,
         claude_code: Some(claude_code_choice(st, &row.realm).await?),
         claude_code_tools: claude_code_tools(st, Some(&row.realm)).await?.tools,
         claude_code_tools_chosen: true,
@@ -2538,6 +2574,123 @@ pub async fn release_notices(st: &HeadState, session_id: &str) -> anyhow::Result
     send_control(st, &session, cmd).await
 }
 
+pub async fn recovery_action(st: &HeadState, session: &SessionRow, request: api::SessionRecoveryRequest) -> anyhow::Result<()> {
+    let worker_id = session.worker_id.parse()?;
+    if session.archived != 0 || !st.store.session_routable(&session.id, worker_id, session.ownership_epoch).await? {
+        return Err(conflict("this session cannot be recovered on its current worker"));
+    }
+    st.registry
+        .call(
+            worker_id,
+            "session.recovery_action",
+            json!({
+                "session_id": session.id, "ownership_epoch": session.ownership_epoch,
+                "incident": request.incident, "action": request.action,
+            }),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(conflict)?;
+    Ok(())
+}
+
+/// Recovery can outlive the worker journal. Accept status only from the
+/// current owner; use the head's existing notification and report delivery.
+pub(crate) async fn report_recovery(st: &HeadState, worker: WorkerId, session: &SessionRow, params: &Value) -> anyhow::Result<Value> {
+    let epoch = params["ownership_epoch"].as_i64().ok_or_else(|| bad_request("ownership_epoch is required"))?;
+    if !st.store.session_routable(&session.id, worker, epoch).await? {
+        // A move gate is temporary. Do not acknowledge a status or clear
+        // without taking it while this incarnation still owns the session.
+        // Re-read ownership as the move may have completed since dispatch.
+        return match st.store.session(&session.id).await? {
+            // No retry is useful once this incarnation is superseded.
+            None => Ok(Value::Null),
+            Some(owner) if owner.ownership_epoch > epoch => Ok(Value::Null),
+            Some(owner) if owner.worker_id != worker.to_string() => Err(bad_request("that session is not on this worker")),
+            Some(owner) if owner.ownership_epoch == epoch => Err(conflict("session is moving; retry the recovery status")),
+            Some(_) => Err(conflict("that recovery status does not match the current ownership epoch")),
+        };
+    }
+    let id = params["incident"].as_str().and_then(|s| Uuid::parse_str(s).ok()).ok_or_else(|| bad_request("invalid incident"))?.to_string();
+    let reason = params["reason"].as_str().map(|r| r.chars().take(1000).collect::<String>());
+    let (status, first, parent_pending) = {
+        let mut book = st.hub.recovery.lock().unwrap();
+        let owner = (session.id.clone(), worker, epoch);
+        let key = (session.id.clone(), worker, epoch, id.clone());
+        let now = Instant::now();
+        let same_owner = |s: &&RecoveryStatus| s.worker == worker && s.epoch == epoch;
+        if let Some(reason) = reason {
+            if book.cleared.get(&key).is_some_and(|at| now.duration_since(*at) < RECOVERY_HISTORY_TTL)
+                || book.highest.get(&owner).is_some_and(|(highest, at)| *highest > id && now.duration_since(*at) < RECOVERY_HISTORY_TTL)
+                || book.live.get(&session.id).is_some_and(|s| s.epoch > epoch)
+            {
+                return Ok(Value::Null);
+            }
+            let current = book.live.get(&session.id).filter(same_owner);
+            if current.is_some_and(|s| s.status.incident > id) {
+                return Ok(Value::Null);
+            }
+            let first = current.is_none_or(|s| s.status.incident != id);
+            let parent_reported = !first && current.is_some_and(|s| s.parent_reported);
+            let status = api::SessionRecovery { incident: id.clone(), reason };
+            if current.is_none_or(|s| s.status != status || s.heard.elapsed() >= RECOVERY_STATUS_LEASE) {
+                st.hub.publish(&session.id, api::StreamMsg::Recovery { status: Some(status.clone()) });
+            }
+            if first {
+                book.live.retain(|key, s| key == &session.id || now.duration_since(s.heard) < RECOVERY_HISTORY_TTL);
+                book.highest.retain(|_, (_, at)| now.duration_since(*at) < RECOVERY_HISTORY_TTL);
+            }
+            book.highest.insert(owner, (id.clone(), now));
+            book.live.insert(session.id.clone(), RecoveryStatus { status: status.clone(), worker, epoch, heard: now, parent_reported });
+            (status, first, !parent_reported)
+        } else {
+            // A timed-out report can arrive after its clear, even if the
+            // head has not seen this incident. Never clear a different one.
+            book.cleared.retain(|_, at| now.duration_since(*at) < RECOVERY_HISTORY_TTL);
+            book.cleared.insert(key, now);
+            // Clearing the accepted high-water incident must not make an
+            // older timeout visible again. An unseen clear sets no watermark.
+            if let Some((_, at)) = book.highest.get_mut(&owner).filter(|(highest, _)| *highest == id) {
+                *at = now;
+            }
+            if book.live.get(&session.id).filter(same_owner).is_some_and(|s| s.status.incident == id) {
+                book.live.remove(&session.id);
+                st.hub.publish(&session.id, api::StreamMsg::Recovery { status: None });
+            }
+            return Ok(Value::Null);
+        }
+    };
+    if first {
+        let message = crate::prompts::get(st, "session.recovery_notification", &session.realm).await.replace("{{reason}}", &status.reason);
+        st.notifier.send(crate::notify::Note {
+            event: "failed",
+            title: format!("Session recovery stuck: {}", session.title),
+            message,
+            priority: "high",
+            session_id: Some(session.id.clone()),
+            labels: session.all_labels(),
+            ..Default::default()
+        });
+    }
+    if parent_pending {
+        if let Some(parent) = session.parent_id.as_deref().filter(|_| session.parent_call_id.is_some()) {
+            crate::remote::recovery_notice(st, session, parent, &status).await?;
+        }
+        if let Some(s) = st
+            .hub
+            .recovery
+            .lock()
+            .unwrap()
+            .live
+            .get_mut(&session.id)
+            .filter(|s| s.status.incident == id && s.worker == worker && s.epoch == epoch)
+        {
+            s.parent_reported = true;
+        }
+    }
+    Ok(Value::Null)
+}
+
 /// Stops a session's background task (one of Claude Code's too: its
 /// process is asked to). `false`: its worker is not connected.
 pub async fn stop_task(st: &HeadState, session_id: &str, task_id: &str) -> anyhow::Result<bool> {
@@ -3295,6 +3448,204 @@ mod input_compatibility_tests {
             .execute(&st.store.pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_escalation_is_owner_fenced_and_queues_one_editable_parent_notice() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let owner = WorkerId::new();
+        assign_worker(st, owner).await;
+        let mut child = st.store.session("session").await.unwrap().unwrap();
+        child.id = "child".into();
+        child.parent_id = Some("session".into());
+        child.parent_call_id = Some("parent-call".into());
+        st.store.create_session(&child, &[], false).await.unwrap();
+        crate::prompts::set(st, "session.subagent_recovery_stuck", "Edited warning for {{child}}: {{reason}}.").await.unwrap();
+        crate::prompts::set(st, "session.recovery_notification", "Edited user warning: {{reason}}.").await.unwrap();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let hook = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(value): axum::Json<Value>| {
+                let sent = sent.clone();
+                async move {
+                    sent.send(value).unwrap();
+                    "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hook_server = tokio::spawn(async { axum::serve(listener, hook).await.unwrap() });
+        let channels = json!([{ "name": "test", "kind": "webhook", "url": url, "events": ["failed"] }]);
+        crate::notify::check_channels(&serde_json::from_value::<Vec<api::Channel>>(channels.clone()).unwrap()).unwrap();
+        st.store.set_setting(crate::notify::CHANNELS, &channels.to_string()).await.unwrap();
+        let mut live = st.hub.subscribe("child");
+        let incident = Uuid::now_v7().to_string();
+        let mut report = json!({"session_id": "child", "ownership_epoch": 0, "incident": incident, "reason": "write unavailable"});
+        assert!(crate::fabric::handle(st, WorkerId::new(), "session.recovery_status", report.clone()).await.is_err());
+        report["ownership_epoch"] = json!(1);
+        assert!(crate::fabric::handle(st, owner, "session.recovery_status", report.clone()).await.is_err());
+        assert!(live.try_recv().is_err());
+        assert!(st.store.pending_commands(owner, 0).await.unwrap().is_empty());
+
+        report["ownership_epoch"] = json!(0);
+        for _ in 0..2 {
+            crate::fabric::handle(st, owner, "session.recovery_status", report.clone()).await.unwrap();
+        }
+        let api::StreamMsg::Recovery { status: Some(status) } = live.try_recv().unwrap() else { panic!("expected escalation") };
+        assert_eq!(status, api::SessionRecovery { incident: incident.clone(), reason: "write unavailable".into() });
+        assert_eq!(recovery_status(st, "child").await, Some(status));
+        assert!(live.try_recv().is_err(), "a repeat heartbeat must not broadcast another escalation");
+        let pending = st.store.pending_commands(owner, 0).await.unwrap();
+        assert_eq!(pending.len(), 1, "a repeated report must not duplicate the parent's command");
+        let notice = SessionCommand::decode(pending[0].data.as_slice()).unwrap();
+        assert_eq!(notice.session_id, "session");
+        let Some(session_command::Kind::DelegationEnded(ended)) = notice.kind else { panic!("expected a parent notice") };
+        assert!(ended.call_id.is_empty(), "a recovery warning must not replace a real delegation outcome");
+        assert!(ended.wake);
+        assert_eq!(ended.digest, "Edited warning for child: write unavailable.");
+        let task_notice = ended.task_notice.expect("a recovery warning displays as a failed subagent notice");
+        assert_eq!(task_notice.kind, "subagent");
+        assert_eq!(task_notice.session_id, "child");
+        assert_eq!(task_notice.status, "failed");
+        assert_eq!(task_notice.markdown, "Subagent failed.\n\nEdited warning for child: write unavailable.");
+
+        report["reason"] = Value::Null;
+        report["incident"] = json!(Uuid::now_v7().to_string());
+        crate::fabric::handle(st, owner, "session.recovery_status", report.clone()).await.unwrap();
+        assert!(recovery_status(st, "child").await.is_some(), "only the current incident may be cleared");
+        report["reason"] = json!("the head had not seen this incident before its clear");
+        crate::fabric::handle(st, owner, "session.recovery_status", report.clone()).await.unwrap();
+        assert_eq!(recovery_status(st, "child").await.unwrap().incident, incident);
+        assert!(live.try_recv().is_err());
+        report["reason"] = Value::Null;
+        report["incident"] = json!(incident);
+        crate::fabric::handle(st, owner, "session.recovery_status", report.clone()).await.unwrap();
+        assert!(matches!(live.try_recv().unwrap(), api::StreamMsg::Recovery { status: None }));
+        assert!(recovery_status(st, "child").await.is_none());
+        report["reason"] = json!("old request that arrived late");
+        crate::fabric::handle(st, owner, "session.recovery_status", report).await.unwrap();
+        assert!(recovery_status(st, "child").await.is_none());
+        assert!(live.try_recv().is_err());
+
+        // The notifier delivers in order. This marker checks for duplicates
+        // from replay or stale controls without racing the webhook task.
+        st.notifier.send(crate::notify::Note { event: "failed", title: "notification barrier".into(), ..Default::default() });
+        let note = c6_testkit::within("the recovery webhook notification", received.recv()).await.unwrap();
+        assert_eq!(note["event"], "failed");
+        assert_eq!(note["session_id"], "child");
+        assert_eq!(note["priority"], "high");
+        assert_eq!(note["message"], "Edited user warning: write unavailable.");
+        let marker = c6_testkit::within("the notification barrier", received.recv()).await.unwrap();
+        assert_eq!(marker["title"], "notification barrier");
+        hook_server.abort();
+    }
+
+    #[tokio::test]
+    async fn recovery_status_clear_before_report_and_ownership_change() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let old_worker = WorkerId::new();
+        let new_worker = WorkerId::new();
+        assign_worker(st, old_worker).await;
+        let old_high_id = "ffffffff-ffff-7fff-8fff-ffffffffffff";
+        let new_low_id = "00000000-0000-7000-8000-000000000001";
+        let mut status = json!({"session_id": "session", "ownership_epoch": 0, "incident": new_low_id, "reason": null});
+        crate::fabric::handle(st, old_worker, "session.recovery_status", status.clone()).await.unwrap();
+        status["reason"] = json!("late report after clear before the first report");
+        crate::fabric::handle(st, old_worker, "session.recovery_status", status.clone()).await.unwrap();
+        assert!(recovery_status(st, "session").await.is_none());
+
+        status["incident"] = json!(old_high_id);
+        crate::fabric::handle(st, old_worker, "session.recovery_status", status.clone()).await.unwrap();
+        assert_eq!(recovery_status(st, "session").await.unwrap().incident, old_high_id);
+        sqlx::query("UPDATE sessions SET worker_id = ?, ownership_epoch = 1 WHERE id = 'session'")
+            .bind(new_worker.to_string())
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        assert!(recovery_status(st, "session").await.is_none(), "an open WebSocket or a new viewer must not see the old owner's status");
+        status["ownership_epoch"] = json!(1);
+        status["incident"] = json!(new_low_id);
+        crate::fabric::handle(st, new_worker, "session.recovery_status", status.clone()).await.unwrap();
+        assert_eq!(recovery_status(st, "session").await.unwrap().incident, new_low_id, "neither old UUID order nor its tombstones apply");
+        status["ownership_epoch"] = json!(0);
+        status["incident"] = json!(old_high_id);
+        assert_eq!(crate::fabric::handle(st, old_worker, "session.recovery_status", status).await.unwrap(), Value::Null);
+        assert_eq!(recovery_status(st, "session").await.unwrap().incident, new_low_id);
+    }
+
+    #[tokio::test]
+    async fn recovery_status_retains_highest_accepted_incident_through_clear() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let worker = WorkerId::new();
+        assign_worker(st, worker).await;
+        let send = |incident, reason: Option<&str>| {
+            crate::fabric::handle(
+                st,
+                worker,
+                "session.recovery_status",
+                json!({"session_id": "session", "ownership_epoch": 0, "incident": incident, "reason": reason}),
+            )
+        };
+        let older = "00000000-0000-7000-8000-000000000001";
+        let newer = "00000000-0000-7000-8000-000000000002";
+        let next = "00000000-0000-7000-8000-000000000003";
+        let unseen = "00000000-0000-7000-8000-000000000004";
+        let mut live = st.hub.subscribe("session");
+        send(older, Some("older warning")).await.unwrap();
+        send(newer, Some("newer warning")).await.unwrap();
+        send(newer, None).await.unwrap();
+        for _ in 0..3 {
+            live.try_recv().unwrap();
+        }
+        send(older, Some("the old clear was lost; a late report arrives")).await.unwrap();
+        assert!(recovery_status(st, "session").await.is_none());
+        assert!(live.try_recv().is_err(), "a superseded report must not reopen the banner");
+
+        send(unseen, None).await.unwrap();
+        send(next, Some("accepted despite the unrelated unseen clear")).await.unwrap();
+        send(unseen, Some("unseen clear still tombstones its exact report")).await.unwrap();
+        assert_eq!(recovery_status(st, "session").await.unwrap().incident, next);
+    }
+
+    #[tokio::test]
+    async fn recovery_status_reports_and_clears_retry_while_owner_is_move_gated() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let owner = WorkerId::new();
+        assign_worker(st, owner).await;
+        sqlx::query("INSERT INTO session_moves (id,session_id,source_worker_id,target_worker_id,source_epoch,target_epoch,state,request_json,created_at,updated_at) \
+                    VALUES ('move','session',?,?,0,1,'requested','{}',1,1)")
+            .bind(owner.to_string()).bind(WorkerId::new().to_string()).execute(&st.store.pool).await.unwrap();
+        let incident = Uuid::now_v7().to_string();
+        let send = |reason: Option<&str>| {
+            crate::fabric::handle(
+                st,
+                owner,
+                "session.recovery_status",
+                json!({"session_id": "session", "ownership_epoch": 0, "incident": incident, "reason": reason}),
+            )
+        };
+        let move_state = |state: &'static str| async move {
+            sqlx::query("UPDATE session_moves SET state = ? WHERE id = 'move'").bind(state).execute(&st.store.pool).await.unwrap();
+        };
+        let error = send(Some("warning while move is gated")).await.unwrap_err();
+        assert!(error.to_string().contains("session is moving"));
+        assert!(recovery_status(st, "session").await.is_none());
+        move_state("failed").await;
+        send(Some("retried after move did not proceed")).await.unwrap();
+        assert_eq!(recovery_status(st, "session").await.unwrap().incident, incident);
+
+        move_state("requested").await;
+        let error = send(None).await.unwrap_err();
+        assert!(error.to_string().contains("session is moving"));
+        move_state("failed").await;
+        assert_eq!(recovery_status(st, "session").await.unwrap().incident, incident, "the gated clear wasn't applied");
+        send(None).await.unwrap();
+        assert!(recovery_status(st, "session").await.is_none());
     }
 
     #[tokio::test]

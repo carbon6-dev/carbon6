@@ -4266,6 +4266,11 @@ fn SubagentLimitsSetting() -> impl IntoView {
                     <input type="number" min="1" max="1440" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.claude_code_idle_minutes.to_string()) on:input=move |ev| setting.update(|s| s.claude_code_idle_minutes = number(&ev)) />
                 </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Automatic journal recovery for new sessions (seconds)"</span>
+                    <input type="number" min="1" max="3600" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.session_recovery_seconds.to_string()) on:input=move |ev| setting.update(|s| s.session_recovery_seconds = number(&ev)) />
+                </label>
             </div>
             <p class="text-sm text-muted">
                 "An agent can message another session of its realm. Each send adds one to the last session message it received. The default chain limit is 4; a chain longer than the configured limit is refused, so two agents can't keep waking each other. Your next message resets the count to 0. A session sends at most this many messages an hour."

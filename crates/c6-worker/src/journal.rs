@@ -495,6 +495,20 @@ impl Journal {
         Ok(Self { pool, claude_rewind_ownership: tokio::sync::Mutex::new(()), appended: Notify::new() })
     }
 
+    /// Discard the journal's single connection before recovery reads or writes.
+    /// SQLx holds the pool permit through close; the next checkout opens a
+    /// fresh connection with the same options. No interrupted SQL is replayed:
+    /// callers must reload durable state if a write's outcome is uncertain.
+    pub(crate) async fn recover_connection(&self) -> anyhow::Result<()> {
+        self.pool
+            .acquire()
+            .await
+            .context("checking out journal connection for recovery")?
+            .close()
+            .await
+            .context("closing journal connection for recovery")
+    }
+
     async fn begin_write(&self) -> sqlx::Result<Transaction<'_, Sqlite>> {
         // Wait for the writer lock before any reads; a deferred read
         // snapshot can fail to upgrade without honoring the busy timeout.
@@ -1093,11 +1107,191 @@ async fn write_event_in(tx: &mut sqlx::SqliteConnection, session_id: &str, event
 }
 
 #[cfg(test)]
+impl Journal {
+    /// Matching appends fail with 4874 until this particular SQLite connection closes.
+    pub(crate) async fn inject_append_shmsize(&self, marker: &str) {
+        use std::ffi::{c_char, c_int, c_void};
+
+        // Inject a real extended SQLite result through a connection-local
+        // trigger, without manipulating the filesystem or the global VFS.
+        unsafe extern "C" {
+            fn sqlite3_create_function_v2(
+                db: *mut c_void,
+                name: *const c_char,
+                argc: c_int,
+                flags: c_int,
+                data: *mut c_void,
+                func: Option<unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_void)>,
+                step: Option<unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_void)>,
+                finalizer: Option<unsafe extern "C" fn(*mut c_void)>,
+                destroy: Option<unsafe extern "C" fn(*mut c_void)>,
+            ) -> c_int;
+            fn sqlite3_result_error_code(ctx: *mut c_void, code: c_int);
+        }
+        const SQLITE_UTF8: c_int = 1;
+        const SQLITE_IOERR_SHMSIZE: c_int = 4874;
+        unsafe extern "C" fn shmsize(ctx: *mut c_void, _: c_int, _: *mut *mut c_void) {
+            // SAFETY: SQLite invokes this function with its live result context.
+            unsafe { sqlite3_result_error_code(ctx, SQLITE_IOERR_SHMSIZE) };
+        }
+
+        assert!(!marker.is_empty());
+        let mut conn = self.pool.acquire().await.unwrap();
+        {
+            let mut handle = conn.lock_handle().await.unwrap();
+            // SAFETY: SQLx pauses its worker while this handle is locked;
+            // the callback has static lifetime and owns no user data.
+            let status = unsafe {
+                sqlite3_create_function_v2(
+                    handle.as_raw_handle().as_ptr().cast(),
+                    c"inject_shmsize".as_ptr(),
+                    0,
+                    SQLITE_UTF8,
+                    std::ptr::null_mut(),
+                    Some(shmsize),
+                    None,
+                    None,
+                    None,
+                )
+            };
+            assert_eq!(status, 0);
+        }
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TEMP TRIGGER poison_append BEFORE INSERT ON main.events
+             WHEN instr(NEW.data, X'{}') > 0 BEGIN SELECT inject_shmsize(); END",
+            hex::encode(marker)
+        )))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
 mod ownership_tests {
     use super::*;
 
     fn event(seq: u64) -> SessionEvent {
         SessionEvent { seq, ts_ms: 0, kind: Some(session_event::Kind::Started(c6_proto::SessionStarted::default())) }
+    }
+
+    #[tokio::test]
+    async fn connection_recovery_after_shmsize_does_not_replay_failed_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        journal.create_session("s", &CreateSession::default(), &event(1)).await.unwrap();
+        journal.inject_append_shmsize("uncertain").await;
+
+        let failed = SessionEvent {
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage { command_id: "uncertain".into(), ..Default::default() })),
+            ..event(2)
+        };
+        let err = journal.append("s", &failed).await.unwrap_err();
+        let sqlx = err.downcast_ref::<sqlx::Error>().expect("SQLite error");
+        assert_eq!(sqlx.as_database_error().and_then(|err| err.code()).as_deref(), Some("4874"));
+        // SQLite rolled back automatically, but SQLx 0.9 still thinks it
+        // owns a transaction and refuses the next BEGIN IMMEDIATE.
+        let stale = journal.append("s", &failed).await.unwrap_err();
+        let stale = stale.downcast_ref::<sqlx::Error>().expect("SQLite error");
+        assert!(
+            matches!(stale, sqlx::Error::InvalidSavePointStatement)
+                || stale.as_database_error().and_then(|err| err.code()).as_deref() == Some("4874"),
+            "{stale:?}"
+        );
+
+        journal.recover_connection().await.unwrap();
+        assert_eq!(journal.events_after("s", 0, 10).await.unwrap(), [event(1)]);
+        assert!(!journal.is_applied("uncertain").await.unwrap());
+        // The replacement still matches the fault trigger but is a new
+        // caller decision, not a replay of the earlier write.
+        let replacement = SessionEvent {
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage {
+                command_id: "replacement".into(),
+                text: "supersedes the uncertain append".into(),
+                ..Default::default()
+            })),
+            ..event(2)
+        };
+        journal.append("s", &replacement).await.unwrap();
+        assert_eq!(journal.events_after("s", 0, 10).await.unwrap(), [event(1), replacement]);
+    }
+
+    #[tokio::test]
+    async fn running_session_recovers_notice_after_shmsize() {
+        use c6_proto::{DelegationEnded, ModelSpec, SessionCommand, TurnEndReason, UserInput, session_command};
+
+        struct MockHead(String);
+
+        #[async_trait::async_trait]
+        impl crate::link::LocalHead for MockHead {
+            async fn call(&self, _: &str, _: serde_json::Value) -> Result<serde_json::Value, String> {
+                Err("not needed by this test".into())
+            }
+
+            async fn credential(&self, connection_id: &str) -> c6_proto::CredentialGrant {
+                c6_proto::CredentialGrant {
+                    connection_id: connection_id.into(),
+                    kind: "openai_compat".into(),
+                    base_url: self.0.clone(),
+                    ..Default::default()
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mock = c6_testkit::MockLlm::start().await;
+        let gate = mock.push_gated(c6_testkit::Reply::Text("The first turn stays in flight.".into()));
+        for _ in 0..2 {
+            mock.push(c6_testkit::Reply::Text("Recovery completed.".into()));
+        }
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let model =
+            ModelSpec { connection_id: "mock".into(), connection_kind: "openai_compat".into(), model: "m".into(), ..Default::default() };
+        let cwd = dir.path().display().to_string();
+        let spec = CreateSession { model: Some(model.clone()), cwd: cwd.clone(), ..Default::default() };
+        let started = c6_proto::SessionStarted { model: Some(model), cwd, tool_profile: "generic".into(), ..Default::default() };
+        journal.import("s", &spec, &[SessionEvent { kind: Some(session_event::Kind::Started(started)), ..event(1) }]).await.unwrap();
+        let link = crate::link::HeadLink::local(Arc::new(MockHead(mock.base_url())));
+        let manager = crate::session::SessionManager::new(journal.clone(), Arc::new(link), dir.path().join("worktrees"));
+        let command =
+            |id: &str, kind| SessionCommand { session_id: "s".into(), command_id: id.into(), ownership_epoch: 0, kind: Some(kind) };
+        manager
+            .handle(command(
+                "running-input",
+                session_command::Kind::Input(UserInput { text: "Start the gated turn.".into(), human_origin: true, ..Default::default() }),
+            ))
+            .await
+            .unwrap();
+        mock.request_headers(0).await;
+
+        let marker = "retained-notice-after-shmsize";
+        journal.inject_append_shmsize(marker).await;
+        let failure = manager
+            .handle(command(
+                "report",
+                session_command::Kind::DelegationEnded(DelegationEnded {
+                    child_session_id: "test-child".into(),
+                    report: marker.into(),
+                    wake: true,
+                    reason: TurnEndReason::Completed as i32,
+                    ..Default::default()
+                }),
+            ))
+            .await
+            .unwrap_err();
+        assert!(failure.contains("4874"), "{failure}");
+        let is_notice = |event: &SessionEvent| matches!(&event.kind, Some(session_event::Kind::User(user)) if user.command_id == "subagent:report" && user.text.contains(marker));
+        let events = c6_testkit::eventually("the faulted notice to reach the model and complete", async || {
+            let events = journal.events_after("s", 0, u32::MAX).await.ok()?;
+            let index = events.iter().position(is_notice)?;
+            let completed = events[index + 1..]
+                .iter()
+                .any(|e| matches!(&e.kind, Some(session_event::Kind::TurnEnded(end)) if end.reason == TurnEndReason::Completed as i32));
+            (completed && mock.requests().iter().any(|request| request.to_string().contains(marker))).then_some(events)
+        })
+        .await;
+        assert_eq!(events.iter().filter(|e| is_notice(e)).count(), 1);
+        gate.notify_one();
     }
 
     #[tokio::test]

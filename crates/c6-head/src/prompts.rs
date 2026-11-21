@@ -89,6 +89,16 @@ pub const DEFAULTS: &[Prompt] = &[
         default: c6_agent::TASK_LOST_AFTER_FAILURE,
     },
     Prompt {
+        name: "session.recovery_notification",
+        description: "Notification to the user when automatic journal recovery stalls. Substitution: {{reason}}.",
+        default: "Automatic recovery stopped. Queued messages and notices are held. Open the session to retry or restart its agent. Reason: {{reason}}",
+    },
+    Prompt {
+        name: "session.subagent_recovery_stuck",
+        description: "Notice to the parent agent when its child needs manual journal recovery. Substitutions: {{child}}, {{reason}}.",
+        default: "Subagent {{child}} could not recover its session automatically. Its unfinished work is not a result. Its queued messages are held until the user retries or restarts its agent. Reason: {{reason}}",
+    },
+    Prompt {
         name: "session.task_lost_unknown",
         description: "What the agent is told when a task is no longer tracked on session reload and the reason is unknown.",
         default: c6_agent::TASK_LOST_UNKNOWN,
