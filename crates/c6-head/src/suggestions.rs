@@ -110,7 +110,7 @@ pub(crate) async fn model_for(st: &HeadState, row: &crate::store::SessionRow, la
 pub(crate) async fn rule_for(st: &HeadState, row: &crate::store::SessionRow, label: &str) -> anyhow::Result<Option<(String, String)>> {
     let mut labels = row.all_labels();
     labels.push(label.into());
-    let connections = st.store.connections().await?;
+    let connections = st.store.effective_connections().await?;
     // The realm's rules, then root's (setting_for merges them).
     let routes: Vec<api::Route> =
         serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, &row.realm).await?.unwrap_or_default()).unwrap_or_default();
@@ -217,7 +217,7 @@ async fn make(st: &HeadState, row: &crate::store::SessionRow, for_seq: i64) -> a
         &[("title", &row.title), ("labels", &labels), ("exchanges", &exchanges(st, &row.id, for_seq as u64).await?)],
     );
     let (connection, model) = model_for(st, row, ROUTE_LABEL).await?;
-    let kind = st.store.connections().await?.into_iter().find(|c| c.id == connection).map(|c| c.kind);
+    let kind = st.store.effective_connection(&connection).await?.map(|c| c.kind);
     anyhow::ensure!(
         kind.as_deref() != Some("claude_code"),
         "a Claude Code session needs a {ROUTE_LABEL} rule with an API connection (Settings → Model routing)"
@@ -248,6 +248,7 @@ async fn make(st: &HeadState, row: &crate::store::SessionRow, for_seq: i64) -> a
         acc.push(&ev?);
     }
     let usage = acc.usage;
+    let connection = acc.account.take().map(|a| a.resolved_connection_id).filter(|id| !id.is_empty()).unwrap_or(connection);
     let msg = acc.finish(true);
     // Its tokens count toward the session (a row of its own, below zero).
     sqlx::query(
@@ -287,6 +288,38 @@ fn clean(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn head_tasks_record_usage_for_the_account_behind_an_alias() {
+        use serde_json::json;
+
+        let (_dir, head, mock, _id) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let target = st.store.connection("api").await.unwrap().unwrap();
+        let alias = crate::store::ConnectionRow { id: "alias".into(), name: "stable".into(), kind: "alias".into(), ..target };
+        crate::aliases::create(&st.store, &alias, "api", "test").await.unwrap();
+        let routes = json!([{"name": "alias", "connection": "stable", "applies_to": [ROUTE_LABEL], "model": "test", "enabled": true}]);
+        st.store.set_setting(crate::sessions::ROUTES, &routes.to_string()).await.unwrap();
+        let row = st.store.session("session").await.unwrap().unwrap();
+
+        mock.push(c6_testkit::Reply::Text("Follow up".into()));
+        assert_eq!(make(st, &row, 1).await.unwrap(), "Follow up");
+        mock.push(c6_testkit::Reply::Text("Catch up".into()));
+        assert_eq!(crate::catchup::ask(st, &row, ROUTE_LABEL, "catchup", "Context".into(), 1024).await.unwrap(), "Catch up");
+        mock.push(c6_testkit::Reply::Text(r#"{"note":"Done"}"#.into()));
+        assert_eq!(
+            crate::work::ask_as(st, &row.realm, ("alias".into(), "test".into()), "work", "note", "Work", "Summarize".into()).await.unwrap(),
+            json!({"note": "Done"})
+        );
+
+        let accounted: Vec<String> =
+            sqlx::query_scalar("SELECT connection_id FROM usage WHERE session_id IN ('session', 'work:note') AND seq < 0")
+                .fetch_all(&st.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(accounted, ["api", "api", "api"]);
+        head.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn exchanges_project_rewinds_before_selecting_turns_or_a_cutoff() {

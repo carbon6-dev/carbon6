@@ -20,7 +20,7 @@ use c6_api::watchers::{Finding, SessionWatch, Watcher, WatcherDef, preinstalled,
 use c6_core::now_ms;
 use c6_llm::{Accumulator, Block, Message, ModelRequest, Role};
 use c6_proto::session_event::Kind;
-use c6_proto::{SessionEvent, SessionEventBatch, TurnEndReason, content_block};
+use c6_proto::{SessionEvent, TurnEndReason, content_block};
 use futures::StreamExt;
 use prost::Message as _;
 use serde_json::{Value, json};
@@ -349,7 +349,6 @@ async fn state_for(st: &HeadState, d: &WatcherDef, key: &str, realm: &str, watch
 
 /// Adds events to a watcher's session.
 async fn append(st: &HeadState, session_id: &str, kinds: Vec<Kind>) -> anyhow::Result<u64> {
-    let head = st.assistant.head_id().ok_or_else(|| anyhow::anyhow!("the head is starting"))?;
     let row = st.store.session(session_id).await?.ok_or_else(|| anyhow::anyhow!("the watcher's session is gone"))?;
     let mut seq = row.last_seq as u64;
     let events = kinds
@@ -359,7 +358,7 @@ async fn append(st: &HeadState, session_id: &str, kinds: Vec<Kind>) -> anyhow::R
             SessionEvent { seq, ts_ms: now_ms(), kind: Some(k) }
         })
         .collect();
-    crate::sessions::ingest(st, head, SessionEventBatch { session_id: session_id.to_owned(), events, ownership_epoch: 0 }).await?;
+    crate::sessions::ingest_from_head(st, session_id, events).await?;
     Ok(seq)
 }
 
@@ -830,15 +829,7 @@ async fn wake(st: &HeadState, name: &str, key: &str, forced: &[String], message:
                 blocks: vec![c6_proto::ContentBlock { block: Some(content_block::Block::Text(said)), ..Default::default() }],
                 stop_reason: "end_turn".into(),
             }),
-            Kind::Usage(c6_proto::Usage {
-                model: model.clone(),
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_read_tokens: usage.cache_read_tokens,
-                cache_write_tokens: usage.cache_write_tokens,
-                reasoning_tokens: usage.reasoning_tokens,
-                context_window: 0,
-            }),
+            Kind::Usage(usage),
         ],
     )
     .await?;
@@ -1608,12 +1599,7 @@ pub async fn guard(st: &HeadState, session: &SessionRow, tool: &str, input: &str
                 blocks: vec![c6_proto::ContentBlock { block: Some(content_block::Block::Text(said)), ..Default::default() }],
                 stop_reason: "end_turn".into(),
             }),
-            Kind::Usage(c6_proto::Usage {
-                model,
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                ..Default::default()
-            }),
+            Kind::Usage(usage),
             Kind::TurnEnded(c6_proto::TurnEnded { turn, reason: TurnEndReason::Completed as i32 }),
         ],
     )
@@ -1633,7 +1619,7 @@ async fn ask(
     connection: &str,
     model: &str,
     prompt: String,
-) -> anyhow::Result<(Value, c6_llm::Usage)> {
+) -> anyhow::Result<(Value, c6_proto::Usage)> {
     ask_json(st, realm, &format!("watcher {watcher}"), watcher, connection, model, prompt).await
 }
 
@@ -1647,7 +1633,7 @@ pub(crate) async fn ask_json(
     connection: &str,
     model: &str,
     prompt: String,
-) -> anyhow::Result<(Value, c6_llm::Usage)> {
+) -> anyhow::Result<(Value, c6_proto::Usage)> {
     let req = ModelRequest {
         model: model.to_owned(),
         system: String::new(),
@@ -1674,7 +1660,7 @@ pub(crate) async fn ask_message(
     about: &str,
     connection: &str,
     req: &ModelRequest,
-) -> anyhow::Result<(Message, c6_llm::Usage)> {
+) -> anyhow::Result<(Message, c6_proto::Usage)> {
     let origin = c6_llm::activity::Origin {
         what: what.to_owned(),
         about: about.to_owned(),
@@ -1688,7 +1674,20 @@ pub(crate) async fn ask_message(
     while let Some(ev) = stream.next().await {
         acc.push(&ev?);
     }
-    let usage = acc.usage;
+    let mut usage = c6_proto::Usage {
+        model: req.model.clone(),
+        input_tokens: acc.usage.input_tokens,
+        output_tokens: acc.usage.output_tokens,
+        cache_read_tokens: acc.usage.cache_read_tokens,
+        cache_write_tokens: acc.usage.cache_write_tokens,
+        reasoning_tokens: acc.usage.reasoning_tokens,
+        ..Default::default()
+    };
+    if let Some(account) = acc.account.take() {
+        usage.resolved_connection_id = account.resolved_connection_id;
+        usage.resolved_connection_name = account.resolved_connection_name;
+        usage.alias_connection_name = account.alias_connection_name;
+    }
     let msg = acc.finish(true);
     Ok((msg, usage))
 }
@@ -1870,6 +1869,58 @@ pub fn spawn(st: std::sync::Arc<HeadState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn watcher_alias_usage_preserves_head_attribution_but_rejects_worker_claim() {
+        let (_dir, head, mock, _id) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let head_id = st.assistant.head_id().unwrap();
+        let target = st.store.connection("api").await.unwrap().unwrap();
+        let alias = crate::store::ConnectionRow {
+            id: "alias".into(),
+            name: "Stable".into(),
+            kind: crate::aliases::KIND.into(),
+            base_url: String::new(),
+            ..target
+        };
+        crate::aliases::create(&st.store, &alias, "api", "test").await.unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, realm) \
+             VALUES ('watch', ?, '', '', 'alias', 'test-model', 'idle', 0, 0, ?)",
+        )
+        .bind(head_id.to_string())
+        .bind(crate::realms::HOME)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+
+        let prompt = "record watcher alias usage";
+        mock.push_about(prompt, c6_testkit::Reply::Text(r#"{"findings":[]}"#.into()));
+        let (_, usage) = ask(st, crate::realms::HOME, "test", "alias", "test-model", prompt.into()).await.unwrap();
+        assert_eq!(usage.resolved_connection_id, "api");
+        assert_eq!(append(st, "watch", vec![Kind::Usage(usage.clone())]).await.unwrap(), 1);
+
+        // A wire-path batch still needs a grant, even if its worker ID
+        // matches the in-process writer for the same session.
+        let batch = c6_proto::SessionEventBatch {
+            session_id: "watch".into(),
+            events: vec![SessionEvent { seq: 2, ts_ms: now_ms(), kind: Some(Kind::Usage(usage.clone())) }],
+            ownership_epoch: 0,
+        };
+        assert_eq!(crate::sessions::ingest(st, head_id, batch).await.unwrap(), Some(2));
+        let events = st.store.events_after("watch", 0, 2).await.unwrap();
+        assert_eq!(events[0].kind, Some(Kind::Usage(usage)));
+        let Some(Kind::Usage(forged)) = &events[1].kind else { panic!("expected usage") };
+        assert!(forged.resolved_connection_id.is_empty());
+        assert!(forged.resolved_connection_name.is_empty());
+        assert!(forged.alias_connection_name.is_empty());
+        let accounted: Vec<String> = sqlx::query_scalar("SELECT connection_id FROM usage WHERE session_id = 'watch' ORDER BY seq")
+            .fetch_all(&st.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(accounted, ["api", "alias"]);
+        head.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn current_digest_projects_before_windowing_but_rewinds_still_wake() {

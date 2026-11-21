@@ -2,6 +2,7 @@
 
 pub mod activity;
 pub mod agent_ops;
+mod aliases;
 pub mod analytics;
 pub mod api;
 pub mod apps;

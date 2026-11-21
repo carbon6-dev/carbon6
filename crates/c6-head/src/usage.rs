@@ -24,11 +24,12 @@ const BUDGET_STATE: &str = "budget_state";
 pub async fn record(tx: &mut sqlx::SqliteConnection, session_id: &str, seq: u64, ts: i64, u: &c6_proto::Usage) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT OR IGNORE INTO usage (session_id, seq, ts, connection_id, model, input, output, cache_read, cache_write, realm) \
-         SELECT ?, ?, ?, connection_id, CASE WHEN ? = '' THEN model ELSE ? END, ?, ?, ?, ?, realm FROM sessions WHERE id = ?",
+         SELECT ?, ?, ?, COALESCE(NULLIF(?, ''), connection_id), CASE WHEN ? = '' THEN model ELSE ? END, ?, ?, ?, ?, realm FROM sessions WHERE id = ?",
     )
     .bind(session_id)
     .bind(seq as i64)
     .bind(ts)
+    .bind(&u.resolved_connection_id)
     .bind(&u.model)
     .bind(&u.model)
     .bind(u.input_tokens as i64)

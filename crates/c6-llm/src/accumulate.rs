@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{Block, Message, ModelEvent, Role, Usage};
+use crate::{Block, Message, ModelAccount, ModelEvent, Role, Usage};
 
 #[derive(Default)]
 pub struct Accumulator {
@@ -14,12 +14,14 @@ pub struct Accumulator {
     /// Text streamed since the last finished block, kept if interrupted.
     partial_text: String,
     pub usage: Usage,
+    pub account: Option<ModelAccount>,
     pub stop_reason: Option<String>,
 }
 
 impl Accumulator {
     pub fn push(&mut self, ev: &ModelEvent) {
         match ev {
+            ModelEvent::Account(account) => self.account = Some(account.clone()),
             ModelEvent::TextDelta(t) => {
                 self.partial_text.push_str(t);
                 match self.blocks.last_mut() {

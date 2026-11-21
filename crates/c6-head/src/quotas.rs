@@ -634,12 +634,38 @@ fn codex_comparisons(identities: &[(Option<String>, Option<String>)], origin: &a
 }
 
 /// A turn ended on `connection`: a ChatGPT plan's windows are read soon.
-pub async fn turn_ended(st: &HeadState, session_id: &str) {
+pub async fn turn_ended(st: &HeadState, session_id: &str, end_seq: u64) {
     let Ok(Some(s)) = st.store.session(session_id).await else { return };
-    let stale = st.quotas.get(&s.connection_id).is_none_or(|q| now_ms() - q.updated_at > FRESH_MS);
-    if stale && st.store.connection(&s.connection_id).await.ok().flatten().is_some_and(|c| c.kind == "chatgpt") {
-        st.quotas.wake.notify_one();
+    // A switch can happen before this event arrives. Use the account that
+    // actually answered, not the alias's (possibly already changed) target.
+    let mut connections = turn_connections(&st.store, session_id, end_seq).await.unwrap_or_default();
+    if connections.is_empty() {
+        match st.store.resolve_connection(&s.connection_id).await {
+            Ok(Some(c)) => connections.push(c.resolved_connection_id.unwrap_or(c.row.id)),
+            _ => return,
+        }
     }
+    for connection in connections {
+        let stale = st.quotas.get(&connection).is_none_or(|q| now_ms() - q.updated_at > FRESH_MS);
+        if stale && st.store.connection(&connection).await.ok().flatten().is_some_and(|c| c.kind == "chatgpt") {
+            // The poll reads all real accounts, including both sides of a switch.
+            st.quotas.wake.notify_one();
+            break;
+        }
+    }
+}
+
+async fn turn_connections(store: &crate::store::Store, session_id: &str, end_seq: u64) -> anyhow::Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT DISTINCT connection_id FROM usage WHERE session_id = ? AND seq < ? AND seq > \
+         COALESCE((SELECT MAX(seq) FROM activity WHERE session_id = ? AND seq < ? AND kind = 'turn_start'), 0) ORDER BY connection_id",
+    )
+    .bind(session_id)
+    .bind(end_seq as i64)
+    .bind(session_id)
+    .bind(end_seq as i64)
+    .fetch_all(&store.pool)
+    .await?)
 }
 
 async fn usage_url(st: &HeadState) -> String {
@@ -768,6 +794,34 @@ async fn list(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn alias_quota_refresh_uses_only_accounts_from_the_ending_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("head.db")).await.unwrap();
+        for seq in [1, 5, 8] {
+            sqlx::query("INSERT INTO activity (session_id, seq, ts, kind) VALUES ('s', ?, 0, 'turn_start')")
+                .bind(seq)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        for (seq, account) in [(-1, "head-call"), (2, "a"), (3, "b"), (9, "c")] {
+            sqlx::query(
+                "INSERT INTO usage (session_id, seq, ts, connection_id, model, input, output, cache_read, cache_write) \
+                 VALUES ('s', ?, 0, ?, 'm', 1, 1, 0, 0)",
+            )
+            .bind(seq)
+            .bind(account)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(super::turn_connections(&store, "s", 4).await.unwrap(), ["a", "b"]);
+        assert!(super::turn_connections(&store, "s", 7).await.unwrap().is_empty());
+        assert_eq!(super::turn_connections(&store, "s", 10).await.unwrap(), ["c"]);
+        store.pool.close().await;
+    }
+
     use super::*;
 
     #[test]

@@ -181,7 +181,7 @@ pub struct Connection {
     pub id: String,
     pub name: String,
     /// `openai_compat`, `openai`, `anthropic`, `chatgpt`, `claude_code`, or
-    /// `pool` (docs/pools.md).
+    /// `pool` (docs/pools.md), or `alias` (a switchable API connection).
     pub kind: String,
     pub base_url: String,
     pub default_model: Option<String>,
@@ -198,6 +198,12 @@ pub struct Connection {
     /// A pool's members (docs/pools.md).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<PoolMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_target_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_target_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_switched_at: Option<UnixMs>,
     /// The model subagents of sessions on it run on when no routing rule or
     /// session setting names one (a cheaper one saves tokens); none: the
     /// session's own.
@@ -341,8 +347,9 @@ pub struct PoolMember {
 pub struct CreateConnection {
     /// `openai_compat` (default), `openai`, `anthropic`, `claude_code`
     /// (runs the worker's own signed-in Claude Code), or `pool` (other
-    /// connections, for what runs in the head: docs/pools.md). ChatGPT
-    /// connections are created by signing in instead.
+    /// connections, for what runs in the head: docs/pools.md), or `alias`
+    /// (one switchable API account). ChatGPT connections are created by
+    /// signing in instead.
     #[serde(default)]
     pub kind: Option<String>,
     pub name: String,
@@ -355,6 +362,24 @@ pub struct CreateConnection {
     /// A pool's members.
     #[serde(default)]
     pub members: Vec<PoolMember>,
+    /// For kind `alias`, the ID of its first target. Its provider kind is fixed from then on.
+    pub alias_target_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SwitchConnectionAlias {
+    pub target_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ConnectionAliasChange {
+    /// None for the initial target.
+    pub previous_target_id: Option<String>,
+    pub target_id: String,
+    pub switched_at: UnixMs,
+    pub changed_by: String,
 }
 
 /// `PATCH /api/v1/connections/{id}`: what changes (what is left out stays).
@@ -2559,6 +2584,14 @@ pub enum EventKind {
         /// The window of the model that made the call, when known; 0: unknown.
         #[serde(default, skip_serializing_if = "is_zero_u64")]
         context_window: u64,
+        /// The account that handled this model call, when reported by the worker.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        resolved_connection_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        resolved_connection_name: String,
+        /// The selected alias's display name at the time of the call, if any.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        alias_connection_name: String,
     },
     TurnEnded {
         turn: u64,

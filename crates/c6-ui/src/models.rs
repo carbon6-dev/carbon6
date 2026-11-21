@@ -10,7 +10,7 @@ pub fn prefetch() {
     let connections = crate::resources::connections();
     Effect::new(move || {
         if let Some(Ok(all)) = connections.get() {
-            for c in all {
+            for c in all.into_iter().filter(|c| c.kind != "alias") {
                 crate::resources::models(c.id);
             }
         }
@@ -55,8 +55,18 @@ pub fn ModelInput(
             all.into_iter()
                 .filter(|x| c.is_empty() || x.id == c || x.name == c)
                 .map(|x| {
-                    let list = crate::resources::models(x.id);
-                    async move { (x.name, list.await) }
+                    // The target can switch via the API or in another tab. Revalidate
+                    // aliases when shown; the head still shares the provider's cached list.
+                    let list = (x.kind != "alias").then(|| crate::resources::models(x.id.clone()));
+                    async move {
+                        (
+                            x.name,
+                            match list {
+                                Some(list) => list.await,
+                                None => crate::api::models(x.id).await,
+                            },
+                        )
+                    }
                 })
                 .collect::<Vec<_>>()
         });

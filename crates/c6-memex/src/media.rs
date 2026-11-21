@@ -566,7 +566,7 @@ pub async fn transcribe(m: &Memex, task: &Task, audio: &[u8]) -> anyhow::Result<
     let text = match m.link.pool(&task.connection_id).await {
         Some(pool) => pool.run(&task.model, &m.realm, |e| transcription(e, &task.model, audio)).await?,
         None => {
-            let g = m.link.credential(&task.connection_id).await?;
+            let g = m.link.realm_credential(&m.realm, &task.connection_id).await?;
             let e = c6_llm::pool::Endpoint {
                 kind: g.kind,
                 base_url: g.base_url,

@@ -11,7 +11,11 @@ cd "$(dirname "$0")/.."
 # starts, capture and Up next, session goals, browser Back, transcript times
 # and more), measured from the Linux release build.
 accepted_raw=10852038
-accepted_br=2708080
+# 2026-11-21: aliases add creation/switch controls and per-account transcript
+# metadata. After sharing Settings renderers, the measured Linux release is
+# 2,790,904 bytes Brotli (82,824 above the previous accepted build); raw WASM
+# still fits its existing allowance, so retain that baseline.
+accepted_br=2790904
 dist=${UI_DIST:-crates/c6-ui/dist}
 shopt -s nullglob
 wasm=("$dist"/*_bg.wasm)

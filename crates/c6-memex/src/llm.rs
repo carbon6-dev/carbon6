@@ -81,7 +81,12 @@ pub async fn ask(
             (Box::new(c6_llm::pool::PoolClient::new(pool, &m.realm, origin).with_limits(limits)), window)
         }
         None => {
-            let grant = m.link.credential(&task.connection_id).await?;
+            let grant = m.link.realm_credential(&m.realm, &task.connection_id).await?;
+            let mut origin = origin;
+            if grant.is_alias {
+                origin.via.clone_from(&task.connection_id);
+                origin.connection = grant.resolved_connection_id;
+            }
             let endpoint = c6_llm::pool::Endpoint {
                 kind: grant.kind,
                 base_url: grant.base_url,
@@ -89,10 +94,10 @@ pub async fn ask(
                 headers: grant.headers,
                 context_window: grant.context_window,
             };
-            let window = c6_llm::window::known(&task.connection_id, &task.model, &endpoint).await;
+            let window = c6_llm::window::known(&origin.connection, &task.model, &endpoint).await;
             let mut client = c6_llm::client_for(&endpoint.kind, &endpoint.base_url, &endpoint.bearer, endpoint.headers)?;
             if endpoint.kind == "chatgpt"
-                && let Some(hook) = m.link.chatgpt_limits_hook(&task.connection_id)
+                && let Some(hook) = m.link.chatgpt_limits_hook(&origin.connection)
             {
                 client.set_chatgpt_limits_hook(hook);
             }

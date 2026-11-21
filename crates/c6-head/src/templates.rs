@@ -253,7 +253,7 @@ async fn connection_of(st: &HeadState, name: &str, t: &api::Template) -> anyhow:
     if t.connection.trim().is_empty() {
         return Ok(String::new());
     }
-    let connections = st.store.connections().await?;
+    let connections = st.store.effective_connections().await?;
     Ok(connections
         .iter()
         .find(|c| c.name == t.connection || c.id == t.connection)

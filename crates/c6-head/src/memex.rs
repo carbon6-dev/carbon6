@@ -298,7 +298,7 @@ pub async fn check_pool_use(st: &HeadState, pool_id: &str, members: &[api::PoolM
 
 pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::Result<()> {
     if let Some(m) = &s.embedding {
-        let connections = st.store.connections().await?;
+        let connections = st.store.effective_connections().await?;
         let c = connections
             .iter()
             .find(|c| c.id == m.connection || c.name == m.connection)
@@ -316,7 +316,7 @@ pub async fn check_settings(st: &HeadState, s: &api::MemexSettings) -> anyhow::R
             return Err(bad_request("choose an embedding model"));
         }
     }
-    let connections = st.store.connections().await?;
+    let connections = st.store.effective_connections().await?;
     for (what, m) in
         [("understanding", &s.understanding), ("drafting", &s.drafting), ("vision", &s.vision), ("transcription", &s.transcription)]
     {
@@ -384,7 +384,7 @@ pub const MAX_AT_ONCE: u32 = 64;
 /// (it fetches credentials for them like a worker does).
 pub async fn config(st: &HeadState) -> anyhow::Result<Value> {
     let s = settings(st).await?;
-    let connections = st.store.connections().await?;
+    let connections = st.store.effective_connections().await?;
     // Understanding reads many times a day without reasoning by default;
     // drafting and vision reason a little.
     let task_with = |m: &Option<api::MemexModel>, effort: &str| {

@@ -18,8 +18,8 @@ use c6_api as api;
 use c6_core::{WorkerId, now_ms};
 use c6_llm::{Message, Provider, Role, ToolSpec, model_info};
 use c6_proto::{
-    ErrorEvent, HeadMsg, ModelSwitched, SessionActivity, SessionCommand, SessionEvent, SessionEventBatch, SessionStarted, TurnEndReason,
-    TurnEnded, TurnStarted, ephemeral_event, head_msg, session_command, session_event,
+    ErrorEvent, HeadMsg, ModelSwitched, SessionActivity, SessionCommand, SessionEvent, SessionStarted, TurnEndReason, TurnEnded,
+    TurnStarted, ephemeral_event, head_msg, session_command, session_event,
 };
 use c6_tools::{Concurrency, SessionTools, Tool, ToolCtx, ToolOutput};
 use serde_json::{Value, json};
@@ -266,12 +266,7 @@ impl EventSink for Sink {
         let mut seq = self.seq.lock().await;
         *seq += 1;
         let ev = SessionEvent { seq: *seq, ts_ms: now_ms(), kind: Some(kind) };
-        crate::sessions::ingest(
-            &self.st,
-            self.head_id,
-            SessionEventBatch { session_id: self.session_id.clone(), events: vec![ev], ownership_epoch: 0 },
-        )
-        .await?;
+        crate::sessions::ingest_from_head(&self.st, &self.session_id, vec![ev]).await?;
         self.logged.store(*seq + 1, std::sync::atomic::Ordering::SeqCst);
         Ok(*seq)
     }
@@ -1347,7 +1342,7 @@ async fn start_in_realm(st: &HeadState, args: &mut Value) -> Result<IntoRealm, S
         said.push_str(&format!(", in {}{}", req.cwd.trim(), if req.worktree { " (a new git worktree)" } else { "" }));
     }
     if !req.model.trim().is_empty() || !req.connection_id.trim().is_empty() {
-        let connection = match st.store.connection(req.connection_id.trim()).await {
+        let connection = match st.store.effective_connection(req.connection_id.trim()).await {
             Ok(Some(c)) => c.name,
             _ => req.connection_id.trim().to_owned(),
         };
@@ -2050,7 +2045,7 @@ pub async fn model(st: &HeadState, realm: &str) -> anyhow::Result<(String, Strin
         serde_json::from_str(&st.store.setting_for(SETTING, realm).await?.unwrap_or_default()).unwrap_or_default();
     let (conn, model) = match &s.model {
         Some(m) => {
-            let connections = st.store.connections().await?;
+            let connections = st.store.effective_connections().await?;
             let c = connections
                 .iter()
                 .find(|c| c.id == m.connection || c.name == m.connection)
@@ -2064,7 +2059,7 @@ pub async fn model(st: &HeadState, realm: &str) -> anyhow::Result<(String, Strin
 
 pub async fn check_settings(st: &HeadState, s: &api::AssistantSettings) -> anyhow::Result<()> {
     if let Some(m) = &s.model {
-        let connections = st.store.connections().await?;
+        let connections = st.store.effective_connections().await?;
         let c = connections
             .iter()
             .find(|c| c.id == m.connection || c.name == m.connection)

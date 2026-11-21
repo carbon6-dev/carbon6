@@ -24,6 +24,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/connections", get(list_connections).post(create_connection))
         .route("/api/v1/connections/test", post(test_connection))
         .route("/api/v1/connections/{id}", delete(delete_connection).patch(update_connection))
+        .route("/api/v1/connections/{id}/alias/switch", post(switch_connection_alias))
+        .route("/api/v1/connections/{id}/alias/history", get(connection_alias_history))
         .route("/api/v1/connections/{id}/models", get(connection_models))
         .route("/api/v1/connections/chatgpt/start", post(chatgpt_start))
         .route("/api/v1/connections/chatgpt/complete", post(chatgpt_complete))
@@ -495,6 +497,9 @@ async fn live_socket(st: Arc<HeadState>, caller: Caller, mut socket: WebSocket) 
 fn connection_view(c: crate::store::ConnectionRow) -> api::Connection {
     api::Connection {
         members: crate::pools::members(&c),
+        alias_target_id: None,
+        alias_target_kind: None,
+        alias_switched_at: None,
         supports_effort: c6_llm::supports_effort(&c.kind, &c.base_url),
         id: c.id,
         name: c.name,
@@ -510,18 +515,96 @@ fn connection_view(c: crate::store::ConnectionRow) -> api::Connection {
     }
 }
 
-/// The connections a caller may use: a realm's, those serving it.
-async fn list_connections(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Connection>>> {
-    let mut all: Vec<api::Connection> = st.store.connections().await?.into_iter().map(connection_view).collect();
-    if let Some(realm) = &caller.realm {
-        all.retain(|c| crate::realms::serves(&c.realms, realm));
+async fn alias_view(st: &HeadState, mut c: api::Connection, alias: crate::aliases::Alias) -> ApiResult<api::Connection> {
+    if let Some(target) = st.store.connection(&alias.target_id).await? {
+        c.supports_effort = c6_llm::supports_effort(&target.kind, &target.base_url);
+        c.default_model = c.default_model.or(target.default_model);
     }
-    Ok(Json(all))
+    c.alias_target_id = Some(alias.target_id);
+    c.alias_target_kind = Some(alias.target_kind);
+    c.alias_switched_at = Some(alias.switched_at);
+    Ok(c)
 }
 
-async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api::CreateConnection>) -> ApiResult<Json<api::Connection>> {
+/// The connections a caller may use: a realm's, those serving it.
+async fn list_connections(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Connection>>> {
+    #[derive(sqlx::FromRow)]
+    struct Listed {
+        #[sqlx(flatten)]
+        row: crate::store::ConnectionRow,
+        target_id: Option<String>,
+        target_kind: Option<String>,
+        switched_at: Option<i64>,
+        effective_realms: String,
+        effective_base_url: String,
+        effective_default_model: Option<String>,
+    }
+    // Authorize and return metadata from the same snapshot: a concurrent
+    // switch must not expose a target from a different realm.
+    let rows: Vec<Listed> = sqlx::query_as(
+        "SELECT c.*, a.target_id, a.target_kind, a.switched_at, e.realms AS effective_realms, e.base_url AS effective_base_url, \
+         e.default_model AS effective_default_model \
+         FROM connections c JOIN effective_connections e ON e.id = c.id \
+         LEFT JOIN connection_aliases a ON a.alias_id = c.id ORDER BY c.name",
+    )
+    .fetch_all(&st.store.pool)
+    .await
+    .map_err(anyhow::Error::from)?;
+    let out = rows
+        .into_iter()
+        .filter(|c| caller.realm.as_deref().is_none_or(|r| crate::realms::available(&c.effective_realms, r)))
+        .map(|c| {
+            let mut view = connection_view(c.row);
+            if let Some(kind) = &c.target_kind {
+                view.supports_effort = c6_llm::supports_effort(kind, &c.effective_base_url);
+                view.default_model = c.effective_default_model;
+            }
+            view.alias_target_id = c.target_id;
+            view.alias_target_kind = c.target_kind;
+            view.alias_switched_at = c.switched_at;
+            view
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+fn connection_actor(caller: &Caller) -> String {
+    let fallback = caller.api_token_name.as_deref().filter(|s| !s.is_empty()).map(|s| format!("token:{s}"));
+    crate::agent_ops::by(fallback.as_deref().unwrap_or("user"))
+}
+
+async fn create_connection(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(req): Json<api::CreateConnection>,
+) -> ApiResult<Json<api::Connection>> {
     let context_window = checked_context_window(req.context_window)?;
     let kind = req.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()).unwrap_or("openai_compat");
+    if kind == crate::aliases::KIND {
+        let target = req.alias_target_id.as_deref().ok_or_else(|| crate::bad_request("an alias needs a target connection"))?;
+        if req.name.trim().is_empty() || req.api_key.is_some() || !req.base_url.trim().is_empty() || !req.members.is_empty() {
+            return Err(crate::bad_request("an alias needs a name and target; its URL and credentials come from the target").into());
+        }
+        let row = crate::store::ConnectionRow {
+            id: uuid::Uuid::now_v7().to_string(),
+            name: req.name.trim().into(),
+            kind: kind.into(),
+            base_url: String::new(),
+            api_key: None,
+            default_model: req.default_model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned),
+            context_window,
+            created_at: now_ms(),
+            realms: "[]".into(),
+            members: "[]".into(),
+            subagent_model: None,
+            compact_at: None,
+        };
+        let alias = crate::aliases::create(&st.store, &row, target, &connection_actor(&caller)).await?;
+        return Ok(Json(alias_view(&st, connection_view(row), alias).await?));
+    }
+    if req.alias_target_id.is_some() {
+        return Err(crate::bad_request("only aliases have an alias target").into());
+    }
     if kind == crate::pools::KIND {
         return Ok(Json(create_pool(&st, &req).await?));
     }
@@ -531,7 +614,12 @@ async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api
         "openai" => Some("https://api.openai.com/v1"),
         "anthropic" => Some("https://api.anthropic.com"),
         "chatgpt" => return Err(ApiErr(StatusCode::BAD_REQUEST, "ChatGPT connections are created with Sign in with ChatGPT".into())),
-        _ => return Err(ApiErr(StatusCode::BAD_REQUEST, "kind must be openai_compat, openai, anthropic, claude_code or pool".into())),
+        _ => {
+            return Err(ApiErr(
+                StatusCode::BAD_REQUEST,
+                "kind must be openai_compat, openai, anthropic, claude_code, pool or alias".into(),
+            ));
+        }
     };
     let name = req.name.trim();
     let base_url = Some(req.base_url.trim().trim_end_matches('/')).filter(|u| !u.is_empty()).or(default_url).unwrap_or("");
@@ -653,7 +741,29 @@ async fn update_connection(
         link.forget_connection(&id);
     }
     let row = st.store.connection(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such connection".into()))?;
-    Ok(Json(connection_view(row)))
+    let view = connection_view(row);
+    Ok(Json(match crate::aliases::get(&st.store, &id).await? {
+        Some(alias) => alias_view(&st, view, alias).await?,
+        None => view,
+    }))
+}
+
+async fn switch_connection_alias(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(req): Json<api::SwitchConnectionAlias>,
+) -> ApiResult<Json<api::Connection>> {
+    let alias = crate::aliases::switch(&st.store, &id, &req.target_id, &connection_actor(&caller)).await?;
+    let row = st.store.connection(&id).await?.ok_or_else(|| crate::not_found("no such connection alias"))?;
+    Ok(Json(alias_view(&st, connection_view(row), alias).await?))
+}
+
+async fn connection_alias_history(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<api::ConnectionAliasChange>>> {
+    Ok(Json(crate::aliases::history(&st.store, &id).await?))
 }
 
 async fn chatgpt_start(State(st): State<Arc<HeadState>>, Json(req): Json<api::StartChatGptSignIn>) -> ApiResult<Json<api::ChatGptSignIn>> {
@@ -668,6 +778,7 @@ async fn chatgpt_start(State(st): State<Arc<HeadState>>, Json(req): Json<api::St
                 client_id: tokens.client_id,
                 id_token: tokens.id_token,
                 sub: tokens.sub,
+                workspace: tokens.workspace,
             })
         }
         None => None,
@@ -773,7 +884,18 @@ fn html_escape(s: &str) -> String {
 }
 
 async fn delete_connection(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
-    if !st.store.delete_connection(&id).await? {
+    let deleted = match st.store.delete_connection(&id).await {
+        Err(e)
+            if e.downcast_ref::<sqlx::Error>().and_then(sqlx::Error::as_database_error).is_some_and(|e| e.is_foreign_key_violation()) =>
+        {
+            return Err(ApiErr(
+                StatusCode::CONFLICT,
+                "this connection is an active alias target; switch or delete its aliases first".into(),
+            ));
+        }
+        result => result?,
+    };
+    if !deleted {
         return Err(ApiErr(StatusCode::NOT_FOUND, "no such connection".into()));
     }
     st.models.clear();
@@ -794,11 +916,12 @@ pub(crate) struct ModelQuery {
 
 async fn connection_models(
     State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Query(q): Query<ModelQuery>,
 ) -> ApiResult<Json<Vec<String>>> {
     let generation = st.models.generation();
-    let c = st.store.connection(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such connection".into()))?;
+    let c = model_connection(&st, &id, caller.realm.as_deref()).await?;
     if c.kind == crate::pools::KIND {
         // The cheap union uses each member's cache. Caching it again
         // would make a stale member list fresh for another ten minutes.
@@ -808,6 +931,20 @@ async fn connection_models(
         return list_connection_models(&st, &c).await.map(Json);
     }
     connection_models_of(&st, &c, generation).await.map(Json)
+}
+
+async fn model_connection(st: &HeadState, id: &str, realm: Option<&str>) -> ApiResult<crate::store::ConnectionRow> {
+    let resolved = st
+        .store
+        .resolve_connection(id)
+        .await?
+        .filter(|c| realm.is_none_or(|r| crate::realms::available(&c.row.realms, r)))
+        .ok_or_else(|| crate::not_found("no such connection"))?;
+    let mut row = resolved.row;
+    if let Some(id) = resolved.resolved_connection_id {
+        row.id = id;
+    }
+    Ok(row)
 }
 
 /// A (non-pool) connection's models, from its provider.
@@ -862,6 +999,16 @@ pub(crate) struct TestConnection {
 /// Checks connection details before (or after) saving and returns the
 /// models the server offers.
 async fn test_connection(State(st): State<Arc<HeadState>>, Json(req): Json<TestConnection>) -> ApiResult<Json<Vec<String>>> {
+    if req.api_key.is_none()
+        && let Some(id) = &req.connection_id
+        && (req.base_url.trim().is_empty() || crate::aliases::get(&st.store, id).await?.is_some())
+    {
+        let c = model_connection(&st, id, None).await?;
+        if c.kind == crate::pools::KIND {
+            return Ok(Json(crate::pools::models(&st, &c, true).await?));
+        }
+        return list_connection_models(&st, &c).await.map(Json);
+    }
     let kind = req.kind.as_deref().filter(|k| !k.is_empty()).unwrap_or("openai_compat");
     let base = match (req.base_url.trim(), kind) {
         ("", "anthropic") => "https://api.anthropic.com",

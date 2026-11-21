@@ -9,6 +9,7 @@ pub mod models;
 pub mod openai_chat;
 pub mod openai_responses;
 pub mod pool;
+pub mod replay;
 mod sse;
 pub mod window;
 
@@ -150,6 +151,8 @@ pub struct Usage {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelEvent {
+    /// The real account that served this stream, when the caller selected an alias.
+    Account(ModelAccount),
     TextDelta(String),
     ThinkingDelta(String),
     /// A tool call begins. `index` identifies it in later deltas.
@@ -173,6 +176,13 @@ pub enum ModelEvent {
     Done {
         stop_reason: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelAccount {
+    pub resolved_connection_id: String,
+    pub resolved_connection_name: String,
+    pub alias_connection_name: String,
 }
 
 /// Normalized stop reasons the agent loop acts on.

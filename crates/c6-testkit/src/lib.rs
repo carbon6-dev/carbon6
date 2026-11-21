@@ -78,7 +78,8 @@ struct Step {
 #[derive(Default)]
 struct Inner {
     script: Mutex<VecDeque<Step>>,
-    requests: Mutex<Vec<Value>>,
+    requests: Mutex<Vec<(Value, axum::http::HeaderMap)>>,
+    requests_changed: Notify,
     /// Each request as it was answered, one line: for a test's failure.
     log: Mutex<Vec<String>>,
     /// Report the request's own size as its prompt tokens (`real_usage`),
@@ -158,7 +159,24 @@ impl MockLlm {
     }
 
     pub fn requests(&self) -> Vec<Value> {
-        self.inner.requests.lock().unwrap().clone()
+        self.inner.requests.lock().unwrap().iter().map(|(body, _)| body.clone()).collect()
+    }
+
+    /// Waits for a particular request to arrive (0 is the first request).
+    /// The reply may still be gated. Returns its HTTP headers as received.
+    pub async fn request_headers(&self, index: usize) -> axum::http::HeaderMap {
+        within("a mock model request", async {
+            loop {
+                let changed = self.inner.requests_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if let Some((_, headers)) = self.inner.requests.lock().unwrap().get(index) {
+                    return headers.clone();
+                }
+                changed.await;
+            }
+        })
+        .await
     }
 
     /// What each request asked (its model and the start of its last
@@ -201,7 +219,7 @@ async fn embeddings(Json(body): Json<Value>) -> Json<Value> {
     Json(json!({"data": data, "model": body["model"]}))
 }
 
-async fn completions(State(inner): State<Arc<Inner>>, Json(body): Json<Value>) -> Response {
+async fn completions(State(inner): State<Arc<Inner>>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
     let messages = body["messages"].to_string();
     let size = (body.to_string().chars().count() as u64 * 2).div_ceil(7);
     let asked: String = {
@@ -215,7 +233,8 @@ async fn completions(State(inner): State<Arc<Inner>>, Json(body): Json<Value>) -
         at.and_then(|i| script.remove(i))
     };
     if !naming || step.is_some() {
-        inner.requests.lock().unwrap().push(body);
+        inner.requests.lock().unwrap().push((body, headers));
+        inner.requests_changed.notify_waiters();
     }
     let answered = match &step {
         Some(s) => format!("{:?}", s.reply).chars().take(120).collect(),

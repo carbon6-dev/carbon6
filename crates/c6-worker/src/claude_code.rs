@@ -3997,6 +3997,7 @@ fn usage(model: String, u: &Value, context_window: u64) -> Usage {
         cache_write_tokens: n("cache_creation_input_tokens"),
         reasoning_tokens: 0,
         context_window,
+        ..Default::default()
     }
 }
 

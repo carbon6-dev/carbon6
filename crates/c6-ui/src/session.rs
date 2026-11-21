@@ -77,13 +77,15 @@ impl Tokens {
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct TurnStats {
     tokens: Tokens,
     started: i64,
     ended: Option<i64>,
     /// Context size at the turn's last model call.
     context: Option<u64>,
+    /// Distinct alias routes observed in this turn, in order of first use.
+    routes: Vec<String>,
 }
 
 /// Per-turn usage plus the session's totals and current context size.
@@ -99,6 +101,10 @@ pub(crate) struct UsageStats {
 }
 
 impl UsageStats {
+    fn current_line(&self, now: i64) -> Option<String> {
+        self.turns.get(&self.current_turn?).map(|t| turn_line(t, Some(now)))
+    }
+
     fn from_events(evs: &[Event]) -> Self {
         let mut st = Self::default();
         for e in evs {
@@ -119,7 +125,17 @@ impl UsageStats {
                 }
                 EventKind::Compaction { .. } => st.context = None,
                 EventKind::ModelSwitched { context_window, .. } => st.context_window = *context_window,
-                EventKind::Usage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, context_window, .. } => {
+                EventKind::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    context_window,
+                    alias_connection_name,
+                    resolved_connection_name,
+                    resolved_connection_id,
+                    ..
+                } => {
                     // The model that made the call says its window (Claude Code's
                     // aliases don't).
                     if *context_window > 0 {
@@ -131,6 +147,13 @@ impl UsageStats {
                     if let Some(t) = st.current_turn.and_then(|n| st.turns.get_mut(&n)) {
                         t.tokens.add(&e.kind);
                         t.context = Some(ctx);
+                        let account = if resolved_connection_name.is_empty() { resolved_connection_id } else { resolved_connection_name };
+                        if !alias_connection_name.is_empty() && !account.is_empty() {
+                            let route = format!("{alias_connection_name} → {account}");
+                            if !t.routes.contains(&route) {
+                                t.routes.push(route);
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -158,11 +181,14 @@ fn duration(ms: i64) -> String {
     if s >= 60 { format!("{}m {:02}s", s / 60, s % 60) } else { format!("{s}s") }
 }
 
-/// One line of a turn's numbers; `elapsed` for a turn still running.
+/// One line of a turn's usage; `now` is used for a turn still running.
 fn turn_line(t: &TurnStats, now: Option<i64>) -> String {
     let mut parts = Vec::new();
     if let Some(end) = t.ended.or(now) {
         parts.push(duration(end - t.started));
+    }
+    if !t.routes.is_empty() {
+        parts.push(t.routes.join(", "));
     }
     if t.tokens.calls > 0 {
         parts.push(format!("{} model call{}", t.tokens.calls, if t.tokens.calls == 1 { "" } else { "s" }));
@@ -3481,9 +3507,9 @@ fn Transcript(
                             {move || stream_status.with(|s| if s.is_empty() { "Working…".to_owned() } else { s.clone() })}
                         </span>
                         <span class="min-w-0 flex-1 truncate font-mono text-[11px]" data-turn-stats="true" tabindex="0"
-                            aria-label=move || usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied())).map(|t| format!("This turn: {}", turn_line(&t, Some(now.get()))))
-                            title=move || usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied())).map(|t| format!("This turn: {}", turn_line(&t, Some(now.get()))))>
-                            {move || usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied())).map(|t| turn_line(&t, Some(now.get())))}
+                            aria-label=move || usage.with(|u| u.current_line(now.get())).map(|s| format!("This turn: {s}"))
+                            title=move || usage.with(|u| u.current_line(now.get())).map(|s| format!("This turn: {s}"))>
+                            {move || usage.with(|u| u.current_line(now.get()))}
                         </span>
                 })}
                 </div>
@@ -3661,9 +3687,7 @@ fn PhoneStatus(chrome: SessionChrome, streaming: RwSignal<Streaming>, latest: Si
         }
     });
     let status = Signal::derive(move || streaming.with(|s| s.status.clone()));
-    let turn = Signal::derive(move || {
-        chrome.usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied())).map(|t| turn_line(&t, Some(now.get())))
-    });
+    let turn = Signal::derive(move || chrome.usage.with(|u| u.current_line(now.get())));
     let live = api::live();
     let failure = Memo::new(move |_| {
         if chrome.running.get() {
@@ -5449,9 +5473,9 @@ fn render_event(
             };
             view! {
                 {note.map(|n| view! { <p class="text-center text-xs text-muted">{n}</p> })}
-                {move || usage.with(|u| u.turns.get(&turn).copied()).map(|t| view! {
+                {move || usage.with(|u| u.turns.get(&turn).map(|t| turn_line(t, None))).map(|line| view! {
                     <p class="border-t border-zinc-200 pt-1 font-mono text-[11px] text-muted dark:border-zinc-800">
-                        {format!("Turn {turn} · {}", turn_line(&t, None))}
+                        {format!("Turn {turn} · {line}")}
                     </p>
                 })}
             }
@@ -8926,6 +8950,48 @@ mod tests {
             ev(2, usage(1_000_000)),
         ]);
         assert_eq!((u.context, u.context_window), (Some(300_015), 1_000_000));
+    }
+
+    #[test]
+    fn turn_line_shows_accounts_used_by_an_alias_in_that_turn() {
+        use serde_json::json;
+
+        let usage = |id, name, alias| {
+            json!({"type": "usage", "model": "gpt", "input_tokens": 10, "output_tokens": 5,
+                "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0,
+                "resolved_connection_id": id, "resolved_connection_name": name, "alias_connection_name": alias})
+        };
+        let events: Vec<Event> = [
+            json!({"type": "turn_started", "turn": 1}),
+            usage("account-1", "work account", "chatgpt"),
+            usage("account-1", "work account", "chatgpt"),
+            usage("account-2", "", "chatgpt"),
+            json!({"type": "turn_ended", "turn": 1, "reason": "completed"}),
+            json!({"type": "turn_started", "turn": 2}),
+            // No alias: don't show a route, even if the account is known.
+            usage("account-3", "direct account", ""),
+            // A usage event from an old worker still counts.
+            json!({"type": "usage", "model": "gpt", "input_tokens": 10, "output_tokens": 5,
+                "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0}),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(seq, mut kind)| {
+            kind["seq"] = json!(seq);
+            kind["ts"] = json!(0);
+            serde_json::from_value(kind).unwrap()
+        })
+        .collect();
+
+        let live = UsageStats::from_events(&events[..4]);
+        let ended = UsageStats::from_events(&events);
+        let route = "chatgpt → work account, chatgpt → account-2";
+        for line in [live.current_line(1_000).unwrap(), turn_line(&ended.turns[&1], None)] {
+            assert!(line.contains(route), "{line}");
+            assert_eq!(line.matches("work account").count(), 1);
+            assert!(line.contains("3 model calls"), "{line}");
+        }
+        assert_eq!(ended.current_line(1_000).unwrap(), "1s · 2 model calls · 20 in (0% cached) · 10 out · context 15");
     }
 
     #[test]

@@ -169,7 +169,7 @@ pub async fn discuss(st: &HeadState, id: i64, req: &api::DecisionDiscuss) -> any
 }
 
 async fn model_for(st: &HeadState, d: &api::Decision) -> anyhow::Result<(String, String)> {
-    let connections = st.store.connections().await?;
+    let connections = st.store.effective_connections().await?;
     let available = |id: &str| {
         connections.iter().any(|c| c.id == id && (d.realm == crate::realms::ROOT || crate::realms::available(&c.realms, &d.realm)))
     };

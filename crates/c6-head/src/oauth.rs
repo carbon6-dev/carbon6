@@ -68,6 +68,7 @@ pub struct Reauth {
     pub client_id: String,
     pub id_token: String,
     pub sub: String,
+    pub workspace: String,
 }
 
 struct Pending {
@@ -116,6 +117,21 @@ pub struct Identity {
     pub sub: String,
     pub email: String,
     pub workspace: String,
+}
+
+fn check_account(sub: &str, workspace: &str, who: &Identity) -> anyhow::Result<()> {
+    // A connection is one account/workspace, including when its credentials
+    // rotate. Alias replay provenance and prompt caches depend on that identity.
+    if sub.is_empty() {
+        return Err(bad_request("the saved ChatGPT sign-in has no verified account identity; use Add a ChatGPT account instead"));
+    }
+    if sub != who.sub || workspace != who.workspace {
+        return Err(bad_request(format!(
+            "that signed in a different ChatGPT account or workspace ({}); to add it, use Add a ChatGPT account instead",
+            if who.email.is_empty() { &who.sub } else { &who.email }
+        )));
+    }
+    Ok(())
 }
 
 fn random_b64(n: usize) -> String {
@@ -201,14 +217,8 @@ impl OAuth {
         // Who signed in, from the verified ID token.
         let id_token = resp.id_token.clone().ok_or_else(|| bad_request("auth.openai.com returned no ID token"))?;
         let who = self.verify(http, &id_token, &client_id, Some(&pending.nonce)).await?;
-        if let Some(r) = &pending.reauth
-            && !r.sub.is_empty()
-            && r.sub != who.sub
-        {
-            return Err(bad_request(format!(
-                "that signed in a different ChatGPT account ({}); to add it, use Add a ChatGPT account instead",
-                if who.email.is_empty() { &who.sub } else { &who.email }
-            )));
+        if let Some(r) = &pending.reauth {
+            check_account(&r.sub, &r.workspace, &who)?;
         }
         let tokens = ChatGptTokens {
             client_id,
@@ -250,9 +260,7 @@ impl OAuth {
         let mut id_token = tokens.id_token.clone();
         if let Some(t) = resp.id_token.filter(|t| !t.is_empty()) {
             let who = self.verify(http, &t, &tokens.client_id, None).await.context("checking the refreshed sign-in")?;
-            if !tokens.sub.is_empty() && who.sub != tokens.sub {
-                bail!("the refreshed sign-in is for a different ChatGPT account; sign in again");
-            }
+            check_account(&tokens.sub, &tokens.workspace, &who).context("checking the refreshed account and workspace")?;
             id_token = t;
         }
         Ok(ChatGptTokens {
@@ -380,7 +388,13 @@ mod tests {
     #[test]
     fn reauth_has_no_name_hint() {
         let o = OAuth::default();
-        let reauth = Reauth { connection_id: "c1".into(), client_id: "oaiapp_x".into(), id_token: "a.b.c".into(), sub: "user-1".into() };
+        let reauth = Reauth {
+            connection_id: "c1".into(),
+            client_id: "oaiapp_x".into(),
+            id_token: "a.b.c".into(),
+            sub: "user-1".into(),
+            workspace: "ws-1".into(),
+        };
         let url = url::Url::parse(&o.start("me", 7700, Some(reauth), "urn:uuid:5f0c", Some("me@example.com"))).unwrap();
         let q: HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(q["client_id"], "oaiapp_x");
@@ -388,6 +402,19 @@ mod tests {
         assert_eq!(q["ext_agent_host_id"], "urn:uuid:5f0c");
         assert_eq!(q["id_token_hint"], "a.b.c");
         assert_eq!(q["login_hint"], "me@example.com");
+    }
+
+    #[test]
+    fn reauth_and_refresh_keep_the_account_and_workspace_identity() {
+        let who = Identity { sub: "user-1".into(), email: "a@b.c".into(), workspace: "ws-1".into() };
+        assert!(check_account("user-1", "ws-1", &who).is_ok());
+        assert!(check_account("user-2", "ws-1", &who).is_err());
+        assert!(check_account("user-1", "ws-2", &who).is_err());
+        assert!(check_account("user-1", "", &who).is_err());
+        let personal = Identity { workspace: String::new(), ..who };
+        assert!(check_account("user-1", "ws-1", &personal).is_err());
+        assert!(check_account("user-1", "", &personal).is_ok());
+        assert!(check_account("", "", &personal).is_err(), "an unknown prior account must not be replaced under the same ID");
     }
 
     #[test]

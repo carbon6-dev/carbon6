@@ -180,6 +180,7 @@ struct Turn<'a> {
 struct Response {
     message: Option<Message>,
     usage: c6_llm::Usage,
+    account: Option<c6_llm::ModelAccount>,
     stop_reason: String,
     interrupted: bool,
     error: Option<LlmError>,
@@ -254,7 +255,7 @@ impl Turn<'_> {
     async fn call(&self, req: &ModelRequest, live: bool) -> Result<Response, LlmError> {
         let mut stream = tokio::select! {
             _ = self.cancel.cancelled() => {
-                return Ok(Response { message: None, usage: Default::default(), stop_reason: String::new(), interrupted: true, error: None });
+                return Ok(Response { message: None, usage: Default::default(), account: None, stop_reason: String::new(), interrupted: true, error: None });
             }
             r = self.client.stream(req) => r?,
         };
@@ -294,9 +295,10 @@ impl Turn<'_> {
         }
         let complete = !interrupted && error.is_none();
         let usage = acc.usage;
+        let account = acc.account.take();
         let stop_reason = acc.stop_reason.clone().unwrap_or_default();
         let message = (complete || acc.has_content()).then(|| acc.finish(complete));
-        Ok(Response { message, usage, stop_reason, interrupted, error })
+        Ok(Response { message, usage, account, stop_reason, interrupted, error })
     }
 
     async fn run(
@@ -379,7 +381,7 @@ impl Turn<'_> {
                     conv.history.push(msg);
                 }
             }
-            self.record_usage(&resp.usage).await?;
+            self.record_usage(&resp.usage, resp.account.as_ref()).await?;
             if resp.usage != Default::default() {
                 let u = resp.usage;
                 conv.context_tokens = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens + u.output_tokens;
@@ -479,7 +481,7 @@ impl Turn<'_> {
         self.fail(format!("stopped after {MAX_STEPS} model calls in one turn")).await
     }
 
-    async fn record_usage(&self, u: &c6_llm::Usage) -> anyhow::Result<()> {
+    async fn record_usage(&self, u: &c6_llm::Usage, account: Option<&c6_llm::ModelAccount>) -> anyhow::Result<()> {
         if *u == Default::default() {
             return Ok(());
         }
@@ -492,6 +494,9 @@ impl Turn<'_> {
                 cache_write_tokens: u.cache_write_tokens,
                 reasoning_tokens: u.reasoning_tokens,
                 context_window: 0,
+                resolved_connection_id: account.map(|a| a.resolved_connection_id.clone()).unwrap_or_default(),
+                resolved_connection_name: account.map(|a| a.resolved_connection_name.clone()).unwrap_or_default(),
+                alias_connection_name: account.map(|a| a.alias_connection_name.clone()).unwrap_or_default(),
             }))
             .await?;
         Ok(())
@@ -609,7 +614,7 @@ impl Turn<'_> {
             Err(e @ LlmError::ContextOverflow(_)) => return Ok(Err(NoSummary::Overflow(e.to_string()))),
             Err(e) => return Ok(Err(NoSummary::Failed(e.to_string()))),
         };
-        self.record_usage(&resp.usage).await?;
+        self.record_usage(&resp.usage, resp.account.as_ref()).await?;
         if resp.interrupted {
             return Ok(Err(NoSummary::Failed("interrupted".into())));
         }
@@ -679,7 +684,7 @@ impl Turn<'_> {
             let why = e.to_string();
             warn!(error = %why, attempt, ?wait, "model call failed; trying again");
             if let Ok(resp) = &r
-                && let Err(e) = self.record_usage(&resp.usage).await
+                && let Err(e) = self.record_usage(&resp.usage, resp.account.as_ref()).await
             {
                 warn!("recording usage: {e:#}");
             }
@@ -688,7 +693,7 @@ impl Turn<'_> {
             self.sink.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true, status }));
             tokio::select! {
                 _ = self.cancel.cancelled() => {
-                    return Ok(Response { message: None, usage: Default::default(), stop_reason: String::new(), interrupted: true, error: None });
+                    return Ok(Response { message: None, usage: Default::default(), account: None, stop_reason: String::new(), interrupted: true, error: None });
                 }
                 _ = tokio::time::sleep(wait) => {}
             }

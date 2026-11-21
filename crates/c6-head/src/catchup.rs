@@ -659,6 +659,7 @@ pub(crate) async fn ask(st: &HeadState, row: &SessionRow, label: &str, what: &st
         acc.push(&ev?);
     }
     let usage = acc.usage;
+    let connection = acc.account.take().map(|a| a.resolved_connection_id).filter(|id| !id.is_empty()).unwrap_or(connection);
     let msg = acc.finish(true);
     // Its tokens count toward the session (a row of its own, below zero).
     sqlx::query(

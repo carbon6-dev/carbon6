@@ -12,6 +12,7 @@ use c6_api as api;
 use c6_llm::LlmError;
 use c6_llm::pool::{Endpoint, Member, Pool};
 use c6_proto::CredentialRequest;
+use futures::StreamExt;
 use tracing::warn;
 
 use crate::store::ConnectionRow;
@@ -89,13 +90,22 @@ pub async fn client(
     if let Some(pool) = get(st, connection_id).await? {
         return Ok(Box::new(c6_llm::pool::PoolClient::new(pool, realm, origin)));
     }
+    if crate::aliases::get(&st.store, connection_id).await?.is_some() {
+        let head = st.arc().ok_or_else(|| anyhow::anyhow!("the head stopped"))?;
+        return Ok(Box::new(AliasClient {
+            head,
+            connection_id: connection_id.into(),
+            realm: realm.into(),
+            origin,
+            history: Default::default(),
+        }));
+    }
     // Claude Code answers through the `claude` on the head machine.
     if st.store.connections().await?.iter().any(|c| c.id == connection_id && c.kind == "claude_code") {
         let bin = st.claude_bin().ok_or_else(|| anyhow::anyhow!("{}", NO_CLAUDE))?;
         return Ok(c6_llm::activity::track(Box::new(c6_worker::hosted::ClaudeOnce::new(bin)), origin));
     }
-    let req = CredentialRequest { connection_id: connection_id.to_owned(), ..Default::default() };
-    let g = crate::sessions::credential_for(st, None, "head", req).await;
+    let g = crate::sessions::head_credential(st, realm, connection_id).await;
     anyhow::ensure!(g.error.is_empty(), "{}", g.error);
     let mut client = c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?;
     if g.kind == "chatgpt"
@@ -104,6 +114,47 @@ pub async fn client(
         client.set_chatgpt_limits_hook(hook);
     }
     Ok(c6_llm::activity::track(client, origin))
+}
+
+struct AliasClient {
+    head: Arc<HeadState>,
+    connection_id: String,
+    realm: String,
+    origin: c6_llm::activity::Origin,
+    history: Arc<c6_llm::replay::AliasHistory>,
+}
+
+#[async_trait::async_trait]
+impl c6_llm::ModelClient for AliasClient {
+    async fn stream(&self, req: &c6_llm::ModelRequest) -> Result<c6_llm::EventStream, LlmError> {
+        let g = crate::sessions::head_credential(&self.head, &self.realm, &self.connection_id).await;
+        if !g.error.is_empty() {
+            return Err(LlmError::Config(g.error));
+        }
+        let mut client = c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?;
+        let mut req = req.clone();
+        let replay = self.history.prepare(&mut req, &self.connection_id, &g.kind, &g.resolved_connection_id);
+        if g.kind == "chatgpt" {
+            if let Some(hook) = crate::quotas::chatgpt_hook(&self.head, &g.resolved_connection_id) {
+                client.set_chatgpt_limits_hook(hook);
+            }
+            if let Some(key) = &req.cache_key {
+                req.cache_key = Some(format!("{key}:{}", g.resolved_connection_id));
+            }
+        }
+        let origin = c6_llm::activity::Origin {
+            connection: g.resolved_connection_id.clone(),
+            via: self.connection_id.clone(),
+            ..self.origin.clone()
+        };
+        let stream = replay.track(c6_llm::activity::track(client, origin).stream(&req).await?);
+        let account = c6_llm::ModelAccount {
+            resolved_connection_id: g.resolved_connection_id,
+            resolved_connection_name: g.resolved_connection_name,
+            alias_connection_name: g.alias_connection_name,
+        };
+        Ok(futures::stream::iter([Ok(c6_llm::ModelEvent::Account(account))]).chain(stream).boxed())
+    }
 }
 
 const NO_CLAUDE: &str = "Claude Code (`claude`) is not on the head machine's PATH";
@@ -123,10 +174,16 @@ pub async fn context_window(st: &HeadState, model: &c6_proto::ModelSpec, realm: 
     if let Ok(Some(pool)) = get(st, &model.connection_id).await {
         return pool.known_context_window(&model.model, realm).await.unwrap_or(built_in);
     }
-    match st.local_link.get() {
-        Some(link) => link.context_window("", model).await,
-        None => built_in,
+    if model.connection_kind == "claude_code" {
+        return built_in;
     }
+    let g = crate::sessions::head_credential(st, realm, &model.connection_id).await;
+    if !g.error.is_empty() {
+        return built_in;
+    }
+    let id = if g.is_alias { &g.resolved_connection_id } else { &model.connection_id };
+    let endpoint = Endpoint { kind: g.kind, base_url: g.base_url, bearer: g.bearer, headers: g.headers, context_window: g.context_window };
+    c6_llm::window::known(id, &model.model, &endpoint).await.unwrap_or(built_in)
 }
 
 /// Checks a pool's members before they are saved: other connections (by
@@ -146,6 +203,9 @@ pub async fn check_members(st: &HeadState, pool_id: &str, members: &[api::PoolMe
             .ok_or_else(|| bad_request(format!("a pool's member: no connection {want:?}")))?;
         if c.kind == KIND || c.id == pool_id {
             return Err(bad_request(format!("{} is a pool: a pool's members are other connections", c.name)));
+        }
+        if c.kind == crate::aliases::KIND {
+            return Err(bad_request(format!("{} is an alias: choose a concrete account as a pool member", c.name)));
         }
         if c.kind == "claude_code" {
             return Err(bad_request(format!("{} is Claude Code, which runs on workers: a pool's members are API connections", c.name)));

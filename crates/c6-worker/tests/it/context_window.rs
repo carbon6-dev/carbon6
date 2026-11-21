@@ -305,6 +305,120 @@ async fn settings_reach_assistant_turns_subagents_and_model_switches() {
     head.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn alias_switch_reaches_next_root_and_subagent_calls_in_the_same_turn() {
+    use c6_api::{StreamMsg, TurnEndReason};
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (dir, state, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (head, api) = head(dir.path()).await;
+    let (worker, stop) = worker(&head, state.path()).await;
+    let http = reqwest::Client::new();
+    let (a, b) = (MockLlm::start().await, MockLlm::start().await);
+    let create = async |body: Value| -> Connection {
+        http.post(format!("{api}/connections")).json(&body).send().await.unwrap().error_for_status().unwrap().json().await.unwrap()
+    };
+    let account = |name: &str, mock: &MockLlm| json!({"name": name, "base_url": mock.base_url(), "api_key": format!("key-{name}"), "context_window": 32768});
+    let ca = create(account("account-a", &a)).await;
+    let cb = create(account("account-b", &b)).await;
+    let alias = create(json!({"name": "switchboard", "kind": "alias", "alias_target_id": ca.id})).await;
+    let switch = async |target: &str| {
+        http.post(format!("{api}/connections/{}/alias/switch", alias.id))
+            .json(&json!({"target_id": target}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    };
+
+    let shell = || Reply::ToolCalls(vec![("bash".into(), r#"{"command":"true"}"#.into())]);
+    let root_gate = a.push_gated(shell());
+    b.push(Reply::ToolCalls(vec![(
+        "task".into(),
+        json!({"description": "Look around", "prompt": "Check the workspace", "connection": "switchboard", "model": "mock-1"}).to_string(),
+    )]));
+    let child_gate = b.push_gated(shell());
+    a.push(Reply::Text("Child finished on account A".into()));
+    a.push(Reply::Text("Root finished on account A".into()));
+    let root: Session = http
+        .post(format!("{api}/sessions"))
+        .json(&json!({
+            "worker_id": worker.identity.meta.worker_id.0, "cwd": project.path(), "connection_id": alias.id,
+            "model": "mock-1", "prompt": "Use the tools"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(a.request_headers(0).await["authorization"], "Bearer key-account-a");
+    switch(&cb.id).await;
+    root_gate.notify_one();
+    assert_eq!(b.request_headers(0).await["authorization"], "Bearer key-account-b");
+    assert_eq!(b.request_headers(1).await["authorization"], "Bearer key-account-b");
+    switch(&ca.id).await;
+    child_gate.notify_one();
+    assert_eq!(a.request_headers(1).await["authorization"], "Bearer key-account-a");
+    assert_eq!(a.request_headers(2).await["authorization"], "Bearer key-account-a");
+
+    let turn = async |id: &str| -> Vec<Event> {
+        let url = format!("ws://127.0.0.1:{}/api/v1/sessions/{id}/stream?after=0", head.ui_addrs[0].port());
+        let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        c6_testkit::within("the alias turn to finish", async {
+            let mut events = Vec::new();
+            loop {
+                let Message::Text(text) = socket.next().await.unwrap().unwrap() else { continue };
+                let StreamMsg::Event { event } = serde_json::from_str(&text).unwrap() else { continue };
+                let ended = matches!(event.kind, EventKind::TurnEnded { .. });
+                events.push(event);
+                if ended {
+                    assert!(
+                        matches!(events.last().unwrap().kind, EventKind::TurnEnded { reason: TurnEndReason::Completed, .. }),
+                        "{events:?}"
+                    );
+                    return events;
+                }
+            }
+        })
+        .await
+    };
+    let root_events = turn(&root.id).await;
+    let child_id = root_events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::SubagentSpawned { child_session_id, .. } => Some(child_session_id.as_str()),
+            _ => None,
+        })
+        .unwrap();
+    let child_events = turn(child_id).await;
+    for (id, events, expected) in [(root.id.as_str(), &root_events, vec![&ca, &cb, &ca]), (child_id, &child_events, vec![&cb, &ca])] {
+        let attribution: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Usage { resolved_connection_id, resolved_connection_name, alias_connection_name, .. } => {
+                    assert_eq!(alias_connection_name, "switchboard");
+                    Some((resolved_connection_id, resolved_connection_name))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attribution, expected.iter().map(|c| (&c.id, &c.name)).collect::<Vec<_>>());
+        let ledger: Vec<String> = sqlx::query_scalar("SELECT connection_id FROM usage WHERE session_id = ? ORDER BY seq")
+            .bind(id)
+            .fetch_all(head.state.store.pool())
+            .await
+            .unwrap();
+        assert_eq!(ledger, expected.iter().map(|c| c.id.as_str()).collect::<Vec<_>>());
+    }
+    stop.cancel();
+    head.shutdown().await.unwrap();
+}
+
 /// The session's own calls, without the head's that names it once its
 /// "hi" has had a second turn (docs/suggestions.md §7).
 fn own(requests: &Mutex<Vec<Value>>) -> Vec<Value> {

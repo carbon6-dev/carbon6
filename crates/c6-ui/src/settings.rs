@@ -1907,11 +1907,10 @@ fn Upgrades() -> impl IntoView {
 
 /// LLM connections: the list, adding one, signing in with ChatGPT.
 #[component]
-fn Connections(signed_in: bool) -> impl IntoView {
+fn Connections(signed_in: bool) -> AnyView {
     let connections = crate::resources::connections();
     let all = Signal::derive(move || connections.get().and_then(Result::ok).unwrap_or_default());
     let error = RwSignal::new(None::<String>);
-    let signed_in = move || signed_in;
     view! {
             <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
                 <div>
@@ -1920,7 +1919,7 @@ fn Connections(signed_in: bool) -> impl IntoView {
                         "Model providers for sessions. Keys and sign-ins are encrypted on the head; workers fetch short-lived credentials when they call the model and keep them only in memory."
                     </p>
                 </div>
-                {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+                {connection_error(error)}
                 <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                     <Suspense fallback=|| ()>
                         {move || connections.get().map(|r| match r {
@@ -1932,14 +1931,14 @@ fn Connections(signed_in: bool) -> impl IntoView {
                     <crate::quota::UnmatchedCodexLimits list_rows=true />
                 </div>
             </section>
-            {move || signed_in().then(|| view! {
+            {signed_in.then(|| view! {
                 <div class="rounded-md border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200">
                     "Signed in with ChatGPT."
                 </div>
             })}
             <AddConnection all on_added=move || connections.refetch() />
-            <ChatGptSignIn on_added=move || connections.refetch() />
-    }
+            <ChatGptSignIn on_added=Callback::new(move |_| connections.refetch()) />
+    }.into_any()
 }
 
 fn kind_label(kind: &str) -> &'static str {
@@ -1949,14 +1948,245 @@ fn kind_label(kind: &str) -> &'static str {
         "chatgpt" => "ChatGPT plan",
         "claude_code" => "Claude Code",
         "pool" => "Pool",
+        "alias" => "Alias",
         _ => "OpenAI-compatible",
     }
+}
+
+// Keep the concrete button and event types shared across Connection settings.
+#[inline(never)]
+fn connection_button(
+    class: String,
+    title: Option<&'static str>,
+    label: Signal<&'static str>,
+    visible: Signal<bool>,
+    disabled: Signal<bool>,
+    action: Callback<()>,
+) -> AnyView {
+    view! {
+        <button type="button" class=class title=title hidden=move || !visible.get() disabled=move || disabled.get()
+            on:click=move |_| action.run(())>{move || label.get()}</button>
+    }
+    .into_any()
+}
+
+fn connection_action(class: String, label: &'static str, title: Option<&'static str>, action: Callback<()>) -> AnyView {
+    connection_button(class, title, Signal::stored(label), Signal::stored(true), Signal::stored(false), action)
+}
+
+#[derive(Default)]
+struct ConnectionInput {
+    kind: Option<&'static str>,
+    title: Option<&'static str>,
+    range: Option<(&'static str, &'static str)>,
+    autocomplete: Option<&'static str>,
+}
+
+#[inline(never)]
+fn connection_input(value: RwSignal<String>, placeholder: Signal<&'static str>, class: String, input: ConnectionInput) -> AnyView {
+    view! {
+        <input class=class placeholder=placeholder type=input.kind title=input.title autocomplete=input.autocomplete
+            min=input.range.map(|(min, _)| min) max=input.range.map(|(_, max)| max) step=input.range.map(|_| "1")
+            prop:value=move || value.get() on:input=move |ev| value.set(event_target_value(&ev)) />
+    }
+    .into_any()
+}
+
+#[inline(never)]
+fn connection_field(
+    label: &'static str,
+    value: RwSignal<String>,
+    placeholder: Signal<&'static str>,
+    input: ConnectionInput,
+    wide: bool,
+) -> AnyView {
+    view! {
+        <label class=if wide { "block min-w-40 flex-1 text-xs text-muted" } else { "block text-xs text-muted" }>
+            {label}{connection_input(value, placeholder, format!("mt-1 {INPUT}"), input)}
+        </label>
+    }
+    .into_any()
+}
+
+#[inline(never)]
+fn connection_error(error: RwSignal<Option<String>>) -> AnyView {
+    (move || error.get().map(|e| view! { <ErrorBox message=e /> })).into_any()
+}
+
+#[inline(never)]
+fn connection_test_result(result: Result<Vec<String>, String>, adding: bool) -> AnyView {
+    let (ok, text, model_hint) = match result {
+        Ok(models) if adding => {
+            let n = models.len();
+            (true, format!("Connected · {n} model{} available", if n == 1 { "" } else { "s" }), n != 0)
+        }
+        Ok(models) => (true, format!("Connected · {} models", models.len()), false),
+        Err(error) => (false, error, false),
+    };
+    let color = match (adding, ok) {
+        (true, true) => "text-sm text-emerald-700 dark:text-emerald-400",
+        (false, true) => "text-xs text-emerald-700 dark:text-emerald-400",
+        (true, false) => "text-sm text-red-600",
+        (false, false) => "text-xs text-red-600",
+    };
+    let icon = if ok { crate::icons::check() } else { crate::icons::icon(crate::icons::Icon::CircleX, crate::icons::Size::S14) };
+    view! {
+        <div class=color>
+            {icon}" "{text}
+            {model_hint.then_some(view! { <span class="text-muted">" (listed in the model field)"</span> })}
+        </div>
+    }
+    .into_any()
+}
+
+/// Creation offers real API connections; a switch is limited to the original provider kind.
+fn alias_choices<'a>(all: &'a [Connection], kind: Option<&'a str>, current: Option<&'a str>) -> impl Iterator<Item = &'a Connection> {
+    all.iter().filter(move |c| {
+        matches!(c.kind.as_str(), "anthropic" | "openai" | "openai_compat" | "chatgpt")
+            && kind.is_none_or(|kind| c.kind == kind)
+            && current != Some(c.id.as_str())
+    })
+}
+
+type ConnectionChoices = Vec<(String, String)>;
+
+#[inline(never)]
+fn connection_options(choices: ConnectionChoices, selected: &str) -> AnyView {
+    choices.into_iter().map(|(id, label)| view! { <option selected=id == selected value=id>{label}</option> }).collect_view().into_any()
+}
+
+fn alias_options(all: &[Connection], kind: Option<&str>, current: Option<&str>) -> ConnectionChoices {
+    alias_choices(all, kind, current).map(|c| (c.id.clone(), format!("{} · {}", c.name, kind_label(&c.kind)))).collect()
+}
+
+fn valid_alias_target(choices: &[(String, String)], selected: &str) -> bool {
+    !selected.is_empty() && choices.iter().any(|(id, _)| id == selected)
+}
+
+fn alias_switch_request(choices: &[(String, String)], target: String, pending: bool) -> Option<c6_api::SwitchConnectionAlias> {
+    (!pending && valid_alias_target(choices, &target)).then_some(c6_api::SwitchConnectionAlias { target_id: target })
+}
+
+fn alias_create_request(name: String, target: String, choices: &[(String, String)]) -> Result<CreateConnection, String> {
+    if name.trim().is_empty() {
+        return Err("Enter a name for the alias.".into());
+    }
+    if !valid_alias_target(choices, &target) {
+        return Err("Choose an eligible target connection.".into());
+    }
+    Ok(CreateConnection { kind: Some("alias".into()), name, alias_target_id: Some(target), ..Default::default() })
+}
+
+#[derive(Clone, Copy)]
+struct AliasPicker {
+    choices: Memo<ConnectionChoices>,
+    value: RwSignal<String>,
+    pending: RwSignal<bool>,
+}
+
+impl AliasPicker {
+    fn new(choices: Memo<ConnectionChoices>) -> Self {
+        Self { choices, value: RwSignal::new(String::new()), pending: RwSignal::new(false) }
+    }
+
+    fn disabled(self) -> bool {
+        self.pending.get() || self.choices.with(|cs| self.value.with(|v| !valid_alias_target(cs, v)))
+    }
+}
+
+#[inline(never)]
+fn alias_target_view(picker: AliasPicker, label: &'static str) -> AnyView {
+    let AliasPicker { choices, value, pending } = picker;
+    view! {
+        <label class="block min-w-0 flex-1 text-xs text-muted">
+            {label}
+            <select class=format!("mt-1 {INPUT}") disabled=move || pending.get() || choices.with(Vec::is_empty)
+                prop:value=move || value.get()
+                on:change=move |ev| value.set(event_target_value(&ev))>
+                <option value="" selected=move || !choices.with(|cs| value.with(|v| valid_alias_target(cs, v)))>
+                    {move || if choices.with(Vec::is_empty) { "No eligible connections" } else { "Choose a connection" }}
+                </option>
+                {move || value.with_untracked(|v| connection_options(choices.get(), v))}
+            </select>
+        </label>
+    }
+    .into_any()
+}
+
+#[inline(never)]
+fn alias_switch_view(
+    id: String,
+    provider_kind: Option<String>,
+    current_target: Option<String>,
+    switched_at: Option<i64>,
+    all: Signal<Vec<Connection>>,
+    on_change: Callback<()>,
+) -> AnyView {
+    let current = RwSignal::new((current_target, switched_at));
+    let provider = provider_kind.as_deref().map(kind_label);
+    let picker = AliasPicker::new(Memo::new(move |_| {
+        all.with(|cs| {
+            current
+                .with(|(target, _)| provider_kind.as_deref().map_or_else(Vec::new, |kind| alias_options(cs, Some(kind), target.as_deref())))
+        })
+    }));
+    let AliasPicker { choices, value: selected, pending } = picker;
+    let error = RwSignal::new(None);
+    let switch = move |_| {
+        let Some(req) = choices.with_untracked(|cs| alias_switch_request(cs, selected.get_untracked(), pending.get_untracked())) else {
+            return;
+        };
+        pending.set(true);
+        error.set(None);
+        let id = id.clone();
+        spawn_local(async move {
+            match api::switch_connection_alias(id, req).await {
+                Ok(c) => {
+                    current.try_set((c.alias_target_id, c.alias_switched_at));
+                    selected.try_set(String::new());
+                    on_change.run(());
+                }
+                Err(e) => {
+                    error.try_set(Some(e));
+                }
+            }
+            pending.try_set(false);
+        });
+    };
+    view! {
+        <div class="space-y-2 px-4 pb-3">
+            <p class="break-words text-xs text-muted">
+                {move || current.with(|(target, at)| {
+                    let target_name = target.as_ref().map_or_else(|| "Unavailable".to_owned(), |id| {
+                        all.with(|cs| cs.iter().find(|c| c.id == *id).map(|c| c.name.clone())).unwrap_or_else(|| id.clone())
+                    });
+                    let provider = provider.map(|p| format!(" ({p})")).unwrap_or_default();
+                    let since = at.map(|ms| format!(" · Since {}", crate::when::full(ms))).unwrap_or_default();
+                    format!("Current target: {target_name}{provider}{since}")
+                })}
+            </p>
+            <div class="flex items-end gap-2">
+                {alias_target_view(picker, "Switch to")}
+                {connection_button(BUTTON.into(), None, Signal::derive(move || if pending.get() { "Switching…" } else { "Switch" }),
+                    Signal::stored(true), Signal::derive(move || picker.disabled()), Callback::new(switch))}
+            </div>
+            {connection_error(error)}
+        </div>
+    }
+    .into_any()
 }
 
 /// A pool's members (docs/pools.md): each connection and its calls at once.
 #[component]
 fn PoolMembers(members: RwSignal<Vec<PoolMember>>, all: Signal<Vec<Connection>>) -> impl IntoView {
-    let choices = move || all.get().into_iter().filter(|c| !matches!(c.kind.as_str(), "pool" | "claude_code")).collect::<Vec<_>>();
+    let choices = move || {
+        all.with(|cs| {
+            cs.iter()
+                .filter(|c| !matches!(c.kind.as_str(), "alias" | "pool" | "claude_code"))
+                .map(|c| (c.id.clone(), c.name.clone()))
+                .collect::<ConnectionChoices>()
+        })
+    };
     view! {
         <div class="space-y-2">
             {move || members.get().into_iter().enumerate().map(|(i, m)| view! {
@@ -1964,7 +2194,7 @@ fn PoolMembers(members: RwSignal<Vec<PoolMember>>, all: Signal<Vec<Connection>>)
                     <select class=INPUT prop:value=m.connection_id.clone()
                         on:change=move |ev| members.update(|ms| ms[i].connection_id = event_target_value(&ev))>
                         <option value="">"Choose a connection"</option>
-                        {choices().into_iter().map(|c| view! { <option value=c.id.clone() selected=c.id == m.connection_id>{c.name}</option> }).collect_view()}
+                        {connection_options(choices(), &m.connection_id)}
                     </select>
                     <label class="flex shrink-0 items-center gap-1 text-xs text-muted">
                         "Calls at once"
@@ -1972,12 +2202,11 @@ fn PoolMembers(members: RwSignal<Vec<PoolMember>>, all: Signal<Vec<Connection>>)
                             prop:value=m.slots.to_string()
                             on:change=move |ev| members.update(|ms| ms[i].slots = event_target_value(&ev).parse().unwrap_or(1)) />
                     </label>
-                    <button class=format!("{BUTTON_QUIET} text-muted hover:text-red-600") on:click=move |_| members.update(|ms| { ms.remove(i); })>"Remove"</button>
+                    {connection_action(format!("{BUTTON_QUIET} text-muted hover:text-red-600"), "Remove", None, Callback::new(move |_| members.update(|ms| { ms.remove(i); })))}
                 </div>
             }).collect_view()}
-            <button class=format!("{BUTTON_QUIET} text-muted") on:click=move |_| members.update(|ms| ms.push(PoolMember { connection_id: String::new(), slots: 1 }))>
-                "Add a member"
-            </button>
+            {connection_action(format!("{BUTTON_QUIET} text-muted"), "Add a member", None,
+                Callback::new(move |_| members.update(|ms| ms.push(PoolMember { connection_id: String::new(), slots: 1 }))))}
             <p class="text-xs text-muted">
                 "Each call goes to the least busy member with a free slot, else waits its turn; a member that fails rests and the call goes to another. Pools are for head-side model calls (the memex, the assistant, suggestions, work and projects), not sessions or subagents. Set Settings → Memex → calls at once to about the total of the members' calls at once."
             </p>
@@ -1986,35 +2215,30 @@ fn PoolMembers(members: RwSignal<Vec<PoolMember>>, all: Signal<Vec<Connection>>)
 }
 
 #[component]
-fn ContextWindow(value: RwSignal<String>) -> impl IntoView {
-    view! {
-        <label class="block text-xs text-muted">
-            "Context window"
-            <input type="number" min="1024" max="100000000" step="1" class=format!("mt-1 {INPUT}") placeholder="empty: automatic"
-                prop:value=move || value.get() on:input=move |ev| value.set(event_target_value(&ev)) />
-        </label>
-    }
+fn ContextWindow(value: RwSignal<String>) -> AnyView {
+    connection_field(
+        "Context window",
+        value,
+        Signal::stored("empty: automatic"),
+        ConnectionInput { kind: Some("number"), range: Some(("1024", "100000000")), ..Default::default() },
+        false,
+    )
 }
 
 /// What sessions on a connection do by default to spend fewer tokens.
 #[component]
-fn SessionDefaults(subagent_model: RwSignal<String>, compact_at: RwSignal<String>) -> impl IntoView {
+fn SessionDefaults(subagent_model: RwSignal<String>, compact_at: RwSignal<String>) -> AnyView {
     view! {
         <div class="grid gap-2 @lg/settings:grid-cols-2">
-            <label class="block text-xs text-muted">
-                "Subagent model"
-                <input class=format!("mt-1 {INPUT}") placeholder="empty: the session's own"
-                    title="Subagents of sessions on this connection run on this model unless a routing rule or the session names another. A smaller model costs far less for searching and reading."
-                    prop:value=move || subagent_model.get() on:input=move |ev| subagent_model.set(event_target_value(&ev)) />
-            </label>
-            <label class="block text-xs text-muted">
-                "Compact at (% of context window)"
-                <input type="number" min="30" max="95" step="1" class=format!("mt-1 {INPUT}") placeholder="empty: 70 for large windows, else 85"
-                    title="Sessions summarize their conversation once it fills this share of the window. Every call sends the whole conversation, so compacting sooner spends fewer tokens per step."
-                    prop:value=move || compact_at.get() on:input=move |ev| compact_at.set(event_target_value(&ev)) />
-            </label>
+            {connection_field("Subagent model", subagent_model, Signal::stored("empty: the session's own"), ConnectionInput {
+                title: Some("Subagents of sessions on this connection run on this model unless a routing rule or the session names another. A smaller model costs far less for searching and reading."), ..Default::default()
+            }, false)}
+            {connection_field("Compact at (% of context window)", compact_at, Signal::stored("empty: 70 for large windows, else 85"), ConnectionInput {
+                kind: Some("number"), range: Some(("30", "95")),
+                title: Some("Sessions summarize their conversation once it fills this share of the window. Every call sends the whole conversation, so compacting sooner spends fewer tokens per step."), ..Default::default()
+            }, false)}
         </div>
-    }
+    }.into_any()
 }
 
 #[component]
@@ -2023,9 +2247,10 @@ fn ConnectionRow(
     all: Signal<Vec<Connection>>,
     on_change: impl Fn() + Copy + Send + Sync + 'static,
     error: RwSignal<Option<String>>,
-) -> impl IntoView {
+) -> AnyView {
     let pool = c.kind == "pool";
-    let editable = c.kind != "claude_code";
+    let alias = c.kind == "alias";
+    let editable = !alias && c.kind != "claude_code";
     let context_window = RwSignal::new(c.context_window.map(|n| n.to_string()).unwrap_or_default());
     let subagent_model = RwSignal::new(c.subagent_model.clone().unwrap_or_default());
     let compact_at = RwSignal::new(c.compact_at.map(|n| n.to_string()).unwrap_or_default());
@@ -2099,60 +2324,67 @@ fn ConnectionRow(
     let chatgpt = c.kind == "chatgpt";
     let again_id = c.id.clone();
     let test_id = c.id.clone();
+    let alias_id = c.id.clone();
+    let provider_kind = c.alias_target_kind.clone();
+    let current_target = c.alias_target_id.clone();
+    let switched_at = c.alias_switched_at;
     let test = move |_| {
         let id = test_id.clone();
         check.set(None);
         spawn_local(async move { check.set(Some(api::check_models(id).await)) });
     };
     view! {
+      <div>
         <div class="flex items-center gap-3 px-4 py-3">
             <div class="min-w-0 flex-1">
                 <div class="font-medium">{c.name.clone()}</div>
-                {move || check.get().map(|r| match r {
-                    Ok(m) => view! { <div class="text-xs text-emerald-700 dark:text-emerald-400">{crate::icons::check()}" "{format!("Connected · {} models", m.len())}</div> }.into_any(),
-                    Err(e) => view! { <div class="text-xs text-red-600">{crate::icons::icon(crate::icons::Icon::CircleX, crate::icons::Size::S14)}" "{e}</div> }.into_any(),
-                })}
+                {move || check.get().map(|r| connection_test_result(r, false))}
                 <div class="truncate font-mono text-xs text-muted">
-                    {kind_label(&c.kind)} {(!matches!(c.kind.as_str(), "claude_code" | "pool")).then(|| format!(" · {}", c.base_url))}
+                    {kind_label(&c.kind)} {(!matches!(c.kind.as_str(), "alias" | "claude_code" | "pool")).then(|| format!(" · {}", c.base_url))}
                     {pool.then_some(move || format!(" · {}", members_text()))}
                     {c.default_model.clone().map(|m| format!(" · {m}"))}
                     {c.subagent_model.clone().map(|m| format!(" · subagents: {m}"))}
                     {c.compact_at.map(|n| format!(" · compacts at {n}%"))}
-                    {match (c.kind.as_str(), c.has_api_key) { ("chatgpt" | "claude_code" | "pool", _) => "", (_, true) => " · key set", _ => " · no key" }}
+                    {match (c.kind.as_str(), c.has_api_key) { ("alias" | "chatgpt" | "claude_code" | "pool", _) => "", (_, true) => " · key set", _ => " · no key" }}
                 </div>
                 {
                     let id = c.id.clone();
                     move || crate::quota::of(&id).map(|q| view! { <div class="mt-1"><crate::quota::QuotaBars q /></div> })
                 }
             </div>
-            {editable.then(|| view! { <button class=format!("{BUTTON_QUIET} text-muted") on:click=move |_| editing.update(|e| *e = !*e)>"Edit"</button> })}
-            {chatgpt.then(|| view! { <button class=format!("{BUTTON_QUIET} text-muted") title="Sign this account in again" on:click=move |_| reauth.update(|r| *r = !*r)>"Sign in again"</button> })}
-            <button class=format!("{BUTTON_QUIET} text-muted") on:click=test>"Test"</button>
-            <button class=format!("{BUTTON_QUIET} text-muted hover:text-red-600") on:click=remove>"Delete"</button>
+            {editable.then(|| connection_action(format!("{BUTTON_QUIET} text-muted"), "Edit", None, Callback::new(move |_| editing.update(|e| *e = !*e))))}
+            {chatgpt.then(|| connection_action(format!("{BUTTON_QUIET} text-muted"), "Sign in again", Some("Sign this account in again"),
+                Callback::new(move |_| reauth.update(|r| *r = !*r))))}
+            {connection_action(format!("{BUTTON_QUIET} text-muted"), "Test", None, Callback::new(test))}
+            {connection_action(format!("{BUTTON_QUIET} text-muted hover:text-red-600"), "Delete", None, Callback::new(remove))}
         </div>
-        {move || reauth.get().then(|| view! { <ChatGptSignIn on_added=move || { reauth.set(false); on_change(); } again=again_id.clone() /> })}
+        {alias.then(|| alias_switch_view(alias_id, provider_kind, current_target, switched_at, all, Callback::new(move |_| on_change())))}
+        {move || reauth.get().then(|| view! { <ChatGptSignIn on_added=Callback::new(move |_| { reauth.set(false); on_change(); }) again=again_id.clone() /> })}
         {move || editing.get().then(|| view! {
             <div class="space-y-2 px-4 pb-3">
                 {pool.then(|| view! { <PoolMembers members all /> })}
                 {editable.then(|| view! { <ContextWindow value=context_window /> })}
                 {sessions_on.then(|| view! { <SessionDefaults subagent_model compact_at /> })}
-                <div class="flex justify-end"><button class=BUTTON on:click=save.clone()>"Save"</button></div>
+                <div class="flex justify-end">{connection_action(BUTTON.into(), "Save", None, Callback::new(save.clone()))}</div>
             </div>
         })}
-    }
+      </div>
+    }.into_any()
 }
 
 #[component]
-fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send + Sync + 'static) -> impl IntoView {
+fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send + Sync + 'static) -> AnyView {
     let kind = RwSignal::new("anthropic".to_owned());
     let members = RwSignal::new(vec![PoolMember { connection_id: String::new(), slots: 1 }]);
-    let pool = move || kind.get() == "pool";
+    let alias = move || kind.with(|k| k == "alias");
+    let providers_hidden = move || kind.with(|k| matches!(k.as_str(), "pool" | "alias"));
+    let picker = AliasPicker::new(Memo::new(move |_| all.with(|cs| alias_options(cs, None, None))));
+    let AliasPicker { choices, value: alias_target, pending } = picker;
     let name = RwSignal::new(String::new());
     let base_url = RwSignal::new(String::new());
     let api_key = RwSignal::new(String::new());
     let default_model = RwSignal::new(String::new());
     let context_window = RwSignal::new(String::new());
-    let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     // Result of "Test connection": the server's models, or why it failed.
     let tested = RwSignal::new(None::<Result<Vec<String>, String>>);
@@ -2181,23 +2413,38 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
     };
 
     let add = move |_| {
-        let window = context_window.get_untracked();
-        let window =
-            if kind.get_untracked() == "claude_code" || window.trim().is_empty() { Ok(None) } else { window.parse::<u64>().map(Some) };
-        let Ok(window) = window else {
-            error.set(Some("context window must be a whole number".into()));
+        if pending.get_untracked() {
             return;
+        }
+        let k = kind.get_untracked();
+        let n = name.get_untracked();
+        let req = if k == "alias" {
+            match choices.with_untracked(|cs| alias_create_request(n, alias_target.get_untracked(), cs)) {
+                Ok(req) => req,
+                Err(e) => {
+                    error.set(Some(e));
+                    return;
+                }
+            }
+        } else {
+            let window = context_window.get_untracked();
+            let window = if k == "claude_code" || window.trim().is_empty() { Ok(None) } else { window.parse::<u64>().map(Some) };
+            let Ok(window) = window else {
+                error.set(Some("context window must be a whole number".into()));
+                return;
+            };
+            CreateConnection {
+                members: if k == "pool" { members.get_untracked() } else { Vec::new() },
+                kind: Some(k),
+                name: n,
+                base_url: base_url.get_untracked(),
+                api_key: Some(api_key.get_untracked()).filter(|k| !k.is_empty()),
+                default_model: Some(default_model.get_untracked()).filter(|m| !m.is_empty()),
+                context_window: window,
+                ..Default::default()
+            }
         };
         pending.set(true);
-        let req = CreateConnection {
-            kind: Some(kind.get_untracked()),
-            name: name.get_untracked(),
-            base_url: base_url.get_untracked(),
-            api_key: Some(api_key.get_untracked()).filter(|k| !k.is_empty()),
-            default_model: Some(default_model.get_untracked()).filter(|m| !m.is_empty()),
-            context_window: window,
-            members: if kind.get_untracked() == "pool" { members.get_untracked() } else { Vec::new() },
-        };
         spawn_local(async move {
             match api::create_connection(req).await {
                 Ok(_) => {
@@ -2207,6 +2454,7 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
                     api_key.set(String::new());
                     default_model.set(String::new());
                     context_window.set(String::new());
+                    alias_target.set(String::new());
                     members.set(vec![PoolMember { connection_id: String::new(), slots: 1 }]);
                     tested.set(None);
                     on_added();
@@ -2217,14 +2465,14 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
         });
     };
 
-    let field = move |label: &'static str, sig: RwSignal<String>, placeholder: Signal<&'static str>, input_type: &'static str| {
-        view! {
-            <label class="block text-xs text-muted">
-                {label}
-                <input type=input_type class=format!("mt-1 {INPUT}") placeholder=placeholder autocomplete="off"
-                    prop:value=move || sig.get() on:input=move |ev| sig.set(event_target_value(&ev)) />
-            </label>
-        }
+    let field = |label, value, placeholder, kind| {
+        connection_field(
+            label,
+            value,
+            placeholder,
+            ConnectionInput { kind: Some(kind), autocomplete: Some("off"), ..Default::default() },
+            false,
+        )
     };
     let by_kind = move |anthropic: &'static str, openai: &'static str, compat: &'static str| {
         Signal::derive(move || match kind.get().as_str() {
@@ -2246,21 +2494,23 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
                     <option value="openai_compat">"OpenAI-compatible (Chat Completions: Ollama, vLLM, OpenRouter, …)"</option>
                     <option value="claude_code">"Claude Code (each worker's own signed-in claude CLI)"</option>
                     <option value="pool">"Pool (other connections, for the memex and head-side tasks)"</option>
+                    <option value="alias">"Alias (a connection you can switch between accounts)"</option>
                 </select>
             </label>
-            {move || pool().then(|| view! {
+            {move || providers_hidden().then(|| view! {
                 <div class="space-y-3">
-                    {field("Name", name, Signal::stored("Ollamas"), "text")}
-                    <PoolMembers members all />
+                    {field("Name", name, Signal::stored(if alias() { "ChatGPT" } else { "Ollamas" }), "text")}
+                    {if alias() { alias_target_view(picker, "Initial target") } else { view! { <PoolMembers members all /> }.into_any() }}
+                    {alias().then_some(view! { <p class="text-xs text-muted">"Use this name in sessions and routing. Later, you can switch it to another connection of the same kind."</p> })}
                 </div>
-            })}
+            }.into_any())}
             {move || (kind.get() == "claude_code").then(|| view! {
                 <p class="text-sm text-muted">
                     "Sessions run the official Claude Code CLI on the worker, with its own tools and sign-in (your Claude subscription or API key). Install it on each worker and run "
                     <code class="font-mono">"claude auth login"</code> " there. No key is stored here."
                 </p>
             })}
-            <div class="grid gap-3 @lg/settings:grid-cols-2" class:hidden=pool>
+            <div class="grid gap-3 @lg/settings:grid-cols-2" class:hidden=providers_hidden>
                 {field("Name", name, by_kind("Anthropic", "OpenAI", "Ollama"), "text")}
                 {field("Base URL", base_url, by_kind("https://api.anthropic.com (default)", "https://api.openai.com/v1 (default)", "http://127.0.0.1:11434/v1"), "url")}
                 {field("API key", api_key, by_kind("sk-ant-…", "sk-…", "optional for local servers"), "password")}
@@ -2272,25 +2522,17 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
                         placeholder=Signal::derive(move || if matches!(tested.get(), Some(Ok(_))) { "pick or type a model".to_owned() } else { by_kind("claude-opus-5-5", "gpt-5.5", "qwen3.6:27b").get().to_owned() }) /></div>
                 </label>
             </div>
-            {move || (kind.get() != "claude_code").then(|| view! { <ContextWindow value=context_window /> })}
-            {move || tested.get().map(|r| match r {
-                Ok(models) => view! {
-                    <p class="text-sm text-emerald-700 dark:text-emerald-400">
-                        {crate::icons::check()}" "{format!("Connected · {} model{} available", models.len(), if models.len() == 1 { "" } else { "s" })}
-                        {(!models.is_empty()).then(|| view! { <span class="text-muted">" (listed in the model field)"</span> })}
-                    </p>
-                }.into_any(),
-                Err(e) => view! { <p class="text-sm text-red-600">{crate::icons::icon(crate::icons::Icon::CircleX, crate::icons::Size::S14)}" "{e}</p> }.into_any(),
-            })}
-            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            {move || (!alias() && kind.get() != "claude_code").then(|| view! { <ContextWindow value=context_window /> })}
+            {move || if alias() { None } else { tested.get().map(|r| connection_test_result(r, true)) }}
+            {connection_error(error)}
             <div class="flex justify-end gap-2">
-                <button class=BUTTON_QUIET class:hidden=pool disabled=move || testing.get() on:click=test>
-                    {move || if testing.get() { "Testing…" } else { "Test connection" }}
-                </button>
-                <button class=BUTTON disabled=move || pending.get() on:click=add>"Add connection"</button>
+                {connection_button(BUTTON_QUIET.into(), None, Signal::derive(move || if testing.get() { "Testing…" } else { "Test connection" }),
+                    Signal::derive(move || !providers_hidden()), testing.into(), Callback::new(test))}
+                {connection_button(BUTTON.into(), None, Signal::stored("Add connection"), Signal::stored(true),
+                    Signal::derive(move || if alias() { picker.disabled() } else { pending.get() }), Callback::new(add))}
             </div>
         </section>
-    }
+    }.into_any()
 }
 
 /// Sign in with ChatGPT: opens OpenAI's consent page; the redirect lands on
@@ -2298,11 +2540,11 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
 /// the user pastes the address it ended on.
 #[component]
 fn ChatGptSignIn(
-    on_added: impl Fn() + Copy + Send + Sync + 'static,
+    on_added: Callback<()>,
     /// Sign this connection's account in again (instead of adding one).
     #[prop(optional)]
     again: Option<String>,
-) -> impl IntoView {
+) -> AnyView {
     let again = StoredValue::new(again);
     let name = RwSignal::new(String::new());
     let email = RwSignal::new(String::new());
@@ -2334,7 +2576,7 @@ fn ChatGptSignIn(
                     url.set(None);
                     callback.set(String::new());
                     error.set(None);
-                    on_added();
+                    on_added.run(());
                 }
                 Err(e) => error.set(Some(e)),
             }
@@ -2352,23 +2594,17 @@ fn ChatGptSignIn(
                 </div>
             })}
             {move || match url.get() {
-                None if adding => view! {
-                    <div class="flex flex-wrap items-end gap-2">
-                        <label class="block min-w-40 flex-1 text-xs text-muted">
-                            "Connection name"
-                            <input class=format!("mt-1 {INPUT}") placeholder="ChatGPT (your email)" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
-                        </label>
-                        <label class="block min-w-40 flex-1 text-xs text-muted">
-                            "Account email (optional)"
-                            <input class=format!("mt-1 {INPUT}") type="email" placeholder="to pick the account" prop:value=move || email.get() on:input=move |ev| email.set(event_target_value(&ev)) />
-                        </label>
-                        <button class=BUTTON disabled=move || pending.get() on:click=start>"Sign in"</button>
-                    </div>
-                }.into_any(),
                 None => view! {
-                    <div class="flex items-center gap-2 text-sm">
-                        <span class="flex-1 text-muted">"Sign this account in again (if its sign-in expired or was revoked)."</span>
-                        <button class=BUTTON disabled=move || pending.get() on:click=start>"Sign in again"</button>
+                    <div class=if adding { "flex flex-wrap items-end gap-2" } else { "flex items-center gap-2 text-sm" }>
+                        {adding.then(|| view! {
+                            {connection_field("Connection name", name, Signal::stored("ChatGPT (your email)"), ConnectionInput::default(), true)}
+                            {connection_field("Account email (optional)", email, Signal::stored("to pick the account"), ConnectionInput {
+                                kind: Some("email"), ..Default::default()
+                            }, true)}
+                        })}
+                        {(!adding).then_some(view! { <span class="flex-1 text-muted">"Sign this account in again (if its sign-in expired or was revoked)."</span> })}
+                        {connection_button(BUTTON.into(), None, Signal::stored(if adding { "Sign in" } else { "Sign in again" }),
+                            Signal::stored(true), pending.into(), Callback::new(start))}
                     </div>
                 }.into_any(),
                 Some(u) => view! {
@@ -2379,16 +2615,15 @@ fn ChatGptSignIn(
                             "fails to load: copy its full address and paste it below."
                         </p>
                         <div class="flex gap-2">
-                            <input class=format!("{INPUT} font-mono text-xs") placeholder="http://127.0.0.1:…/callback?code=…"
-                                prop:value=move || callback.get() on:input=move |ev| callback.set(event_target_value(&ev)) />
-                            <button class=BUTTON disabled=move || pending.get() on:click=complete>"Finish"</button>
+                            {connection_input(callback, Signal::stored("http://127.0.0.1:…/callback?code=…"), format!("{INPUT} font-mono text-xs"), ConnectionInput::default())}
+                            {connection_button(BUTTON.into(), None, Signal::stored("Finish"), Signal::stored(true), pending.into(), Callback::new(complete))}
                         </div>
                     </div>
                 }.into_any(),
             }}
-            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            {connection_error(error)}
         </section>
-    }
+    }.into_any()
 }
 
 /// A ready-made entry: (label, what it needs, the entry).
@@ -4852,6 +5087,80 @@ fn MemorySetting() -> impl IntoView {
                 <button class=BUTTON on:click=save>{move || if editing.get().is_some() { "Save note" } else { "Add note" }}</button>
             </div>
         </section>
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod alias_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fixture() -> Vec<Connection> {
+        [
+            ("first", "chatgpt"),
+            ("second", "chatgpt"),
+            ("compatible", "openai_compat"),
+            ("openai", "openai"),
+            ("anthropic", "anthropic"),
+            ("another-alias", "alias"),
+            ("pooled", "pool"),
+            ("native", "claude_code"),
+        ]
+        .into_iter()
+        .map(|(id, kind)| {
+            serde_json::from_value(json!({"id": id, "name": id, "kind": kind, "base_url": "", "created_at": 1, "has_api_key": false}))
+                .unwrap()
+        })
+        .collect()
+    }
+
+    #[test]
+    fn creation_needs_a_name_and_real_target_and_sends_no_provider_details() {
+        let all = fixture();
+        let choices = alias_options(&all, None, None);
+        assert_eq!(choices.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["first", "second", "compatible", "openai", "anthropic"]);
+        assert!(alias_create_request(" ".into(), "first".into(), &choices).is_err());
+        for invalid in ["", "missing", "another-alias", "pooled", "native"] {
+            assert!(alias_create_request("My alias".into(), invalid.into(), &choices).is_err(), "accepted {invalid:?}");
+        }
+        let req = alias_create_request("My alias".into(), "first".into(), &choices).unwrap();
+        assert_eq!(req.kind.as_deref(), Some("alias"));
+        assert_eq!(req.name, "My alias");
+        assert_eq!(req.alias_target_id.as_deref(), Some("first"));
+        assert!(req.base_url.is_empty() && req.api_key.is_none() && req.members.is_empty());
+        assert!(req.default_model.is_none() && req.context_window.is_none());
+    }
+
+    #[test]
+    fn switch_accepts_only_a_different_target_of_the_same_kind_and_blocks_duplicate_submissions() {
+        let all = fixture();
+        let choices = alias_options(&all, Some("chatgpt"), Some("first"));
+        assert_eq!(choices.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["second"]);
+        for invalid in ["", "first", "compatible", "another-alias", "missing"] {
+            assert!(alias_switch_request(&choices, invalid.into(), false).is_none(), "accepted {invalid:?}");
+        }
+        assert!(alias_switch_request(&choices, "second".into(), true).is_none());
+        let req = alias_switch_request(&choices, "second".into(), false).unwrap();
+        assert_eq!(serde_json::to_value(req).unwrap(), json!({"target_id": "second"}));
+        assert_eq!(alias_choices(&all, Some("chatgpt"), Some("second")).next().unwrap().id, "first");
+    }
+
+    #[test]
+    fn switch_row_shows_current_target_without_offering_it_or_other_provider_kinds() {
+        Owner::new().with(|| {
+            let all = Signal::stored(fixture());
+            let html = untrack(|| {
+                alias_switch_view("stable".into(), Some("chatgpt".into()), Some("first".into()), None, all, Callback::new(|_| ())).to_html()
+            });
+            assert!(html.contains("Current target:") && html.contains("first"), "{html}");
+            assert!(html.contains("Switch to") && html.contains("value=\"second\""), "{html}");
+            for hidden in ["first", "compatible", "openai", "anthropic", "another-alias", "pooled", "native"] {
+                assert!(!html.contains(&format!("value=\"{hidden}\"")), "offered {hidden}: {html}");
+            }
+            let button = html.split("<button").nth(1).unwrap().split('>').next().unwrap();
+            assert!(button.contains("disabled"), "switch must not submit a blank selection: {html}");
+        });
     }
 }
 

@@ -561,6 +561,10 @@ pub async fn create_connection(req: CreateConnection) -> Result<Connection, Stri
     send_json(Request::post("/api/v1/connections"), &req).await
 }
 
+pub async fn switch_connection_alias(id: String, req: c6_api::SwitchConnectionAlias) -> Result<Connection, String> {
+    send_json(Request::post(&format!("/api/v1/connections/{id}/alias/switch")), &req).await
+}
+
 /// Starts signing in with ChatGPT: a new account, or `connection_id`'s
 /// account again.
 pub async fn start_chatgpt(

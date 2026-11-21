@@ -577,7 +577,9 @@ pub fn MemexSettings() -> impl IntoView {
                     <span class="text-xs text-muted">"Embedding connection"</span>
                     <select class=format!("{INPUT} py-1 text-sm") prop:value=move || conn.get() on:change=move |ev| conn.set(event_target_value(&ev))>
                         <option value="">"None (keyword search only)"</option>
-                        {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|c| !matches!(c.kind.as_str(), "anthropic" | "claude_code" | "chatgpt")).map(|c| view! { <option value=c.name.clone()>{c.name.clone()}</option> }).collect_view()}
+                        {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter()
+                            .filter(|c| !matches!(c.alias_target_kind.as_deref().unwrap_or(&c.kind), "anthropic" | "claude_code" | "chatgpt"))
+                            .map(|c| view! { <option value=c.name.clone()>{c.name.clone()}</option> }).collect_view()}
                     </select>
                 </label>
                 <label class="space-y-0.5">
@@ -606,7 +608,10 @@ pub fn MemexSettings() -> impl IntoView {
                             <select class=format!("{INPUT} py-1 text-sm") prop:value=move || c.get() on:change=move |ev| c.set(event_target_value(&ev))>
                                 <option value="">{if k == "drafting" { "Same as understanding" } else { "None (off)" }}</option>
                                 {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter()
-                                    .filter(|x| x.kind != "claude_code" && (k != "transcription" || !matches!(x.kind.as_str(), "anthropic" | "chatgpt")))
+                                    .filter(|x| {
+                                        let kind = x.alias_target_kind.as_deref().unwrap_or(&x.kind);
+                                        kind != "claude_code" && (k != "transcription" || !matches!(kind, "anthropic" | "chatgpt"))
+                                    })
                                     .map(|x| view! { <option value=x.name.clone()>{x.name.clone()}</option> }).collect_view()}
                             </select>
                         </label>

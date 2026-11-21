@@ -1451,7 +1451,7 @@ pub(crate) async fn model_for_route(
     fallback: Option<(String, String)>,
 ) -> anyhow::Result<Option<(String, String)>> {
     let route_label = label;
-    let connections = st.store.connections().await?;
+    let connections = st.store.effective_connections().await?;
     let labels = vec![route_label.to_owned()];
     // The realm's rules, then root's (setting_for merges them). A rule
     // whose connection the realm may not use is passed over.
@@ -1571,6 +1571,7 @@ pub(crate) async fn ask_as(
         acc.push(&ev?);
     }
     let usage = acc.usage;
+    let connection = acc.account.take().map(|a| a.resolved_connection_id).filter(|id| !id.is_empty()).unwrap_or(connection);
     let msg = acc.finish(true);
     sqlx::query(
         "INSERT OR REPLACE INTO usage (session_id, seq, ts, connection_id, model, input, output, cache_read, cache_write, realm) \

@@ -29,9 +29,16 @@ impl c6_worker::link::LocalHead for Local {
     }
 
     async fn credential(&self, connection_id: &str) -> CredentialGrant {
-        let req = CredentialRequest { request_id: 0, connection_id: connection_id.to_owned(), refresh: false, session_id: String::new() };
+        let req = CredentialRequest { connection_id: connection_id.to_owned(), ..Default::default() };
         match self.st.upgrade() {
             Some(st) => crate::sessions::credential_for(&st, None, "head", req).await,
+            None => CredentialGrant { connection_id: connection_id.to_owned(), error: "the head stopped".into(), ..Default::default() },
+        }
+    }
+
+    async fn realm_credential(&self, realm: &str, connection_id: &str) -> CredentialGrant {
+        match self.st.upgrade() {
+            Some(st) => crate::sessions::head_credential(&st, realm, connection_id).await,
             None => CredentialGrant { connection_id: connection_id.to_owned(), error: "the head stopped".into(), ..Default::default() },
         }
     }

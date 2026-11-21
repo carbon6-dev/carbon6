@@ -3,7 +3,7 @@
 //! and when each starts afresh; shown with the connection wherever you
 //! pick one.
 
-use c6_api::{ConnectionQuota, QuotaWindow};
+use c6_api::{Connection, ConnectionQuota, QuotaWindow};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -12,7 +12,10 @@ use crate::util::now_ms;
 
 /// Every connection's limits as last seen, kept fresh while the app is open.
 #[derive(Clone, Copy)]
-pub struct Quotas(pub RwSignal<Vec<ConnectionQuota>>);
+struct Quotas {
+    limits: RwSignal<Vec<ConnectionQuota>>,
+    connections: crate::resources::Connections,
+}
 
 thread_local! {
     /// The app's one copy: read from anywhere a connection is shown (tiles
@@ -33,20 +36,35 @@ pub fn provide() {
     };
     load();
     set_interval(load, std::time::Duration::from_secs(60));
+    let connections = crate::resources::connections();
     QUOTAS.with(|c| {
-        let _ = c.set(Quotas(q));
+        let _ = c.set(Quotas { limits: q, connections });
     });
 }
 
 /// Every connection's limits (tracked), once [`provide`] ran.
 pub fn all() -> Vec<ConnectionQuota> {
-    QUOTAS.with(|c| c.get().copied()).map(|q| q.0.get()).unwrap_or_default()
+    QUOTAS.with(|c| c.get().copied()).map(|q| q.limits.get()).unwrap_or_default()
 }
 
 /// A connection's limits, if it has a plan with any.
 pub fn of(connection: &str) -> Option<ConnectionQuota> {
     let q = QUOTAS.with(|c| c.get().copied())?;
-    q.0.with(|v| v.iter().find(|q| q.connection_id == connection && !q.windows.is_empty()).cloned())
+    q.limits.with(|v| quota_for(connection, &[], v).cloned())
+}
+
+/// In a picker, the stable alias points to the current account's limits.
+fn of_choice(connection: &str) -> Option<ConnectionQuota> {
+    let q = QUOTAS.with(|c| c.get().copied())?;
+    q.connections.with(|cs| {
+        let cs = cs.as_ref().and_then(|result| result.as_ref().ok()).map(Vec::as_slice).unwrap_or_default();
+        q.limits.with(|v| quota_for(connection, cs, v).cloned())
+    })
+}
+
+fn quota_for<'a>(id: &str, connections: &[Connection], quotas: &'a [ConnectionQuota]) -> Option<&'a ConnectionQuota> {
+    let account = connections.iter().find(|c| c.id == id).and_then(|c| c.alias_target_id.as_deref()).unwrap_or(id);
+    quotas.iter().find(|q| q.connection_id == account && !q.windows.is_empty())
 }
 
 fn source_note(w: &QuotaWindow) -> Option<String> {
@@ -270,7 +288,7 @@ pub fn line(w: &QuotaWindow) -> String {
 /// The option text for a connection in a picker: its name, and what's left
 /// of its plan's tightest window ("Max · 90% left").
 pub fn option_label(id: &str, name: &str) -> String {
-    match of(id).as_ref().and_then(|q| q.tightest().map(remaining)) {
+    match of_choice(id).as_ref().and_then(|q| q.tightest().map(remaining)) {
         Some(left) => format!("{name} · {left}"),
         None => name.to_owned(),
     }
@@ -283,7 +301,7 @@ pub fn option_label(id: &str, name: &str) -> String {
 #[component]
 pub fn QuotaNote(#[prop(into)] connection: Signal<String>, #[prop(optional)] chip: bool) -> impl IntoView {
     move || {
-        let q = of(&connection.get())?;
+        let q = of_choice(&connection.get())?;
         let w = q.tightest()?;
         let t = tone(w);
         Some(if chip {
@@ -312,7 +330,7 @@ pub fn QuotaNote(#[prop(into)] connection: Signal<String>, #[prop(optional)] chi
 #[component]
 pub fn PlanMenu(#[prop(into)] connection: Signal<String>) -> impl IntoView {
     move || {
-        let q = of(&connection.get())?;
+        let q = of_choice(&connection.get())?;
         let error = (!q.error.is_empty()).then(|| q.error.clone());
         Some(view! {
             <div class="space-y-2 border-b border-zinc-200 pb-2 dark:border-zinc-700">
@@ -369,6 +387,25 @@ pub fn QuotaBars(q: ConnectionQuota) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picker_limits_follow_the_current_alias_target() {
+        let mut alias: Connection = serde_json::from_value(serde_json::json!({
+            "id": "stable", "name": "ChatGPT", "kind": "alias", "base_url": "", "has_api_key": false,
+            "created_at": 0, "alias_target_id": "first"
+        }))
+        .unwrap();
+        let quotas = [("first", 10.0), ("second", 35.0)].map(|(id, used)| ConnectionQuota {
+            connection_id: id.into(),
+            windows: vec![w("week", used, None, "")],
+            ..Default::default()
+        });
+        assert!(quota_for("stable", &[], &quotas).is_none(), "there is no quota stored on the alias");
+        assert_eq!(quota_for("stable", std::slice::from_ref(&alias), &quotas), Some(&quotas[0]));
+        alias.alias_target_id = Some("second".into());
+        assert_eq!(quota_for("stable", std::slice::from_ref(&alias), &quotas), Some(&quotas[1]));
+        assert_eq!(quota_for("first", &[alias], &quotas), Some(&quotas[0]));
+    }
 
     #[test]
     fn unmatched_codex_row_names_worker_masks_account_and_explains_no_match() {

@@ -413,3 +413,11 @@ carbon6.v1.SessionEventBatch 3 uint64 ownership_epoch
 carbon6.v1.EventAck 3 uint64 ownership_epoch
 carbon6.v1.SessionCommand 22 uint64 ownership_epoch
 carbon6.v1.CommandRejected 4 uint64 ownership_epoch
+carbon6.v1.CredentialGrant 10 string resolved_connection_id
+carbon6.v1.CredentialGrant 11 bool is_alias
+carbon6.v1.CredentialGrant 12 string resolved_connection_name
+carbon6.v1.CredentialGrant 13 string alias_connection_name
+carbon6.v1.Usage 8 string resolved_connection_id
+carbon6.v1.Usage 9 string resolved_connection_name
+carbon6.v1.Usage 10 string alias_connection_name
+carbon6.v1.CredentialRequest 5 bool supports_alias

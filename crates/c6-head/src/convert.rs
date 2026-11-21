@@ -133,6 +133,9 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             cache_write_tokens: u.cache_write_tokens,
             reasoning_tokens: u.reasoning_tokens,
             context_window: u.context_window,
+            resolved_connection_id: u.resolved_connection_id.clone(),
+            resolved_connection_name: u.resolved_connection_name.clone(),
+            alias_connection_name: u.alias_connection_name.clone(),
         },
         Kind::TurnEnded(t) => api::EventKind::TurnEnded {
             turn: t.turn,
@@ -330,6 +333,30 @@ pub fn queued(c: &CommandRow) -> api::QueuedInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_alias_metadata_is_additive() {
+        let to_json = |usage| {
+            let shown = event(&SessionEvent { kind: Some(session_event::Kind::Usage(usage)), ..Default::default() }).unwrap();
+            let json = serde_json::to_value(&shown).unwrap();
+            assert_eq!(serde_json::from_value::<api::Event>(json.clone()).unwrap(), shown);
+            json
+        };
+        let legacy = to_json(c6_proto::Usage::default());
+        assert!(legacy.get("alias_connection_name").is_none());
+        assert!(legacy.get("resolved_connection_name").is_none());
+        assert!(legacy.get("resolved_connection_id").is_none());
+
+        let aliased = to_json(c6_proto::Usage {
+            alias_connection_name: "chatgpt".into(),
+            resolved_connection_name: "work account".into(),
+            resolved_connection_id: "account-id".into(),
+            ..Default::default()
+        });
+        assert_eq!(aliased["alias_connection_name"], "chatgpt");
+        assert_eq!(aliased["resolved_connection_name"], "work account");
+        assert_eq!(aliased["resolved_connection_id"], "account-id");
+    }
 
     #[test]
     fn message_origins_are_additive_and_missing_legacy_provenance_stays_absent() {

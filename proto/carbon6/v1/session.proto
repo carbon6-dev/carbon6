@@ -474,6 +474,10 @@ message Usage {
   // The window of the model that made the call, when the runtime reports
   // which one it was (Claude Code); 0: unknown.
   uint64 context_window = 7;
+  // Account that served this particular call, when selected through an alias.
+  string resolved_connection_id = 8;
+  string resolved_connection_name = 9;
+  string alias_connection_name = 10;
 }
 
 enum TurnEndReason {
@@ -949,6 +953,8 @@ message CredentialRequest {
   // gives a worker only its live sessions' connections and secrets, as
   // their realms allow. Empty from older workers (and the head's own).
   string session_id = 4;
+  // The worker knows not to cache alias grants across model calls.
+  bool supports_alias = 5;
 }
 
 message CredentialGrant {
@@ -962,4 +968,10 @@ message CredentialGrant {
   map<string, string> headers = 7;
   int64 expires_at_ms = 8; // 0 = no expiry
   uint64 context_window = 9; // 0 = automatic
+  // connection_id remains the ID requested by the worker. Its real target
+  // and the display names are snapshots of this grant's resolution.
+  string resolved_connection_id = 10;
+  bool is_alias = 11;
+  string resolved_connection_name = 12;
+  string alias_connection_name = 13;
 }

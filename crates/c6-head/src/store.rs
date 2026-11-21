@@ -468,6 +468,11 @@ pub struct ConnectionRow {
 
 impl Store {
     pub async fn insert_connection(&self, c: &ConnectionRow) -> anyhow::Result<()> {
+        let mut db = self.pool.acquire().await?;
+        Self::insert_connection_on(&mut db, c).await
+    }
+
+    pub(crate) async fn insert_connection_on(db: &mut sqlx::SqliteConnection, c: &ConnectionRow) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT INTO connections (id, name, kind, base_url, api_key, default_model, created_at, members, context_window, subagent_model, compact_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -483,7 +488,7 @@ impl Store {
         .bind(c.context_window)
         .bind(&c.subagent_model)
         .bind(c.compact_at)
-        .execute(&self.pool)
+        .execute(db)
         .await?;
         Ok(())
     }
@@ -505,6 +510,19 @@ impl Store {
 
     pub async fn connections(&self) -> anyhow::Result<Vec<ConnectionRow>> {
         Ok(sqlx::query_as("SELECT * FROM connections ORDER BY name").fetch_all(&self.pool).await?)
+    }
+
+    /// Provider-facing rows retain the selected ID/name, including for an alias.
+    pub(crate) async fn effective_connections(&self) -> anyhow::Result<Vec<ConnectionRow>> {
+        Ok(sqlx::query_as("SELECT * FROM effective_connections ORDER BY name").fetch_all(&self.pool).await?)
+    }
+
+    pub(crate) async fn effective_connection(&self, id: &str) -> anyhow::Result<Option<ConnectionRow>> {
+        Ok(self.resolve_connection(id).await?.map(|c| c.row))
+    }
+
+    pub(crate) async fn resolve_connection(&self, id: &str) -> anyhow::Result<Option<ResolvedConnection>> {
+        Ok(sqlx::query_as("SELECT * FROM effective_connections WHERE id = ?").bind(id).fetch_optional(&self.pool).await?)
     }
 
     /// The connection and model of your latest session (on a connection, or
@@ -532,6 +550,14 @@ impl Store {
     pub async fn delete_connection(&self, id: &str) -> anyhow::Result<bool> {
         Ok(sqlx::query("DELETE FROM connections WHERE id = ?").bind(id).execute(&self.pool).await?.rows_affected() > 0)
     }
+}
+
+#[derive(FromRow)]
+pub(crate) struct ResolvedConnection {
+    #[sqlx(flatten)]
+    pub row: ConnectionRow,
+    pub resolved_connection_id: Option<String>,
+    pub resolved_connection_name: Option<String>,
 }
 
 // --- Sessions and events ------------------------------------------------------
@@ -658,6 +684,12 @@ pub struct Ingested {
     pub done_commands: Vec<String>,
     /// Commands now with the agent (`InputDelivered`).
     pub delivered_commands: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum IngestSource {
+    Worker,
+    Head,
 }
 
 async fn project_place_changed(
@@ -1227,6 +1259,17 @@ impl Store {
         ownership_epoch: u64,
         events: &[c6_proto::SessionEvent],
     ) -> anyhow::Result<Option<Ingested>> {
+        self.ingest_batch(worker_id, session_id, ownership_epoch, events, IngestSource::Worker).await
+    }
+
+    pub(crate) async fn ingest_batch(
+        &self,
+        worker_id: WorkerId,
+        session_id: &str,
+        ownership_epoch: u64,
+        events: &[c6_proto::SessionEvent],
+        source: IngestSource,
+    ) -> anyhow::Result<Option<Ingested>> {
         use c6_proto::session_event::Kind;
         use prost::Message;
 
@@ -1261,6 +1304,15 @@ impl Store {
             if ev.seq != last + 1 {
                 break;
             }
+            // Check worker attribution before writing or publishing the event.
+            // This transaction already knows the selected connection at this
+            // sequence, including earlier switches in the same batch.
+            let mut ev = ev.clone();
+            if matches!(source, IngestSource::Worker)
+                && let Some(Kind::Usage(usage)) = &mut ev.kind
+            {
+                crate::aliases::verify_usage(&mut tx, session_id, usage).await?;
+            }
             sqlx::query("INSERT INTO events (session_id, seq, ts, data) VALUES (?, ?, ?, ?)")
                 .bind(session_id)
                 .bind(ev.seq as i64)
@@ -1268,8 +1320,8 @@ impl Store {
                 .bind(ev.encode_to_vec())
                 .execute(&mut *tx)
                 .await?;
-            crate::search::index_event(&mut tx, session_id, ev).await?;
-            crate::analytics::mark(&mut tx, session_id, ev).await?;
+            crate::search::index_event(&mut tx, session_id, &ev).await?;
+            crate::analytics::mark(&mut tx, session_id, &ev).await?;
             last = ev.seq;
             match &ev.kind {
                 Some(Kind::Started(s)) => {
@@ -1380,7 +1432,7 @@ impl Store {
                 }
                 _ => {}
             }
-            stored.push(ev.clone());
+            stored.push(ev);
         }
         if !stored.is_empty() {
             sqlx::query("UPDATE sessions SET last_seq = ?, status = ?, updated_at = ? WHERE id = ?")

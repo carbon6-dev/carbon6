@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail};
 use c6_proto::{CredentialGrant, CredentialRequest, EphemeralEvent, WorkerMsg, ephemeral_event, worker_msg};
+use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 const CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -30,6 +31,9 @@ const COALESCE: Duration = Duration::from_millis(25);
 pub trait LocalHead: Send + Sync {
     async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String>;
     async fn credential(&self, connection_id: &str) -> CredentialGrant;
+    async fn realm_credential(&self, _realm: &str, connection_id: &str) -> CredentialGrant {
+        self.credential(connection_id).await
+    }
     /// Records ChatGPT reply headers on calls made in the head's process.
     fn chatgpt_limits_hook(&self, _connection_id: &str) -> Option<c6_llm::openai_responses::ChatGptLimitsHook> {
         None
@@ -54,6 +58,9 @@ pub struct HeadLink {
     /// By (session, connection). In memory only: credentials are never
     /// written to disk on workers.
     cache: Mutex<HashMap<(String, String), CredentialGrant>>,
+    // A turn recreates its model client; the actual caller's private
+    // provider history stays known for as long as this worker does.
+    alias_history: Arc<c6_llm::replay::AliasHistory>,
     /// Invalidations also discard fills that started before them.
     cache_generation: AtomicU64,
     next_request: AtomicU64,
@@ -205,6 +212,15 @@ impl HeadLink {
         self.credential_with("", connection_id, false).await
     }
 
+    /// Credentials for a realm's in-process knowledge work. Authorize each
+    /// request as that realm rather than sharing the worker credential cache.
+    pub async fn realm_credential(&self, realm: &str, connection_id: &str) -> anyhow::Result<CredentialGrant> {
+        let Some(local) = self.local.get() else { return self.credential(connection_id).await };
+        let grant = local.realm_credential(realm, connection_id).await;
+        anyhow::ensure!(grant.error.is_empty(), "{}", grant.error);
+        Ok(grant)
+    }
+
     /// Credentials on behalf of one of this worker's sessions (a subagent
     /// asks as its root): the head gives only what the session uses, as its
     /// realm allows.
@@ -258,6 +274,8 @@ impl HeadLink {
             return built_in;
         }
         let Ok(g) = self.session_credential(session_id, &model.connection_id).await else { return built_in };
+        let resolved = if g.resolved_connection_id.is_empty() { &model.connection_id } else { &g.resolved_connection_id };
+        let built_in = c6_llm::window::built_in(&g.kind, &model.model);
         let e = c6_llm::pool::Endpoint {
             kind: g.kind,
             base_url: g.base_url,
@@ -265,7 +283,7 @@ impl HeadLink {
             headers: g.headers,
             context_window: g.context_window,
         };
-        c6_llm::window::known(&model.connection_id, &model.model, &e).await.unwrap_or(built_in)
+        c6_llm::window::known(resolved, &model.model, &e).await.unwrap_or(built_in)
     }
 
     /// The pool a connection is, when the head is in this process and it is
@@ -333,7 +351,13 @@ impl HeadLink {
             self.waiters.lock().unwrap().insert(request_id, done);
         }
         let _cleanup = CredentialWaiter { link: self, id: request_id };
-        let req = CredentialRequest { request_id, connection_id: connection_id.to_owned(), refresh, session_id: session_id.to_owned() };
+        let req = CredentialRequest {
+            request_id,
+            connection_id: connection_id.to_owned(),
+            refresh,
+            session_id: session_id.to_owned(),
+            supports_alias: true,
+        };
         let grant = match tokio::time::timeout(CREDENTIAL_TIMEOUT, async {
             tx.send(WorkerMsg { msg: Some(worker_msg::Msg::CredentialRequest(req)) }).await.ok()?;
             wait.await.ok()
@@ -385,7 +409,13 @@ impl HeadLink {
     fn cache_grant(&self, key: (String, String), grant: &CredentialGrant, generation: u64) {
         let mut cache = self.cache.lock().unwrap();
         if self.cache_generation.load(Ordering::Relaxed) == generation {
-            cache.insert(key, grant.clone());
+            if grant.is_alias {
+                // Resolve again on the next request, even offline: reusing
+                // the old account could bypass a switch or an access change.
+                cache.remove(&key);
+            } else {
+                cache.insert(key, grant.clone());
+            }
         }
     }
 
@@ -423,7 +453,7 @@ impl std::fmt::Display for CredentialTransport {
 impl std::error::Error for CredentialTransport {}
 
 /// A model client that takes its credentials from the head for every call
-/// (cached until they near expiry), so a long turn never runs on an
+/// (cached until they near expiry, except for aliases), so a long turn never runs on an
 /// expired token; when the provider refuses them anyway (HTTP 401), it
 /// asks the head for new ones and tries once more.
 pub struct LinkedClient {
@@ -444,15 +474,47 @@ impl LinkedClient {
         let mut current = self.current.lock().unwrap();
         if let Some((previous, c)) = current.as_ref()
             && previous.kind == g.kind
+            && previous.resolved_connection_id == g.resolved_connection_id
             && previous.base_url == g.base_url
             && previous.bearer == g.bearer
             && previous.headers == g.headers
         {
             return Ok(c.clone());
         }
-        let c: Arc<dyn c6_llm::ModelClient> = Arc::from(c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers.clone())?);
+        let mut client = c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers.clone())?;
+        if g.kind == "chatgpt" {
+            let resolved = if g.resolved_connection_id.is_empty() { &self.connection_id } else { &g.resolved_connection_id };
+            if let Some(hook) = self.link.chatgpt_limits_hook(resolved) {
+                client.set_chatgpt_limits_hook(hook);
+            }
+        }
+        let c: Arc<dyn c6_llm::ModelClient> = Arc::from(client);
         *current = Some((g.clone(), c.clone()));
         Ok(c)
+    }
+
+    async fn stream_with_grant(&self, req: &c6_llm::ModelRequest, g: &CredentialGrant) -> Result<c6_llm::EventStream, c6_llm::LlmError> {
+        let client = self.client(g)?;
+        if !g.is_alias {
+            return client.stream(req).await;
+        }
+        let mut req = req.clone();
+        let replay = self.link.alias_history.prepare(&mut req, &self.connection_id, &g.kind, &g.resolved_connection_id);
+        if g.kind == "chatgpt"
+            && let Some(key) = req.cache_key.as_deref()
+        {
+            // Separate the backend's conversation affinity and prompt cache
+            // by real account. The key still identifies the actual caller
+            // (not the root that authorized a subagent's grant).
+            req.cache_key = Some(format!("{key}:{}", g.resolved_connection_id));
+        }
+        let stream = replay.track(client.stream(&req).await?);
+        let account = c6_llm::ModelAccount {
+            resolved_connection_id: g.resolved_connection_id.clone(),
+            resolved_connection_name: g.resolved_connection_name.clone(),
+            alias_connection_name: g.alias_connection_name.clone(),
+        };
+        Ok(futures::stream::iter([Ok(c6_llm::ModelEvent::Account(account))]).chain(stream).boxed())
     }
 }
 
@@ -461,11 +523,11 @@ impl c6_llm::ModelClient for LinkedClient {
     async fn stream(&self, req: &c6_llm::ModelRequest) -> Result<c6_llm::EventStream, c6_llm::LlmError> {
         let unreachable = |e: anyhow::Error| c6_llm::LlmError::Network(format!("credentials from the head: {e:#}"));
         let g = self.link.model_credential(&self.session_id, &self.connection_id).await.map_err(unreachable)?;
-        match self.client(&g)?.stream(req).await {
+        match self.stream_with_grant(req, &g).await {
             Err(c6_llm::LlmError::Http { status: 401, body, .. }) => {
                 tracing::warn!(connection = %self.connection_id, "the provider refused the credentials; asking the head for new ones: {body}");
                 let g = self.link.fresh_credential(&self.session_id, &self.connection_id).await.map_err(unreachable)?;
-                let retried = self.client(&g)?.stream(req).await;
+                let retried = self.stream_with_grant(req, &g).await;
                 if matches!(&retried, Err(c6_llm::LlmError::Http { status: 401, .. })) {
                     self.link.forget_session_credential(&self.session_id, &self.connection_id);
                 }
@@ -600,6 +662,7 @@ mod tests {
 
     fn take_request(rx: &mut mpsc::Receiver<WorkerMsg>) -> CredentialRequest {
         let Some(worker_msg::Msg::CredentialRequest(req)) = rx.try_recv().unwrap().msg else { panic!("expected credential request") };
+        assert!(req.supports_alias, "the worker must advertise that it won't cache alias grants");
         req
     }
 
@@ -783,5 +846,139 @@ mod tests {
         }
         assert_eq!(text, "hi");
         assert_eq!(head.0.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chatgpt_alias_uses_the_child_and_real_account_for_cache_and_quota() {
+        use c6_llm::{ModelClient, ModelEvent};
+        use serde_json::Value;
+
+        struct Head {
+            url: String,
+            grants: AtomicU64,
+            quota_accounts: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl LocalHead for Head {
+            async fn call(&self, _: &str, _: Value) -> Result<Value, String> {
+                Err("unused".into())
+            }
+
+            async fn credential(&self, connection_id: &str) -> CredentialGrant {
+                let account = if self.grants.fetch_add(1, Ordering::Relaxed) == 2 { "b" } else { "a" };
+                CredentialGrant {
+                    connection_id: connection_id.into(),
+                    resolved_connection_id: account.into(),
+                    is_alias: true,
+                    kind: "chatgpt".into(),
+                    // Deliberately identical: the client's quota hook must
+                    // still be rebound when only the resolved account changes.
+                    base_url: self.url.clone(),
+                    bearer: "token".into(),
+                    ..Default::default()
+                }
+            }
+
+            fn chatgpt_limits_hook(&self, id: &str) -> Option<c6_llm::openai_responses::ChatGptLimitsHook> {
+                let id = id.to_owned();
+                let accounts = self.quota_accounts.clone();
+                Some(Arc::new(move |_| {
+                    accounts.lock().unwrap().push(id.clone());
+                    Box::pin(async {})
+                }))
+            }
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new().route(
+            "/responses",
+            axum::routing::post({
+                let requests = requests.clone();
+                move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let requests = requests.clone();
+                    async move {
+                        let header = headers["session_id"].to_str().unwrap().to_owned();
+                        let cache = body["prompt_cache_key"].as_str().unwrap().to_owned();
+                        let (_, account) = cache.rsplit_once(':').unwrap();
+                        let item = serde_json::json!({
+                            "type": "response.output_item.done", "output_index": 0,
+                            "item": {"type": "reasoning", "id": format!("rs_{account}"), "encrypted_content": format!("encrypted-{account}"), "summary": []}
+                        });
+                        requests.lock().unwrap().push((header, cache, body["input"].clone()));
+                        (
+                            [("content-type", "text/event-stream"), ("x-codex-primary-used-percent", "10")],
+                            format!("data: {item}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{}}}}\n\n"),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let head = Arc::new(Head { url, grants: Default::default(), quota_accounts: Default::default() });
+        let link = Arc::new(HeadLink::local(head.clone()));
+        let mut req = c6_llm::ModelRequest {
+            model: "m".into(),
+            system: String::new(),
+            messages: vec![
+                c6_llm::Message::user_text("hi"),
+                c6_llm::Message {
+                    role: c6_llm::Role::Assistant,
+                    blocks: vec![
+                        c6_llm::Block::Reasoning { id: "old".into(), encrypted: "unknown".into(), summary: String::new() },
+                        c6_llm::Block::Text("ordinary text".into()),
+                        c6_llm::Block::ToolUse { id: "call_1".into(), name: "tool".into(), input_json: "{}".into() },
+                    ],
+                },
+                c6_llm::Message {
+                    role: c6_llm::Role::User,
+                    blocks: vec![c6_llm::Block::ToolResult { id: "call_1".into(), content: "ordinary result".into(), is_error: false }],
+                },
+            ],
+            tools: Vec::new(),
+            max_output_tokens: None,
+            cache_key: Some("child".into()),
+            effort: None,
+            web_search: false,
+            json: false,
+        };
+        let restarted = Arc::new(HeadLink::local(head.clone()));
+        for (i, id) in ["a", "a", "b", "a", "a"].into_iter().enumerate() {
+            // A new client each turn; the last call reloads on a new worker.
+            let client = LinkedClient::new(if i == 4 { restarted.clone() } else { link.clone() }, "root", "alias");
+            let mut stream = client.stream(&req).await.unwrap();
+            let ModelEvent::Account(account) = stream.next().await.unwrap().unwrap() else { panic!("missing stream account") };
+            assert_eq!(account.resolved_connection_id, id);
+            let mut acc = c6_llm::Accumulator::default();
+            while let Some(event) = stream.next().await {
+                acc.push(&event.unwrap());
+            }
+            assert_eq!(acc.stop_reason.as_deref(), Some("stop"));
+            if i == 0 || i == 2 {
+                req.messages.push(acc.finish(true));
+            }
+        }
+        assert_eq!(*head.quota_accounts.lock().unwrap(), ["a", "a", "b", "a", "a"]);
+        let requests = requests.lock().unwrap();
+        for ((header, key, input), (expected, private)) in requests.iter().zip([
+            ("child:a", None),
+            ("child:a", Some("encrypted-a")),
+            ("child:b", None),
+            ("child:a", Some("encrypted-a")),
+            ("child:a", None),
+        ]) {
+            assert_eq!(header, expected);
+            assert_eq!(key, expected);
+            let items = input.as_array().unwrap();
+            let encrypted: Vec<_> = items.iter().filter_map(|item| item["encrypted_content"].as_str()).collect();
+            assert_eq!(encrypted, private.into_iter().collect::<Vec<_>>());
+            assert!(items.iter().any(|item| item["content"][0]["text"] == "ordinary text"));
+            assert!(items.iter().any(|item| item["type"] == "function_call"));
+            assert!(items.iter().any(|item| item["type"] == "function_call_output" && item["output"] == "ordinary result"));
+        }
+        assert_eq!(requests.len(), 5);
+        assert!(link.cache.lock().unwrap().is_empty());
+        server.abort();
     }
 }

@@ -54,7 +54,7 @@ impl Embedder {
         if let Some(pool) = self.link.pool(&c.connection_id).await {
             return Ok(pool.run(&c.model, &self.realm, |e| self.post(e, &c.model, texts)).await?);
         }
-        let g = self.link.credential(&c.connection_id).await?;
+        let g = self.link.realm_credential(&self.realm, &c.connection_id).await?;
         Ok(self
             .post(
                 Endpoint { kind: g.kind, base_url: g.base_url, bearer: g.bearer, headers: g.headers, context_window: g.context_window },
