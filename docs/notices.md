@@ -15,6 +15,9 @@ that name when delivery is considered. Use a fresh name for each fan-out. A
 success waits for the threshold; failures and lost children bypass the group's
 threshold and merge delay. A delivery includes the finished members and a short
 group summary. A running turn still receives reports at its next step.
+If a `count:N` threshold exceeds the group's size, finishing every known member
+also releases it; the summary explains the unmet threshold instead of waiting
+for members that do not exist.
 
 ## Expected wakes and progress
 
@@ -65,11 +68,44 @@ ignored, and its wire tag is never reused.
 
 ## Visibility and recovery
 
-NoticeQueued records contain a reason: merging reports, waiting for a group's
-threshold, or paused for progress/spending. The waiting-notices pill retains
-Deliver now (Continue when paused). A pause also emits a user notification;
-there are no silent guard holds. Your next message delivers all held notices
-together, regardless of group or batching conditions.
+NoticeQueued records contain a reason. The head sends an explicit `hold` kind
+(`collecting`, `group`, or `needs_you`) alongside that display reason, including
+for older journals. Clients do not infer attention from wording. The shared
+`NoticeHoldReason` classification distinguishes two kinds of waiting:
+
+* **Proceeding by itself:** collecting a burst of reports, or waiting for a
+  group the agent requested (`all` or `count:N`). This is a quiet neutral status,
+  not an attention alert. For example, “Collecting reports; delivering
+  automatically in a few seconds”, or “The agent is waiting for its group
+  da-audit: 4 of 5 finished; waiting for 1”, naming pending task descriptions
+  and explaining “The agent wakes automatically; no action needed.” “Deliver
+  now anyway” remains a secondary link for optional early delivery. These holds count
+  as working, not as needing the user, in session lists, Activity and work.
+* **Needs you:** paused by no-progress, relaunch or spending guards, stuck
+  recovery, non-waking notices waiting for your next message, or an unknown
+  hold that cannot promise automatic progress. This uses amber attention styling
+  and the reason, with Continue, Raise limit, Retry or Deliver now as appropriate.
+  For example, “Needs you — 2 notices held” with “spending limit”. A guard pause
+  also emits a user notification; there are no silent guard holds.
+
+Live recovery stops and unresolved work losses override an older automatic
+snapshot: the UI suppresses its automatic-wake claim and early-delivery control
+until the stop is resolved, showing the existing recovery or loss controls instead.
+
+Failures and lost group members release the barrier immediately through the
+existing liveness failure-report path, unless a guard requires your attention;
+they never silently wait for an impossible group threshold. Your next message
+delivers all held notices together, regardless of group or batching conditions.
+
+A repeated NoticeQueued with the same command id is a metadata update (for
+example, a changed group count or guard reason), not another input. Clients
+retain first-queue ordering/grace and the latest reason. The eventual User
+event consumes that command id once, so reports appear once and are delivered
+once even if the hold reason changed several times.
+The session stream also sends an authoritative `notices` snapshot, independently
+of its transcript window. Old pending reports therefore remain visible on a
+fresh tail load; consumption and rewinds replace the snapshot rather than
+leaving stale holds in the pill.
 
 Queued inputs remain in the session log until a User event consumes them.
 Worker restart and actor supervision reconstruct held inputs, group membership,

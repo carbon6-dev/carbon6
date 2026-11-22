@@ -1049,6 +1049,7 @@ pub async fn archive_session(st: &HeadState, id: &str, session: &str, caller: &C
     crate::starts::session_archived(st, session).await;
     drop_session_from(st, id, session, by).await?;
     st.registry.bump();
+    st.attention.changed();
     get(st, id, caller).await
 }
 

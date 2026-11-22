@@ -2040,7 +2040,7 @@ impl Workspace {
             }
         };
         // Waiting on you comes first.
-        for s in sessions.iter().filter(|s| s.awaiting_approval) {
+        for s in sessions.iter().filter(|s| s.needs_you()) {
             push(s.clone(), Tracked::Approval, &mut out);
         }
         for id in self.pinned.get() {

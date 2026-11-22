@@ -115,6 +115,9 @@ pub async fn get(st: &HeadState, id: &str, q: &api::CatchupQuery, caller: &Calle
     if row.awaiting > approvals {
         waiting.push(CatchupItem { text: "A tool call waits for your approval".into(), ..Default::default() });
     }
+    if row.notice_waiting_at.is_some() {
+        waiting.push(CatchupItem { text: "Held notices need you".into(), ..Default::default() });
+    }
     for d in crate::decisions::of_session(st, id, caller).await?.into_iter().filter(|d| d.kind != "task") {
         waiting.push(CatchupItem { text: d.title, ..Default::default() });
     }

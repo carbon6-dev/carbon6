@@ -258,11 +258,19 @@ async fn a_spending_pause_survives_restart_and_delivers_held_notices_once() {
 
 #[tokio::test]
 async fn twenty_grouped_subagents_wake_the_parent_in_one_turn() {
-    const CHILDREN: usize = 20;
+    grouped_subagents_wake_the_parent_in_one_turn(20).await;
+}
+
+#[tokio::test]
+async fn three_grouped_subagents_proceed_without_user_attention() {
+    grouped_subagents_wake_the_parent_in_one_turn(3).await;
+}
+
+async fn grouped_subagents_wake_the_parent_in_one_turn(children: usize) {
     const GROUP: &str = "scout-burst";
-    let env = Env::new(json!({"max_running": CHILDREN})).await;
+    let env = Env::new(json!({"max_running": children})).await;
     let (worker, stop) = run_worker(env.state.path()).await;
-    let calls = (0..CHILDREN)
+    let calls = (0..children)
         .map(|i| {
             (
                 "task".into(),
@@ -275,7 +283,7 @@ async fn twenty_grouped_subagents_wake_the_parent_in_one_turn() {
     env.mock.push(Reply::ToolCalls(calls));
     // Match the parent follow-up first: its history also contains the prompts.
     env.mock.push_about("Started the subagent in the background as bg", Reply::Text("Scouts launched.".into()));
-    let gates = (0..CHILDREN)
+    let gates = (0..children)
         .map(|i| env.mock.push_gated_about(&format!("scout-work-{i:02}"), Reply::Text(format!("Scout report {i:02}."))))
         .collect::<Vec<_>>();
     let id = env.create(&worker, "Launch the scout burst.").await;
@@ -293,17 +301,32 @@ async fn twenty_grouped_subagents_wake_the_parent_in_one_turn() {
             .collect()
     };
     env.mock.push(Reply::Text("Got every scout report.".into()));
-    for gate in &gates[..CHILDREN - 1] {
+    for gate in &gates[..children - 1] {
         gate.notify_one();
     }
+    let progress = format!("group {GROUP}: {} of {children} finished; waiting for 1 (Scout {:02})", children - 1, children - 1);
     let held = eventually("all but the last scout's report to be queued", async || {
         let events = env.events(&id).await;
         let reports = reports(&events);
-        (reports.len() == CHILDREN - 1
-            && reports
-                .iter()
-                .all(|cid| waiting_reason(&events, cid).is_some_and(|reason| reason.contains("waiting for") && reason.contains(GROUP))))
-        .then_some(events)
+        if reports.len() != children - 1
+            || !reports.iter().any(|cid| waiting_reason(&events, cid) == Some(progress.as_str()))
+            || !reports.iter().all(|cid| {
+                events.iter().rev().find_map(|event| match &event.kind {
+                    EventKind::NoticeQueued { command_id, hold, .. } if command_id == cid => Some(*hold),
+                    _ => None,
+                }) == Some(c6_api::NoticeHoldReason::Group)
+            })
+        {
+            return None;
+        }
+        let detail: SessionDetail = env.http.get(format!("{}/sessions/{id}", env.api)).send().await.unwrap().json().await.unwrap();
+        // The last child is gated, so this flag must come from the held
+        // notices, not just the session's display status for running children.
+        assert!(detail.session.notices_proceeding);
+        assert!(!detail.session.needs_you());
+        assert_eq!(detail.session.status, SessionStatus::Idle);
+        assert_eq!(detail.session.display_status(), SessionStatus::Running);
+        Some(events)
     })
     .await;
     for cid in reports(&held) {
@@ -313,14 +336,14 @@ async fn twenty_grouped_subagents_wake_the_parent_in_one_turn() {
     gates.last().unwrap().notify_one();
     let complete = env.idle(&id, 2).await;
     let queued = reports(&complete);
-    assert_eq!(queued.len(), CHILDREN);
+    assert_eq!(queued.len(), children);
     for cid in queued {
         assert_eq!(taken(&complete, &cid), 1, "each scout's report was delivered once");
     }
-    assert_eq!(env.mock.requests().len(), CHILDREN + 3, "two parent turns and twenty children");
+    assert_eq!(env.mock.requests().len(), children + 3, "two parent turns and one request per child");
     let last = env.mock.requests().last().unwrap()["messages"].to_string();
-    assert!(last.contains(GROUP) && last.contains("20 of 20"), "missing final group summary: {last}");
-    for i in 0..CHILDREN {
+    assert!(last.contains(&format!("group {GROUP}: {children} of {children} finished")), "missing final group summary: {last}");
+    for i in 0..children {
         assert!(last.contains(&format!("Scout report {i:02}.")), "missing scout {i}: {last}");
     }
     stop.cancel();

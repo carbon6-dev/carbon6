@@ -47,6 +47,7 @@ fn tag(kind: &str) -> &'static str {
     match kind {
         "approval" => "Approval",
         "question" => "Question",
+        "notice" => "Notice",
         _ => "Decision",
     }
 }
@@ -90,7 +91,7 @@ fn target(i: &AttentionItem) -> View {
                 .as_ref()
                 .map(|call| crate::workspace::Target { anchor: Some(crate::session::waiting_card_id(s, call)), ..Default::default() }),
         },
-        ("turn_ended" | "failed", Some(s), _) => View::session(s.clone()),
+        ("notice" | "turn_ended" | "failed", Some(s), _) => View::session(s.clone()),
         ("comment_answer", _, Some(d)) => View::Docs { id: d.clone(), target: None },
         ("brief", ..) => View::Brief,
         _ => View::Decisions,
@@ -455,6 +456,7 @@ mod tests {
         let s = Some("s1".to_owned());
         assert_eq!(target(&AttentionItem { session_id: s.clone(), ..item("approval") }), View::session("s1"));
         assert_eq!(target(&AttentionItem { session_id: s.clone(), ..item("failed") }), View::session("s1"));
+        assert_eq!(target(&AttentionItem { session_id: s.clone(), ..item("notice") }), View::session("s1"));
         assert_eq!(target(&AttentionItem { session_id: s, ..item("decision") }), View::Decisions);
         assert_eq!(
             target(&AttentionItem { doc_id: Some("d1".into()), ..item("comment_answer") }),

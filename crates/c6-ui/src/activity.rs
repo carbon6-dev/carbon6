@@ -73,7 +73,7 @@ fn dot(status: SessionStatus, tracked: Tracked) -> &'static str {
 
 fn what(status: SessionStatus, tracked: Tracked) -> &'static str {
     match (status, tracked) {
-        (_, Tracked::Approval) => "needs your approval",
+        (_, Tracked::Approval) => "needs you",
         (SessionStatus::Running, _) => "running",
         (SessionStatus::Failed, _) => "failed",
         (_, Tracked::Attention) => "finished, not opened yet",
@@ -275,7 +275,7 @@ fn MinimizedItem(key: u64, n: usize, views: Vec<View>) -> impl IntoView {
     let state = move || {
         session.get().map(|s| {
             let seen = !ws.attention.with(|a| a.contains(&s.id));
-            let t = if s.awaiting_approval {
+            let t = if s.needs_you() {
                 Tracked::Approval
             } else if seen {
                 Tracked::Pinned
@@ -387,7 +387,7 @@ pub fn InboxPage() -> impl IntoView {
                     <p class="-mt-4 text-xs text-muted">{format!("{hidden} more without these labels.")}</p>
                 })
             }}
-            {move || items.with(|i| i.iter().any(|(_, t)| *t == Tracked::Approval)).then(|| section("Needs your approval", Tracked::Approval, || ().into_any()))}
+            {move || items.with(|i| i.iter().any(|(_, t)| *t == Tracked::Approval)).then(|| section("Needs you", Tracked::Approval, || ().into_any()))}
             {section("Finished, not opened yet", Tracked::Attention, || "Nothing finished while you were elsewhere.".into_any())}
             {move || items.with(|i| i.iter().any(|(_, t)| *t == Tracked::Attention)).then(|| view! {
                 <button class="-mt-4 text-xs text-muted underline" on:click=move |_| ws.attention.set(Vec::new())>"Mark all seen"</button>

@@ -1059,20 +1059,20 @@ pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Resul
             }
         })
         .collect();
-    project_liveness_losses(st, &mut sessions).await?;
+    project_session_health(st, &mut sessions).await?;
     Ok(sessions)
 }
 
-/// Project only losses belonging to the already-authorized rows. Incidents
-/// do not appear in the worker-authored session journal.
-async fn project_liveness_losses(st: &HeadState, sessions: &mut [api::Session]) -> anyhow::Result<()> {
+/// Project losses and leased recovery stops on the already-authorized rows.
+/// Neither appears in the worker-authored session journal.
+pub(crate) async fn project_session_health(st: &HeadState, sessions: &mut [api::Session]) -> anyhow::Result<()> {
     if sessions.is_empty() {
         return Ok(());
     }
     let ids = serde_json::to_string(&sessions.iter().map(|s| &s.id).collect::<Vec<_>>())?;
     let losses: std::collections::HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
-        "SELECT session_id, cause FROM liveness_incidents \
-         WHERE kind = 'lost' AND resolved_at IS NULL AND session_id IN (SELECT value FROM json_each(?)) \
+        "SELECT session_id, cause FROM active_liveness_losses \
+         WHERE session_id IN (SELECT value FROM json_each(?)) \
          ORDER BY observed_at, id",
     )
     .bind(ids)
@@ -1080,8 +1080,12 @@ async fn project_liveness_losses(st: &HeadState, sessions: &mut [api::Session]) 
     .await?
     .into_iter()
     .collect();
+    let ids = sessions.iter().map(|s| s.id.as_str()).collect();
+    let recovering: std::collections::HashSet<_> =
+        crate::sessions::recovery_attention(st, Some(&ids)).await?.into_iter().map(|s| s.id).collect();
     for session in sessions {
         session.liveness_loss = losses.get(&session.id).cloned();
+        session.recovery_stuck = recovering.contains(&session.id);
     }
     Ok(())
 }
@@ -1519,7 +1523,7 @@ async fn get_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -
     };
     let queued = st.store.queued_inputs(&id).await?.iter().map(crate::convert::queued).collect();
     let mut session = crate::convert::session_with_activity(&row, working.get(&row.id), st.assistant.head_id());
-    project_liveness_losses(&st, std::slice::from_mut(&mut session)).await?;
+    project_session_health(&st, std::slice::from_mut(&mut session)).await?;
     Ok(Json(api::SessionDetail {
         session,
         worker_name: worker.map(|w| w.name).unwrap_or_else(|| "(removed)".into()),
@@ -1703,7 +1707,7 @@ async fn session_children(
     let tree = matches!(q.tree.as_str(), "1" | "true");
     let rows = if tree { st.store.descendant_sessions(&id).await? } else { st.store.child_sessions(&id).await? };
     let mut sessions: Vec<_> = rows.iter().map(|r| crate::convert::session(r, st.assistant.head_id())).collect();
-    project_liveness_losses(&st, &mut sessions).await?;
+    project_session_health(&st, &mut sessions).await?;
     Ok(Json(sessions))
 }
 
@@ -3605,6 +3609,15 @@ async fn stream_socket(st: Arc<HeadState>, session_id: String, q: StreamQuery, m
             }
         }
     }
+    async fn send_notices(st: &HeadState, session_id: &str, socket: &mut WebSocket) -> bool {
+        match st.store.pending_notices(session_id).await {
+            Ok(notices) => send(socket, &api::StreamMsg::Notices { notices }).await,
+            Err(error) => {
+                tracing::warn!(session_id, %error, "loading pending notices for stream");
+                false
+            }
+        }
+    }
 
     if let Ok(rows) = st.store.queued_inputs(&session_id).await
         && !send(&mut socket, &api::StreamMsg::Queue { queued: rows.iter().map(crate::convert::queued).collect() }).await
@@ -3631,15 +3644,18 @@ async fn stream_socket(st: Arc<HeadState>, session_id: String, q: StreamQuery, m
         }
         last = from - 1;
     }
-    if !catch_up(&st, &session_id, &mut last, &mut socket).await || !send(&mut socket, &api::StreamMsg::Synced).await {
+    if !catch_up(&st, &session_id, &mut last, &mut socket).await {
         return;
     }
-    let mut showing_recovery = false;
-    if let Some(status) = crate::sessions::recovery_status(&st, &session_id).await {
-        showing_recovery = true;
-        if !send(&mut socket, &api::StreamMsg::Recovery { status: Some(status) }).await {
-            return;
-        }
+    // Restore health before publishing pending notices or declaring replay
+    // current: an older automatic hold must never conceal a recovery stop.
+    let status = crate::sessions::recovery_status(&st, &session_id).await;
+    let mut showing_recovery = status.is_some();
+    if !send(&mut socket, &api::StreamMsg::Recovery { status }).await
+        || !send_notices(&st, &session_id, &mut socket).await
+        || !send(&mut socket, &api::StreamMsg::Synced).await
+    {
+        return;
     }
     let mut recovery_lease = tokio::time::interval(Duration::from_secs(15));
     loop {
@@ -3657,6 +3673,10 @@ async fn stream_socket(st: Arc<HeadState>, session_id: String, q: StreamQuery, m
                     if event.seq <= last { continue }
                     if event.seq != last + 1 {
                         if !catch_up(&st, &session_id, &mut last, &mut socket).await { return }
+                        let status = crate::sessions::recovery_status(&st, &session_id).await;
+                        showing_recovery = status.is_some();
+                        if !send(&mut socket, &api::StreamMsg::Recovery { status }).await
+                            || !send_notices(&st, &session_id, &mut socket).await { return }
                         continue;
                     }
                     last = event.seq;
@@ -3668,14 +3688,16 @@ async fn stream_socket(st: Arc<HeadState>, session_id: String, q: StreamQuery, m
                     showing_recovery = status.is_some();
                     if !send(&mut socket, &api::StreamMsg::Recovery { status }).await { return }
                 }
+                Ok(api::StreamMsg::Notices { .. }) => {
+                    if !send_notices(&st, &session_id, &mut socket).await { return }
+                }
                 Ok(other) => if !send(&mut socket, &other).await { return },
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     if !catch_up(&st, &session_id, &mut last, &mut socket).await { return }
                     let status = crate::sessions::recovery_status(&st, &session_id).await;
-                    if showing_recovery || status.is_some() {
-                        showing_recovery = status.is_some();
-                        if !send(&mut socket, &api::StreamMsg::Recovery { status }).await { return }
-                    }
+                    showing_recovery = status.is_some();
+                    if !send(&mut socket, &api::StreamMsg::Recovery { status }).await
+                        || !send_notices(&st, &session_id, &mut socket).await { return }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             },
@@ -5303,6 +5325,128 @@ async fn decision_discussion_session(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_notice_stream_replays_recovery_and_pending_holds_before_sync() {
+        use c6_proto::{NoticeQueued, SessionEvent, SessionEventBatch, UserMessage, session_event::Kind};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpStream;
+
+        // A minimal client for the real HTTP upgrade and unmasked server text
+        // frames; no client frames or extra WebSocket dependency are needed.
+        async fn connect(addr: std::net::SocketAddr, query: &str) -> BufReader<TcpStream> {
+            c6_testkit::within("the session WebSocket upgrade", async {
+                let mut socket = BufReader::new(TcpStream::connect(addr).await.unwrap());
+                let request = format!(
+                    "GET /api/v1/sessions/session/stream?{query} HTTP/1.1\r\nHost: {addr}\r\nConnection: upgrade\r\n\
+                     Upgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                );
+                socket.write_all(request.as_bytes()).await.unwrap();
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with("HTTP/1.1 101"), "WebSocket upgrade failed: {line:?}");
+                loop {
+                    line.clear();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0, "truncated upgrade response");
+                    if line == "\r\n" {
+                        return socket;
+                    }
+                }
+            })
+            .await
+        }
+
+        async fn read(socket: &mut BufReader<TcpStream>) -> api::StreamMsg {
+            c6_testkit::within("the next session WebSocket frame", async {
+                assert_eq!(socket.read_u8().await.unwrap(), 0x81, "expected a final text frame");
+                let size = socket.read_u8().await.unwrap();
+                assert_eq!(size & 0x80, 0, "server frames are unmasked");
+                let size = match size {
+                    126 => u64::from(socket.read_u16().await.unwrap()),
+                    127 => socket.read_u64().await.unwrap(),
+                    size => u64::from(size),
+                };
+                assert!(size < 64 * 1024, "unexpectedly large test frame: {size}");
+                let mut text = vec![0; size as usize];
+                socket.read_exact(&mut text).await.unwrap();
+                serde_json::from_slice(&text).unwrap()
+            })
+            .await
+        }
+
+        fn assert_notice(msg: api::StreamMsg, expected_seq: u64, expected_hold: api::NoticeHoldReason) {
+            let api::StreamMsg::Notices { notices } = msg else { panic!("expected a notice snapshot, got {msg:?}") };
+            let [notice] = notices.as_slice() else { panic!("expected one pending notice, got {notices:?}") };
+            assert_eq!((notice.seq, notice.ts), (expected_seq, 10), "latest sequence, original grace timestamp");
+            let api::EventKind::NoticeQueued { command_id, hold, .. } = &notice.kind else { panic!("not a queued notice: {notice:?}") };
+            assert_eq!((command_id.as_str(), *hold), ("notice", expected_hold));
+        }
+
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let addr = head.ui_addrs[0];
+        let worker = WorkerId::new();
+        sqlx::query("UPDATE sessions SET worker_id = ? WHERE id = 'session'")
+            .bind(worker.to_string())
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        let session = st.store.session("session").await.unwrap().unwrap();
+        let queued = |seq, ts_ms, reason: &str| SessionEvent {
+            seq,
+            ts_ms,
+            kind: Some(Kind::NoticeQueued(NoticeQueued { command_id: "notice".into(), reason: reason.into(), ..Default::default() })),
+        };
+        let user = |seq, command: &str| SessionEvent {
+            seq,
+            ts_ms: (seq as i64) * 10,
+            kind: Some(Kind::User(UserMessage { command_id: command.into(), ..Default::default() })),
+        };
+        let ingest =
+            |events| crate::sessions::ingest(st, worker, SessionEventBatch { session_id: "session".into(), ownership_epoch: 0, events });
+        assert_eq!(ingest(vec![queued(1, 10, "waiting for group audits"), user(2, "other")]).await.unwrap(), Some(2));
+        let incident = uuid::Uuid::now_v7().to_string();
+        let mut recovery = json!({"ownership_epoch": 0, "incident": incident, "reason": "journal unavailable"});
+        crate::sessions::report_recovery(st, worker, &session, &recovery).await.unwrap();
+
+        let mut socket = connect(addr, "tail=1").await;
+        assert!(matches!(read(&mut socket).await, api::StreamMsg::Queue { .. }));
+        assert!(matches!(read(&mut socket).await, api::StreamMsg::Window { from: 2 }));
+        assert!(matches!(read(&mut socket).await, api::StreamMsg::Event { event } if event.seq == 2));
+        let running_recovery = |msg| {
+            assert!(matches!(msg, api::StreamMsg::Recovery { status: Some(status) } if status.incident == incident));
+        };
+        running_recovery(read(&mut socket).await);
+        assert_notice(read(&mut socket).await, 1, api::NoticeHoldReason::Group);
+        assert!(matches!(read(&mut socket).await, api::StreamMsg::Synced));
+
+        // The head runs on this single-threaded runtime. Without yielding,
+        // overflow its 1024-slot broadcast before the socket task can drain it.
+        for _ in 0..2048 {
+            st.hub.publish("session", api::StreamMsg::Activity { running: false, status: String::new() });
+        }
+        running_recovery(read(&mut socket).await);
+        assert_notice(read(&mut socket).await, 1, api::NoticeHoldReason::Group);
+        drop(socket);
+
+        // Clear recovery and update the hold while disconnected. Reconnect
+        // using the last transcript sequence, not the pre-window notice's seq.
+        recovery["reason"] = serde_json::Value::Null;
+        crate::sessions::report_recovery(st, worker, &session, &recovery).await.unwrap();
+        assert_eq!(ingest(vec![queued(3, 30, "paused: spending limit")]).await.unwrap(), Some(3));
+        let mut socket = connect(addr, "after=2").await;
+        assert!(matches!(read(&mut socket).await, api::StreamMsg::Queue { .. }));
+        assert!(matches!(read(&mut socket).await, api::StreamMsg::Event { event } if event.seq == 3));
+        assert!(matches!(read(&mut socket).await, api::StreamMsg::Recovery { status: None }));
+        assert_notice(read(&mut socket).await, 3, api::NoticeHoldReason::NeedsYou);
+        assert!(matches!(read(&mut socket).await, api::StreamMsg::Synced));
+
+        assert_eq!(ingest(vec![user(4, "notice")]).await.unwrap(), Some(4));
+        assert!(matches!(read(&mut socket).await, api::StreamMsg::Event { event } if event.seq == 4));
+        assert!(matches!(read(&mut socket).await, api::StreamMsg::Notices { notices } if notices.is_empty()));
+        drop(socket);
+        head.shutdown().await.unwrap();
+    }
 
     #[test]
     fn attachment_download_headers_are_safe_and_only_raster_images_inline() {

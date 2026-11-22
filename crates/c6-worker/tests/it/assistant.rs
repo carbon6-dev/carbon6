@@ -394,6 +394,8 @@ async fn head_records_old_worker_origins_without_rewriting_legacy_and_limits_rew
         home: String::new(),
         ssh_target: String::new(),
         awaiting: 0,
+        notice_waiting_at: None,
+        notices_proceeding: false,
         subagent_model: String::new(),
         subagent_connection_id: String::new(),
         subagent_effort: String::new(),

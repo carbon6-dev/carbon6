@@ -62,6 +62,8 @@ struct RecoveryStatus {
     worker: WorkerId,
     epoch: i64,
     heard: Instant,
+    since: i64,
+    expiry_announced: bool,
     parent_reported: bool,
 }
 
@@ -114,6 +116,64 @@ pub(crate) async fn recovery_status(st: &HeadState, session_id: &str) -> Option<
         .filter(|s| s.heard.elapsed() < RECOVERY_STATUS_LEASE)
         .map(|s| (s.worker, s.epoch, s.status.clone()))?;
     st.store.session_routable(session_id, worker, epoch).await.ok()?.then_some(status)
+}
+
+pub(crate) struct RecoveryAttention {
+    pub id: String,
+    pub realm: String,
+    pub title: String,
+    pub since: i64,
+    pub notice_waiting: bool,
+}
+
+/// Find current recovery stops with one lookup for the live memory snapshot, not
+/// a lookup per session. Read ownership and the move gate just as recovery_status does.
+pub(crate) async fn recovery_attention(
+    st: &HeadState,
+    ids: Option<&std::collections::HashSet<&str>>,
+) -> anyhow::Result<Vec<RecoveryAttention>> {
+    let candidates: Vec<_> = st
+        .hub
+        .recovery
+        .lock()
+        .unwrap()
+        .live
+        .iter()
+        .filter(|(id, s)| s.heard.elapsed() < RECOVERY_STATUS_LEASE && ids.is_none_or(|ids| ids.contains(id.as_str())))
+        .map(|(id, s)| (id.clone(), s.worker.to_string(), s.epoch, s.since))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(st
+        .store
+        .recovery_attention(&candidates)
+        .await?
+        .into_iter()
+        .map(|(id, realm, title, since, notice_waiting)| RecoveryAttention { id, realm, title, since, notice_waiting })
+        .collect())
+}
+
+fn recovery_attention_changed(st: &HeadState) {
+    st.registry.bump();
+    st.attention.changed();
+}
+
+/// Reads always enforce the exact lease; this wakes live lists when a worker
+/// disappears without clearing its status. Keep incident history for deduplication.
+pub(crate) fn recovery_attention_expired(st: &HeadState) {
+    let mut book = st.hub.recovery.lock().unwrap();
+    let mut changed = false;
+    for s in book.live.values_mut() {
+        if !s.expiry_announced && s.heard.elapsed() >= RECOVERY_STATUS_LEASE {
+            s.expiry_announced = true;
+            changed = true;
+        }
+    }
+    drop(book);
+    if changed {
+        recovery_attention_changed(st);
+    }
 }
 
 pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<api::Session> {
@@ -260,6 +320,8 @@ async fn create_linked_with_origin(
         home: String::new(),
         ssh_target: ssh.clone(),
         awaiting: 0,
+        notice_waiting_at: None,
+        notices_proceeding: false,
         subagent_model,
         subagent_connection_id,
         subagent_effort,
@@ -424,6 +486,8 @@ async fn create_assistant_with_origin(
         home: String::new(),
         ssh_target: String::new(),
         awaiting: 0,
+        notice_waiting_at: None,
+        notices_proceeding: false,
         subagent_model: String::new(),
         subagent_connection_id: String::new(),
         subagent_effort: String::new(),
@@ -534,6 +598,8 @@ async fn create_side_chat_with_origin(
         home: parent.home.clone(),
         ssh_target: parent.ssh_target.clone(),
         awaiting: 0,
+        notice_waiting_at: None,
+        notices_proceeding: false,
         subagent_model: parent.subagent_model.clone(),
         subagent_connection_id: parent.subagent_connection_id.clone(),
         subagent_effort: parent.subagent_effort.clone(),
@@ -2633,15 +2699,20 @@ pub(crate) async fn report_recovery(st: &HeadState, worker: WorkerId, session: &
             let first = current.is_none_or(|s| s.status.incident != id);
             let parent_reported = !first && current.is_some_and(|s| s.parent_reported);
             let status = api::SessionRecovery { incident: id.clone(), reason };
+            let since = current.filter(|_| !first).map_or_else(c6_core::now_ms, |s| s.since);
             if current.is_none_or(|s| s.status != status || s.heard.elapsed() >= RECOVERY_STATUS_LEASE) {
                 st.hub.publish(&session.id, api::StreamMsg::Recovery { status: Some(status.clone()) });
+                recovery_attention_changed(st);
             }
             if first {
                 book.live.retain(|key, s| key == &session.id || now.duration_since(s.heard) < RECOVERY_HISTORY_TTL);
                 book.highest.retain(|_, (_, at)| now.duration_since(*at) < RECOVERY_HISTORY_TTL);
             }
             book.highest.insert(owner, (id.clone(), now));
-            book.live.insert(session.id.clone(), RecoveryStatus { status: status.clone(), worker, epoch, heard: now, parent_reported });
+            book.live.insert(
+                session.id.clone(),
+                RecoveryStatus { status: status.clone(), worker, epoch, heard: now, since, expiry_announced: false, parent_reported },
+            );
             (status, first, !parent_reported)
         } else {
             // A timed-out report can arrive after its clear, even if the
@@ -2656,6 +2727,7 @@ pub(crate) async fn report_recovery(st: &HeadState, worker: WorkerId, session: &
             if book.live.get(&session.id).filter(same_owner).is_some_and(|s| s.status.incident == id) {
                 book.live.remove(&session.id);
                 st.hub.publish(&session.id, api::StreamMsg::Recovery { status: None });
+                recovery_attention_changed(st);
             }
             return Ok(Value::Null);
         }
@@ -2764,6 +2836,11 @@ async fn ingest_batch(
             st.hub.publish(&batch.session_id, api::StreamMsg::Event { event });
         }
     }
+    if ing.pending_notices_changed {
+        // A stream subscriber reads the committed snapshot, not a buffered
+        // payload that might predate its initial history replay.
+        st.hub.publish(&batch.session_id, api::StreamMsg::Notices { notices: Vec::new() });
+    }
     if !ing.done_commands.is_empty() || !ing.delivered_commands.is_empty() {
         publish_queue(st, &batch.session_id).await;
     }
@@ -2781,12 +2858,11 @@ async fn ingest_batch(
         }
         st.registry.bump();
     }
-    // A turn that ended is worth a look; one that started isn't any more.
-    if ing
-        .events
-        .iter()
-        .any(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::TurnEnded(_) | c6_proto::session_event::Kind::TurnStarted(_))))
-    {
+    // Turns and notice queue updates can both change what needs a look.
+    use session_event::Kind;
+    if ing.events.iter().any(|e| {
+        matches!(e.kind, Some(Kind::TurnEnded(_) | Kind::TurnStarted(_) | Kind::NoticeQueued(_) | Kind::User(_) | Kind::Rewound(_)))
+    }) {
         st.attention.changed();
     }
     notify_events(st, &batch.session_id, &ing.events).await;
@@ -3653,12 +3729,23 @@ mod input_compatibility_tests {
         move_state("failed").await;
         send(Some("retried after move did not proceed")).await.unwrap();
         assert_eq!(recovery_status(st, "session").await.unwrap().incident, incident);
+        let row = st.store.session("session").await.unwrap().unwrap();
+        let mut displayed = crate::convert::session(&row, None);
+        crate::api::project_session_health(st, std::slice::from_mut(&mut displayed)).await.unwrap();
+        assert!(displayed.recovery_stuck && displayed.needs_you());
+        assert_eq!(crate::work::session_live(st, &row.realm, "session").await.unwrap().state, "needs_you");
+        let attention = crate::attention::get(st, &crate::realms::Caller::in_realm(&row.realm)).await.unwrap();
+        assert!(attention.waiting.iter().any(|i| i.title == "Session recovery needs you" && i.session_id.as_deref() == Some("session")));
 
         move_state("requested").await;
+        assert!(recovery_attention(st, None).await.unwrap().is_empty());
         let error = send(None).await.unwrap_err();
         assert!(error.to_string().contains("session is moving"));
         move_state("failed").await;
         assert_eq!(recovery_status(st, "session").await.unwrap().incident, incident, "the gated clear wasn't applied");
+        st.hub.recovery.lock().unwrap().live.get_mut("session").unwrap().heard -= RECOVERY_STATUS_LEASE;
+        assert!(recovery_status(st, "session").await.is_none());
+        assert!(recovery_attention(st, None).await.unwrap().is_empty());
         send(None).await.unwrap();
         assert!(recovery_status(st, "session").await.is_none());
     }

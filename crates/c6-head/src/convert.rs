@@ -232,6 +232,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             from_title: n.from_title.clone(),
             deliver_at_ms: n.deliver_at_ms,
             reason: n.reason.clone(),
+            hold: api::NoticeHoldReason::parse(&n.reason),
         },
     };
     Some(api::Event { seq: ev.seq, ts: ev.ts_ms, kind })
@@ -282,6 +283,9 @@ pub fn session(r: &SessionRow, head: Option<WorkerId>) -> api::Session {
         auto_labels: r.all_labels().split_off(r.user_labels().len()),
         ssh: Some(r.ssh_target.clone()).filter(|t| !t.is_empty()),
         awaiting_approval: r.awaiting > 0,
+        notices_need_you: r.notice_waiting_at.is_some(),
+        notices_proceeding: r.notices_proceeding,
+        recovery_stuck: false,
         realm: r.realm.clone(),
         agent: r.agent.clone(),
         end_reason: match r.end_reason.as_str() {
@@ -334,6 +338,26 @@ pub fn queued(c: &CommandRow) -> api::QueuedInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_notices_send_explicit_hold_state_separate_from_display_reason() {
+        for (reason, hold, wire) in [
+            ("group audit: 2 of 3 finished; waiting for 1 (Audit evidence)", api::NoticeHoldReason::Group, "group"),
+            ("waiting for 3 of 3 in group audit (2 finished)", api::NoticeHoldReason::Group, "group"),
+            ("waiting for your next message", api::NoticeHoldReason::NeedsYou, "needs_you"),
+            ("paused: spending limit", api::NoticeHoldReason::NeedsYou, "needs_you"),
+            ("collecting reports for delivery", api::NoticeHoldReason::Collecting, "collecting"),
+        ] {
+            let queued = c6_proto::NoticeQueued { command_id: "notice".into(), reason: reason.into(), ..Default::default() };
+            let shown = event(&SessionEvent { kind: Some(session_event::Kind::NoticeQueued(queued)), ..Default::default() }).unwrap();
+            let json = serde_json::to_value(&shown).unwrap();
+            assert_eq!(json["hold"], wire);
+            assert_eq!(json["reason"], reason);
+            assert!(
+                matches!(serde_json::from_value::<api::Event>(json).unwrap().kind, api::EventKind::NoticeQueued { hold: actual, .. } if actual == hold)
+            );
+        }
+    }
 
     #[test]
     fn usage_alias_metadata_is_additive() {

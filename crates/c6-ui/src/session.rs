@@ -347,6 +347,8 @@ pub(crate) struct Feed {
     spawns: Memo<usize>,
     pub(crate) streaming: RwSignal<Streaming>,
     queued: RwSignal<Vec<QueuedInput>>,
+    /// Authoritative pending notices, independent of the transcript window.
+    notices: RwSignal<Option<Vec<Event>>>,
     /// Catch-up arrives as a batch. Placements already received here also
     /// win over queue snapshots and in-flight withdrawal responses.
     replay: StoredValue<Vec<Event>>,
@@ -489,6 +491,7 @@ impl Feed {
             spawns: child_spawns(events),
             streaming: RwSignal::new(Streaming::default()),
             queued: RwSignal::new(Vec::new()),
+            notices: RwSignal::new(None),
             replay: StoredValue::new(Vec::new()),
             composer: RwSignal::new(None),
             activity: RwSignal::new(None),
@@ -554,6 +557,7 @@ impl Feed {
                 }
             }
             StreamMsg::Recovery { status } => recovery.set(status),
+            StreamMsg::Notices { notices } => feed.notices.set(Some(notices)),
             StreamMsg::Queue { queued: mut q } => {
                 if !q.is_empty() {
                     // Initial catch-up and concurrent publishers can leave a
@@ -565,7 +569,6 @@ impl Feed {
                 queued.set(q);
             }
             StreamMsg::Synced => {
-                recovery.set(None);
                 let r = replay.try_update_value(std::mem::take).unwrap_or_default();
                 // Opened at a place: drawn from there, not to the end.
                 if !synced.get_untracked()
@@ -1117,6 +1120,10 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         col,
         events,
         queued,
+        notices: feed.notices,
+        recovery,
+        loss: liveness_loss,
+        notice_current: Signal::derive(move || feed.synced.get() && !feed.stream_failed.get()),
         from: feed.from,
         latest: Signal::derive(move || feed.to.get().is_none()),
         usage,
@@ -1515,6 +1522,10 @@ pub struct SessionChrome {
     pub(crate) col: Option<ColumnCtx>,
     pub(crate) events: RwSignal<Vec<Event>>,
     queued: RwSignal<Vec<QueuedInput>>,
+    notices: RwSignal<Option<Vec<Event>>>,
+    recovery: RwSignal<Option<SessionRecovery>>,
+    loss: Memo<Option<String>>,
+    notice_current: Signal<bool>,
     /// The first event its transcript shows (see [`Feed::from`]).
     from: RwSignal<u64>,
     /// Whether this event window includes the latest turn.
@@ -1891,7 +1902,7 @@ impl SessionChrome {
             .or_else(|| self.detail.get().and_then(Result::ok).map(|d| d.session));
         if session.as_ref().is_some_and(|s| s.liveness_loss.is_some()) {
             AgentState::Failed
-        } else if !self.waiting.with(Vec::is_empty) || session.as_ref().is_some_and(|s| s.awaiting_approval) {
+        } else if !self.waiting.with(Vec::is_empty) || session.as_ref().is_some_and(|s| s.needs_you()) {
             AgentState::Waiting
         } else if !self.running.get()
             && (session.as_ref().is_some_and(|s| s.status == SessionStatus::Failed)
@@ -1901,7 +1912,9 @@ impl SessionChrome {
                     .is_some())
         {
             AgentState::Failed
-        } else if self.running.get() || session.as_ref().is_some_and(|s| s.status == SessionStatus::Starting) {
+        } else if self.running.get()
+            || session.as_ref().is_some_and(|s| matches!(s.display_status(), SessionStatus::Starting | SessionStatus::Running))
+        {
             AgentState::Working
         } else {
             AgentState::Idle
@@ -2647,7 +2660,11 @@ fn BackgroundWork(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>, #[
             </div>
             <Show when=move || page.get() == Page::Details>
                 <crate::details::Glance chrome on_done />
-                <Show when=move || !chrome.running.get()><WaitingNotices events=chrome.events now session_id=chrome.id.get_value() /></Show>
+                <RecoveryBanner recovery=chrome.recovery session_id=chrome.id.get_value() />
+                {move || chrome.loss.get().map(|cause| view! { <ErrorBox message=format!("Work lost: {cause}. Send a message to resume this session.") /> })}
+                <Show when=move || !chrome.running.get()><WaitingNotices events=chrome.events now session_id=chrome.id.get_value()
+                    snapshot=chrome.notices
+                    blocked=Signal::derive(move || !chrome.notice_current.get() || chrome.recovery.with(Option::is_some) || chrome.loss.with(Option::is_some)) /></Show>
                 <button class="flex min-h-11 w-full items-center gap-2 text-left text-xs" on:click=move |_| chrome.details.set(true)>"Usage & configuration"{crate::icons::chevron_right()}</button>
             </Show>
             <Show when=move || history_visited.get()>
@@ -3000,6 +3017,17 @@ fn Transcript(
 ) -> impl IntoView {
     let Feed { events, usage, spawns, streaming, queued, recovery, secrets, from, to, .. } = feed;
     let id = StoredValue::new(session.id.clone());
+    let live = api::live();
+    let initially_lost = session.liveness_loss.is_some();
+    let notice_blocked = Signal::derive(move || {
+        !feed.synced.get()
+            || feed.stream_failed.get()
+            || recovery.with(Option::is_some)
+            || chrome.map_or_else(
+                || live.session(&id.get_value()).map_or(initially_lost, |s| s.liveness_loss.is_some()),
+                |chrome| chrome.loss.with(Option::is_some),
+            )
+    });
     let paths = {
         let session_id = session.id.clone();
         let worker = session.worker_id.to_string();
@@ -3570,7 +3598,7 @@ fn Transcript(
                     </Show>
                 })}
             </div>
-            {move || (!running.get()).then(|| view! { <div class="c6-transcript-notices hidden md:block"><WaitingNotices events now session_id=id.get_value() /></div> })}
+            {move || (!running.get()).then(|| view! { <div class="c6-transcript-notices hidden md:block"><WaitingNotices events now session_id=id.get_value() snapshot=feed.notices blocked=notice_blocked /></div> })}
             <crate::capture::SelectionCapture session=id.get_value() on_quote=quote_in />
             <Show when=move || actions_present.get()>
                 <leptos::portal::Portal>
@@ -3752,7 +3780,10 @@ fn PhoneStatus(chrome: SessionChrome, streaming: RwSignal<Streaming>, latest: Si
     });
     let state = Memo::new(move |_| PhoneStatusState {
         working: chrome.running.get(),
-        waiting: chrome.waiting.with(Vec::len),
+        waiting: chrome.waiting.with(Vec::len)
+            + usize::from(
+                live.sessions.with(|ss| ss.iter().any(|s| s.id == chrome.id.get_value() && (s.notices_need_you || s.recovery_stuck))),
+            ),
         background: phone_background_count(chrome),
         failed: failure.with(Option::is_some),
     });
@@ -3908,14 +3939,54 @@ struct WaitingNotice {
     line: String,
     deliver_at_ms: i64,
     reason: String,
+    hold: c6_api::NoticeHoldReason,
+}
+
+fn notice_waiting_line(hold: c6_api::NoticeHoldReason, reason: &str) -> String {
+    match hold {
+        c6_api::NoticeHoldReason::Collecting => "Collecting reports; delivering automatically in a few seconds.".into(),
+        c6_api::NoticeHoldReason::Group => {
+            if reason.starts_with("The agent is waiting for its group ") {
+                reason.into()
+            } else if reason.starts_with("group ") {
+                format!("The agent is waiting for its {reason}. It will continue automatically.")
+            } else if let Some((threshold, rest)) = reason.strip_prefix("waiting for ").and_then(|s| s.split_once(" in group ")) {
+                let counts = threshold.split_once(" of ");
+                let progress = rest.split_once(" (");
+                if let (Some((target, total)), Some((group, finished))) = (counts, progress)
+                    && let (Ok(target), Ok(done)) = (target.parse::<usize>(), finished.trim_end_matches(" finished)").parse::<usize>())
+                {
+                    return format!(
+                        "The agent is waiting for its group {group}: {done} of {total} finished; waiting for {}. It continues automatically when its group is ready.",
+                        target.saturating_sub(done)
+                    );
+                }
+                "The agent continues automatically when its group is ready.".into()
+            } else {
+                // Older journals did not retain pending descriptions.
+                format!("{reason}. The agent continues automatically when its group is ready.")
+            }
+        }
+        c6_api::NoticeHoldReason::NeedsYou => {
+            if reason.is_empty() {
+                "These notices need you to deliver them.".into()
+            } else if let Some(reason) = reason.strip_prefix("paused:") {
+                format!("Automatic delivery is paused: {}", reason.trim())
+            } else {
+                reason.trim().into()
+            }
+        }
+    }
 }
 
 /// Pending notices, retaining first-queue order and grace time but using the
 /// latest metadata. The worker can append an updated wait reason while a
 /// notice is still pending without enqueuing another input.
 fn waiting_notices(evs: &[Event], now: i64) -> Vec<WaitingNotice> {
+    let (rewound, _) = rewound_events(evs);
     let taken: std::collections::HashSet<&str> = evs
         .iter()
+        .filter(|e| !rewound.contains_key(&e.seq))
         .filter_map(|e| match &e.kind {
             EventKind::User { command_id, .. } => Some(command_id.as_str()),
             _ => None,
@@ -3924,6 +3995,9 @@ fn waiting_notices(evs: &[Event], now: i64) -> Vec<WaitingNotice> {
     let mut indices = std::collections::HashMap::new();
     let mut pending: Vec<(i64, &EventKind)> = Vec::new();
     for e in evs {
+        if rewound.contains_key(&e.seq) {
+            continue;
+        }
         let EventKind::NoticeQueued { command_id, .. } = &e.kind else { continue };
         if taken.contains(command_id.as_str()) {
             continue;
@@ -3940,12 +4014,13 @@ fn waiting_notices(evs: &[Event], now: i64) -> Vec<WaitingNotice> {
         .into_iter()
         .filter(|(ts, _)| now.saturating_sub(*ts) >= NOTICE_GRACE_MS)
         .filter_map(|(_, kind)| {
-            let EventKind::NoticeQueued { text, from_title, deliver_at_ms, reason, .. } = kind else { return None };
+            let EventKind::NoticeQueued { text, from_title, deliver_at_ms, reason, hold, .. } = kind else { return None };
             Some(WaitingNotice {
                 from: from_title.clone(),
                 line: text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_owned(),
                 deliver_at_ms: *deliver_at_ms,
                 reason: reason.clone(),
+                hold: *hold,
             })
         })
         .collect()
@@ -3990,8 +4065,17 @@ fn RecoveryBanner(recovery: RwSignal<Option<SessionRecovery>>, session_id: Strin
 /// While the session is idle: the notices waiting for its agent, and a way
 /// to deliver them now.
 #[component]
-fn WaitingNotices(events: RwSignal<Vec<Event>>, now: RwSignal<i64>, session_id: String) -> impl IntoView {
-    let waiting = Memo::new(move |_| events.with(|evs| waiting_notices(evs, now.get())));
+fn WaitingNotices(
+    events: RwSignal<Vec<Event>>,
+    now: RwSignal<i64>,
+    session_id: String,
+    #[prop(optional)] snapshot: Option<RwSignal<Option<Vec<Event>>>>,
+    #[prop(default = Signal::derive(|| false))] blocked: Signal<bool>,
+) -> impl IntoView {
+    let waiting = Memo::new(move |_| match snapshot.and_then(|snapshot| snapshot.get()) {
+        Some(notices) => waiting_notices(&notices, now.get()),
+        None => events.with(|evs| waiting_notices(evs, now.get())),
+    });
     let status = RwSignal::new(None::<String>);
     let id = StoredValue::new(session_id);
     let deliver = move |_| {
@@ -4001,41 +4085,45 @@ fn WaitingNotices(events: RwSignal<Vec<Event>>, now: RwSignal<i64>, session_id: 
     };
     move || {
         let w = waiting.get();
-        (!w.is_empty()).then(|| {
+        (!w.is_empty() && !blocked.get()).then(|| {
             let n = w.len();
-            let pause_reason = w.iter().find(|notice| notice.reason.starts_with("paused:")).map(|notice| notice.reason.clone());
-            let paused = pause_reason.is_some();
+            let needs_you = w.iter().any(|notice| notice.hold.needs_you());
+            let paused = w.iter().any(|notice| notice.reason.starts_with("paused:"));
+            let spending = w.iter().any(|notice| notice.reason.starts_with("paused:") && notice.reason.contains("spending"));
+            let reasons: Vec<String> = w.iter().map(|notice| notice_waiting_line(notice.hold, &notice.reason)).fold(Vec::new(), |mut lines, line| {
+                if !lines.contains(&line) {
+                    lines.push(line);
+                }
+                lines
+            });
             view! {
-                <div class="space-y-1 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm dark:border-amber-800 dark:bg-amber-950">
+                <div role="status" class=if needs_you {
+                    "space-y-1 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200"
+                } else {
+                    "space-y-1 px-3 py-2 text-sm text-zinc-600 dark:text-zinc-400"
+                }>
                     <div class="flex flex-wrap items-center gap-3">
-                        <span class="flex-1 text-amber-800 dark:text-amber-300">
-                            {if n == 1 { "1 notice waiting for the agent".to_owned() } else { format!("{n} notices waiting for the agent") }}
-                            {move || if paused {
-                                Some(" — automatic delivery paused".into())
+                        <span class="min-w-0 flex-1">
+                            {if needs_you {
+                                format!("Needs you — {n} {} held", if n == 1 { "notice" } else { "notices" })
                             } else {
-                                let now = now.get();
-                                waiting.with(|notices| notices.iter().map(|n| n.deliver_at_ms).filter(|at| *at > now).min())
-                                    .map(|at| format!(" — next automatic delivery at {}", crate::when::time(at)))
+                                "The agent wakes automatically; no action needed.".into()
                             }}
                         </span>
-                        {paused.then(|| view! {
+                        {spending.then(|| view! {
                             <Go to=View::Settings { note: None, section: "agents".into() } class=BUTTON_QUIET
                                 title="Change notice limits, then select Continue to apply them here">"Raise limit"</Go>
                         })}
-                        <button class=BUTTON on:click=deliver title="Start a turn with these notices now">
-                            {if paused { "Continue" } else { "Deliver now" }}
+                        <button class=if needs_you { BUTTON } else { "text-xs text-muted underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100" }
+                            on:click=deliver title=if needs_you { "Start a turn with these notices now" } else { "Optional: deliver the available reports before the rest finish" }>
+                            {if paused { "Continue" } else if needs_you { "Deliver now" } else { "Deliver now anyway" }}
                         </button>
                     </div>
-                    {pause_reason.map(|reason| view! {
-                        <p class="text-xs text-amber-800 dark:text-amber-300">{reason["paused:".len()..].trim().to_owned()}</p>
-                    })}
+                    {reasons.into_iter().map(|reason| view! { <p class="wrap-anywhere text-xs">{reason}</p> }).collect_view()}
                     <ul class="space-y-0.5 text-xs text-zinc-600 dark:text-zinc-400">
                         {w.into_iter().map(|notice| view! {
                             <li>
                                 <div class="truncate">{if notice.from.is_empty() { notice.line } else { format!("From {}: {}", notice.from, notice.line) }}</div>
-                                {(!notice.reason.is_empty() && !notice.reason.starts_with("paused:")).then(|| view! {
-                                    <div class="wrap-anywhere text-muted">{notice.reason}</div>
-                                })}
                             </li>
                         }).collect_view()}
                     </ul>
@@ -6246,7 +6334,7 @@ fn MadeSession(id: String, title: String) -> impl IntoView {
                     .or_else(|| Some(title.clone()).filter(|t| !t.trim().is_empty()))
                     .unwrap_or_else(|| "New session".into());
                 let (cls, word) = match &s {
-                    Some(s) if s.awaiting_approval => ("text-amber-700 dark:text-amber-400", "needs you"),
+                    Some(s) if s.needs_you() => ("text-amber-700 dark:text-amber-400", "needs you"),
                     Some(s) => match s.display_status() {
                         SessionStatus::Running => ("text-blue-600 dark:text-blue-400", "running"),
                         SessionStatus::Idle => ("text-muted", "idle"),
@@ -8221,7 +8309,10 @@ mod tests {
     fn held_notices_stay_in_details_without_creating_a_quiet_status_row() {
         let source = include_str!("session.rs");
         let details = source.split("fn BackgroundWork(").nth(1).unwrap().split("/// Session chrome keeps").next().unwrap();
-        assert!(details.contains("<WaitingNotices events=chrome.events now session_id=chrome.id.get_value() />"));
+        assert!(details.contains("<WaitingNotices events=chrome.events now session_id=chrome.id.get_value()"));
+        assert!(details.contains("chrome.recovery.with(Option::is_some) || chrome.loss.with(Option::is_some)"));
+        assert!(details.contains("!chrome.notice_current.get()"), "disconnected and replaying feeds cannot promise an automatic wake");
+        assert!(source.contains("blocked=notice_blocked"), "both mounts must withhold automatic claims during a live stop");
         assert!(!PhoneStatusState::default().visible(), "held notices are for the agent, not attention from you");
     }
 
@@ -8884,6 +8975,7 @@ mod tests {
             from_title: from.into(),
             deliver_at_ms: 42,
             reason: String::new(),
+            hold: c6_api::NoticeHoldReason::NeedsYou,
         };
         let user = |id: &str| EventKind::User {
             command_id: id.into(),
@@ -8908,8 +9000,224 @@ mod tests {
         evs.push(ev(3, ts, queued("m-2", "Alice")));
         assert_eq!(
             waiting_notices(&evs, ts + NOTICE_GRACE_MS + 1),
-            [WaitingNotice { from: "Alice".into(), line: "about m-2".into(), deliver_at_ms: 42, reason: String::new() }]
+            [WaitingNotice {
+                from: "Alice".into(),
+                line: "about m-2".into(),
+                deliver_at_ms: 42,
+                reason: String::new(),
+                hold: c6_api::NoticeHoldReason::NeedsYou
+            }]
         );
+    }
+
+    #[test]
+    fn notice_wording_distinguishes_optional_delivery_from_required_action() {
+        let notice_waiting_line = |reason: &str| super::notice_waiting_line(c6_api::NoticeHoldReason::parse(reason), reason);
+        assert_eq!(notice_waiting_line("merging 2 reports"), "Collecting reports; delivering automatically in a few seconds.");
+        let line = notice_waiting_line("waiting for 5 of 5 in group da-audit (4 finished)");
+        assert!(line.contains("4 of 5 finished; waiting for 1"), "{line}");
+        assert!(line.contains("continues automatically"));
+        assert!(!line.contains("waiting for 5 of 5"));
+        assert_eq!(
+            notice_waiting_line("group audit: 2 of 3 finished; waiting for 1 (Audit evidence)"),
+            "The agent is waiting for its group audit: 2 of 3 finished; waiting for 1 (Audit evidence). It will continue automatically."
+        );
+        let line = "The agent is waiting for its group audit: 2 of 3 finished; waiting for 1. It continues when Audit evidence finishes.";
+        assert_eq!(notice_waiting_line(line), line);
+        assert_eq!(notice_waiting_line("paused: spending limit"), "Automatic delivery is paused: spending limit");
+        assert!(notice_waiting_line("").contains("need you"));
+    }
+
+    #[test]
+    fn grouped_notice_snapshots_appear_once_each_with_latest_progress() {
+        let reason =
+            "The agent is waiting for its group audit: 2 of 3 finished; waiting for 1 (Audit evidence). It will continue automatically.";
+        let queued = |seq, id: &str, reason: &str| Event {
+            seq,
+            ts: 10_000 + seq as i64,
+            kind: EventKind::NoticeQueued {
+                command_id: id.into(),
+                text: format!("Report {id}"),
+                command: String::new(),
+                from_title: String::new(),
+                deliver_at_ms: 0,
+                reason: reason.into(),
+                hold: c6_api::NoticeHoldReason::parse(reason),
+            },
+        };
+        let events = [
+            queued(1, "bg1", "collecting reports for delivery"),
+            queued(2, "bg2", "collecting reports for delivery"),
+            queued(3, "bg1", reason),
+            queued(4, "bg2", reason),
+        ];
+        let notices = waiting_notices(&events, 10_000 + NOTICE_GRACE_MS + 4);
+        assert_eq!(notices.len(), 2, "reason updates are not extra reports in the pill");
+        assert_eq!(notices.iter().map(|n| n.line.as_str()).collect::<Vec<_>>(), ["Report bg1", "Report bg2"]);
+        assert!(notices.iter().all(|n| n.reason == reason && n.hold == c6_api::NoticeHoldReason::Group));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn held_notice_rendering_uses_explicit_kind_not_reason_wording() {
+        use c6_api::NoticeHoldReason;
+        let group = "group audit: 2 of 3 finished; waiting for 1 (Audit evidence)";
+        for (hold, reason) in [
+            (NoticeHoldReason::Group, group),
+            (NoticeHoldReason::NeedsYou, group),
+            (NoticeHoldReason::NeedsYou, "paused: no progress after repeated identical reports"),
+        ] {
+            let owner = Owner::new();
+            owner.with(|| {
+                let events = RwSignal::new(vec![Event {
+                    seq: 1,
+                    ts: 10_000,
+                    kind: EventKind::NoticeQueued {
+                        command_id: "bg1".into(),
+                        text: "Audit report".into(),
+                        command: String::new(),
+                        from_title: String::new(),
+                        deliver_at_ms: 0,
+                        reason: reason.into(),
+                        hold,
+                    },
+                }]);
+                let now = RwSignal::new(10_000 + NOTICE_GRACE_MS);
+                let html = view! { <WaitingNotices events now session_id="s".to_owned() /> }.to_html();
+                assert!(html.contains("role=\"status\""), "{html}");
+                if hold == NoticeHoldReason::Group {
+                    assert!(html.contains("no action needed") && html.contains("Deliver now anyway"), "{html}");
+                    assert!(html.contains("2 of 3 finished") && html.contains("Audit evidence"), "{html}");
+                    assert!(!html.contains("border-amber") && !html.contains("Needs you"), "{html}");
+                } else {
+                    assert!(html.contains("border-amber") && html.contains("Needs you"), "{html}");
+                    assert!(!html.contains("no action needed") && !html.contains("Deliver now anyway"), "{html}");
+                    if reason.starts_with("paused:") {
+                        assert!(html.contains("Continue") && html.contains("no progress after repeated identical reports"), "{html}");
+                    }
+                }
+            });
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_live_stop_suppresses_an_old_groups_automatic_claim_and_deliver_control() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let events = RwSignal::new(vec![Event {
+                seq: 1,
+                ts: 10_000,
+                kind: EventKind::NoticeQueued {
+                    command_id: "bg1".into(),
+                    text: "Audit report".into(),
+                    command: String::new(),
+                    from_title: String::new(),
+                    deliver_at_ms: 0,
+                    reason: "group audit: 2 of 3 finished; waiting for 1 (Audit evidence)".into(),
+                    hold: c6_api::NoticeHoldReason::Group,
+                },
+            }]);
+            let now = RwSignal::new(10_000 + NOTICE_GRACE_MS);
+            let recovery = RwSignal::new(Some(SessionRecovery { incident: "incident".into(), reason: "Recovery could not finish".into() }));
+            let stopped = Signal::derive(move || recovery.with(Option::is_some));
+            let html = view! {
+                <RecoveryBanner recovery session_id="s".to_owned() />
+                <WaitingNotices events now session_id="s".to_owned() blocked=stopped />
+            }
+            .to_html();
+            assert!(
+                html.contains("Recovery could not finish") && html.contains("Retry") && html.contains("Restart this session agent"),
+                "{html}"
+            );
+            assert!(!html.contains("no action needed") && !html.contains("Deliver now anyway"), "{html}");
+            let html = view! { <WaitingNotices events now session_id="s".to_owned() blocked=Signal::derive(|| true) /> }.to_html();
+            assert!(
+                !html.contains("no action needed") && !html.contains("Deliver now anyway"),
+                "lost work must not promise a wake: {html}"
+            );
+        });
+    }
+
+    #[test]
+    fn rewinds_restore_consumed_notices_and_remove_withdrawn_queue_snapshots() {
+        let mut events = vec![
+            Event {
+                seq: 1,
+                ts: 10_000,
+                kind: EventKind::NoticeQueued {
+                    command_id: "bg1".into(),
+                    text: "Report".into(),
+                    command: String::new(),
+                    from_title: String::new(),
+                    deliver_at_ms: 0,
+                    reason: "waiting for your next message".into(),
+                    hold: c6_api::NoticeHoldReason::NeedsYou,
+                },
+            },
+            Event {
+                seq: 2,
+                ts: 10_001,
+                kind: EventKind::User {
+                    command_id: "bg1".into(),
+                    text: "Report".into(),
+                    attachments: Vec::new(),
+                    command: String::new(),
+                    prompt: String::new(),
+                    blocked: String::new(),
+                    delegated_by: String::new(),
+                    wake: false,
+                    from_session_id: String::new(),
+                    from_title: String::new(),
+                    task_notice: None,
+                    origin: None,
+                },
+            },
+        ];
+        let now = 10_000 + NOTICE_GRACE_MS;
+        assert!(waiting_notices(&events, now).is_empty());
+        events.push(Event {
+            seq: 3,
+            ts: 10_002,
+            kind: EventKind::Rewound { to_seq: 2, restored_files: false, restore_error: String::new() },
+        });
+        assert_eq!(waiting_notices(&events, now).len(), 1, "the receipt was rewound");
+        events.push(Event {
+            seq: 4,
+            ts: 10_003,
+            kind: EventKind::Rewound { to_seq: 1, restored_files: false, restore_error: String::new() },
+        });
+        assert!(waiting_notices(&events, now).is_empty(), "the queue snapshot was rewound too");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn authoritative_notice_snapshot_survives_a_fresh_tail_and_clears_stale_history() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let pending = Event {
+                seq: 1,
+                ts: 1,
+                kind: EventKind::NoticeQueued {
+                    command_id: "old-report".into(),
+                    text: "An old report".into(),
+                    command: String::new(),
+                    from_title: String::new(),
+                    deliver_at_ms: 0,
+                    reason: "waiting for your next message".into(),
+                    hold: c6_api::NoticeHoldReason::NeedsYou,
+                },
+            };
+            let events = RwSignal::new(Vec::<Event>::new());
+            let now = RwSignal::new(10_000);
+            let snapshot = RwSignal::new(Some(vec![pending.clone()]));
+            let html = view! { <WaitingNotices events now session_id="s".to_owned() snapshot /> }.to_html();
+            assert!(html.contains("An old report") && html.contains("Needs you"), "{html}");
+            events.set(vec![pending]);
+            snapshot.set(Some(Vec::new()));
+            let html = view! { <WaitingNotices events now session_id="s".to_owned() snapshot /> }.to_html();
+            assert!(!html.contains("An old report"), "a consumed or rewound notice must not return from stale history: {html}");
+        });
     }
 
     #[test]
@@ -8925,9 +9233,18 @@ mod tests {
                 from_title: "Alice".into(),
                 deliver_at_ms: 0,
                 reason: String::new(),
+                hold: c6_api::NoticeHoldReason::NeedsYou,
             },
         };
-        let expected = |at| [WaitingNotice { from: "Alice".into(), line: "Ready".into(), deliver_at_ms: at, reason: String::new() }];
+        let expected = |at| {
+            [WaitingNotice {
+                from: "Alice".into(),
+                line: "Ready".into(),
+                deliver_at_ms: at,
+                reason: String::new(),
+                hold: c6_api::NoticeHoldReason::NeedsYou,
+            }]
+        };
         let evs = std::slice::from_ref(&ev);
         assert!(waiting_notices(evs, ts - 1).is_empty());
         assert!(waiting_notices(evs, ts + 47).is_empty());

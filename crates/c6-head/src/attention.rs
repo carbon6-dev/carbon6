@@ -1,5 +1,5 @@
 //! What needs you, in one list (`GET /api/v1/attention`): what waits on
-//! you (open decisions, among them approvals of tool calls and agents'
+//! you (guarded notices and open decisions, including approvals and agents'
 //! questions; not task cards, which ask nothing), what's worth a look (a
 //! turn that ended or failed since you last saw it, agents' answers to your
 //! comments, one row per document, people waiting on you in the Brief),
@@ -74,9 +74,17 @@ impl Pings {
 
 pub fn spawn(st: Arc<HeadState>) {
     tokio::spawn(async move {
+        let expire = async {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                crate::sessions::recovery_attention_expired(&st);
+            }
+        };
         tokio::select! {
             _ = st.shutdown.cancelled() => {}
             _ = st.attention.run(EVERY) => {}
+            _ = expire => {}
         }
     });
 }
@@ -121,8 +129,7 @@ pub async fn get(st: &HeadState, caller: &Caller) -> anyhow::Result<api::Attenti
     Ok(api::Attention { waiting, worth, elsewhere })
 }
 
-/// Open decisions, newest first, each with the session it's in (an
-/// approval's or a question's from its reference).
+/// Open decisions and guarded notice queues, newest first.
 async fn waiting(st: &HeadState, realm: Option<&str>) -> anyhow::Result<Vec<api::AttentionItem>> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT id, kind, title, ref, context, realm, updated_at FROM decisions WHERE {WAITING} AND (? IS NULL OR realm = ?) \
@@ -133,7 +140,51 @@ async fn waiting(st: &HeadState, realm: Option<&str>) -> anyhow::Result<Vec<api:
     .bind(realm)
     .fetch_all(&st.store.pool)
     .await?;
-    waiting_items(st, rows).await
+    let mut out = waiting_items(st, rows).await?;
+    let notices = sqlx::query(
+        "SELECT id, title, realm, at, lost FROM session_notice_attention \
+         WHERE (?1 IS NULL OR realm = ?1) ORDER BY at DESC, id LIMIT 500",
+    )
+    .bind(realm)
+    .fetch_all(&st.store.pool)
+    .await?;
+    out.extend(notices.into_iter().map(|r| {
+        let id: String = r.get("id");
+        api::AttentionItem {
+            key: format!("notice:{id}"),
+            kind: "notice".into(),
+            title: if r.get::<bool, _>("lost") { "Session lost: needs you" } else { "Held notices need you" }.into(),
+            detail: display_title(r.get("title")),
+            at: r.get("at"),
+            session_id: Some(id),
+            realm: Some(r.get("realm")),
+            ..Default::default()
+        }
+    }));
+    let recovery = crate::sessions::recovery_attention(st, None).await?;
+    for s in recovery.into_iter().filter(|s| realm.is_none_or(|r| r == s.realm)) {
+        let key = format!("notice:{}", s.id);
+        let item = api::AttentionItem {
+            key,
+            kind: "notice".into(),
+            title: "Session recovery needs you".into(),
+            detail: display_title(s.title),
+            at: s.since,
+            session_id: Some(s.id),
+            realm: Some(s.realm),
+            ..Default::default()
+        };
+        if let Some(held) = out.iter_mut().find(|r| r.key == item.key) {
+            if held.title != "Session lost: needs you" {
+                *held = api::AttentionItem { at: held.at.max(item.at), ..item };
+            }
+        } else {
+            out.push(item);
+        }
+    }
+    out.sort_by_key(|item| std::cmp::Reverse(item.at));
+    out.truncate(500);
+    Ok(out)
 }
 
 /// Everything answerable in a session, including its offered task cards,
@@ -225,13 +276,15 @@ async fn turns(st: &HeadState, realm: Option<&str>, waiting: &[api::AttentionIte
     // rather than session_live's three database reads per candidate.
     let rows = sqlx::query(
         "WITH candidates AS (\
-             SELECT id, realm, title, status, end_reason, awaiting, turn_ended_at FROM sessions \
+             SELECT id, realm, title, status, end_reason, awaiting, turn_ended_at, notice_waiting_at, notices_proceeding FROM sessions \
              WHERE archived = 0 AND parent_id IS NULL AND (?1 IS NULL OR realm = ?1) \
              AND turn_ended_at > seen_at ORDER BY turn_ended_at DESC LIMIT ?2\
          ), asked(id) AS (\
              SELECT json_extract(context, '$.session') FROM decisions WHERE state = 'open' AND kind != 'task' \
              UNION SELECT j.value FROM decisions d, json_each(d.sessions) j WHERE d.state = 'open' AND d.kind != 'task'\
          ) SELECT * FROM candidates s WHERE awaiting <= 0 AND status NOT IN ('running', 'starting') \
+         AND notice_waiting_at IS NULL AND NOT notices_proceeding \
+         AND NOT EXISTS (SELECT 1 FROM active_liveness_losses l WHERE l.session_id = s.id) \
          AND id NOT IN (SELECT id FROM asked WHERE typeof(id) = 'text') \
          ORDER BY turn_ended_at DESC",
     )
@@ -366,22 +419,33 @@ fn mark(seen: &mut Seen, answers: &[Answered], brief: Option<i64>, keys: &[Strin
 
 /// How many things wait on you in a realm: what `waiting` lists there.
 pub async fn waiting_count(st: &HeadState, realm: &str) -> anyhow::Result<i64> {
-    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM decisions WHERE {WAITING} AND realm = ?")))
-        .bind(now_ms())
-        .bind(realm)
-        .fetch_one(&st.store.pool)
-        .await?)
+    let waiting: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT (SELECT COUNT(*) FROM decisions WHERE {WAITING} AND realm = ?2) + \
+         (SELECT COUNT(*) FROM session_notice_attention WHERE realm = ?2)"
+    )))
+    .bind(now_ms())
+    .bind(realm)
+    .fetch_one(&st.store.pool)
+    .await?;
+    let recovery = crate::sessions::recovery_attention(st, None).await?;
+    Ok(waiting + recovery.into_iter().filter(|s| s.realm == realm && !s.notice_waiting).count() as i64)
 }
 
 /// What waits on you in each realm the caller may know about: counts only,
 /// for the realm switcher (`GET /api/v1/elsewhere`). A realm's token
 /// learns only about its own; the console's (root's) is your browser's.
 pub async fn places(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<api::RealmWaiting>> {
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT realm, COUNT(*) AS n FROM decisions WHERE {WAITING} GROUP BY realm")))
-        .bind(now_ms())
-        .fetch_all(&st.store.pool)
-        .await?;
-    let counts: HashMap<String, i64> = rows.into_iter().map(|r| (r.get("realm"), r.get("n"))).collect();
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT realm, COUNT(*) AS n FROM (SELECT realm FROM decisions WHERE {WAITING} UNION ALL \
+         SELECT realm FROM session_notice_attention) GROUP BY realm"
+    )))
+    .bind(now_ms())
+    .fetch_all(&st.store.pool)
+    .await?;
+    let mut counts: HashMap<String, i64> = rows.into_iter().map(|r| (r.get("realm"), r.get("n"))).collect();
+    for s in crate::sessions::recovery_attention(st, None).await?.into_iter().filter(|s| !s.notice_waiting) {
+        *counts.entry(s.realm).or_default() += 1;
+    }
     let mut out = Vec::new();
     for r in crate::realms::list(st, &Caller::root()).await? {
         let console = r.id == crate::realms::ROOT;
@@ -542,6 +606,87 @@ mod tests {
         let counts: HashMap<_, _> = all.iter().map(|r| (r.id.as_str(), r.waiting)).collect();
         assert_eq!(counts["commons"], 2);
         assert_eq!(counts["root"], 1);
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn notice_holds_agree_across_sessions_work_and_attention() {
+        use c6_core::WorkerId;
+        use c6_proto::{NoticeQueued, Rewound, SessionEvent, SessionEventBatch, UserMessage, session_event::Kind};
+
+        let (_dir, head) = test_head().await;
+        let st = &head.state;
+        let worker = WorkerId::new();
+        attention_session(st, "held", "Held session", "home").await;
+        sqlx::query("UPDATE sessions SET worker_id = ? WHERE id = 'held'").bind(worker.to_string()).execute(&st.store.pool).await.unwrap();
+        let queued = |seq, command_id: &str, reason: &str| SessionEvent {
+            seq,
+            ts_ms: seq as i64,
+            kind: Some(Kind::NoticeQueued(NoticeQueued { command_id: command_id.into(), reason: reason.into(), ..Default::default() })),
+        };
+        let taken = |seq, command_id: &str| SessionEvent {
+            seq,
+            ts_ms: seq as i64,
+            kind: Some(Kind::User(UserMessage { command_id: command_id.into(), ..Default::default() })),
+        };
+        let batch = |events| SessionEventBatch { session_id: "held".into(), ownership_epoch: 0, events };
+        let session = || async { crate::convert::session(&st.store.session("held").await.unwrap().unwrap(), None) };
+        let work = || async { crate::work::session_live(st, "home", "held").await.unwrap().state };
+
+        crate::sessions::ingest(
+            st,
+            worker,
+            batch(vec![
+                queued(1, "merge", "merging 3 reports"),
+                queued(2, "group", "group audit: 2 of 3 finished; waiting for 1 (Audit evidence)"),
+            ]),
+        )
+        .await
+        .unwrap();
+        assert!(session().await.notices_proceeding);
+        assert!(!session().await.notices_need_you);
+        assert_eq!(work().await, "running");
+        assert!(waiting(st, Some("home")).await.unwrap().is_empty());
+        assert!(turns(st, Some("home"), &[]).await.unwrap().is_empty());
+        let notices = st.store.pending_notices("held").await.unwrap();
+        assert!(matches!(notices[1].kind, api::EventKind::NoticeQueued { hold: api::NoticeHoldReason::Group, .. }));
+
+        crate::sessions::ingest(st, worker, batch(vec![queued(3, "merge", "paused: spending limit")])).await.unwrap();
+        assert!(session().await.notices_need_you);
+        assert!(!session().await.awaiting_approval);
+        assert_eq!(work().await, "needs_you");
+        let items = waiting(st, Some("home")).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!((items[0].kind.as_str(), items[0].session_id.as_deref()), ("notice", Some("held")));
+        assert_eq!(waiting_count(st, "home").await.unwrap(), 1);
+        assert!(waiting(st, Some("commons")).await.unwrap().is_empty());
+        let notices = st.store.pending_notices("held").await.unwrap();
+        assert_eq!((notices[0].seq, notices[0].ts), (3, 1), "the latest metadata retains the original queue age");
+        assert!(matches!(notices[0].kind, api::EventKind::NoticeQueued { hold: api::NoticeHoldReason::NeedsYou, .. }));
+        assert_eq!(serde_json::to_value(api::StreamMsg::Notices { notices }).unwrap()["notices"][1]["hold"], "group");
+
+        crate::sessions::ingest(
+            st,
+            worker,
+            batch(vec![taken(4, "merge"), taken(5, "group"), queued(6, "merge", "paused: spending limit")]),
+        )
+        .await
+        .unwrap();
+        assert!(!session().await.notices_need_you);
+        assert!(!session().await.notices_proceeding);
+        assert_eq!(work().await, "idle");
+        assert!(waiting(st, Some("home")).await.unwrap().is_empty());
+        assert_eq!(turns(st, Some("home"), &[]).await.unwrap().len(), 1);
+        assert!(st.store.pending_notices("held").await.unwrap().is_empty());
+
+        let rewind = SessionEvent { seq: 7, ts_ms: 7, kind: Some(Kind::Rewound(Rewound { to_seq: 3, ..Default::default() })) };
+        crate::sessions::ingest(st, worker, batch(vec![rewind])).await.unwrap();
+        assert!(session().await.notices_proceeding, "rewind restores the consumed automatic holds");
+        assert!(!session().await.notices_need_you, "rewind removes the newer guard snapshot");
+        assert_eq!(work().await, "running");
+        let notices = st.store.pending_notices("held").await.unwrap();
+        assert_eq!(notices.iter().map(|n| n.seq).collect::<Vec<_>>(), [1, 2]);
+        assert!(matches!(notices[1].kind, api::EventKind::NoticeQueued { hold: api::NoticeHoldReason::Group, .. }));
         head.shutdown().await.unwrap();
     }
 

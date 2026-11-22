@@ -130,7 +130,7 @@ pub async fn sweep_at(st: &HeadState, now: i64) -> anyhow::Result<()> {
         .collect();
     // Continued work resolves an earlier observation, never an unrelated
     // metadata edit or another heartbeat from the same dead incarnation.
-    sqlx::query(
+    let resolved = sqlx::query(
         "UPDATE liveness_incidents SET resolved_at = ? WHERE resolved_at IS NULL AND EXISTS \
          (SELECT 1 FROM sessions s WHERE s.id = session_id AND (s.last_seq > liveness_incidents.last_seq \
           OR (liveness_incidents.worker_id IS NOT NULL AND (s.worker_id <> liveness_incidents.worker_id \
@@ -139,12 +139,16 @@ pub async fn sweep_at(st: &HeadState, now: i64) -> anyhow::Result<()> {
     .bind(now)
     .execute(st.store.pool())
     .await?;
+    if resolved.rows_affected() != 0 {
+        st.registry.bump();
+        st.attention.changed();
+    }
     let mut limits = HashMap::new();
     for s in &sessions {
         if let std::collections::hash_map::Entry::Vacant(entry) = limits.entry(s.realm.clone()) {
             entry.insert(crate::sessions::subagent_limits(st, Some(&s.realm)).await?);
         }
-        let waiting = s.status == "running" || pending.contains(&s.id) || tasks.contains(&s.id);
+        let waiting = s.status == "running" || s.notices_proceeding || pending.contains(&s.id) || tasks.contains(&s.id);
         if !waiting {
             continue;
         }
@@ -231,7 +235,7 @@ pub async fn sweep_at(st: &HeadState, now: i64) -> anyhow::Result<()> {
                 s.id != parent.id
                     && tree.contains(s.id.as_str())
                     && s.parent_call_id.is_some()
-                    && (pending.contains(&s.id) || s.status == "running" || tasks.contains(&s.id))
+                    && (pending.contains(&s.id) || s.status == "running" || s.notices_proceeding || tasks.contains(&s.id))
             })
             .collect();
         if descendants.is_empty() {
@@ -395,6 +399,13 @@ async fn deliver(st: &HeadState, s: &SessionRow, id: &str, kind: &str, cause: &s
     Ok(())
 }
 
+pub(crate) async fn is_lost(st: &HeadState, id: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM active_liveness_losses WHERE session_id = ?)")
+        .bind(id)
+        .fetch_one(st.store.pool())
+        .await?)
+}
+
 /// Read-only, realm-filterable evidence and retained incident history.
 pub async fn snapshot(st: &HeadState) -> anyhow::Result<Value> {
     let rows = sqlx::query(
@@ -439,6 +450,66 @@ mod tests {
     use super::*;
     use c6_proto::SessionLiveness;
     use prost::Message;
+
+    #[tokio::test]
+    async fn unavailable_parent_with_automatic_group_hold_needs_you_and_receives_child_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        let parent = WorkerId::new();
+        let child = WorkerId::new();
+        for (id, worker, owner, call) in [("parent", parent, None, None), ("child", child, Some("parent"), Some("call"))] {
+            sqlx::query("INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, parent_id, parent_call_id) \
+                         VALUES (?, ?, ?, '', '', '', 'idle', 0, 0, ?, ?)")
+                .bind(id).bind(worker.to_string()).bind(id).bind(owner).bind(call).execute(st.store.pool()).await.unwrap();
+        }
+        let now = now_ms();
+        let notice = c6_proto::SessionEvent {
+            seq: 1,
+            ts_ms: now,
+            kind: Some(c6_proto::session_event::Kind::NoticeQueued(c6_proto::NoticeQueued {
+                command_id: "first-child".into(),
+                wake: true,
+                reason: "group audit: 1 of 2 finished; waiting for 1".into(),
+                ..Default::default()
+            })),
+        };
+        st.store.ingest(parent, "parent", &[notice]).await.unwrap();
+        let wait = format!("{}call", crate::remote::LOCAL_WAIT_PREFIX);
+        st.store.add_remote_delegation(&wait, "child", "parent", "call").await.unwrap();
+        let work = || async { crate::work::session_live(st, "home", "parent").await.unwrap().state };
+        assert_eq!(work().await, "running");
+        sweep_at(st, now).await.unwrap();
+        let grace = crate::sessions::subagent_limits(st, Some("home")).await.unwrap().liveness_worker_grace_seconds;
+        sweep_at(st, now + (i64::from(grace) + 1) * 1000).await.unwrap();
+        assert!(is_lost(st, "parent").await.unwrap(), "the notice is its only pending work");
+        let parent_row = st.store.session("parent").await.unwrap().unwrap();
+        let mut display = crate::convert::session(&parent_row, None);
+        crate::api::project_session_health(st, std::slice::from_mut(&mut display)).await.unwrap();
+        assert!(display.notices_proceeding && display.needs_you());
+        assert_eq!(work().await, "needs_you");
+        let attention = crate::attention::get(st, &crate::realms::Caller::in_realm("home")).await.unwrap();
+        assert!(attention.waiting.iter().any(|r| r.key == "notice:parent" && r.title == "Session lost: needs you"));
+        assert!(!attention.worth.iter().any(|r| r.session_id.as_deref() == Some("parent")));
+        let rows = st.store.pending_commands(parent, 0).await.unwrap();
+        let report = rows.iter().find(|r| r.id.starts_with("liveness:lost:child:")).unwrap();
+        let command = c6_proto::decode_stored_command(&report.data).unwrap();
+        let Some(c6_proto::session_command::Kind::DelegationEnded(ended)) = command.kind else { panic!("expected terminal report") };
+        assert!(ended.wake);
+        assert_eq!(ended.call_id, "call");
+        assert_eq!(ended.task_notice.unwrap().status, "lost");
+        assert!(st.store.waiting_delegations("child").await.unwrap().is_empty());
+        head.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn stale_connection_evidence_and_session_generation_do_not_commit_loss() {

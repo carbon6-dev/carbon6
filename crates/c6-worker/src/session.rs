@@ -2368,12 +2368,15 @@ fn rewind_child_history_stopped(id: &str, events: &[SessionEvent], registry: &[c
 /// the session.
 fn notices_of(events: &[SessionEvent]) -> (Vec<i64>, Vec<String>, Vec<(PendingInput, bool)>) {
     let events = c6_agent::effective_events(events);
-    let mut noticed = HashSet::new();
+    let mut noticed = Vec::new();
+    let mut latest = HashMap::new();
     let mut taken = HashSet::new();
     for e in &events {
         match &e.kind {
             Some(session_event::Kind::NoticeQueued(n)) => {
-                noticed.insert(n.command_id.clone());
+                if latest.insert(n.command_id.as_str(), n).is_none() {
+                    noticed.push(n.command_id.clone());
+                }
             }
             Some(session_event::Kind::User(u)) => {
                 taken.insert(u.command_id.clone());
@@ -2387,7 +2390,7 @@ fn notices_of(events: &[SessionEvent]) -> (Vec<i64>, Vec<String>, Vec<(PendingIn
         match &e.kind {
             Some(session_event::Kind::User(u)) => inputs.push(&u.command_id),
             Some(session_event::Kind::TurnStarted(_)) => {
-                if !inputs.is_empty() && inputs.iter().all(|i| noticed.contains(*i)) {
+                if !inputs.is_empty() && inputs.iter().all(|i| latest.contains_key(*i)) {
                     auto_turns.push(e.ts_ms);
                 }
                 inputs.clear();
@@ -2395,32 +2398,29 @@ fn notices_of(events: &[SessionEvent]) -> (Vec<i64>, Vec<String>, Vec<(PendingIn
             _ => {}
         }
     }
-    let mut seen_pending = HashSet::new();
-    let mut pending: Vec<_> = events
+    // Scheduling snapshots update the payload, not the notice's place in line.
+    let pending = noticed
         .iter()
-        .rev()
-        .filter_map(|e| match &e.kind {
-            Some(session_event::Kind::NoticeQueued(n)) if !taken.contains(&n.command_id) && seen_pending.insert(n.command_id.clone()) => {
-                Some((
-                    PendingInput {
-                        command_id: n.command_id.clone(),
-                        text: n.text.clone(),
-                        command: n.command.clone(),
-                        prompt: n.prompt.clone(),
-                        from_session_id: n.from_session_id.clone(),
-                        from_title: n.from_title.clone(),
-                        hops: n.hops,
-                        task_notice: n.task_notice.clone(),
-                        ..Default::default()
-                    },
-                    n.wake,
-                ))
-            }
-            _ => None,
+        .filter(|id| !taken.contains(*id))
+        .map(|id| {
+            let n = latest[id.as_str()];
+            (
+                PendingInput {
+                    command_id: n.command_id.clone(),
+                    text: n.text.clone(),
+                    command: n.command.clone(),
+                    prompt: n.prompt.clone(),
+                    from_session_id: n.from_session_id.clone(),
+                    from_title: n.from_title.clone(),
+                    hops: n.hops,
+                    task_notice: n.task_notice.clone(),
+                    ..Default::default()
+                },
+                n.wake,
+            )
         })
         .collect();
-    pending.reverse();
-    (auto_turns, noticed.into_iter().collect(), pending)
+    (auto_turns, noticed, pending)
 }
 
 /// Sets a spec's default for its subagents (`None`: the session's own
@@ -4569,7 +4569,7 @@ impl Actor {
         let mut finished = HashSet::new();
         let mut failed = HashSet::new();
         let mut previous = HashMap::new();
-        let mut group_calls: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut group_calls: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut pending_group_calls = HashMap::new();
         let mut launched_tasks = HashMap::new();
         let mut linked_tasks = HashSet::new();
@@ -4584,7 +4584,8 @@ impl Actor {
                             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&t.input_json)
                             && let Some(group) = v["group"].as_str().map(str::trim).filter(|g| !g.is_empty())
                         {
-                            group_calls.entry(group.to_owned()).or_default().insert(t.id.clone());
+                            let description = v["description"].as_str().unwrap_or_default();
+                            group_calls.entry(group.to_owned()).or_default().insert(t.id.clone(), description.to_owned());
                             rejected_calls.remove(&t.id);
                             pending_group_calls.insert(t.id.clone(), (group.to_owned(), v["wake"].as_str().unwrap_or("all").to_owned()));
                         }
@@ -4598,7 +4599,7 @@ impl Actor {
                         && let Some(task) = background_report_task(&t.output)
                         && let Some(group) = pending_group_calls.remove(&t.call_id)
                     {
-                        launched_tasks.insert(task, group);
+                        launched_tasks.insert(task, (group.0, group.1, t.call_id.as_str()));
                     }
                 }
                 Some(session_event::Kind::SubagentSpawned(s)) => {
@@ -4655,8 +4656,11 @@ impl Actor {
             }
         }
         let mut orphan_counts = HashMap::new();
+        let mut finished_orphan_calls = HashSet::new();
         for (task, failure) in orphan_outcomes {
-            let (done, failed) = orphan_counts.entry(launched_tasks[task].0.as_str()).or_insert((0, 0));
+            let (group, _, call) = &launched_tasks[task];
+            let (done, failed) = orphan_counts.entry(group.as_str()).or_insert((0, 0));
+            finished_orphan_calls.insert((group.as_str(), *call));
             *done += 1;
             *failed += usize::from(failure);
         }
@@ -4679,7 +4683,7 @@ impl Actor {
                 if let Some(s) = grouped_tasks.get(task) {
                     return Some((s.group.as_str(), s.wake.as_str()));
                 }
-                let (group, wake) = launched_tasks.get(task).filter(|_| !linked_tasks.contains(task))?;
+                let (group, wake, _) = launched_tasks.get(task).filter(|_| !linked_tasks.contains(task))?;
                 Some((group.as_str(), wake.as_str()))
             } else {
                 session_reports.get(input.command_id.as_str()).map(|s| (s.group.as_str(), s.wake.as_str()))
@@ -4711,13 +4715,13 @@ impl Actor {
             let representative = represented.insert(key);
             let (ready, immediate, waiting) = if let Some((group, wake)) = member {
                 let members = groups.get(group).map_or(&[][..], Vec::as_slice);
+                let calls = group_calls.get(group);
                 let (orphan_done, orphan_failed) = orphan_counts.get(group).copied().unwrap_or_default();
                 // Task acknowledges background launch before its detached
                 // runner necessarily links the child. Count logged calls too,
                 // so an already acknowledged sibling cannot be missed.
-                let total = group_calls
-                    .get(group)
-                    .map_or(0, |calls| calls.iter().filter(|id| !rejected_calls.contains(*id)).count())
+                let total = calls
+                    .map_or(0, |calls| calls.keys().filter(|id| !rejected_calls.contains(*id)).count())
                     .max(members.len() + orphan_done);
                 let done = members.iter().filter(|s| finished.contains(&grouped_run_key(s))).count() + orphan_done;
                 let failures = members.iter().filter(|s| failed.contains(&grouped_run_key(s))).count() + orphan_failed;
@@ -4727,9 +4731,16 @@ impl Actor {
                     _ => total,
                 };
                 let failure = input.task_notice.as_ref().is_some_and(|t| matches!(t.status.as_str(), "failed" | "lost" | "error"));
-                let ready = failure || failures > 0 || done >= target;
+                // A count may exceed the number of launches (e.g. a call was
+                // rejected). Once all known members have settled, no more
+                // reports can arrive to satisfy the original threshold.
+                let settled_short = total > 0 && done == total && done < target;
+                let ready = failure || failures > 0 || done >= target || settled_short;
                 if ready {
-                    let summary = format!("group {group}: {done} of {total} finished, {failures} failed");
+                    let mut summary = format!("group {group}: {done} of {total} finished, {failures} failed");
+                    if settled_short {
+                        summary.push_str(&format!("; wake threshold of {target} not met, but all members finished"));
+                    }
                     let body = if input.text.starts_with(&format!("group {group}:")) {
                         input.text.split_once("\n\n").map_or(input.text.as_str(), |(_, body)| body)
                     } else {
@@ -4737,7 +4748,38 @@ impl Actor {
                     };
                     input.text = format!("{summary}\n\n{body}");
                 }
-                (ready, true, format!("waiting for {target} of {total} in group {group} ({done} finished)"))
+                let waiting = if ready {
+                    "collecting reports for delivery".into()
+                } else if representative && self.notice_pause.is_none() {
+                    let linked_calls: HashSet<_> = members.iter().map(|s| s.call_id.as_str()).collect();
+                    let mut descriptions: Vec<_> = members
+                        .iter()
+                        .filter(|s| !finished.contains(&grouped_run_key(s)))
+                        .map(|s| s.description.as_str())
+                        .chain(calls.into_iter().flatten().filter_map(|(id, description)| {
+                            (!linked_calls.contains(id.as_str())
+                                && !finished_orphan_calls.contains(&(group, id.as_str()))
+                                && !rejected_calls.contains(id))
+                            .then_some(description.as_str())
+                        }))
+                        .map(str::trim)
+                        .filter(|description| !description.is_empty())
+                        .collect();
+                    descriptions.sort_unstable();
+                    let pending = if descriptions.is_empty() {
+                        String::new()
+                    } else {
+                        let suffix = if descriptions.len() > 3 { ", …" } else { "" };
+                        descriptions.truncate(3);
+                        format!(" ({}{suffix})", descriptions.join(", "))
+                    };
+                    let remaining = target.min(total).saturating_sub(done);
+                    let threshold = if target > total { format!("; wake threshold is {target}") } else { String::new() };
+                    format!("group {group}: {done} of {total} finished; waiting for {remaining}{pending}{threshold}")
+                } else {
+                    format!("waiting for group {group}")
+                };
+                (ready, true, waiting)
             } else {
                 let failure = input.task_notice.as_ref().is_some_and(|t| matches!(t.status.as_str(), "failed" | "lost" | "error"));
                 (true, failure, format!("merging {count} reports"))
@@ -4753,10 +4795,10 @@ impl Actor {
             let reason = self.notice_pause.clone().unwrap_or_else(|| {
                 if !*wake {
                     "waiting for your next message".into()
-                } else if representative {
+                } else if representative || member.is_some() {
                     waiting
                 } else {
-                    member.map_or_else(|| "merging reports".to_owned(), |(group, _)| format!("waiting for group {group}"))
+                    "merging reports".into()
                 }
             });
             let updated = Self::queued_notice(input, *wake, reason, deliver);
@@ -4764,6 +4806,8 @@ impl Actor {
                 updates.push(updated);
             }
         }
+        // Scheduling snapshots supersede earlier ones by command_id on
+        // replay; only a User event is a delivery receipt.
         for n in updates {
             self.writer.append(session_event::Kind::NoticeQueued(n)).await?;
         }
@@ -4804,7 +4848,10 @@ impl Actor {
         if !self.noticed.insert(input.command_id.clone()) {
             return Ok(());
         }
-        let queued = Self::queued_notice(&input, wake, String::new(), 0);
+        // The first durable receipt precedes scheduling. Do not briefly mark
+        // an automatic input as needing the user while its snapshot catches up.
+        let reason = if wake || busy { "collecting reports for delivery" } else { "waiting for your next message" };
+        let queued = Self::queued_notice(&input, wake, reason.into(), 0);
         if let Err(e) = self.writer.append(session_event::Kind::NoticeQueued(queued)).await {
             self.noticed.remove(&input.command_id);
             // The head does not redeliver tool callbacks. Keep this input
@@ -8213,6 +8260,30 @@ mod notice_tests {
         assert_eq!(pending, [("subagent:s", "about subagent:s", false), ("task:bg2:finished", "about task:bg2:finished", true)]);
     }
 
+    #[test]
+    fn notice_replay_keeps_first_queue_order_and_latest_payload() {
+        let update = |id: &str, text: &str| {
+            session_event::Kind::NoticeQueued(c6_proto::NoticeQueued {
+                command_id: id.into(),
+                text: text.into(),
+                wake: true,
+                ..Default::default()
+            })
+        };
+        let events = [
+            ev(1, 100, queued("a", false)),
+            ev(2, 200, queued("b", false)),
+            ev(3, 300, queued("already-taken", false)),
+            ev(4, 400, update("b", "latest b")),
+            ev(5, 500, user("already-taken")),
+            ev(6, 600, update("a", "latest a")),
+            ev(7, 700, update("already-taken", "never replayed")),
+        ];
+        let (_, _, pending) = notices_of(&events);
+        let pending: Vec<_> = pending.iter().map(|(input, wake)| (input.command_id.as_str(), input.text.as_str(), *wake)).collect();
+        assert_eq!(pending, [("a", "latest a", true), ("b", "latest b", true)]);
+    }
+
     const QUIET: std::time::Duration = std::time::Duration::from_secs(3);
     const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
     const SECOND: std::time::Duration = std::time::Duration::from_secs(1);
@@ -8674,6 +8745,11 @@ mod notice_tests {
             tokio::time::advance(MAX_WAIT + TICK).await;
             barrier(&manager, "group-still-waiting").await;
             assert_waiting(&manager, &mock, target - 1).await;
+            if target == GROUP_SIZE {
+                let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+                assert!(events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::NoticeQueued(n))
+                    if n.reason.contains("4 of 5 finished; waiting for 1 (Audit part 5)"))));
+            }
         }
         enqueue_audit_reports(&manager, target..=target, TurnEndReason::Completed).await;
         audit_delivered(&manager, &mock, target, 0).await;
@@ -8685,8 +8761,74 @@ mod notice_tests {
     }
 
     #[tokio::test]
+    async fn audit_group_snapshots_and_duplicate_callbacks_deliver_three_reports_once() {
+        use session_event::Kind;
+
+        let (_dir, manager, mock) = idle_session().await;
+        append_seed(&manager.journal, 1, (1..=3).map(|n| audit_spawn(n, "all"))).await;
+        let clock = pause_clock();
+        mock.push(c6_testkit::Reply::Text("Saw the three audit reports.".into()));
+        enqueue_audit_reports(&manager, 1..=2, TurnEndReason::Completed).await;
+        enqueue_audit_reports(&manager, 1..=1, TurnEndReason::Completed).await;
+        tokio::time::advance(MAX_WAIT + TICK).await;
+        barrier(&manager, "two-of-three-are-still-held").await;
+        assert_waiting(&manager, &mock, 2).await;
+
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        let reasons: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(Kind::NoticeQueued(n)) if n.command_id == "subagent:audit-child-1" => Some(n.reason.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                "collecting reports for delivery",
+                "group audit: 1 of 3 finished; waiting for 2 (Audit part 2, Audit part 3)",
+                "group audit: 2 of 3 finished; waiting for 1 (Audit part 3)",
+            ],
+            "queue snapshots record progress, not a second receipt of the same callback"
+        );
+        assert!(!c6_api::NoticeHoldReason::parse(reasons[2]).needs_you());
+
+        enqueue_audit_reports(&manager, 3..=3, TurnEndReason::Completed).await;
+        tokio::time::advance(TICK).await;
+        let (_, request) = completed_batch(&manager, &mock).await;
+        drop(clock);
+        let _clock = pause_clock();
+        enqueue_audit_reports(&manager, 1..=3, TurnEndReason::Completed).await;
+        tokio::time::advance(MAX_WAIT + TICK).await;
+        barrier(&manager, "duplicates-after-delivery").await;
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        assert_audit_batch(&events, &request, 3, 3, 0);
+        assert!(notices_of(&events).2.is_empty(), "delivered snapshots must not replay as pending");
+        assert_eq!(events.iter().filter(|e| matches!(&e.kind, Some(Kind::TurnStarted(_)))).count(), 1);
+        assert_eq!(mock.requests().len(), 1);
+    }
+
+    #[tokio::test]
     async fn audit_group_count_wakes_at_its_configured_threshold() {
         audit_threshold("count:3", 3).await;
+    }
+
+    #[tokio::test]
+    async fn audit_group_count_releases_when_all_members_settle_below_threshold() {
+        let (_dir, manager, mock) = idle_session().await;
+        append_seed(&manager.journal, 1, (1..=3).map(|n| audit_spawn(n, "count:5"))).await;
+        let _clock = pause_clock();
+        mock.push(c6_testkit::Reply::Text("Saw all available audit reports.".into()));
+        enqueue_audit_reports(&manager, 1..=2, TurnEndReason::Completed).await;
+        tokio::time::advance(MAX_WAIT + TICK).await;
+        barrier(&manager, "count-still-has-an-unsettled-member").await;
+        assert_waiting(&manager, &mock, 2).await;
+
+        enqueue_audit_reports(&manager, 3..=3, TurnEndReason::Completed).await;
+        tokio::time::advance(TICK).await;
+        let (events, request) = completed_batch(&manager, &mock).await;
+        assert_audit_batch(&events, &request, 3, 3, 0);
+        assert!(request.contains("wake threshold of 5 not met, but all members finished"), "{request}");
     }
 
     #[tokio::test]
@@ -8696,11 +8838,20 @@ mod notice_tests {
 
     #[tokio::test]
     async fn audit_group_failure_wakes_immediately_with_four_children_unfinished() {
+        audit_group_adverse_outcome_wakes(TurnEndReason::Error).await;
+    }
+
+    #[tokio::test]
+    async fn audit_group_loss_wakes_immediately_with_four_children_unfinished() {
+        audit_group_adverse_outcome_wakes(TurnEndReason::WorkerRestarted).await;
+    }
+
+    async fn audit_group_adverse_outcome_wakes(reason: TurnEndReason) {
         let (_dir, manager, mock) = idle_session().await;
         seed_audit_group(&manager, "all").await;
         let _clock = pause_clock();
         mock.push(c6_testkit::Reply::Text("Saw the audit failure.".into()));
-        enqueue_audit_reports(&manager, 1..=1, TurnEndReason::Error).await;
+        enqueue_audit_reports(&manager, 1..=1, reason).await;
         audit_delivered(&manager, &mock, 1, 1).await;
     }
 
@@ -8781,7 +8932,7 @@ mod notice_tests {
             Some(session_event::Kind::NoticeQueued(n)) if n.command_id == "subagent:audit-child-1" => Some(n.reason.as_str()),
             _ => None,
         });
-        assert_eq!(reason, Some("waiting for 2 of 2 in group audit (1 finished)"));
+        assert_eq!(reason, Some("group audit: 1 of 2 finished; waiting for 1 (Audit part 2)"));
 
         // Replay the same pending report in a separate journal so the live
         // actor's sequence counter never races a direct test append.
@@ -9039,6 +9190,7 @@ mod notice_tests {
             })
             .unwrap();
         assert_eq!(latest.reason, PAUSED);
+        assert!(c6_api::NoticeHoldReason::parse(&latest.reason).needs_you());
         assert_eq!(latest.deliver_at_ms, 0, "paused notices have no automatic delivery deadline");
         assert_eq!(
             events.iter().filter(|e| matches!(&e.kind, Some(Kind::Notice(n)) if !n.quiet && n.message.starts_with(PAUSED))).count(),

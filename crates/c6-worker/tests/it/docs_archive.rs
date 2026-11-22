@@ -89,6 +89,8 @@ impl Env {
             home: String::new(),
             ssh_target: String::new(),
             awaiting: 0,
+            notice_waiting_at: None,
+            notices_proceeding: false,
             subagent_model: String::new(),
             subagent_connection_id: String::new(),
             subagent_effort: String::new(),

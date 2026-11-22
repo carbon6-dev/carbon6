@@ -116,6 +116,8 @@ pub(crate) async fn start(
     }
     crate::agent_ops::link_placement_command(&mut tx, session_id, &id).await?;
     tx.commit().await?;
+    st.registry.bump();
+    st.attention.changed();
     Ok(id)
 }
 
@@ -525,6 +527,7 @@ impl Move<'_> {
         tx.commit().await?;
         self.st.registry.deliver(self.source);
         self.st.registry.bump();
+        self.st.attention.changed();
         Ok(())
     }
 

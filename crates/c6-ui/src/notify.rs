@@ -62,11 +62,11 @@ pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace, filter: c
         previous.update_value(|prev| {
             for s in &sessions {
                 let finished = finished(prev, s);
-                // Starting to wait for your approval is worth a notice too.
-                let asks = s.awaiting_approval && !waiting.with_value(|w| w.contains(&s.id));
+                // Automatic report/group holds never ask for attention.
+                let asks = s.needs_you() && !waiting.with_value(|w| w.contains(&s.id));
                 if asks {
                     waiting.update_value(|w| w.push(s.id.clone()));
-                } else if !s.awaiting_approval {
+                } else if !s.needs_you() {
                     waiting.update_value(|w| w.retain(|x| *x != s.id));
                 }
                 if (finished || asks) && hidden && enabled() && crate::labels::matches(s, &wanted) {
@@ -74,7 +74,7 @@ pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace, filter: c
                     opts.set_body(&format!(
                         "{} on {}",
                         if asks {
-                            "Needs your approval"
+                            if s.awaiting_approval { "Needs your approval" } else { "Needs you" }
                         } else if s.display_status() == SessionStatus::Failed {
                             "Failed"
                         } else {

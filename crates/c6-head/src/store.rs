@@ -7,6 +7,13 @@ use c6_core::WorkerId;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::{FromRow, Row};
 
+/// Both single-session routing and batched recovery use the same move gate.
+macro_rules! without_active_session_move {
+    () => {
+        "NOT EXISTS(SELECT 1 FROM session_moves m WHERE m.session_id = s.id AND m.state NOT IN ('done', 'failed'))"
+    };
+}
+
 #[derive(Clone)]
 pub struct Store {
     pub(crate) pool: SqlitePool,
@@ -320,6 +327,7 @@ impl Store {
             .busy_timeout(std::time::Duration::from_secs(30))
             .foreign_keys(true);
         let (pool, report) = c6_core::upgrade::open(path, opts, SqlitePoolOptions::new().max_connections(8), &MIGRATOR, &UPGRADES).await?;
+        backfill_notice_holds(&pool).await?;
         crate::lists::ensure(&pool).await?;
         crate::prompts::seed(&pool).await?;
         crate::claims::seed(&pool).await?;
@@ -590,6 +598,9 @@ pub struct SessionRow {
     pub ssh_target: String,
     /// Tool calls waiting for approval.
     pub awaiting: i64,
+    /// Latest time a pending notice needed a person rather than an automatic wake.
+    pub notice_waiting_at: Option<i64>,
+    pub notices_proceeding: bool,
     /// The model for subagents, from a routing rule or picked in the
     /// session; empty: `model`.
     pub subagent_model: String,
@@ -684,6 +695,7 @@ pub struct Ingested {
     pub done_commands: Vec<String>,
     /// Commands now with the agent (`InputDelivered`).
     pub delivered_commands: Vec<String>,
+    pub(crate) pending_notices_changed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1229,14 +1241,31 @@ impl Store {
     /// Normal worker controls must not bypass a move's delivery gate. This is
     /// advisory for messages already sent; the worker fences those locally.
     pub(crate) async fn session_routable(&self, session_id: &str, worker_id: WorkerId, ownership_epoch: i64) -> anyhow::Result<bool> {
-        Ok(sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM sessions s WHERE s.id = ? AND s.worker_id = ? AND s.ownership_epoch = ? \
-             AND NOT EXISTS(SELECT 1 FROM session_moves m WHERE m.session_id = s.id AND m.state NOT IN ('done', 'failed')))",
-        )
+        Ok(sqlx::query_scalar(concat!(
+            "SELECT EXISTS(SELECT 1 FROM sessions s WHERE s.id = ? AND s.worker_id = ? AND s.ownership_epoch = ? AND ",
+            without_active_session_move!(),
+            ")",
+        ))
         .bind(session_id)
         .bind(worker_id.to_string())
         .bind(ownership_epoch)
         .fetch_one(&self.pool)
+        .await?)
+    }
+
+    pub(crate) async fn recovery_attention(
+        &self,
+        candidates: &[(String, String, i64, i64)],
+    ) -> anyhow::Result<Vec<(String, String, String, i64, bool)>> {
+        Ok(sqlx::query_as(concat!(
+            "SELECT s.id, s.realm, s.title, json_extract(j.value, '$[3]'), EXISTS(SELECT 1 FROM session_notice_attention a WHERE a.id = s.id) \
+             FROM json_each(?) j JOIN sessions s ON s.id = json_extract(j.value, '$[0]') \
+             WHERE s.archived = 0 AND s.worker_id = json_extract(j.value, '$[1]') AND s.ownership_epoch = json_extract(j.value, '$[2]') \
+             AND ",
+            without_active_session_move!(),
+        ))
+        .bind(serde_json::to_string(candidates)?)
+        .fetch_all(&self.pool)
         .await?)
     }
 
@@ -1295,6 +1324,8 @@ impl Store {
         let mut status: String = row.get("status");
         let remote = !row.get::<String, _>("remote_template").is_empty();
         let mut stored = Vec::new();
+        let mut notice_holds_changed = false;
+        let mut rebuild_notices = false;
         let mut done = Vec::new();
         let mut delivered: Vec<String> = Vec::new();
         for ev in events {
@@ -1322,6 +1353,7 @@ impl Store {
                 .await?;
             crate::search::index_event(&mut tx, session_id, &ev).await?;
             crate::analytics::mark(&mut tx, session_id, &ev).await?;
+            notice_holds_changed |= apply_notice_hold(&mut tx, session_id, &ev).await?;
             last = ev.seq;
             match &ev.kind {
                 Some(Kind::Started(s)) => {
@@ -1387,7 +1419,10 @@ impl Store {
                         .execute(&mut *tx)
                         .await?;
                 }
-                Some(Kind::Rewound(r)) => done.push(r.command_id.clone()),
+                Some(Kind::Rewound(r)) => {
+                    rebuild_notices = true;
+                    done.push(r.command_id.clone());
+                }
                 Some(Kind::PlaceChanged(p)) => {
                     if project_place_changed(&mut tx, session_id, ev.seq, p).await? {
                         done.push(p.command_id.clone());
@@ -1484,6 +1519,11 @@ impl Store {
             stored.push(ev);
         }
         if !stored.is_empty() {
+            if rebuild_notices {
+                rebuild_notice_holds(&mut tx, session_id).await?;
+            } else if notice_holds_changed {
+                refresh_notice_waiting(&mut tx, session_id).await?;
+            }
             sqlx::query("UPDATE sessions SET last_seq = ?, status = ?, updated_at = ? WHERE id = ?")
                 .bind(last as i64)
                 .bind(&status)
@@ -1506,7 +1546,13 @@ impl Store {
             }
         }
         tx.commit().await?;
-        Ok(Some(Ingested { last_seq: last, events: stored, done_commands: done, delivered_commands: delivered }))
+        Ok(Some(Ingested {
+            last_seq: last,
+            events: stored,
+            done_commands: done,
+            delivered_commands: delivered,
+            pending_notices_changed: notice_holds_changed || rebuild_notices,
+        }))
     }
 
     /// Append the single head-authored placement event after the caller's
@@ -1631,6 +1677,28 @@ impl Store {
         Ok(c6_agent::effective_events(&self.events_after(session_id, 0, i64::MAX).await?))
     }
 
+    /// Latest effective snapshot per still-pending notice, even before the
+    /// viewer's history window. The projection and event commit together.
+    pub(crate) async fn pending_notices(&self, session_id: &str) -> anyhow::Result<Vec<c6_api::Event>> {
+        use prost::Message;
+        let rows = sqlx::query_as::<_, (Vec<u8>, i64)>(
+            "SELECT e.data, COALESCE(n.first_at, n.at) FROM notice_holds n JOIN events e ON e.session_id = n.session_id AND e.seq = n.event_seq \
+             WHERE n.session_id = ? AND n.consumed = 0 ORDER BY n.first_seq",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut notices = Vec::with_capacity(rows.len());
+        for (data, first_at) in rows {
+            if let Some(mut event) = crate::convert::event(&c6_proto::SessionEvent::decode(data.as_slice())?) {
+                // Preserve the grace period's origin while exposing the latest reason.
+                event.ts = first_at;
+                notices.push(event);
+            }
+        }
+        Ok(notices)
+    }
+
     pub async fn events_after(&self, session_id: &str, after: u64, limit: i64) -> anyhow::Result<Vec<c6_proto::SessionEvent>> {
         use prost::Message;
         let rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?")
@@ -1641,6 +1709,117 @@ impl Store {
             .await?;
         rows.iter().map(|r| Ok(c6_proto::SessionEvent::decode(r.get::<Vec<u8>, _>("data").as_slice())?)).collect()
     }
+}
+
+/// An updated queue snapshot replaces its previous reason. A User event
+/// consumes a notice by command id, even if another snapshot arrives later.
+async fn apply_notice_hold(tx: &mut sqlx::SqliteConnection, session: &str, ev: &c6_proto::SessionEvent) -> anyhow::Result<bool> {
+    use c6_proto::session_event::Kind;
+    match &ev.kind {
+        Some(Kind::NoticeQueued(n)) => Ok(sqlx::query(
+            "INSERT INTO notice_holds (session_id, command_id, at, needs_you, event_seq, first_at, first_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?3, ?5) \
+             ON CONFLICT (session_id, command_id) DO UPDATE SET at = excluded.at, needs_you = excluded.needs_you, \
+             event_seq = excluded.event_seq WHERE consumed = 0",
+        )
+        .bind(session)
+        .bind(&n.command_id)
+        .bind(ev.ts_ms)
+        .bind(c6_api::NoticeHoldReason::parse(&n.reason).needs_you())
+        .bind(ev.seq as i64)
+        .execute(tx)
+        .await?
+        .rows_affected()
+            != 0),
+        Some(Kind::User(u)) if !u.command_id.is_empty() => Ok(sqlx::query_scalar::<_, bool>(
+            "INSERT INTO notice_holds (session_id, command_id, at, needs_you, consumed) VALUES (?, ?, 0, 0, 1) \
+             ON CONFLICT (session_id, command_id) DO UPDATE SET consumed = 1 WHERE consumed = 0 \
+             RETURNING event_seq IS NOT NULL",
+        )
+        .bind(session)
+        .bind(&u.command_id)
+        .fetch_optional(tx)
+        .await?
+        .unwrap_or(false)),
+        _ => Ok(false),
+    }
+}
+
+async fn refresh_notice_waiting(tx: &mut sqlx::SqliteConnection, session: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE sessions SET notice_waiting_at = (SELECT MAX(at) FROM notice_holds WHERE session_id = ?1 AND consumed = 0 AND needs_you = 1), \
+         notices_proceeding = EXISTS(SELECT 1 FROM notice_holds WHERE session_id = ?1 AND consumed = 0 AND needs_you = 0) WHERE id = ?1",
+    )
+    .bind(session)
+    .execute(tx)
+    .await?;
+    Ok(())
+}
+
+/// A rewind can restore a previously consumed notice or withdraw a queue
+/// snapshot, so replay the effective history for that session only.
+async fn rebuild_notice_holds(tx: &mut sqlx::SqliteConnection, session: &str) -> anyhow::Result<()> {
+    use c6_proto::{SessionEvent, session_event::Kind};
+    use prost::Message;
+    let rows = sqlx::query_scalar::<_, Vec<u8>>("SELECT data FROM events WHERE session_id = ? ORDER BY seq")
+        .bind(session)
+        .fetch_all(&mut *tx)
+        .await?;
+    let events: Vec<_> = rows
+        .into_iter()
+        .filter_map(|data| match SessionEvent::decode(data.as_slice()) {
+            Ok(event) => Some(event),
+            Err(error) => {
+                tracing::warn!(session, %error, "skipping damaged event while rebuilding notice holds");
+                None
+            }
+        })
+        .collect();
+    let mut projection = std::collections::HashMap::new();
+    for event in c6_agent::effective_events(&events) {
+        match event.kind {
+            Some(Kind::NoticeQueued(n)) => {
+                let seq = event.seq as i64;
+                let state = projection.entry(n.command_id).or_insert((0, false, false, None, Some(event.ts_ms), Some(seq)));
+                if !state.2 {
+                    state.0 = event.ts_ms;
+                    state.1 = c6_api::NoticeHoldReason::parse(&n.reason).needs_you();
+                    state.3 = Some(seq);
+                }
+            }
+            Some(Kind::User(u)) if !u.command_id.is_empty() => {
+                projection.insert(u.command_id, (0, false, true, None, None, None));
+            }
+            _ => {}
+        }
+    }
+    sqlx::query("DELETE FROM notice_holds WHERE session_id = ?").bind(session).execute(&mut *tx).await?;
+    for (id, (at, needs_you, consumed, event_seq, first_at, first_seq)) in projection {
+        sqlx::query(
+            "INSERT INTO notice_holds (session_id, command_id, at, needs_you, consumed, event_seq, first_at, first_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(session)
+        .bind(id)
+        .bind(at)
+        .bind(needs_you)
+        .bind(consumed)
+        .bind(event_seq)
+        .bind(first_at)
+        .bind(first_seq)
+        .execute(&mut *tx)
+        .await?;
+    }
+    refresh_notice_waiting(tx, session).await
+}
+
+async fn backfill_notice_holds(pool: &SqlitePool) -> anyhow::Result<()> {
+    let ids: Vec<String> = sqlx::query_scalar("SELECT session_id FROM notice_holds_backfill ORDER BY session_id").fetch_all(pool).await?;
+    for id in ids {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        rebuild_notice_holds(&mut tx, &id).await?;
+        sqlx::query("DELETE FROM notice_holds_backfill WHERE session_id = ?").bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
+    }
+    Ok(())
 }
 
 async fn settle_foreground_local_waits(tx: &mut sqlx::SqliteConnection, parent: &str, call: Option<&str>) -> anyhow::Result<()> {
@@ -2397,6 +2576,8 @@ pub(crate) mod tests {
             home: String::new(),
             ssh_target: String::new(),
             awaiting: 0,
+            notice_waiting_at: None,
+            notices_proceeding: false,
             subagent_model: String::new(),
             subagent_connection_id: String::new(),
             subagent_effort: String::new(),
@@ -2426,6 +2607,38 @@ pub(crate) mod tests {
                 ..Default::default()
             })),
         }
+    }
+
+    #[tokio::test]
+    async fn pending_notices_keep_first_queue_order_across_updates_rewind_and_backfill() {
+        use c6_proto::{NoticeQueued, Rewound, SessionEvent, session_event::Kind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = WorkerId::new();
+        store.create_session(&session("s", worker), &[], false).await.unwrap();
+        let queued = |seq, command_id: &str, ts_ms| SessionEvent {
+            seq,
+            ts_ms,
+            kind: Some(Kind::NoticeQueued(NoticeQueued { command_id: command_id.into(), ..Default::default() })),
+        };
+        let pending = || async { store.pending_notices("s").await.unwrap().into_iter().map(|n| (n.seq, n.ts)).collect::<Vec<_>>() };
+
+        store.ingest(worker, "s", &[queued(1, "a", 100), queued(2, "b", 100), queued(3, "a", 101)]).await.unwrap().unwrap();
+        assert_eq!(pending().await, [(3, 100), (2, 100)]);
+        store.ingest(worker, "s", &[queued(4, "b", 102), queued(5, "a", 103)]).await.unwrap().unwrap();
+        assert_eq!(pending().await, [(5, 100), (4, 100)]);
+
+        // Keep A's first update but withdraw the later interleaved updates.
+        let rewind = SessionEvent { seq: 6, ts_ms: 104, kind: Some(Kind::Rewound(Rewound { to_seq: 4, ..Default::default() })) };
+        store.ingest(worker, "s", &[rewind]).await.unwrap().unwrap();
+        assert_eq!(pending().await, [(3, 100), (2, 100)]);
+
+        // Exercise the startup rebuild from a pre-0074 projection.
+        sqlx::query("UPDATE notice_holds SET event_seq = NULL, first_at = NULL, first_seq = NULL").execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO notice_holds_backfill VALUES ('s')").execute(&store.pool).await.unwrap();
+        backfill_notice_holds(&store.pool).await.unwrap();
+        assert_eq!(pending().await, [(3, 100), (2, 100)]);
     }
 
     #[tokio::test]

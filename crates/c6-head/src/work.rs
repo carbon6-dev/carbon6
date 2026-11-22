@@ -953,9 +953,14 @@ async fn live_of(st: &HeadState, realm: &str, a: &Attached, requests: &HashMap<(
                 l.at = s.updated_at;
                 l.state = if s.archived != 0 {
                     "archived".into()
-                } else if s.awaiting > 0 || asks(st, id).await? {
+                } else if s.awaiting > 0
+                    || s.notice_waiting_at.is_some()
+                    || crate::liveness::is_lost(st, id).await?
+                    || crate::sessions::recovery_status(st, id).await.is_some()
+                    || asks(st, id).await?
+                {
                     "needs_you".into()
-                } else if matches!(s.status.as_str(), "running" | "starting") {
+                } else if s.notices_proceeding || matches!(s.status.as_str(), "running" | "starting") {
                     "running".into()
                 } else if s.status == "failed" || s.end_reason == "error" {
                     "failed".into()

@@ -54,7 +54,7 @@ const SHOWS: [(&str, &str); 4] = [("", "All"), ("running", "Running"), ("needs",
 fn shows(s: &Session, show: &str) -> bool {
     match show {
         "" => true,
-        "needs" => s.awaiting_approval,
+        "needs" => s.needs_you(),
         word => recent_state(s).1 == word,
     }
 }
@@ -561,9 +561,9 @@ pub(crate) fn use_recent(limit: usize, skip: impl Fn(&str) -> bool + Send + Sync
 }
 
 /// A recently viewed session's state, as the Sessions list colours it:
-/// needs you (an approval waits), else running, idle, starting or failed.
+/// needs you (an approval or notice action waits), else running, idle, starting or failed.
 pub(crate) fn recent_state(s: &Session) -> (&'static str, &'static str) {
-    if s.awaiting_approval {
+    if s.needs_you() {
         ("bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300", "needs you")
     } else {
         crate::util::status_look(s.display_status())
@@ -1081,7 +1081,7 @@ fn RailRow(s: Session, hover: Hover) -> impl IntoView {
     };
     let colour = crate::marks::of(&s);
     let glyphs = s.clone();
-    let state = if s.awaiting_approval {
+    let state = if s.needs_you() {
         "h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-amber-500"
     } else {
         match s.display_status() {
@@ -1172,6 +1172,8 @@ fn RailCard(s: Session, hover: Hover, like_this: RwSignal<Option<SessionSeed>>, 
                 <button class=icons::BAR_BUTTON title="Close session details" aria-label="Close session details" on:click=move |_| hover.hide_now()>{icons::x()}</button>
             </div>
             {s.awaiting_approval.then(|| view! { <p class="text-xs font-medium text-amber-600">"A tool call waits for your approval"</p> })}
+            {s.notices_need_you.then(|| view! { <p class="text-xs font-medium text-amber-600">"Notice delivery needs you"</p> })}
+            {s.recovery_stuck.then(|| view! { <p class="text-xs font-medium text-amber-600">"Session recovery needs you"</p> })}
             <div class="space-y-0.5 text-xs text-muted">
                 <div class="truncate"><span title=s.on_head.then_some(api::HEAD_TITLE)>{worker.clone()}</span> " · " {move || current.get().model}</div>
                 <div class="break-all font-mono">{place()}</div>
@@ -2325,6 +2327,13 @@ mod tests {
         assert_eq!(recent_state(&s).0, crate::util::status_look(SessionStatus::Running).0, "the Sessions list's colours");
         s.status = SessionStatus::Idle;
         assert_eq!(recent_state(&s).1, "idle");
+        s.notices_proceeding = true;
+        assert_eq!(recent_state(&s).1, "running");
+        assert!(!shows(&s, "needs"));
+        s.notices_need_you = true;
+        assert_eq!(recent_state(&s).1, "needs you");
+        assert!(shows(&s, "needs"));
+        s.notices_need_you = false;
         s.awaiting_approval = true;
         assert_eq!(recent_state(&s), ("bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300", "needs you"));
     }

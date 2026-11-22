@@ -2,7 +2,7 @@
 //! ends; a server (notify: false) is listed but doesn't (docs/background.md
 //! §4).
 
-use c6_api::{Session, SessionStatus};
+use c6_api::{Event, EventKind, Session, SessionStatus};
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply, eventually};
 use c6_worker::{ConnState, enroll};
@@ -43,6 +43,15 @@ async fn background_tasks_keep_a_session_running() {
         .await
         .unwrap();
     let p = project.path();
+    // Keep completion reports held until explicitly released, so the status
+    // assertions do not race the automatic merge timer.
+    http.put(format!("{api}/settings/subagent-limits"))
+        .json(&json!({"notice_quiet_seconds": 3600, "notice_max_wait_seconds": 3600}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     let wait_for = |f: &str| format!("until [ -f {f} ]; do sleep 0.05; done; echo {f}");
     mock.push(Reply::ToolCalls(vec![
         ("bash".into(), json!({"command": wait_for("build-done"), "run_in_background": true}).to_string()),
@@ -72,10 +81,25 @@ async fn background_tasks_keep_a_session_running() {
     .await;
     assert_eq!(r.display_status(), SessionStatus::Running);
 
-    // The build ends (and wakes the agent); the server alone doesn't keep it running.
+    // The build ends; its automatic completion hold still counts as working,
+    // without asking the user for attention.
     std::fs::write(p.join("build-done"), "").unwrap();
-    let r = eventually("only the server left", async || {
-        row().await.filter(|r| r.status == SessionStatus::Idle && r.tasks_running == 0 && r.servers_running == 1)
+    let r = eventually("the completion notice held with only the server left", async || {
+        row().await.filter(|r| r.status == SessionStatus::Idle && r.tasks_running == 0 && r.servers_running == 1 && r.notices_proceeding)
+    })
+    .await;
+    assert_eq!(r.display_status(), SessionStatus::Running);
+    assert!(!r.needs_you());
+    http.post(format!("{api}/sessions/{id}/notices/deliver")).send().await.unwrap().error_for_status().unwrap();
+
+    // Once the completion turn finishes, the server alone does not keep the
+    // session running. Wait for its durable end, not a gap before it starts.
+    let r = eventually("the completion turn to finish with only the server left", async || {
+        let events: Vec<Event> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
+        if events.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { .. })).count() < 2 {
+            return None;
+        }
+        row().await.filter(|r| r.status == SessionStatus::Idle && r.tasks_running == 0 && r.servers_running == 1 && !r.notices_proceeding)
     })
     .await;
     assert_eq!(r.display_status(), SessionStatus::Idle);

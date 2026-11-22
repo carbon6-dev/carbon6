@@ -342,7 +342,7 @@ fn SessionPeek(id: String) -> impl IntoView {
     let s = Memo::new(move |_| live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned()));
     move || match s.get() {
         Some(s) => {
-            let (cls, word) = if s.awaiting_approval {
+            let (cls, word) = if s.needs_you() {
                 ("bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300", "needs you")
             } else {
                 status_look(s.display_status())

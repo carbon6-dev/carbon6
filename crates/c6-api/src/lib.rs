@@ -13,6 +13,71 @@ pub mod starts;
 pub mod watchers;
 pub mod work;
 use serde::{Deserialize, Serialize};
+
+/// How a queued notice makes progress. The head classifies durable reasons
+/// (including older journals) before sending this state to clients.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeHoldReason {
+    Collecting,
+    Group,
+    #[default]
+    NeedsYou,
+}
+
+impl NoticeHoldReason {
+    pub fn parse(reason: &str) -> Self {
+        if reason.starts_with("merging ") || reason.starts_with("collecting reports") {
+            Self::Collecting
+        } else if reason.starts_with("waiting for group ")
+            || (reason.starts_with("waiting for ") && reason.contains(" in group "))
+            || reason.starts_with("The agent is waiting for its group ")
+            || (reason.starts_with("group ") && reason.contains(" finished; waiting for "))
+        {
+            Self::Group
+        } else {
+            // Empty/unknown reasons, non-waking watchers, guards and recovery
+            // must not promise an automatic wake that may never happen.
+            Self::NeedsYou
+        }
+    }
+
+    pub fn needs_you(self) -> bool {
+        matches!(self, Self::NeedsYou)
+    }
+}
+
+#[cfg(test)]
+mod notice_hold_tests {
+    use super::NoticeHoldReason;
+
+    #[test]
+    fn every_hold_is_either_automatic_or_needs_you() {
+        for reason in [
+            "merging reports",
+            "merging 4 reports",
+            "collecting reports, delivering in a few seconds",
+            "waiting for group audit",
+            "waiting for 5 of 5 in group audit (4 finished)",
+            "The agent is waiting for its group audit: 4 of 5 finished; waiting for 1.",
+            "group audit: 4 of 5 finished; waiting for 1 (Audit evidence)",
+        ] {
+            assert!(!NoticeHoldReason::parse(reason).needs_you(), "{reason}");
+        }
+        for reason in [
+            "",
+            "paused: no progress",
+            "paused: relaunch guard",
+            "paused: spending limit",
+            "waiting for your next message",
+            "recovery stuck",
+            "a future unknown hold",
+        ] {
+            assert!(NoticeHoldReason::parse(reason).needs_you(), "{reason}");
+        }
+    }
+}
 pub use uuid::Uuid;
 
 /// Timestamps are Unix milliseconds.
@@ -459,6 +524,15 @@ pub struct Session {
     /// A tool call is waiting for your approval.
     #[serde(default)]
     pub awaiting_approval: bool,
+    /// At least one held notice needs a person rather than an automatic wake.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notices_need_you: bool,
+    /// At least one notice is collecting or waiting on its automatic group.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notices_proceeding: bool,
+    /// The current owner reports that automatic recovery stopped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recovery_stuck: bool,
     /// The realm it runs in (docs/os.md §3).
     #[serde(default = "home_realm")]
     pub realm: String,
@@ -568,12 +642,19 @@ pub struct GoalPatch {
 }
 
 impl Session {
+    /// The session has an approval, held notice, stuck recovery, or unresolved loss that needs you.
+    pub fn needs_you(&self) -> bool {
+        self.awaiting_approval || self.notices_need_you || self.recovery_stuck || self.liveness_loss.is_some()
+    }
+
     /// Overall activity for display, not the main turn's operational status.
-    /// Approval remains an independent flag; starting and failed sessions
+    /// `needs_you` remains independent; starting and failed sessions
     /// keep their status even when descendants are active.
     pub fn display_status(&self) -> SessionStatus {
         match self.status {
-            SessionStatus::Idle if self.side_chats_running > 0 || self.subagents_running > 0 || self.tasks_running > 0 => {
+            SessionStatus::Idle
+                if self.notices_proceeding || self.side_chats_running > 0 || self.subagents_running > 0 || self.tasks_running > 0 =>
+            {
                 SessionStatus::Running
             }
             status => status,
@@ -634,6 +715,30 @@ mod session_tests {
         s.subagents_running = 2;
         let wire = serde_json::to_value(&s).unwrap();
         assert_eq!(wire["side_chats_running"], 3);
+        assert_eq!(serde_json::from_value::<Session>(wire).unwrap(), s);
+    }
+
+    #[test]
+    fn session_notice_flags_are_optional_and_distinguish_work_from_attention() {
+        let mut s = session();
+        assert!(!s.needs_you());
+        assert!(!s.notices_proceeding);
+        let wire = serde_json::to_value(&s).unwrap();
+        assert!(wire.get("notices_need_you").is_none());
+        assert!(wire.get("notices_proceeding").is_none());
+        assert!(wire.get("recovery_stuck").is_none());
+        s.recovery_stuck = true;
+        assert!(s.needs_you());
+        s.recovery_stuck = false;
+        s.notices_proceeding = true;
+        assert_eq!(s.display_status(), SessionStatus::Running);
+        assert!(!s.needs_you());
+        s.notices_need_you = true;
+        assert!(s.needs_you());
+        assert!(!s.awaiting_approval);
+        let wire = serde_json::to_value(&s).unwrap();
+        assert_eq!(wire["notices_need_you"], true);
+        assert_eq!(wire["notices_proceeding"], true);
         assert_eq!(serde_json::from_value::<Session>(wire).unwrap(), s);
     }
 
@@ -2290,7 +2395,8 @@ mod notice_settings_tests {
         let json = serde_json::json!({"type":"notice_queued", "command_id":"notice", "text":"finished"});
         let mut notice: EventKind = serde_json::from_value(json).unwrap();
         assert!(serde_json::to_value(&notice).unwrap().get("reason").is_none());
-        let EventKind::NoticeQueued { reason, .. } = &mut notice else { panic!("expected notice") };
+        let EventKind::NoticeQueued { reason, hold, .. } = &mut notice else { panic!("expected notice") };
+        assert_eq!(*hold, NoticeHoldReason::NeedsYou);
         *reason = "paused".into();
         assert_eq!(serde_json::to_value(&notice).unwrap()["reason"], "paused");
     }
@@ -2803,9 +2909,12 @@ pub enum EventKind {
         from_title: String,
         #[serde(default)]
         deliver_at_ms: i64,
-        /// Why this notice is waiting, when known. The `paused:` prefix marks a guard pause.
+        /// Human-readable explanation of why this notice is waiting, when known.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         reason: String,
+        /// How this notice will proceed, independent of its display wording.
+        #[serde(default)]
+        hold: NoticeHoldReason,
     },
 }
 
@@ -3324,6 +3433,12 @@ pub enum StreamMsg {
     /// Current queued inputs, sent whenever they change.
     Queue {
         queued: Vec<QueuedInput>,
+    },
+    /// Authoritative pending queue after replay and whenever it changes.
+    /// Each notice has its latest event sequence and kind, but its first
+    /// effective queue timestamp so updated metadata does not reset grace.
+    Notices {
+        notices: Vec<Event>,
     },
     /// The history asked for has all been sent; what follows is live.
     Synced,
@@ -5721,8 +5836,8 @@ pub struct RealmWaiting {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Attention {
-    /// Open decisions (approvals of tool calls and agents' questions among
-    /// them), newest first; not task cards.
+    /// Open decisions (including approvals and agents' questions) and
+    /// guarded notice queues, newest first; not task cards.
     pub waiting: Vec<AttentionItem>,
     /// Turns that ended or failed since you last saw them, agents' answers
     /// to your comments you haven't seen (one per document), people waiting
@@ -5736,10 +5851,10 @@ pub struct Attention {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttentionItem {
-    /// Stable: `decision:<id>`, `session:<id>`, `doc:<doc>` (a document's
-    /// answers) or `brief`.
+    /// Stable: `decision:<id>`, `notice:<session>`, `session:<id>`,
+    /// `doc:<doc>` (a document's answers) or `brief`.
     pub key: String,
-    /// Waiting: `approval`, `question` or `decision`. Worth a look:
+    /// Waiting: `approval`, `question`, `decision` or `notice`. Worth a look:
     /// `turn_ended`, `failed`, `comment_answer` or `brief`. The session-scoped
     /// waiting list also includes `task` (never in Attention.waiting).
     pub kind: String,
