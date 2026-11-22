@@ -1,9 +1,10 @@
 //! bash: run a shell command in the session's working directory.
 
 use std::io::Read as _;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use c6_llm::ToolSpec;
@@ -11,7 +12,7 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::io::unix::AsyncFd;
 
 use crate::{Concurrency, Tool, ToolCtx, ToolOutput, parse_input};
 
@@ -19,9 +20,6 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 /// Hard cap on captured bytes; inline output is further limited.
 const MAX_CAPTURE: usize = 8 * 1024 * 1024;
-/// After the shell exits, how long to keep reading output that background
-/// children may still be writing to the shared pipe.
-const DRAIN_GRACE: Duration = Duration::from_millis(200);
 
 pub struct Bash;
 
@@ -105,6 +103,7 @@ async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result
 
     // One pipe for both streams keeps stdout and stderr interleaved in order.
     let (reader, writer) = std::io::pipe()?;
+    let mut reader = async_pipe(reader)?;
     let mut child = crate::process::session_command(shell)
         .arg("-c")
         .arg(&script)
@@ -126,15 +125,11 @@ async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result
     // whole command goes, not just its shell (docs/restarts.md).
     let mut group = KillGroup(pgid);
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    // A thread, because the pipe is blocking and background children may hold
-    // it open indefinitely; it exits once every writer is gone.
-    std::thread::spawn(move || read_pipe(reader, tx));
-
-    let started = Instant::now();
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
     let mut captured = Vec::new();
-    let on_chunk = |chunk: Vec<u8>, captured: &mut Vec<u8>| {
-        (ctx.output)(&ctx.session.secrets().redact(&String::from_utf8_lossy(&chunk)));
+    let on_chunk = |chunk: &[u8], captured: &mut Vec<u8>| {
+        (ctx.output)(&ctx.session.secrets().redact(&String::from_utf8_lossy(chunk)));
         let room = MAX_CAPTURE.saturating_sub(captured.len());
         captured.extend_from_slice(&chunk[..chunk.len().min(room)]);
     };
@@ -144,11 +139,16 @@ async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result
         TimedOut,
         Cancelled,
     }
+    let mut buf = [0u8; 16 * 1024];
+    let mut eof = false;
     let end = loop {
         tokio::select! {
             status = child.wait() => break End::Exited(status?),
-            Some(chunk) = rx.recv() => on_chunk(chunk, &mut captured),
-            _ = tokio::time::sleep(timeout.saturating_sub(started.elapsed())) => break End::TimedOut,
+            chunk = read_pipe(&mut reader, &mut buf), if !eof => match chunk? {
+                0 => eof = true,
+                n => on_chunk(&buf[..n], &mut captured),
+            },
+            _ = &mut deadline => break End::TimedOut,
             _ = ctx.cancel.cancelled() => break End::Cancelled,
         }
     };
@@ -160,17 +160,7 @@ async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result
     }
     // It ended by itself: what it started in the background is its own.
     group.0 = None;
-    let grace = tokio::time::sleep(DRAIN_GRACE);
-    tokio::pin!(grace);
-    loop {
-        tokio::select! {
-            chunk = rx.recv() => match chunk {
-                Some(c) => on_chunk(c, &mut captured),
-                None => break,
-            },
-            _ = &mut grace => break,
-        }
-    }
+    drain_pipe(&mut reader, |chunk| on_chunk(chunk, &mut captured))?;
 
     if let Ok(dir) = std::fs::read_to_string(&cwd_file) {
         let dir = PathBuf::from(dir.trim());
@@ -214,6 +204,7 @@ async fn run_remote(ctx: &ToolCtx, host: &crate::remote::SshHost, command: &str,
     let pidfile = SshHost::pidfile();
     let script = SshHost::script(command, &ctx.session.cwd(), &ctx.session.secrets().env(), true, &pidfile);
     let (reader, writer) = std::io::pipe()?;
+    let mut reader = async_pipe(reader)?;
     let mut child = host
         .command(SshHost::script_runner())
         .stdin(Stdio::piped())
@@ -225,13 +216,11 @@ async fn run_remote(ctx: &ToolCtx, host: &crate::remote::SshHost, command: &str,
         stdin.write_all(script.as_bytes()).await?;
     }
     let pgid = child.id().map(|id| Pid::from_raw(id as i32));
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    std::thread::spawn(move || read_pipe(reader, tx));
-
-    let started = Instant::now();
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
     let mut captured = Vec::new();
-    let on_chunk = |chunk: Vec<u8>, captured: &mut Vec<u8>| {
-        let text = String::from_utf8_lossy(&chunk);
+    let on_chunk = |chunk: &[u8], captured: &mut Vec<u8>| {
+        let text = String::from_utf8_lossy(chunk);
         // The directory report is ours, not the command's.
         let shown: String = text.lines().filter(|l| !l.starts_with(CWD_MARK)).collect::<Vec<_>>().join("\n");
         if !shown.trim().is_empty() {
@@ -245,11 +234,16 @@ async fn run_remote(ctx: &ToolCtx, host: &crate::remote::SshHost, command: &str,
         TimedOut,
         Cancelled,
     }
+    let mut buf = [0u8; 16 * 1024];
+    let mut eof = false;
     let end = loop {
         tokio::select! {
             status = child.wait() => break End::Exited(status?),
-            Some(chunk) = rx.recv() => on_chunk(chunk, &mut captured),
-            _ = tokio::time::sleep(timeout.saturating_sub(started.elapsed())) => break End::TimedOut,
+            chunk = read_pipe(&mut reader, &mut buf), if !eof => match chunk? {
+                0 => eof = true,
+                n => on_chunk(&buf[..n], &mut captured),
+            },
+            _ = &mut deadline => break End::TimedOut,
             _ = ctx.cancel.cancelled() => break End::Cancelled,
         }
     };
@@ -261,17 +255,7 @@ async fn run_remote(ctx: &ToolCtx, host: &crate::remote::SshHost, command: &str,
         }
         let _ = child.wait().await;
     }
-    let grace = tokio::time::sleep(DRAIN_GRACE);
-    tokio::pin!(grace);
-    loop {
-        tokio::select! {
-            chunk = rx.recv() => match chunk {
-                Some(c) => on_chunk(c, &mut captured),
-                None => break,
-            },
-            _ = &mut grace => break,
-        }
-    }
+    drain_pipe(&mut reader, |chunk| on_chunk(chunk, &mut captured))?;
 
     let raw = String::from_utf8_lossy(&captured).into_owned();
     let mut text = String::new();
@@ -312,18 +296,55 @@ async fn run_remote(ctx: &ToolCtx, host: &crate::remote::SshHost, command: &str,
     Ok(ToolOutput::shell(text, is_error, None))
 }
 
-fn read_pipe(mut reader: std::io::PipeReader, tx: mpsc::UnboundedSender<Vec<u8>>) {
-    let mut buf = [0u8; 16 * 1024];
+fn async_pipe(reader: std::io::PipeReader) -> std::io::Result<AsyncFd<std::io::PipeReader>> {
+    let fd = reader.as_raw_fd();
+    // SAFETY: reader owns this live descriptor. Only its read end becomes
+    // nonblocking; the child's stdout/stderr writers retain blocking writes.
+    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+    if flags < 0 || unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    AsyncFd::new(reader)
+}
+
+async fn read_pipe(reader: &mut AsyncFd<std::io::PipeReader>, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
-        match reader.read(&mut buf) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => {
-                if tx.send(buf[..n].to_vec()).is_err() {
-                    return;
-                }
+        let mut ready = reader.readable_mut().await?;
+        if let Ok(result) = ready.try_io(|reader| reader.get_mut().read(buf)) {
+            if result.as_ref().is_err_and(|error| error.kind() == std::io::ErrorKind::Interrupted) {
+                continue;
             }
+            return result;
         }
     }
+}
+
+/// Once the child is reaped, capture everything already in its pipe without
+/// relying on another reader task getting scheduled. A fixed snapshot also
+/// bounds the drain when descendants retain or keep writing the shared pipe.
+/// Later descendant output belongs in an explicit background task instead.
+fn drain_pipe(reader: &mut AsyncFd<std::io::PipeReader>, mut on_chunk: impl FnMut(&[u8])) -> std::io::Result<()> {
+    let mut queued: nix::libc::c_int = 0;
+    // SAFETY: reader owns a live pipe and FIONREAD writes one c_int to queued
+    // on both Darwin and Linux. It observes the byte count without reading.
+    if unsafe { nix::libc::ioctl(reader.get_ref().as_raw_fd(), nix::libc::FIONREAD, &mut queued) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut remaining = queued as usize;
+    let mut buf = [0u8; 16 * 1024];
+    while remaining > 0 {
+        let len = remaining.min(buf.len());
+        match reader.get_mut().read(&mut buf[..len]) {
+            Ok(0) => break,
+            Ok(n) => {
+                on_chunk(&buf[..n]);
+                remaining -= n;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn unique() -> u64 {
@@ -347,6 +368,7 @@ impl Drop for KillGroup {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     use super::*;
     use crate::SessionTools;
@@ -358,6 +380,44 @@ mod tests {
             output: Arc::new(move |s: &str| streamed.lock().unwrap().push_str(s)),
             call_id: String::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn completed_output_is_drained_before_the_reader_is_polled() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let status = crate::process::session_command("/bin/sh")
+            .args(["-c", "printf retry; printf diagnostic >&2"])
+            .stdout(Stdio::from(writer.try_clone().unwrap()))
+            .stderr(Stdio::from(writer.try_clone().unwrap()))
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        // Register only after exit, and don't yield to the reactor or poll a
+        // streaming read. The retained writer deliberately prevents EOF.
+        let mut reader = async_pipe(reader).unwrap();
+        let mut captured = Vec::new();
+        drain_pipe(&mut reader, |chunk| captured.extend_from_slice(chunk)).unwrap();
+        assert_eq!(captured, b"retrydiagnostic");
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn terminal_drain_is_bounded_while_a_descendant_keeps_writing() {
+        use std::io::Write as _;
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"retry").unwrap();
+        let mut reader = async_pipe(reader).unwrap();
+        let mut captured = Vec::new();
+        drain_pipe(&mut reader, |chunk| {
+            captured.extend_from_slice(chunk);
+            writer.write_all(b"later").unwrap();
+        })
+        .unwrap();
+        assert_eq!(captured, b"retry");
+        let mut later = [0u8; 5];
+        reader.get_mut().read_exact(&mut later).unwrap();
+        assert_eq!(&later, b"later");
     }
 
     #[tokio::test]
@@ -417,6 +477,16 @@ mod tests {
         let ctx = ctx(dir.path(), Default::default());
         let started = Instant::now();
         let r = Bash.call(&ctx, json!({"command": "sleep 30 & sleep 30", "timeout_ms": 300})).await;
+        assert!(r.is_error && r.content.contains("timed out"), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn continuous_output_does_not_reset_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path(), Default::default());
+        let started = Instant::now();
+        let r = Bash.call(&ctx, json!({"command": "while :; do printf output; done", "timeout_ms": 100})).await;
         assert!(r.is_error && r.content.contains("timed out"), "{r:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
