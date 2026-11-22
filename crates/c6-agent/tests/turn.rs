@@ -302,6 +302,72 @@ async fn mid_turn_input(input: PendingInput, expected: &str) {
     assert_eq!(rebuilt, conv.history);
 }
 
+#[derive(Default)]
+struct GatedTool {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl Tool for GatedTool {
+    fn spec(&self) -> c6_llm::ToolSpec {
+        c6_llm::ToolSpec {
+            name: "gated".into(),
+            description: "wait for inbox input".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    fn concurrency(&self) -> c6_tools::Concurrency {
+        c6_tools::Concurrency::Exclusive
+    }
+    async fn call(&self, _ctx: &c6_tools::ToolCtx, _input: serde_json::Value) -> c6_tools::ToolOutput {
+        self.entered.notify_one();
+        self.release.notified().await;
+        c6_tools::ToolOutput::ok("tool finished")
+    }
+}
+
+#[tokio::test]
+async fn inbox_input_arriving_during_a_tool_is_recorded_at_the_step_boundary() {
+    let mock = MockLlm::start().await;
+    mock.push(Reply::ToolCalls(vec![("gated".into(), "{}".into())]));
+    mock.push(Reply::Text("All done.".into()));
+    let dir = tempfile::tempdir().unwrap();
+    let client = OpenAiChat::new(&mock.base_url(), "test-key", HashMap::new()).unwrap();
+    let vec_sink = Arc::new(VecSink::default());
+    let sink: Arc<dyn EventSink> = vec_sink.clone();
+    let session = Arc::new(SessionTools::new(dir.path().to_owned()));
+    let mut conv = Conversation { history: vec![Message::user_text("run the tool")], context_tokens: 0 };
+    let inbox = Mutex::new(Vec::new());
+    let mut pending = || std::mem::take(&mut *inbox.lock().unwrap());
+    let tool = Arc::new(GatedTool::default());
+    let tools: Vec<Arc<dyn Tool>> = vec![tool.clone()];
+    let input = PendingInput { command_id: "mid-turn".into(), text: "and say done".into(), human_origin: true, ..Default::default() };
+    let send = async {
+        tool.entered.notified().await;
+        inbox.lock().unwrap().push(input.clone());
+        tool.release.notify_one();
+    };
+    let cfg = cfg();
+    let cancel = CancellationToken::new();
+    let turn = run_turn(1, &cfg, &client, &tools, &session, &sink, &mut conv, &mut pending, &cancel);
+    let (reason, ()) = c6_testkit::within("inbox input at the tool boundary", async { tokio::join!(turn, send) }).await;
+    assert_eq!(reason.unwrap(), TurnEndReason::Completed);
+
+    let events = vec_sink.events.lock().unwrap();
+    let kinds: Vec<&str> = events.iter().map(kind_name).collect();
+    assert_eq!(kinds, vec!["turn_started", "assistant", "usage", "tool_result", "user", "assistant", "usage", "turn_ended"]);
+    assert_eq!(events[4].kind.as_ref(), Some(&input.event()));
+
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 2);
+    let messages = reqs[1]["messages"].as_array().unwrap();
+    let roles: Vec<&str> = messages.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["system", "user", "assistant", "tool", "user"]);
+    assert_eq!(messages[3]["content"], "tool finished");
+    assert_eq!(messages[4]["content"], input.text.as_str());
+}
+
 /// A message sent while a tool runs, when the turn is then interrupted, is
 /// not taken into the turn that stops: it waits for the next one.
 #[tokio::test]

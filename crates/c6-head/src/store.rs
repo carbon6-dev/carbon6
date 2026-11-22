@@ -2471,6 +2471,44 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn user_placement_completes_an_input_written_to_the_agent() {
+        use c6_proto::{InputDelivered, SessionEvent, session_event::Kind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("head.db")).await.unwrap();
+        let worker = WorkerId::new();
+        store.create_session(&session("s", worker), &[], false).await.unwrap();
+        for id in ["mid-turn", "later"] {
+            store.enqueue_command(&command(id, "s", worker, Some(id))).await.unwrap();
+        }
+
+        let written = SessionEvent {
+            seq: 1,
+            ts_ms: c6_core::now_ms(),
+            kind: Some(Kind::InputDelivered(InputDelivered { command_id: "mid-turn".into() })),
+        };
+        let ing = store.ingest(worker, "s", &[written]).await.unwrap().unwrap();
+        assert_eq!(ing.delivered_commands, ["mid-turn"]);
+        assert!(ing.done_commands.is_empty());
+        assert!(crate::convert::event(&ing.events[0]).is_none());
+        let rows = store.queued_inputs("s").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].state, "pending");
+        assert!(crate::convert::queued(&rows[0]).with_agent);
+        assert!(!crate::convert::queued(&rows[1]).with_agent);
+
+        let ing = store.ingest(worker, "s", &[input_event(2, "mid-turn")]).await.unwrap().unwrap();
+        assert_eq!(ing.done_commands, ["mid-turn"]);
+        assert!(ing.delivered_commands.is_empty());
+        let event = crate::convert::event(&ing.events[0]).unwrap();
+        assert!(matches!(event.kind, c6_api::EventKind::User { command_id, .. } if command_id == "mid-turn"));
+        let rows = store.queued_inputs("s").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "later");
+        assert_eq!(rows[0].state, "pending");
+    }
+
+    #[tokio::test]
     async fn fork_inputs_keep_attachments_queue_rejection_and_take_back_ownership() {
         use c6_proto::{Attachment, UserInput};
 

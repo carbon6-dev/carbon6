@@ -347,6 +347,9 @@ pub(crate) struct Feed {
     spawns: Memo<usize>,
     pub(crate) streaming: RwSignal<Streaming>,
     queued: RwSignal<Vec<QueuedInput>>,
+    /// Catch-up arrives as a batch. Placements already received here also
+    /// win over queue snapshots and in-flight withdrawal responses.
+    replay: StoredValue<Vec<Event>>,
     composer: RwSignal<Option<ComposerDraft>>,
     activity: RwSignal<Option<bool>>,
     recovery: RwSignal<Option<SessionRecovery>>,
@@ -449,6 +452,22 @@ impl Logged {
     }
 }
 
+fn input_is_placed(command_id: &str, replay: &[Event], events: &[Event]) -> bool {
+    !command_id.is_empty()
+        && replay
+            .iter()
+            .rev()
+            .chain(events.iter().rev())
+            .any(|e| matches!(&e.kind, EventKind::User { command_id: id, .. } if id == command_id))
+}
+
+/// A confirmed User supersedes any waiting row with the same command ID.
+fn prune_placed_inputs(queued: &mut Vec<QueuedInput>, replay: &[Event], events: &[Event]) -> bool {
+    let before = queued.len();
+    queued.retain(|input| !input_is_placed(&input.command_id, replay, events));
+    queued.len() != before
+}
+
 /// Events in a window, and loaded at a time before it.
 const TAIL: u64 = 300;
 
@@ -470,6 +489,7 @@ impl Feed {
             spawns: child_spawns(events),
             streaming: RwSignal::new(Streaming::default()),
             queued: RwSignal::new(Vec::new()),
+            replay: StoredValue::new(Vec::new()),
             composer: RwSignal::new(None),
             activity: RwSignal::new(None),
             recovery: RwSignal::new(None),
@@ -482,18 +502,23 @@ impl Feed {
             navigation: RwSignal::new(0),
             id: StoredValue::new(id.clone()),
         };
-        let Feed { events, streaming, queued, activity, recovery, secrets, synced, stream_failed, from, to, .. } = feed;
-        // The replay arrives all at once (not an event at a time, each
-        // drawn and scrolled to).
-        let replay = StoredValue::new(Vec::<Event>::new());
+        let Feed { events, streaming, queued, replay, activity, recovery, secrets, synced, stream_failed, from, to, .. } = feed;
         let again = StoredValue::new(false);
         // How far the log has come: streamed text that arrives late is
         // already in its messages.
         let logged = StoredValue::new(Logged::default());
+        // Durable placement wins even if the queue broadcast is delayed or
+        // lost during catch-up. InputDelivered is not a transcript event.
+        let placed = move |event: &Event| {
+            if matches!(&event.kind, EventKind::User { command_id, .. } if !command_id.is_empty()) {
+                queued.maybe_update(|rows| prune_placed_inputs(rows, &[], std::slice::from_ref(event)));
+            }
+        };
         let receive = move |msg| match msg {
             // Replayed turns don't start and stop it again (the log says
             // whether one is running).
             StreamMsg::Event { event } if !synced.get_untracked() || again.get_value() => {
+                placed(&event);
                 logged.update_value(|l| l.note(&event));
                 let last = replay.with_value(|r| r.last().map(|e| e.seq)).or_else(|| events.with_untracked(|e| e.last().map(|e| e.seq)));
                 if last.is_none_or(|l| l < event.seq) {
@@ -501,6 +526,7 @@ impl Feed {
                 }
             }
             StreamMsg::Event { event } => {
+                placed(&event);
                 streaming.update(|s| logged.update_value(|l| l.event(s, &event)));
                 if let EventKind::TurnEnded { .. } = event.kind {
                     activity.set(Some(false));
@@ -528,7 +554,16 @@ impl Feed {
                 }
             }
             StreamMsg::Recovery { status } => recovery.set(status),
-            StreamMsg::Queue { queued: q } => queued.set(q),
+            StreamMsg::Queue { queued: mut q } => {
+                if !q.is_empty() {
+                    // Initial catch-up and concurrent publishers can leave a
+                    // snapshot behind a User we've already seen.
+                    events.with_untracked(|events| {
+                        replay.with_value(|replay| prune_placed_inputs(&mut q, replay, events));
+                    });
+                }
+                queued.set(q);
+            }
             StreamMsg::Synced => {
                 recovery.set(None);
                 let r = replay.try_update_value(std::mem::take).unwrap_or_default();
@@ -3093,9 +3128,10 @@ fn Transcript(
             draft_files.update_value(|m| {
                 m.remove(&q.command_id);
             });
-            let recorded = events.with_untracked(|evs| {
-                evs.iter().any(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == &q.command_id))
-            });
+            // A withdrawal response can race a reconnect's buffered replay:
+            // never restore a waiting row (or roll back its recovered draft)
+            // after the durable User has already arrived, even before Synced.
+            let recorded = events.with_untracked(|evs| feed.replay.with_value(|replay| input_is_placed(&q.command_id, replay, evs)));
             if recorded || result.as_ref().is_err_and(|(e, _)| e == "The agent has this message") {
                 withdrawal_notes.update(|notes| {
                     notes.insert(
@@ -7434,6 +7470,38 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn only_matching_durable_user_placements_remove_waiting_inputs() {
+        let input = |command_id: &str, with_agent| QueuedInput {
+            command_id: command_id.into(),
+            text: "same text".into(),
+            created_at: 0,
+            rejected: None,
+            with_agent,
+        };
+        let user = |seq, command_id: &str| Event {
+            seq,
+            ts: 0,
+            kind: serde_json::from_value(serde_json::json!({"type": "user", "command_id": command_id, "text": "same text"})).unwrap(),
+        };
+        let snapshot = vec![input("placed", true), input("later", false), input("", false)];
+        let mut waiting = snapshot.clone();
+        assert!(!prune_placed_inputs(&mut waiting, &[], &[user(1, "other"), user(2, "")]));
+        assert_eq!(waiting.len(), 3, "with_agent and same text are not placement");
+        assert!(waiting[0].with_agent);
+
+        assert!(prune_placed_inputs(&mut waiting, &[], &[user(3, "placed")]));
+        assert_eq!(waiting.iter().map(|q| q.command_id.as_str()).collect::<Vec<_>>(), ["later", ""]);
+
+        let mut delayed = snapshot;
+        assert!(prune_placed_inputs(&mut delayed, &[user(3, "placed")], &[user(1, "other")]));
+        assert_eq!(delayed, waiting, "confirmation during replay also supersedes a delayed snapshot");
+        assert!(
+            input_is_placed("placed", &[user(3, "placed")], &[]),
+            "a failed withdrawal must not restore a replay-confirmed row before Synced"
+        );
+    }
 
     #[test]
     fn only_positive_nonhuman_origins_bar_own_message_actions_and_unknown_stays_neutral() {

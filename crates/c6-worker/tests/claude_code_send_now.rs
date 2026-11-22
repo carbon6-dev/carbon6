@@ -10,12 +10,23 @@
 mod held_worker;
 
 use std::path::Path;
+use std::{io::Write, os::unix::fs::OpenOptionsExt};
 
 use c6_api::{Event, EventKind, SessionDetail, SessionStatus, TurnEndReason};
 use c6_head::HeadConfig;
 use c6_testkit::eventually;
 use c6_worker::enroll;
 use serde_json::{Value, json};
+
+async fn release_gate(dir: &Path, name: &str) {
+    // A blocking FIFO open cannot be cancelled by an async deadline. If the
+    // fixture never reaches this reader, fail boundedly instead of hanging.
+    eventually("the CLI to read its placement gate", async || {
+        let mut gate = std::fs::OpenOptions::new().write(true).custom_flags(nix::libc::O_NONBLOCK).open(dir.join(name)).ok()?;
+        gate.write_all(b"continue\n").ok()
+    })
+    .await;
+}
 
 /// A `claude` that stays up and records what it reads (`stdin.txt`). A
 /// message starts a turn that waits on a foreground command; a message
@@ -61,9 +72,26 @@ while read -r line; do
   esac
   if [ -n "$mode" ]; then
     waiting=$(uuid_of "$line")
+    case "$mode" in
+      placement-*)
+        read -r release < placement.gate
+        printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_fg%s","content":"Done."}]},"parent_tool_use_id":null}\n' "$n"
+        if [ "$mode" = placement-echo ]; then
+          echo_of "$waiting"
+        fi
+        say "Mid-turn reply."
+        read -r release < finish.gate
+        done_ok
+        mode="";;
+    esac
     continue
   fi
-  case "$line" in *delivering*) mode=delivering;; *) mode=stopped;; esac
+  case "$line" in
+    *placement-no-echo*) mode=placement-no-echo;;
+    *placement-echo*) mode=placement-echo;;
+    *delivering*) mode=delivering;;
+    *) mode=stopped;;
+  esac
   n=$((n+1))
   init
   echo_of "$(uuid_of "$line")"
@@ -204,6 +232,80 @@ async fn send_now_reaches_claude_code_as_a_send_now() {
         _ => None,
     });
     assert_eq!(last_user.as_deref(), Some("later"), "the message starts the next turn");
+
+    // Ordinary mid-turn delivery does not need Send now or the turn's result.
+    // Explicit FIFO gates let us observe written-but-not-taken, then the exact
+    // placement, while the same turn is still running. Without an echo even a
+    // subsequent assistant message must not pretend the CLI took the input.
+    for echo in [true, false] {
+        let project = tempfile::tempdir().unwrap();
+        for name in ["placement.gate", "finish.gate"] {
+            nix::unistd::mkfifo(&project.path().join(name), nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        }
+        let mode = if echo { "placement-echo" } else { "placement-no-echo" };
+        let s: Value = http
+            .post(format!("{api}/sessions"))
+            .json(&json!({"worker_id": worker.id, "cwd": project.path().display().to_string(),
+                "connection_id": cc["id"], "model": "opus", "prompt": mode}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = s["id"].as_str().unwrap();
+        let events =
+            async || -> Option<Vec<Event>> { http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok() };
+        let detail = async || -> Option<SessionDetail> { http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok() };
+        eventually("the placement turn to hold its tool", async || {
+            events().await?.iter().any(|e| matches!(&e.kind, EventKind::BackgroundTask { state, .. } if state == "started")).then_some(())
+        })
+        .await;
+        http.post(format!("{api}/sessions/{id}/messages"))
+            .json(&json!({"text": "mid-turn input"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let command = eventually("the mid-turn input to be written but not taken", async || {
+            detail().await?.queued.iter().find(|q| q.text == "mid-turn input" && q.with_agent).map(|q| q.command_id.clone())
+        })
+        .await;
+        assert!(!events().await.unwrap().iter().any(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == &command)));
+        release_gate(project.path(), "placement.gate").await;
+        let evs = eventually("the CLI's next reply while the turn stays open", async || {
+            let evs = events().await?;
+            evs.iter()
+                .any(|e| matches!(&e.kind, EventKind::Assistant { blocks, .. } if blocks.iter().any(|b| matches!(b, c6_api::ContentBlock::Text { text, .. } if text == "Mid-turn reply."))))
+                .then_some(evs)
+        })
+        .await;
+        assert!(!evs.iter().any(|e| matches!(e.kind, EventKind::TurnEnded { .. })), "placement is not deferred until result");
+        let users: Vec<_> =
+            evs.iter().filter(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == &command)).collect();
+        if echo {
+            assert_eq!(users.len(), 1, "the echo places the input exactly once");
+            let tool = evs.iter().find(|e| matches!(e.kind, EventKind::ToolResult { .. })).unwrap();
+            let reply = evs.iter().rev().find(|e| matches!(e.kind, EventKind::Assistant { .. })).unwrap();
+            assert!(tool.seq < users[0].seq && users[0].seq < reply.seq, "tool result < taken input < next reply");
+            eventually("the placed input to leave the queue", async || {
+                (!detail().await?.queued.iter().any(|q| q.command_id == command)).then_some(())
+            })
+            .await;
+        } else {
+            assert!(users.is_empty(), "no echo means no evidence that the CLI took the input");
+            assert!(detail().await.unwrap().queued.iter().any(|q| q.command_id == command && q.with_agent));
+        }
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM commands WHERE id = ?").bind(&command).fetch_one(head.state.store.pool()).await.unwrap();
+        assert_eq!(state, if echo { "done" } else { "pending" });
+        release_gate(project.path(), "finish.gate").await;
+        eventually("the placement turn to finish", async || {
+            events().await?.iter().any(|e| matches!(e.kind, EventKind::TurnEnded { .. })).then_some(())
+        })
+        .await;
+    }
     worker.stop();
     head.shutdown().await.unwrap();
 }

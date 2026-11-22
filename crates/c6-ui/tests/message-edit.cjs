@@ -962,6 +962,7 @@ async function checkSentDuringTurn(browser, origin, phone, outcome) {
     const original = page.locator(`#parent-e${actualSeq}`);
     f.phase = `waiting for durable User ${actualSeq}`;
     await original.waitFor();
+    assert.equal(await waiting.count(), 0, 'a durable User replaces its waiting bubble even when no fresh queue snapshot reaches the tab');
     assert.equal(await slot.getByRole('button', { name: /^Stop/ }).isVisible(), true,
       'the agent is still working when the durable User offers actions');
     // Durable User identity alone makes direct icons available, even before
@@ -975,8 +976,12 @@ async function checkSentDuringTurn(browser, origin, phone, outcome) {
     };
     if (provenance === 'unknown') await original.getByText('Message · origin unknown', { exact: true }).waitFor();
     assert.deepEqual(calls.rewind, []);
+    const other = { ...receipt, command_id: 'other-waiting', text: 'Still waiting', created_at: 2 };
+    f.stream({ type: 'queue', queued: [{ ...receipt, with_agent: true }, other] });
+    await queueRow(page, other.command_id).waitFor();
+    assert.equal(await waiting.count(), 0, 'a delayed snapshot cannot put the placed input back in the queue');
     f.stream({ type: 'queue', queued: [] });
-    await waiting.waitFor({ state: 'hidden' });
+    await queueRow(page, other.command_id).waitFor({ state: 'detached' });
     await action('Ask');
     const question = page.getByPlaceholder(/^Ask about this in a side chat/);
     await question.waitFor();

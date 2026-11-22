@@ -2870,7 +2870,13 @@ impl Process {
         std::mem::take(&mut self.unconfirmed).into_iter().filter(|w| !w.recorded).map(|w| w.input).collect()
     }
 
-    /// Records a confirmed input; the turn starts with it if it has not.
+    /// Records a confirmed input at the CLI's position in the stream, not at
+    /// the stdin write. With --replay-user-messages a mid-turn input's replay
+    /// (isReplay plus our uuid) follows the tool result it joins, before the
+    /// next assistant message (2.1.311; rechecked with 2.1.314). Writing only
+    /// means InputDelivered/with_agent; an assistant frame alone is not proof
+    /// that any particular queued input was taken. Result UUIDs are a fallback.
+    /// The turn starts with this input if it has not already started.
     async fn confirm(&mut self, uuid: &str, started: &mut bool, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
         let Some(i) = self.unconfirmed.iter().position(|w| w.uuid == uuid) else { return Ok(()) };
         let w = self.unconfirmed.remove(i).expect("found");
