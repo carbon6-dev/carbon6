@@ -546,7 +546,12 @@ async fn an_update_waits_for_background_work_and_says_on_what() {
         .unwrap();
 
     // A build awaited, and a server not to be waited for; then the turn ends.
-    let (build, server) = (format!("sleep 6001 # {}", bin.path().display()), format!("sleep 6002 # {}", bin.path().display()));
+    // Keep the fixture's name in argv[0] after bash execs sleep, so the
+    // cleanup below also finds the actual process, not just its shell.
+    let (build, server) = (
+        format!("exec -a 'sleep 6001 # {}' sleep 6001", bin.path().display()),
+        format!("exec -a 'sleep 6002 # {}' sleep 6002", bin.path().display()),
+    );
     mock.push(Reply::ToolCalls(vec![
         ("bash".into(), json!({"command": build, "run_in_background": true}).to_string()),
         ("bash".into(), json!({"command": server, "run_in_background": true, "notify": false}).to_string()),
@@ -564,7 +569,9 @@ async fn an_update_waits_for_background_work_and_says_on_what() {
     let sid = s["id"].as_str().unwrap().to_owned();
     eventually("the turn to end", async || {
         let d: Value = http.get(format!("{api}/sessions/{sid}")).send().await.ok()?.json().await.ok()?;
-        (d["session"]["status"] == "idle").then_some(())
+        // Started also makes the session idle, before its queued first
+        // prompt runs. Only the completed turn proves the build has started.
+        (d["session"]["status"] == "idle" && d["session"]["end_reason"] == "completed").then_some(())
     })
     .await;
 

@@ -660,6 +660,9 @@ mod tests {
     async fn routing_prefers_task_card_then_callable_source_then_ask() {
         let (_dir, head, mock, _) = routing_fixture().await;
         let st = &head.state;
+        // Opening the card refreshes the work item attached to its source session.
+        // Disable automatic work notes so only routing is under test.
+        st.store.set_setting(crate::work::SETTING, r#"{"notes":false}"#).await.unwrap();
         let mut d = proposal(st).await;
         st.store
             .set_setting(crate::assistant::SETTING, &json!({"model": {"connection": "api", "model": "ask-model"}}).to_string())
@@ -698,7 +701,8 @@ mod tests {
             .await
             .unwrap();
         assert!(model_for(st, &d).await.is_err(), "an unavailable Ask fallback must not be returned as a callable model");
-        assert!(mock.requests().is_empty(), "routing itself must not call the model");
+        let requests = mock.requests();
+        assert!(requests.is_empty(), "routing itself must not call the model: {requests:#?}");
         head.shutdown().await.unwrap();
     }
 
