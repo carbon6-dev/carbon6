@@ -155,7 +155,7 @@ pub fn scope(name: &str) -> Option<Scope> {
     const REALM_FIRST: &[&str] = &["workers.fs.", "workers.git.", "workers.terminals."];
     if DEVICE.contains(&name) {
         Some(Device)
-    } else if REALM_FIRST.iter().any(|a| name.starts_with(a)) {
+    } else if name == "system.liveness" || REALM_FIRST.iter().any(|a| name.starts_with(a)) {
         Some(Realm)
     } else if SHARED.contains(&name) {
         Some(Shared)
@@ -551,7 +551,7 @@ fn build() -> Vec<Op> {
         op!("settings.claude_code_tools.get", "settings", "GET" "/api/v1/settings/claude-code-tools", Read, Input::None, "carbon6's tools Claude Code sessions get over carbon6's MCP server, every tool that may be chosen, and whether they keep all of Claude Code's own tools."),
         op!("settings.claude_code_tools.put", "settings", "PUT" "/api/v1/settings/claude-code-tools", Write, Input::Body(schema::<api::ClaudeCodeTools>), "Sets which of carbon6's tools Claude Code sessions get (a routing rule's tool list narrows them further), and whether they keep all of Claude Code's own tools (native_all) or only its coding tools."),
         op!("settings.subagent_limits.get", "settings", "GET" "/api/v1/settings/subagent-limits", Read, Input::None, "Subagent depth and running limits, notice turns per hour, Claude Code idle minutes, and session-message limits: max_message_hops (default 4; each send adds one to the last received session message's count, your next direct message resets it to 0; longer chains are refused) and messages_per_hour (default 30)."),
-        op!("settings.subagent_limits.put", "settings", "PUT" "/api/v1/settings/subagent-limits", Write, Input::Body(schema::<api::SubagentLimits>), "Sets subagent depth and running limits, notice turns per hour, Claude Code idle minutes, and session-message limits: max_message_hops (default 4; each send adds one to the last received session message's count, your next direct message resets it to 0; longer chains are refused) and messages_per_hour (default 30)."),
+        op!("settings.subagent_limits.put", "settings", "PUT" "/api/v1/settings/subagent-limits", Write, Input::Body(schema::<api::SubagentLimits>), "Sets subagent depth and running limits, notice limits, Claude Code idle minutes, and liveness: liveness_sweep_seconds and liveness_worker_grace_seconds (1 to 3600, default 30 each); liveness_model_silence_seconds and liveness_tree_silence_seconds (1 to 86400, defaults 600 and 1800). Session-message limits: max_message_hops (default 4; each send adds one to the last received session message's count, your next direct message resets it to 0; longer chains are refused) and messages_per_hour (default 30)."),
         op!("settings.public_url.get", "notifications", "GET" "/api/v1/settings/public_url", Read, Input::None, "The address links in notifications point to."),
         op!("settings.public_url.put", "notifications", "PUT" "/api/v1/settings/public_url", Write, Input::Body(schema::<api::PublicUrl>), "Sets the address links in notifications point to."),
         op!("settings.assistant.get", "assistant", "GET" "/api/v1/settings/assistant", Read, Input::None, "Which model the assistant uses (none: routes for the label assistant, else the default)."),
@@ -760,7 +760,8 @@ fn build() -> Vec<Op> {
         op!("realms.elsewhere", "system", "GET" "/api/v1/elsewhere", Read, Input::None, "How many things wait on you in each realm (open decisions and approvals): counts only, for switching realm."),
         op!("sessions.locate", "sessions", "GET" "/api/v1/locate/sessions/{id}", Read, Input::None, "The realm a session is in, to open it there."),
         op!("system.version", "system", "GET" "/api/v1/version", Read, Input::None, "The version this head runs: a release (0.3.11) or an edge build of main (0.3.11+git<commit time>.<commit>)."),
-        op!("system.activity", "system", "GET" "/api/v1/system/activity", Read, Input::None, "What's going on now: model calls in flight and the last 200 (what each is for, connection, model, state, tokens, the latest line of its answer; system.activity.call has the whole), sessions running, each connector's sync (schedule, the round going on or the last, each account's state) and the memex's work. Kept in memory only."),
+        op!("system.activity", "system", "GET" "/api/v1/system/activity", Read, Input::None, "What's going on now: model calls in flight and the last 200 (what each is for, connection, model, state, tokens, the latest line of its answer; system.activity.call has the whole), sessions running, each connector's sync (schedule, the round going on or the last, each account's state), the memex's work and the system.liveness snapshot."),
+        op!("system.liveness", "system", "GET" "/api/v1/liveness", Read, Input::None, "Session liveness evidence, current losses and recent incidents visible to the caller. Reading this does not run a sweep."),
         op!("system.activity.counts", "system", "GET" "/api/v1/system/activity/counts", Read, Input::None, "How many model calls are in flight, connector syncs under way and sessions running."),
         op!("system.activity.call", "system", "GET" "/api/v1/system/activity/calls/{id}", Read, Input::None, "One model call from the activity panel, whole: its prompt, thinking and answer so far."),
         op!("system.updates", "system", "GET" "/api/v1/system/updates", Read, Input::None, "carbon6 releases found on GitHub and how far each machine (the head, each worker) is in updating to one: versions, states, how each was installed."),
@@ -1424,6 +1425,13 @@ pub fn openapi(urls: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn liveness_is_read_only_and_does_not_open_global_activity_to_realms() {
+        assert_eq!(find("system.liveness").unwrap().effect, Effect::Read);
+        assert_eq!(route_scope("GET", "/api/v1/liveness"), Scope::Realm);
+        assert_eq!(route_scope("GET", "/api/v1/system/activity"), Scope::Admin);
+    }
 
     #[test]
     fn card_discussion_effects_and_scopes() {

@@ -4,19 +4,22 @@
 //! to the parent call (docs/subagents.md). Its log syncs to the head like
 //! any session's.
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use c6_agent::{EventSink, PendingInput};
 use c6_api::SubagentConnection;
 use c6_llm::{Provider, ToolProfile, model_info};
-use c6_proto::{CreateSession, Delegation, ModelSpec, SessionStarted, SubagentSpawned, TurnEndReason, session_event};
+use c6_proto::{
+    CreateSession, Delegation, ModelSpec, SessionEvent, SessionStarted, SubagentSpawned, TurnEndReason, UserMessage, session_event,
+};
 use c6_tools::{AgentDef, ModelChoice, SendMessage, Skill, SkillTool, Subagents, Task, TaskGroup, Tool};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::journal::Journal;
-use crate::session::{SessionManager, Writer};
+use crate::session::{Outcome, SessionManager, Writer};
 
 /// How deep subagents nest (the session itself is depth 0) and how many
 /// delegations may run at once in one tree, unless the spec says.
@@ -542,19 +545,9 @@ impl Subagents for Runner {
             return Ok(v["text"].as_str().unwrap_or_default().to_owned());
         }
         let journal = p.manager.journal();
-        let status = if p.manager.is_running(&child_id) {
-            "running"
-        } else {
-            let events = journal.events_after(&child_id, 0, u32::MAX).await.map_err(|e| format!("{e:#}"))?;
-            match events.iter().rev().find_map(|e| match &e.kind {
-                Some(session_event::Kind::TurnEnded(t)) => Some(TurnEndReason::try_from(t.reason).unwrap_or_default()),
-                _ => None,
-            }) {
-                Some(r) => status_of(r, "x"),
-                None => "not started",
-            }
-        };
-        Ok(digest(journal, &child_id, status, "").await)
+        let events = journal.events_after(&child_id, 0, u32::MAX).await.map_err(|e| format!("{e:#}"))?;
+        let status = if p.manager.is_running(&child_id) { "running" } else { logged_state(&events) };
+        Ok(digest_events(journal, events, &child_id, status, "").await)
     }
 }
 
@@ -659,37 +652,224 @@ impl Runner {
         cancel: CancellationToken,
     ) -> Result<String, String> {
         let p = &self.parent;
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let call_id = input.delegated_by.clone();
+        // Normally the local child replies directly. Register the same call
+        // on the head report path too, so a loss can settle this tool even
+        // when the child's actor can no longer answer its mailbox.
+        let loss = p.manager.wait_remote(&p.session_id, &call_id);
+        let registration = LocalLossRegistration { manager: &p.manager, parent: &p.session_id, call: &call_id };
+        // The parent journal knows the exact call before the child can take
+        // the input. Replicate this marker on the usual persistence stream;
+        // it does not require the new child's Started to reach the head first.
+        p.log
+            .append(session_event::Kind::SubagentReported(c6_proto::SubagentReported {
+                command_id: format!("subagent:local-wait:{}", input.command_id),
+                child_session_id: child_id.to_owned(),
+                call_id: call_id.clone(),
+                status: "waiting".into(),
+            }))
+            .await
+            .map_err(|e| format!("could not record the local subagent wait: {e:#}"))?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
         child
             .send(crate::session::ActorMsg::Delegate(Box::new(input), Some(tx)))
             .map_err(|_| "the subagent stopped before it started".to_owned())?;
         // Stopping the parent's turn (or this background task) stops the
         // subagent's turn; its log keeps what it did. The delegation's
-        // outcome follows once that turn closes.
+        // outcome follows once the foreground and its counted work stop.
         let mut guard = InterruptOnDrop(Some(child.clone()));
         let mut stopped_here = false;
+        let outcome = wait_local_outcome(child_id, rx, loss);
+        tokio::pin!(outcome);
         let outcome = tokio::select! {
-            o = &mut rx => o,
+            biased;
+            o = &mut outcome => o,
             _ = cancel.cancelled() => {
                 stopped_here = true;
-                let _ = child.send(crate::session::ActorMsg::Interrupt);
-                (&mut rx).await
+                let _ = child.send(crate::session::ActorMsg::InterruptDelegation);
+                outcome.await
             }
         };
+        // A liveness observation is not a request to stop surviving work.
         guard.0 = None;
+        drop(registration);
         let journal = p.manager.journal();
         match outcome {
-            Ok(o) if o.reason == TurnEndReason::Completed && !o.report.trim().is_empty() => {
+            Err(loss) => remote_outcome(&p.spec, &loss, stopped_here),
+            Ok(Some(o)) if o.reason == TurnEndReason::Completed && !o.report.trim().is_empty() => {
                 Ok(format!("{}\n\n[subagent session {child_id}]", o.report))
             }
-            Ok(o) => {
+            Ok(Some(o)) => {
                 let status = status_of(o.reason, &o.report);
                 // Stopped from elsewhere than this call: by you.
                 let by = if o.reason == TurnEndReason::Interrupted && !stopped_here { "user" } else { "" };
                 Err(o.with_failure_cause(&p.spec, partial(&p.spec, &digest(journal, child_id, status, by).await)))
             }
-            Err(_) => Err(partial(&p.spec, &digest(journal, child_id, "failed", "").await)),
+            Ok(None) => Err(partial(&p.spec, &digest(journal, child_id, "lost", "").await)),
         }
+    }
+}
+
+struct LocalLossRegistration<'a> {
+    manager: &'a SessionManager,
+    parent: &'a str,
+    call: &'a str,
+}
+
+impl Drop for LocalLossRegistration<'_> {
+    fn drop(&mut self) {
+        self.manager.take_remote_wait(self.parent, self.call);
+    }
+}
+
+async fn wait_local_outcome(
+    child_id: &str,
+    outcome: tokio::sync::oneshot::Receiver<Outcome>,
+    loss: tokio::sync::oneshot::Receiver<c6_proto::DelegationEnded>,
+) -> Result<Option<Outcome>, c6_proto::DelegationEnded> {
+    let loss = async {
+        if let Ok(report) = loss.await
+            && report.child_session_id == child_id
+            && report.reason == TurnEndReason::WorkerRestarted as i32
+        {
+            return report;
+        }
+        // A stale/unrelated report or a removed registration cannot replace
+        // the result from this particular local child.
+        std::future::pending().await
+    };
+    tokio::select! {
+        biased;
+        direct = outcome => Ok(direct.ok()),
+        report = loss => Err(report),
+    }
+}
+
+pub(crate) fn counted_background(notify: bool, kind: &str) -> bool {
+    notify || kind == "claude_code"
+}
+
+fn open_counted_tasks(events: &[SessionEvent]) -> BTreeMap<&str, &c6_proto::BackgroundTask> {
+    let mut open = BTreeMap::new();
+    for e in events {
+        match &e.kind {
+            Some(session_event::Kind::Started(_)) => open.clear(),
+            Some(session_event::Kind::BackgroundTask(t)) if t.state == "started" && counted_background(t.notify, &t.kind) => {
+                open.insert(t.task_id.as_str(), t);
+            }
+            Some(session_event::Kind::BackgroundTask(t)) if t.state != "started" => {
+                open.remove(t.task_id.as_str());
+            }
+            _ => {}
+        }
+    }
+    open
+}
+
+fn logged_state(events: &[SessionEvent]) -> &'static str {
+    let latest = events.iter().rev().find_map(|e| match &e.kind {
+        Some(session_event::Kind::TurnEnded(t)) => Some(status_of(TurnEndReason::try_from(t.reason).unwrap_or_default(), "x")),
+        Some(session_event::Kind::TurnStarted(_)) => Some("running"),
+        Some(session_event::Kind::Started(_)) => Some("not started"),
+        _ => None,
+    });
+    match latest {
+        Some("running") => "running",
+        _ if !open_counted_tasks(events).is_empty() => "waiting",
+        state => state.unwrap_or("not started"),
+    }
+}
+
+/// A delegation reports at quiescence, not merely at the foreground turn
+/// boundary. Replay the same boundaries after a restart; don't let a task's
+/// final notice turn turn the original wait into a second detached report.
+pub(crate) fn local_report_windows(
+    events: &[SessionEvent],
+    tracking_start: usize,
+    received: impl Fn(u64) -> bool,
+) -> Vec<(u64, usize, Vec<&UserMessage>)> {
+    use session_event::Kind;
+    let mut tasks = HashSet::new();
+    let mut foreground = false;
+    let mut pending = Vec::new();
+    let mut inputs = Vec::new();
+    let mut turn_inputs = Vec::new();
+    let mut end = None;
+    for (i, e) in events.iter().enumerate() {
+        // A task's start and its foreground turn end come through different
+        // callbacks. Allow a start written just after TurnEnded to keep the
+        // report open, but close historical work before the next idle input.
+        if !foreground
+            && tasks.is_empty()
+            && matches!(&e.kind, Some(Kind::User(_) | Kind::TurnStarted(_)))
+            && let Some(seq) = end.take()
+        {
+            pending.push((seq, i - 1, std::mem::take(&mut inputs)));
+        }
+        match &e.kind {
+            Some(Kind::Started(_)) => {
+                tasks.clear();
+                foreground = false;
+            }
+            Some(Kind::BackgroundTask(t)) if t.state == "started" && counted_background(t.notify, &t.kind) => {
+                tasks.insert(t.task_id.as_str());
+            }
+            Some(Kind::BackgroundTask(t)) if t.state != "started" => {
+                tasks.remove(t.task_id.as_str());
+            }
+            Some(Kind::User(u)) if i >= tracking_start && u.blocked.is_empty() && u.command != "compact" => turn_inputs.push(u),
+            Some(Kind::TurnStarted(_)) => foreground = true,
+            Some(Kind::TurnEnded(_)) => {
+                foreground = false;
+                inputs.append(&mut turn_inputs);
+                if received(e.seq) {
+                    // Also recognize receipts from before background-aware
+                    // settlement: those inputs were already reported.
+                    inputs.clear();
+                    end = None;
+                } else if !inputs.is_empty() {
+                    end = Some(e.seq);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !foreground
+        && tasks.is_empty()
+        && let Some(seq) = end
+    {
+        pending.push((seq, events.len() - 1, inputs));
+    }
+    pending
+}
+
+/// When no follow-up turn ran, append what the durable task records say to
+/// the last foreground response (which may merely have announced a launch).
+pub(crate) fn local_background_outcome(events: &[SessionEvent], outcome: &mut Outcome) {
+    use session_event::Kind;
+    let mut tasks = Vec::new();
+    for e in events.iter().rev().take_while(|e| !matches!(e.kind, Some(Kind::TurnEnded(_)))) {
+        let Some(Kind::BackgroundTask(t)) = &e.kind else { continue };
+        if t.state == "started" || !counted_background(t.notify, &t.kind) {
+            continue;
+        }
+        if outcome.reason == TurnEndReason::Completed {
+            outcome.reason = match t.state.as_str() {
+                "lost" => TurnEndReason::WorkerRestarted,
+                "stopped" | "stopped_by_user" => TurnEndReason::Interrupted,
+                "failed" => TurnEndReason::Error,
+                _ if t.exit_code != 0 => TurnEndReason::Error,
+                _ => outcome.reason,
+            };
+        }
+        tasks.push(format!("{} ({}): {}", t.description, t.task_id, t.state));
+    }
+    if !tasks.is_empty() {
+        tasks.reverse();
+        if !outcome.report.is_empty() {
+            outcome.report.push_str("\n\n");
+        }
+        outcome.report.push_str(&format!("Background work ended:\n{}", tasks.join("\n")));
     }
 }
 
@@ -794,7 +974,11 @@ pub(crate) fn partial(spec: &CreateSession, digest: &str) -> String {
 /// report: how far it got, the files it changed (by its own calls, so other
 /// agents' edits do not show), its errors and its own subagents.
 pub(crate) async fn digest(journal: &Journal, child_id: &str, status: &str, by: &str) -> String {
-    let mut events = journal.events_after(child_id, 0, u32::MAX).await.unwrap_or_default();
+    let events = journal.events_after(child_id, 0, u32::MAX).await.unwrap_or_default();
+    digest_events(journal, events, child_id, status, by).await
+}
+
+async fn digest_events(journal: &Journal, mut events: Vec<SessionEvent>, child_id: &str, status: &str, by: &str) -> String {
     // The local outcome renders this cause through an editable prompt, not
     // by repeating the user-facing diagnostic in the digest.
     events
@@ -802,16 +986,7 @@ pub(crate) async fn digest(journal: &Journal, child_id: &str, status: &str, by: 
     let mut states = std::collections::HashMap::new();
     for id in spawned_children(&events) {
         let ev = journal.events_after(&id, 0, u32::MAX).await.unwrap_or_default();
-        let state = ev
-            .iter()
-            .rev()
-            .find_map(|e| match &e.kind {
-                Some(session_event::Kind::TurnEnded(t)) => Some(status_of(TurnEndReason::try_from(t.reason).unwrap_or_default(), "x")),
-                Some(session_event::Kind::TurnStarted(_)) => Some("running"),
-                _ => None,
-            })
-            .unwrap_or("not started");
-        states.insert(id, state.to_owned());
+        states.insert(id, logged_state(&ev).to_owned());
     }
     digest_text(&events, child_id, status, by, &states)
 }
@@ -900,6 +1075,20 @@ pub fn digest_text(
     if !errors.is_empty() {
         out.push_str(&format!("Errors: {} (last: {})\n", errors.len(), clip(errors.last().unwrap(), 200)));
     }
+    if matches!(status, "waiting" | "running") {
+        let tasks = open_counted_tasks(events);
+        if !tasks.is_empty() {
+            let work = tasks
+                .into_iter()
+                .map(|(id, task)| {
+                    let description = first_line(&task.description);
+                    if description.is_empty() { id.to_owned() } else { format!("{id} ({})", clip(&description, 200)) }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("Pending background work: {work}\n"));
+        }
+    }
     if !children.is_empty() {
         let list: Vec<String> = children
             .iter()
@@ -984,7 +1173,7 @@ struct InterruptOnDrop(Option<tokio::sync::mpsc::UnboundedSender<crate::session:
 impl Drop for InterruptOnDrop {
     fn drop(&mut self) {
         if let Some(c) = &self.0 {
-            let _ = c.send(crate::session::ActorMsg::Interrupt);
+            let _ = c.send(crate::session::ActorMsg::InterruptDelegation);
         }
     }
 }
@@ -1027,6 +1216,143 @@ impl c6_tools::Hooks for SubagentHooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn head_loss_settles_local_wait_while_the_child_cannot_reply() {
+        let (child, outcome) = tokio::sync::oneshot::channel();
+        let (head, loss) = tokio::sync::oneshot::channel();
+        head.send(c6_proto::DelegationEnded {
+            child_session_id: "child".into(),
+            reason: TurnEndReason::WorkerRestarted as i32,
+            digest: "Observed model timeout".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), wait_local_outcome("child", outcome, loss)).await;
+        assert!(matches!(result, Ok(Err(report)) if report.digest == "Observed model timeout"));
+        assert!(child.is_closed(), "the local reply path was released without waiting for the actor");
+    }
+
+    #[tokio::test]
+    async fn another_childs_loss_cannot_settle_a_local_wait() {
+        let (child, outcome) = tokio::sync::oneshot::channel();
+        let (head, loss) = tokio::sync::oneshot::channel();
+        head.send(c6_proto::DelegationEnded {
+            child_session_id: "previous-child".into(),
+            reason: TurnEndReason::WorkerRestarted as i32,
+            ..Default::default()
+        })
+        .unwrap();
+        let waiting = wait_local_outcome("child", outcome, loss);
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        drop(child);
+        assert!(matches!(waiting.await, Ok(None)), "wait for the local actor to reply or disappear");
+    }
+
+    #[test]
+    fn peek_describes_counted_background_work_as_waiting() {
+        use session_event::Kind;
+        let event = |kind| SessionEvent { kind: Some(kind), ..Default::default() };
+        let work = c6_proto::BackgroundTask {
+            task_id: "bg1".into(),
+            description: "Run the tests".into(),
+            state: "started".into(),
+            notify: true,
+            ..Default::default()
+        };
+        let mut events = vec![
+            event(Kind::TurnStarted(Default::default())),
+            event(Kind::BackgroundTask(work.clone())),
+            event(Kind::BackgroundTask(c6_proto::BackgroundTask {
+                task_id: "bg2".into(),
+                description: "Start a server".into(),
+                notify: false,
+                ..work.clone()
+            })),
+        ];
+        assert_eq!(logged_state(&events), "running");
+        events.push(event(Kind::TurnEnded(c6_proto::TurnEnded { turn: 1, reason: TurnEndReason::Completed as i32 })));
+        assert_eq!(logged_state(&events), "waiting");
+        let text = digest_text(&events, "child", logged_state(&events), "", &Default::default());
+        assert!(text.contains("status=\"waiting\""));
+        assert!(text.contains("Pending background work: bg1 (Run the tests)"));
+        assert!(!text.contains("Start a server"));
+        events.push(event(Kind::BackgroundTask(c6_proto::BackgroundTask { state: "finished".into(), ..work })));
+        assert_eq!(logged_state(&events), "completed");
+    }
+
+    #[test]
+    fn local_delegation_waits_for_counted_work_and_the_open_turn() {
+        use session_event::Kind;
+        let user = |id: &str| Kind::User(UserMessage { command_id: id.into(), ..Default::default() });
+        let task = |id: &str, state: &str, notify| {
+            Kind::BackgroundTask(c6_proto::BackgroundTask {
+                task_id: id.into(),
+                kind: "shell".into(),
+                state: state.into(),
+                notify,
+                ..Default::default()
+            })
+        };
+        let end = |turn| Kind::TurnEnded(c6_proto::TurnEnded { turn, reason: TurnEndReason::Completed as i32 });
+        let events: Vec<_> = [
+            user("original"),
+            Kind::TurnStarted(Default::default()),
+            task("server", "started", false),
+            end(1),
+            task("work", "started", true), // Task callback can land after TurnEnded.
+            user("continue"),
+            Kind::TurnStarted(Default::default()),
+            task("work", "finished", true),
+            end(2),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| SessionEvent { seq: i as u64 + 1, kind: Some(kind), ..Default::default() })
+        .collect();
+        assert!(local_report_windows(&events[..5], 0, |_| false).is_empty(), "counted work still running");
+        assert!(local_report_windows(&events[..8], 0, |_| false).is_empty(), "new foreground turn still running");
+        let reports = local_report_windows(&events, 0, |_| false);
+        assert_eq!(reports.len(), 1, "the uncounted server does not block reporting");
+        assert_eq!(reports[0].0, 9);
+        assert_eq!(reports[0].2.iter().map(|u| u.command_id.as_str()).collect::<Vec<_>>(), ["original", "continue"]);
+        assert!(local_report_windows(&events, 0, |seq| seq == 9).is_empty(), "a durable receipt ends the dependency");
+    }
+
+    #[test]
+    fn terminal_background_event_can_settle_idle_delegation() {
+        use session_event::Kind;
+        let events: Vec<_> = [
+            Kind::User(UserMessage { command_id: "original".into(), ..Default::default() }),
+            Kind::TurnStarted(Default::default()),
+            Kind::BackgroundTask(c6_proto::BackgroundTask {
+                task_id: "bg1".into(),
+                notify: true,
+                state: "started".into(),
+                ..Default::default()
+            }),
+            Kind::TurnEnded(c6_proto::TurnEnded { turn: 1, reason: TurnEndReason::Completed as i32 }),
+            Kind::BackgroundTask(c6_proto::BackgroundTask {
+                task_id: "bg1".into(),
+                description: "work".into(),
+                notify: true,
+                state: "lost".into(),
+                ..Default::default()
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| SessionEvent { seq: i as u64 + 1, kind: Some(kind), ..Default::default() })
+        .collect();
+        assert!(local_report_windows(&events[..4], 0, |_| false).is_empty());
+        let reports = local_report_windows(&events, 0, |_| false);
+        assert_eq!((reports[0].0, reports[0].1), (4, 4));
+        let mut outcome = Outcome { reason: TurnEndReason::Completed, report: "Started work".into(), error: String::new() };
+        local_background_outcome(&events, &mut outcome);
+        assert_eq!(outcome.reason, TurnEndReason::WorkerRestarted);
+        assert!(outcome.report.contains("work (bg1): lost"));
+    }
 
     #[test]
     fn continuation_links_keep_one_child_in_the_tree_and_digest() {

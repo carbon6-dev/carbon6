@@ -1417,7 +1417,7 @@ mod tests {
             .await
             .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let _guard = st.registry.attach(worker, now_ms(), tx, vec!["same_worker_placement_v1".into()], "worker");
+        let _guard = st.registry.attach(worker, now_ms(), tx, vec!["same_worker_placement_v1".into()], "worker").await;
 
         let op = catalog::find(CHANGE_PLACE).unwrap();
         let args =

@@ -828,8 +828,13 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         Memo::new(move |_| live.session(&id).or_else(|| detail.get().and_then(Result::ok).map(|d| d.session)))
     };
     let status = Memo::new(move |_| own_session.get().map_or(SessionStatus::Starting, |s| s.status));
+    let liveness_loss = Memo::new(move |_| own_session.with(|s| s.as_ref().and_then(|s| s.liveness_loss.clone())));
     let archived = Signal::derive(move || own_session.get().is_some_and(|s| s.archived));
-    let running = move || recovery.with(Option::is_none) && (status.get() == SessionStatus::Running || activity.get() == Some(true));
+    let running = move || {
+        liveness_loss.with(Option::is_none)
+            && recovery.with(Option::is_none)
+            && (status.get() == SessionStatus::Running || activity.get() == Some(true))
+    };
 
     // Follow the bottom of the transcript unless the user scrolled up, or
     // came for a particular place (from search).
@@ -1290,6 +1295,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     </button>
                 </div>
             })}
+            {move || liveness_loss.get().map(|cause| view! { <ErrorBox message=format!("Work lost: {cause}") /> })}
             <Suspense fallback=|| ()>
                 {move || detail.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -1299,7 +1305,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                         let online = move || live.workers.with(|ws| !worker_offline(&on, ws));
                         view! {
                             {s.error.clone().map(|e| view! { <ErrorBox message=format!("The session failed to start: {e}") /> })}
-                            {move || (!online() && (status.get() == SessionStatus::Running || !queued.with(Vec::is_empty))).then(|| view! {
+                            {move || (!online() && liveness_loss.with(Option::is_none) && (status.get() == SessionStatus::Running || !queued.with(Vec::is_empty))).then(|| view! {
                                 <p class="mb-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
                                     "The worker is offline. A running turn continues there and syncs back; queued messages are delivered when it reconnects."
                                 </p>
@@ -1883,7 +1889,9 @@ impl SessionChrome {
             .sessions
             .with(|ss| ss.iter().find(|s| s.id == self.id.get_value()).cloned())
             .or_else(|| self.detail.get().and_then(Result::ok).map(|d| d.session));
-        if !self.waiting.with(Vec::is_empty) || session.as_ref().is_some_and(|s| s.awaiting_approval) {
+        if session.as_ref().is_some_and(|s| s.liveness_loss.is_some()) {
+            AgentState::Failed
+        } else if !self.waiting.with(Vec::is_empty) || session.as_ref().is_some_and(|s| s.awaiting_approval) {
             AgentState::Waiting
         } else if !self.running.get()
             && (session.as_ref().is_some_and(|s| s.status == SessionStatus::Failed)
@@ -3734,11 +3742,13 @@ fn PhoneStatus(chrome: SessionChrome, streaming: RwSignal<Streaming>, latest: Si
         if chrome.running.get() {
             return None;
         }
-        let end = live
+        let session = live
             .sessions
-            .with(|ss| ss.iter().find(|s| s.id == chrome.id.get_value()).and_then(|s| s.end_reason))
-            .or_else(|| chrome.detail.get().and_then(Result::ok).and_then(|d| d.session.end_reason));
-        chrome.events.with(|evs| last_turn_failure(if latest.get() { evs } else { &[] }, end))
+            .with(|ss| ss.iter().find(|s| s.id == chrome.id.get_value()).cloned())
+            .or_else(|| chrome.detail.get().and_then(Result::ok).map(|d| d.session));
+        session.as_ref().and_then(|s| s.liveness_loss.clone()).or_else(|| {
+            chrome.events.with(|evs| last_turn_failure(if latest.get() { evs } else { &[] }, session.and_then(|s| s.end_reason)))
+        })
     });
     let state = Memo::new(move |_| PhoneStatusState {
         working: chrome.running.get(),
@@ -5754,14 +5764,17 @@ fn subagent_thread(id: String, subagents: Subagents, waiting: Signal<bool>) -> A
     }
     let row = {
         let id = id.clone();
-        Memo::new(move |_| subagents.rows.with(|m| m.get(&id).cloned()))
+        let live = api::live();
+        Memo::new(move |_| live.session(&id).or_else(|| subagents.rows.with(|m| m.get(&id).cloned())))
     };
     let toggle = move |_: web_sys::MouseEvent| {
         open.update(|o| *o = !*o);
         storage_set(&key.get_value(), if open.get_untracked() { "1" } else { "0" });
     };
     // While it runs or is open, its log is followed live.
-    let busy = Signal::derive(move || waiting.get() || row.with(|r| r.as_ref().is_some_and(|r| r.status == SessionStatus::Running)));
+    let busy = Signal::derive(move || {
+        waiting.get() || row.with(|r| r.as_ref().is_some_and(|r| r.status == SessionStatus::Running || r.tasks_running > 0))
+    });
     let live = move || open.get() || busy.get();
     let sid = StoredValue::new(id.clone());
     let connections = crate::resources::connections();
@@ -5771,12 +5784,16 @@ fn subagent_thread(id: String, subagents: Subagents, waiting: Signal<bool>) -> A
                 view! { <SubagentLive id=sid.get_value() row open toggle=Callback::new(toggle) /> }.into_any()
             } else {
                 let (pill, tone) = row.with(|r| subagent_state(false, r.as_ref().and_then(|r| r.end_reason)));
+                let badge = subagent_liveness_loss(row).map_or_else(
+                    || view! { <span class=format!("shrink-0 {tone}")>{pill}</span> }.into_any(),
+                    subagent_lost_badge,
+                );
                 view! {
                     <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-200" on:click=toggle>
                         <span class="inline-block w-3 shrink-0 text-[9px]">{crate::icons::chevron_right()}</span>
                         <span class="shrink-0 font-medium text-violet-700 dark:text-violet-400">"Subagent"</span>
                         {move || row.with(|r| r.as_ref().and_then(subagent_name)).map(|a| view! { <span class="shrink-0 whitespace-nowrap font-mono" title="Started from this template, where it says">{a}</span> })}
-                        <span class=format!("shrink-0 {tone}")>{pill}</span>
+                        {badge}
                         // Where and on what it runs gives way first (cut
                         // short, whole on hover): squeezed, the name went a
                         // letter a line.
@@ -5792,12 +5809,41 @@ fn subagent_thread(id: String, subagents: Subagents, waiting: Signal<bool>) -> A
     .into_any()
 }
 
+fn subagent_liveness_loss(row: Memo<Option<Session>>) -> Option<String> {
+    row.with(|r| r.as_ref().and_then(|r| r.liveness_loss.clone()))
+}
+
+fn subagent_lost_badge(cause: String) -> AnyView {
+    view! { <span class="min-w-0 truncate text-red-600 dark:text-red-400" title=cause.clone()>{format!("Lost: {cause}")}</span> }.into_any()
+}
+
+/// The foreground turn can finish while its task still owes a report.
+/// Only the last lifecycle record for a task can say it is still running.
+fn subagent_background_wait(running: bool, tasks_running: u32, events: &[Event]) -> Option<String> {
+    if running {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    for event in events.iter().rev() {
+        if let EventKind::BackgroundTask { task_id, kind, description, state, notify, foreground, .. } = &event.kind
+            && seen.insert(task_id)
+            && state == "started"
+            && !foreground
+            && (*notify || kind == "claude_code")
+            && !description.trim().is_empty()
+        {
+            return Some(format!("Waiting on {description}"));
+        }
+    }
+    (tasks_running > 0).then(|| "Waiting on background work".to_owned())
+}
+
 /// A subagent's thread while it is followed: header with its numbers, its
 /// last steps (running, not opened) or its whole conversation (opened).
 #[component]
 fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, toggle: Callback<web_sys::MouseEvent>) -> impl IntoView {
     let feed = Feed::open(id.clone(), Window::Tail);
-    let running = Signal::derive(move || feed.running());
+    let running = Signal::derive(move || subagent_liveness_loss(row).is_none() && feed.running());
     let error = RwSignal::new(None::<String>);
     let wake = RwSignal::new(false);
     let sid = StoredValue::new(id.clone());
@@ -5848,8 +5894,18 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
             <span class="shrink-0 font-medium text-violet-700 dark:text-violet-400">"Subagent"</span>
             {move || row.with(|r| r.as_ref().and_then(subagent_name)).map(|a| view! { <span class="shrink-0 whitespace-nowrap font-mono" title="Started from this template, where it says">{a}</span> })}
             {move || {
-                let (pill, tone) = subagent_state(running.get(), end.get());
-                view! { <span class=format!("shrink-0 {tone}")>{pill}</span> }
+                if let Some(cause) = subagent_liveness_loss(row) {
+                    return subagent_lost_badge(cause);
+                }
+                let active = running.get();
+                let tasks_running = row.with(|r| r.as_ref().map_or(0, |s| s.tasks_running));
+                let background = feed.events.with(|events| subagent_background_wait(active, tasks_running, events));
+                if let Some(label) = background {
+                    let title = label.clone();
+                    return view! { <span class="min-w-0 truncate text-amber-700 dark:text-amber-400" title=title>{label}</span> }.into_any();
+                }
+                let (pill, tone) = subagent_state(active, end.get());
+                view! { <span class=format!("shrink-0 {tone}")>{pill}</span> }.into_any()
             }}
             <span class="shrink-0 whitespace-nowrap">{move || {
                 let n = calls.get();
@@ -8431,6 +8487,29 @@ mod tests {
         let html = subagent_name(&s).unwrap().to_html();
         assert!(html.contains("<svg"), "template lost its icon: {html}");
         assert!(html.contains("review"), "{html}");
+    }
+
+    #[test]
+    fn subagent_waits_for_the_latest_unfinished_background_task() {
+        let task = |seq, task_id, description, state, notify| {
+            logged(
+                seq,
+                serde_json::json!({
+                    "type": "background_task", "task_id": task_id, "kind": "shell",
+                    "description": description, "state": state, "notify": notify
+                }),
+            )
+        };
+        let events = [
+            task(1, "tests", "tests", "started", true),
+            task(2, "build", "build", "started", true),
+            task(3, "watch", "watcher", "started", false),
+            task(4, "build", "build", "finished", true),
+        ];
+        assert_eq!(subagent_background_wait(false, 1, &events).as_deref(), Some("Waiting on tests"));
+        assert_eq!(subagent_background_wait(false, 1, &[]).as_deref(), Some("Waiting on background work"));
+        assert_eq!(subagent_background_wait(false, 0, &events[1..]), None);
+        assert_eq!(subagent_background_wait(true, 1, &events), None);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

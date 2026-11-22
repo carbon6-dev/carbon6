@@ -192,7 +192,7 @@ impl WorkerHub for HubSvc {
         tx.send(Ok(head(head_msg::Msg::Welcome(welcome)))).await.ok();
 
         tokio::spawn(async move {
-            let guard = st.registry.attach(worker_id, now_ms(), tx.clone(), hello.capabilities.clone(), &role);
+            let guard = st.registry.attach(worker_id, now_ms(), tx.clone(), hello.capabilities.clone(), &role).await;
             if role == "memex" {
                 st.memex_feed.wake();
             }
@@ -240,6 +240,9 @@ async fn serve_worker(
         };
         match m {
             worker_msg::Msg::Ping(p) => {
+                if let Some(report) = p.liveness {
+                    crate::liveness::report(st, worker_id, guard.conn_id, report).await;
+                }
                 let rtt = (p.last_rtt_us > 0).then_some(p.last_rtt_us);
                 st.registry.heartbeat(worker_id, guard.conn_id, now_ms(), rtt);
                 // Never block on control replies: losing a pong is harmless.
@@ -639,7 +642,7 @@ mod tests {
             // An unrelated/replacement capable worker is not evidence that
             // the receiving connection implements Claude Code subagents.
             let replacement = if capable { vec!["claude_code".into()] } else { vec!["claude_code_subagents_v1".into()] };
-            let guard = st.registry.attach(worker, now_ms(), tx.clone(), replacement, "worker");
+            let guard = st.registry.attach(worker, now_ms(), tx.clone(), replacement, "worker").await;
             let mut saved = Vec::new();
             for restore in [false, true] {
                 let id = format!("choices-{capable}-{restore}");
@@ -844,7 +847,7 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(8);
             // A replacing connection must not cause a prompt to be sent to
             // the old connection whose own Hello did not advertise it.
-            let guard = st.registry.attach(worker, now_ms(), tx.clone(), vec!["user_input_prompt_v1".into()], "worker");
+            let guard = st.registry.attach(worker, now_ms(), tx.clone(), vec!["user_input_prompt_v1".into()], "worker").await;
             let mut delivered = 0;
             assert!(deliver_pending(st, worker, &mut delivered, &tx, &capabilities).await.unwrap());
             for legacy in [true, false] {

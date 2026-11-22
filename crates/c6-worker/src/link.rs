@@ -471,6 +471,7 @@ pub struct LinkedClient {
     link: Arc<HeadLink>,
     session_id: String,
     connection_id: String,
+    activity: Option<Arc<crate::session::Writer>>,
     /// The client for the last grant's provider configuration.
     current: Mutex<Option<(CredentialGrant, Arc<dyn c6_llm::ModelClient>)>>,
 }
@@ -478,7 +479,12 @@ pub struct LinkedClient {
 impl LinkedClient {
     /// For `session_id`'s model calls (its root's, for a subagent).
     pub fn new(link: Arc<HeadLink>, session_id: &str, connection_id: &str) -> Self {
-        Self { link, session_id: session_id.to_owned(), connection_id: connection_id.to_owned(), current: Mutex::default() }
+        Self { link, session_id: session_id.to_owned(), connection_id: connection_id.to_owned(), activity: None, current: Mutex::default() }
+    }
+
+    pub(crate) fn track_activity(mut self, writer: &Arc<crate::session::Writer>) -> Self {
+        self.activity = Some(writer.clone());
+        self
     }
 
     fn client(&self, g: &CredentialGrant) -> Result<Arc<dyn c6_llm::ModelClient>, c6_llm::LlmError> {
@@ -532,6 +538,9 @@ impl LinkedClient {
 #[async_trait::async_trait]
 impl c6_llm::ModelClient for LinkedClient {
     async fn stream(&self, req: &c6_llm::ModelRequest) -> Result<c6_llm::EventStream, c6_llm::LlmError> {
+        if let Some(writer) = &self.activity {
+            writer.set_activity(c6_proto::SessionActivityKind::Model);
+        }
         let unreachable = |e: anyhow::Error| c6_llm::LlmError::Network(format!("credentials from the head: {e:#}"));
         let g = self.link.model_credential(&self.session_id, &self.connection_id).await.map_err(unreachable)?;
         match self.stream_with_grant(req, &g).await {

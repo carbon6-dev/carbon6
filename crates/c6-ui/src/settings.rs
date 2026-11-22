@@ -4202,7 +4202,7 @@ fn SubagentLimitsSetting() -> impl IntoView {
             status.set(Some(
                 api::put_setting("subagent-limits", v)
                     .await
-                    .map(|_| "Saved. New sessions use these settings; Continue applies the notice limits to a paused session."),
+                    .map(|_| "Saved. Liveness checks use the new limits; Continue applies notice limits to a paused session."),
             ));
         });
     };
@@ -4285,6 +4285,32 @@ fn SubagentLimitsSetting() -> impl IntoView {
                     <span class="text-xs text-muted">"Messages per session per hour (1–1000)"</span>
                     <input type="number" min="1" max="1000" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.messages_per_hour.to_string()) on:input=move |ev| setting.update(|s| s.messages_per_hour = number(&ev)) />
+                </label>
+            </div>
+            <div>
+                <h3 class="font-medium">"Session liveness"</h3>
+                <p class="text-sm text-muted">"The head checks whether sessions still have live work. A live tool is not model silence."</p>
+            </div>
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Time between liveness checks (seconds)"</span>
+                    <input type="number" min="1" max="3600" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.liveness_sweep_seconds.to_string()) on:input=move |ev| setting.update(|s| s.liveness_sweep_seconds = number(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Worker reconnection grace period (seconds)"</span>
+                    <input type="number" min="1" max="3600" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.liveness_worker_grace_seconds.to_string()) on:input=move |ev| setting.update(|s| s.liveness_worker_grace_seconds = number(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Model silence limit (seconds)"</span>
+                    <input type="number" min="1" max="86400" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.liveness_model_silence_seconds.to_string()) on:input=move |ev| setting.update(|s| s.liveness_model_silence_seconds = number(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Tree silence before reporting pending work (seconds)"</span>
+                    <input type="number" min="1" max="86400" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.liveness_tree_silence_seconds.to_string()) on:input=move |ev| setting.update(|s| s.liveness_tree_silence_seconds = number(&ev)) />
                 </label>
             </div>
             <div class="flex items-center justify-end gap-3">

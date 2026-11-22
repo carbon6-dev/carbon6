@@ -1,6 +1,9 @@
 //! M5 chaos: head restarts mid-turn, worker restarts mid-turn, and a worker
 //! that lost its journal.
 
+#[path = "liveness.rs"]
+mod liveness;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,7 +68,11 @@ impl Env {
     }
 
     async fn enroll(&self, state: &Path) {
-        let e = c6_head::api::new_enrollment(&self.head.as_ref().unwrap().state, None).await.unwrap();
+        self.enroll_named(state, None).await;
+    }
+
+    async fn enroll_named(&self, state: &Path, name: Option<&str>) {
+        let e = c6_head::api::new_enrollment(&self.head.as_ref().unwrap().state, name).await.unwrap();
         enroll::enroll(&e.token).await.unwrap().save(state).unwrap();
     }
 

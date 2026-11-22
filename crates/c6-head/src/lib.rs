@@ -42,6 +42,7 @@ pub mod kitjobs;
 pub mod knowledge;
 mod listener;
 pub mod lists;
+pub mod liveness;
 pub mod marks;
 pub mod memex;
 pub mod memory;
@@ -212,6 +213,7 @@ pub struct HeadState {
     pub(crate) watchers: watchers::Runtime,
     /// Per-card action/revision guards; discussion model calls stay unlocked.
     pub(crate) card_chat: card_chat::Runtime,
+    pub(crate) liveness: liveness::Runtime,
     /// HeadConfig's `watchers`: the shipped ones start as they ship.
     pub(crate) watchers_as_shipped: bool,
     /// The config file it was started from (for backups).
@@ -383,6 +385,7 @@ async fn start_bound(
         backups: Default::default(),
         watchers: Default::default(),
         card_chat: Default::default(),
+        liveness: Default::default(),
         watchers_as_shipped: cfg.watchers.unwrap_or(false),
         config_file: cfg.config_file.clone(),
         me: Default::default(),
@@ -446,6 +449,7 @@ async fn start_bound(
     assistant::start(state.clone(), api::router(state.clone())).await?;
     // Watchers take up where they were (docs/watchers.md).
     watchers::spawn(state.clone());
+    liveness::spawn(state.clone());
     {
         let st = state.clone();
         tokio::spawn(async move {

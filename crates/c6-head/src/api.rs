@@ -246,6 +246,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/system/activity", get(get_activity))
         .route("/api/v1/system/activity/counts", get(get_activity_counts))
         .route("/api/v1/system/activity/calls/{id}", get(get_activity_call))
+        .route("/api/v1/liveness", get(get_liveness))
         .route("/api/v1/version", get(get_version))
         .route("/api/v1/elsewhere", get(get_elsewhere))
         .route("/api/v1/locate/sessions/{id}", get(locate_session))
@@ -1040,7 +1041,7 @@ pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Resul
     let work = crate::work::session_tags(st, caller.realm.as_deref()).await?;
     let followups = crate::followups::counts(st).await?;
     let goals = crate::goals::all(st).await?;
-    Ok(st
+    let mut sessions: Vec<_> = st
         .store
         .sessions(caller.realm.as_deref(), SESSION_LIST_LIMIT)
         .await?
@@ -1057,7 +1058,32 @@ pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Resul
                 ..crate::convert::session_with_activity(r, working.get(&r.id), st.assistant.head_id())
             }
         })
-        .collect())
+        .collect();
+    project_liveness_losses(st, &mut sessions).await?;
+    Ok(sessions)
+}
+
+/// Project only losses belonging to the already-authorized rows. Incidents
+/// do not appear in the worker-authored session journal.
+async fn project_liveness_losses(st: &HeadState, sessions: &mut [api::Session]) -> anyhow::Result<()> {
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    let ids = serde_json::to_string(&sessions.iter().map(|s| &s.id).collect::<Vec<_>>())?;
+    let losses: std::collections::HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+        "SELECT session_id, cause FROM liveness_incidents \
+         WHERE kind = 'lost' AND resolved_at IS NULL AND session_id IN (SELECT value FROM json_each(?)) \
+         ORDER BY observed_at, id",
+    )
+    .bind(ids)
+    .fetch_all(&st.store.pool)
+    .await?
+    .into_iter()
+    .collect();
+    for session in sessions {
+        session.liveness_loss = losses.get(&session.id).cloned();
+    }
+    Ok(())
 }
 
 /// The web UI broke (a panic, or an error that leaves it unable to answer):
@@ -1492,8 +1518,10 @@ async fn get_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -
         None => None,
     };
     let queued = st.store.queued_inputs(&id).await?.iter().map(crate::convert::queued).collect();
+    let mut session = crate::convert::session_with_activity(&row, working.get(&row.id), st.assistant.head_id());
+    project_liveness_losses(&st, std::slice::from_mut(&mut session)).await?;
     Ok(Json(api::SessionDetail {
-        session: crate::convert::session_with_activity(&row, working.get(&row.id), st.assistant.head_id()),
+        session,
         worker_name: worker.map(|w| w.name).unwrap_or_else(|| "(removed)".into()),
         worker_online: worker_id.is_some_and(|w| st.registry.get(w).is_some()),
         queued,
@@ -1674,7 +1702,9 @@ async fn session_children(
 ) -> ApiResult<Json<Vec<api::Session>>> {
     let tree = matches!(q.tree.as_str(), "1" | "true");
     let rows = if tree { st.store.descendant_sessions(&id).await? } else { st.store.child_sessions(&id).await? };
-    Ok(Json(rows.iter().map(|r| crate::convert::session(r, st.assistant.head_id())).collect()))
+    let mut sessions: Vec<_> = rows.iter().map(|r| crate::convert::session(r, st.assistant.head_id())).collect();
+    project_liveness_losses(&st, &mut sessions).await?;
+    Ok(Json(sessions))
 }
 
 /// MCP servers and skills are stored as validated JSON arrays and included in
@@ -1938,6 +1968,16 @@ async fn put_subagent_limits(State(st): State<Arc<HeadState>>, Json(l): Json<api
     }
     if !(1..=3600).contains(&l.session_recovery_seconds) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "automatic journal recovery lasts 1 to 3600 seconds".into()));
+    }
+    for (seconds, label, max) in [
+        (l.liveness_sweep_seconds, "the liveness sweep interval", 3600),
+        (l.liveness_worker_grace_seconds, "the worker reconnection grace period", 3600),
+        (l.liveness_model_silence_seconds, "the model silence limit", 86400),
+        (l.liveness_tree_silence_seconds, "the session tree silence limit", 86400),
+    ] {
+        if !(1..=max).contains(&seconds) {
+            return Err(ApiErr(StatusCode::BAD_REQUEST, format!("{label} is 1 to {max} seconds")));
+        }
     }
     if !(1..=32).contains(&l.max_message_hops) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "a chain of session messages is 1 to 32 long".into()));
@@ -2829,6 +2869,29 @@ async fn get_version() -> Json<serde_json::Value> {
 /// Updating carbon6 from GitHub releases (docs/updates.md).
 async fn get_activity(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(crate::activity::get(&st).await?))
+}
+
+async fn get_liveness(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<serde_json::Value>> {
+    let mut snapshot = crate::liveness::snapshot(&st).await?;
+    if let Some(realm) = caller.realm {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM sessions WHERE realm = ?")
+            .bind(realm)
+            .fetch_all(&st.store.pool)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let ids: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        // Only return the explicitly filtered collections to scoped callers.
+        // This also avoids leaking information if the snapshot adds new keys.
+        let mut visible = |key: &str| {
+            let Some(serde_json::Value::Array(mut rows)) = snapshot.get_mut(key).map(std::mem::take) else {
+                return Vec::new();
+            };
+            rows.retain(|r| r["session_id"].as_str().is_some_and(|id| ids.contains(id)));
+            rows
+        };
+        snapshot = serde_json::json!({"incidents": visible("incidents"), "sessions": visible("sessions")});
+    }
+    Ok(Json(snapshot))
 }
 
 async fn get_activity_counts(State(st): State<Arc<HeadState>>) -> ApiResult<Json<serde_json::Value>> {
@@ -5329,7 +5392,7 @@ mod tests {
         .await
         .unwrap();
         let (tx, mut requests) = tokio::sync::mpsc::channel(1);
-        let conn = st.registry.attach(worker, now_ms(), tx, vec![], "worker");
+        let conn = st.registry.attach(worker, now_ms(), tx, vec![], "worker").await;
         let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
         let url = format!("http://{}/api/v1", head.ui_addrs[0]);
         let link = st.store.create_login_link().await.unwrap();

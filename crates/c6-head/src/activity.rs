@@ -108,7 +108,8 @@ pub async fn get(st: &HeadState) -> anyhow::Result<Value> {
                "worker": r.get::<String, _>("worker_name"), "updated_at": r.get::<i64, _>("updated_at")})
     })
     .collect();
-    Ok(json!({"calls": calls, "sessions": sessions, "connectors": connectors(st).await?, "memex": memex(st).await}))
+    Ok(json!({"calls": calls, "sessions": sessions, "connectors": connectors(st).await?, "memex": memex(st).await,
+              "liveness": crate::liveness::snapshot(st).await?}))
 }
 
 /// Each app's scheduled syncs: their schedule, the round going on (or the

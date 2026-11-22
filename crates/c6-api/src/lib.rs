@@ -429,6 +429,10 @@ pub struct Session {
     #[serde(default)]
     pub archived: bool,
     pub error: Option<String>,
+    /// Cause of the current head-observed work loss, if any. This is not a
+    /// worker event or a startup error; it clears when work resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness_loss: Option<String>,
     pub effort: Option<String>,
     /// Subagent sessions: the parent session and the Task call that ran it.
     #[serde(default)]
@@ -2134,6 +2138,18 @@ pub struct SubagentLimits {
     /// Stop retrying automatically after this many seconds of journal recovery.
     #[serde(default = "default_session_recovery_seconds")]
     pub session_recovery_seconds: u32,
+    /// Interval between liveness checks, in seconds.
+    #[serde(default = "default_liveness_sweep_seconds")]
+    pub liveness_sweep_seconds: u32,
+    /// Give a disconnected worker this many seconds to reconnect.
+    #[serde(default = "default_liveness_worker_grace_seconds")]
+    pub liveness_worker_grace_seconds: u32,
+    /// Bound model silence when no live tool is doing work, in seconds.
+    #[serde(default = "default_liveness_model_silence_seconds")]
+    pub liveness_model_silence_seconds: u32,
+    /// Report pending descendants after this many seconds of tree-wide silence.
+    #[serde(default = "default_liveness_tree_silence_seconds")]
+    pub liveness_tree_silence_seconds: u32,
     /// Longest chain of messages between sessions (default 4). A send adds
     /// one to the last session message delivered; direct UI or HTTP API
     /// input resets the session's count to 0. Sends beyond this limit are refused.
@@ -2153,6 +2169,10 @@ pub const DEFAULT_NOTICE_FAILURE_RELAUNCH_LIMIT: u32 = 3;
 pub const DEFAULT_NOTICE_TOKENS_PER_HOUR: u64 = 5_000_000;
 pub const DEFAULT_CLAUDE_CODE_IDLE_MINUTES: u32 = 15;
 pub const DEFAULT_SESSION_RECOVERY_SECONDS: u32 = 180;
+pub const DEFAULT_LIVENESS_SWEEP_SECONDS: u32 = 30;
+pub const DEFAULT_LIVENESS_WORKER_GRACE_SECONDS: u32 = 30;
+pub const DEFAULT_LIVENESS_MODEL_SILENCE_SECONDS: u32 = 600;
+pub const DEFAULT_LIVENESS_TREE_SILENCE_SECONDS: u32 = 1800;
 pub const DEFAULT_MAX_MESSAGE_HOPS: u32 = 4;
 pub const DEFAULT_MESSAGES_PER_HOUR: u32 = 30;
 
@@ -2192,6 +2212,22 @@ fn default_session_recovery_seconds() -> u32 {
     DEFAULT_SESSION_RECOVERY_SECONDS
 }
 
+fn default_liveness_sweep_seconds() -> u32 {
+    DEFAULT_LIVENESS_SWEEP_SECONDS
+}
+
+fn default_liveness_worker_grace_seconds() -> u32 {
+    DEFAULT_LIVENESS_WORKER_GRACE_SECONDS
+}
+
+fn default_liveness_model_silence_seconds() -> u32 {
+    DEFAULT_LIVENESS_MODEL_SILENCE_SECONDS
+}
+
+fn default_liveness_tree_silence_seconds() -> u32 {
+    DEFAULT_LIVENESS_TREE_SILENCE_SECONDS
+}
+
 fn default_subagent_depth() -> u32 {
     DEFAULT_SUBAGENT_DEPTH
 }
@@ -2212,6 +2248,10 @@ impl Default for SubagentLimits {
             notice_tokens_per_hour: DEFAULT_NOTICE_TOKENS_PER_HOUR,
             claude_code_idle_minutes: DEFAULT_CLAUDE_CODE_IDLE_MINUTES,
             session_recovery_seconds: DEFAULT_SESSION_RECOVERY_SECONDS,
+            liveness_sweep_seconds: DEFAULT_LIVENESS_SWEEP_SECONDS,
+            liveness_worker_grace_seconds: DEFAULT_LIVENESS_WORKER_GRACE_SECONDS,
+            liveness_model_silence_seconds: DEFAULT_LIVENESS_MODEL_SILENCE_SECONDS,
+            liveness_tree_silence_seconds: DEFAULT_LIVENESS_TREE_SILENCE_SECONDS,
             max_message_hops: DEFAULT_MAX_MESSAGE_HOPS,
             messages_per_hour: DEFAULT_MESSAGES_PER_HOUR,
         }
@@ -2237,6 +2277,10 @@ mod notice_settings_tests {
         assert_eq!(json["notice_no_progress_limit"], 5);
         assert_eq!(json["notice_failure_relaunch_limit"], 3);
         assert_eq!(json["notice_tokens_per_hour"], 5_000_000);
+        assert_eq!(json["liveness_sweep_seconds"], 30);
+        assert_eq!(json["liveness_worker_grace_seconds"], 30);
+        assert_eq!(json["liveness_model_silence_seconds"], 600);
+        assert_eq!(json["liveness_tree_silence_seconds"], 1800);
         json["notice_tokens_per_hour"] = 10_000_000_000u64.into();
         assert_eq!(serde_json::from_value::<SubagentLimits>(json).unwrap().notice_tokens_per_hour, 10_000_000_000);
     }

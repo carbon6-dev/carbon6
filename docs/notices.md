@@ -37,6 +37,14 @@ more than **3 times** pauses further unattended wakes. Otherwise **5 consecutive
 wakes without progress** pause them. Any direct message or Deliver now continues
 the session and resets the chain. Group failures bypass batching, not guards.
 
+The deterministic liveness monitor (docs/liveness.md) also supplies lost-child
+reports. A **second consecutive loss** for the same description pauses further
+unattended wakes and tells the user through this same guard, rather than
+starting another automatic relaunch. Multiple deliveries or waiters for one
+incident count once. Successful completion or direct user input resets the
+loss streak. A liveness loss also notifies the user independently, so a worker
+disconnect or an existing spending hold cannot conceal it.
+
 ## Spending
 
 Only turns started entirely by notices contribute to a rolling hour's spending.

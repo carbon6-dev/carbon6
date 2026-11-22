@@ -186,9 +186,9 @@ type Inbox = tokio::sync::mpsc::Receiver<Result<c6_proto::HeadMsg, tonic::Status
 
 /// A live connection for a worker in the head's registry: the guard that
 /// takes its answers, and what the head sends it.
-fn attach<'a>(st: &'a HeadState, id: WorkerId, since: i64, caps: &[&str]) -> (c6_head::registry::ConnGuard<'a>, Inbox) {
+async fn attach<'a>(st: &'a HeadState, id: WorkerId, since: i64, caps: &[&str]) -> (c6_head::registry::ConnGuard<'a>, Inbox) {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
-    (st.registry.attach(id, since, tx, caps.iter().map(|c| c.to_string()).collect(), "worker"), rx)
+    (st.registry.attach(id, since, tx, caps.iter().map(|c| c.to_string()).collect(), "worker").await, rx)
 }
 
 async fn worker_of(st: &HeadState, session: &Value) -> String {
@@ -202,8 +202,8 @@ async fn templates_from_a_session_run_on_its_worker() {
     use reqwest::Method as M;
     api.ok(M::POST, "realms", json!({"id": "mach5-agents"})).await;
     let (a, b) = (worker(st, "a", &[]).await, worker(st, "b", &[]).await);
-    let (ga, _ra) = attach(st, a, 1, &[]);
-    let (gb, _rb) = attach(st, b, 2, &[]);
+    let (ga, _ra) = attach(st, a, 1, &[]).await;
+    let (gb, _rb) = attach(st, b, 2, &[]).await;
     let m = connection(&api, "m", &[]).await;
     api.ok(
         M::PUT,
@@ -294,8 +294,8 @@ async fn kit_jobs_run_only_where_their_realm_is_served() {
     api.ok(reqwest::Method::POST, "realms", json!({"id": "mach5-agents"})).await;
     let (vm, mac) = (worker(st, "vm", &["mach5-agents"]).await, worker(st, "mac", &[]).await);
     // The VM connected first.
-    let (gvm, mut rvm) = attach(st, vm, 1, &["kits"]);
-    let (gmac, mut rmac) = attach(st, mac, 2, &["kits"]);
+    let (gvm, mut rvm) = attach(st, vm, 1, &["kits"]).await;
+    let (gmac, mut rmac) = attach(st, mac, 2, &["kits"]).await;
     let job = |realm: &str, worker: Option<WorkerId>| c6_head::kitjobs::Job {
         spec: json!({"name": "sync", "tools": [{"name": "run", "command": ["true"]}]}),
         tool: "run".into(),
@@ -421,8 +421,8 @@ async fn kit_jobs_apply_secret_scopes_to_the_selected_worker() {
     secret_kit(&Api::of(&head)).await;
     let (allowed, other) = (worker(st, "allowed", &[]).await, worker(st, "other", &[]).await);
     // The default target is the oldest connected worker, not the scoped one.
-    let (guard, mut inbox) = attach(st, other, 1, &["kits"]);
-    let (allowed_guard, mut allowed_inbox) = attach(st, allowed, 2, &["kits"]);
+    let (guard, mut inbox) = attach(st, other, 1, &["kits"]).await;
+    let (allowed_guard, mut allowed_inbox) = attach(st, allowed, 2, &["kits"]).await;
     let value = uuid::Uuid::now_v7().to_string();
     for (realm, scopes, permitted) in [
         ("root", vec!["worker:allowed"], false),

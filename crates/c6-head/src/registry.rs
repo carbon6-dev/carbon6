@@ -39,11 +39,21 @@ pub struct LiveWorker {
 
 pub struct Registry {
     conns: Mutex<HashMap<WorkerId, LiveWorker>>,
+    last_attach: Mutex<HashMap<WorkerId, u64>>,
+    /// Orders a loss commit against publication of replacement connections.
+    pub(crate) liveness_commit: tokio::sync::Mutex<()>,
     next_conn: AtomicU64,
     /// Bumped on every change; UI subscribers coalesce on it.
     changed: watch::Sender<u64>,
     /// Parent of every connection's token, so head shutdown ends them all.
     shutdown: CancellationToken,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectionStamp {
+    pub live: Option<u64>,
+    /// Remembers a reconnect even if the replacement already disconnected.
+    pub last: Option<u64>,
 }
 
 /// Handle owned by a connection's task. Dropping it unregisters the
@@ -92,12 +102,24 @@ impl Drop for ConnGuard<'_> {
 
 impl Registry {
     pub fn new(shutdown: CancellationToken) -> Self {
-        Self { conns: Mutex::default(), next_conn: AtomicU64::new(1), changed: watch::channel(0).0, shutdown }
+        Self {
+            conns: Mutex::default(),
+            last_attach: Mutex::default(),
+            liveness_commit: tokio::sync::Mutex::new(()),
+            next_conn: AtomicU64::new(1),
+            changed: watch::channel(0).0,
+            shutdown,
+        }
     }
 
     /// Registers a connection. A previous connection for the same worker is
     /// cancelled: the newest one wins.
-    pub fn attach(&self, worker_id: WorkerId, now: i64, tx: HeadTx, capabilities: Vec<String>, role: &str) -> ConnGuard<'_> {
+    pub async fn attach(&self, worker_id: WorkerId, now: i64, tx: HeadTx, capabilities: Vec<String>, role: &str) -> ConnGuard<'_> {
+        let _fence = self.liveness_commit.lock().await;
+        self.attach_inner(worker_id, now, tx, capabilities, role)
+    }
+
+    fn attach_inner(&self, worker_id: WorkerId, now: i64, tx: HeadTx, capabilities: Vec<String>, role: &str) -> ConnGuard<'_> {
         let conn_id = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let cancel = self.shutdown.child_token();
         let deliver = Arc::new(Notify::new());
@@ -114,9 +136,12 @@ impl Registry {
             rpc_waiters: rpc_waiters.clone(),
             deliver: deliver.clone(),
         };
-        if let Some(old) = self.conns.lock().unwrap().insert(worker_id, live) {
+        let mut conns = self.conns.lock().unwrap();
+        self.last_attach.lock().unwrap().insert(worker_id, conn_id);
+        if let Some(old) = conns.insert(worker_id, live) {
             old.cancel.cancel();
         }
+        drop(conns);
         self.bump();
         ConnGuard { registry: self, worker_id, conn_id, cancel, deliver, rpc_waiters }
     }
@@ -210,6 +235,11 @@ impl Registry {
         self.conns.lock().unwrap().get(&worker_id).cloned()
     }
 
+    pub(crate) fn connection_stamp(&self, worker_id: WorkerId) -> ConnectionStamp {
+        let conns = self.conns.lock().unwrap();
+        ConnectionStamp { live: conns.get(&worker_id).map(|c| c.conn_id), last: self.last_attach.lock().unwrap().get(&worker_id).copied() }
+    }
+
     /// Connected workers with a capability (e.g. `kits`), longest connected first.
     pub fn with_capability(&self, capability: &str) -> Vec<WorkerId> {
         let conns = self.conns.lock().unwrap();
@@ -245,13 +275,13 @@ impl Registry {
 mod tests {
     use super::*;
 
-    #[test]
-    fn newer_connection_wins() {
+    #[tokio::test]
+    async fn newer_connection_wins() {
         let reg = Registry::new(CancellationToken::new());
         let id = WorkerId::new();
         let tx = mpsc::channel(1).0;
-        let first = reg.attach(id, 1, tx.clone(), vec![], "worker");
-        let second = reg.attach(id, 2, tx, vec![], "worker");
+        let first = reg.attach(id, 1, tx.clone(), vec![], "worker").await;
+        let second = reg.attach(id, 2, tx, vec![], "worker").await;
         assert!(first.cancel.is_cancelled());
         drop(first); // must not unregister the newer connection
         assert_eq!(reg.get(id).unwrap().conn_id, second.conn_id);
@@ -276,7 +306,7 @@ mod tests {
             let (selected_tx, mut selected_rx) = mpsc::channel(1);
             let (replacement_tx, mut replacement_rx) = mpsc::channel(1);
             let capabilities = if capable { vec!["user_input_prompt_v1".into()] } else { vec![] };
-            let selected = reg.attach(id, 1, selected_tx, capabilities, "worker");
+            let selected = reg.attach(id, 1, selected_tx, capabilities, "worker").await;
             let replacement = Mutex::new(None);
             let input = c6_proto::UserInput { text: "original".into(), prompt: "expanded mention".into(), ..Default::default() };
             let call = reg.call_with_params(
@@ -287,7 +317,8 @@ mod tests {
                     // Replace after target selection but before encoding. This
                     // also proves the builder does not hold the registry lock.
                     let capabilities = if capable { vec![] } else { vec!["user_input_prompt_v1".into()] };
-                    *replacement.lock().unwrap() = Some(reg.attach(id, 2, replacement_tx, capabilities, "worker"));
+                    // This registry is isolated; no liveness task can race the callback.
+                    *replacement.lock().unwrap() = Some(reg.attach_inner(id, 2, replacement_tx, capabilities, "worker"));
                     let mut wire_input = input.clone();
                     crate::sessions::prepare_worker_input(&live.capabilities, &mut wire_input);
                     let data = base64::engine::general_purpose::STANDARD.encode(wire_input.encode_to_vec());

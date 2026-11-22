@@ -8,10 +8,12 @@ const HOUR_MS: i64 = 3_600_000;
 pub(crate) const CONTINUED_TITLE: &str = "Notice wakes continued";
 
 #[derive(Default)]
-struct Chain {
+struct Chain<'a> {
     descriptions: HashSet<String>,
     failed: HashSet<String>,
     relaunches: BTreeMap<String, u32>,
+    consecutive_losses: BTreeMap<String, u32>,
+    seen_outcomes: HashSet<(&'static str, &'a str, &'a str)>,
     last_reports: HashSet<String>,
     no_progress: u32,
 }
@@ -22,7 +24,12 @@ struct Wake {
     new_description: bool,
 }
 
-impl Chain {
+impl<'a> Chain<'a> {
+    fn reset(&mut self) {
+        // A later receipt or delivery of an old report is not a fresh outcome.
+        *self = Self { seen_outcomes: std::mem::take(&mut self.seen_outcomes), ..Self::default() };
+    }
+
     fn finish(&mut self, wake: Wake) {
         let changed_report = wake.reports.iter().any(|report| !self.last_reports.contains(report));
         if !wake.reports.is_empty() {
@@ -60,6 +67,109 @@ impl Chain {
         self.failed.remove(&description);
         self.relaunches.remove(&description);
     }
+
+    fn subagent_outcome(&mut self, id: (&'static str, &'a str), description: &str, status: &'a str) {
+        if !matches!(status, "lost" | "failed" | "error" | "completed" | "finished" | "interrupted" | "stopped" | "stopped_by_user") {
+            return;
+        }
+        let description = normalized(description);
+        if description.is_empty() || (!id.1.is_empty() && !self.seen_outcomes.insert((id.0, id.1, status))) {
+            return;
+        }
+        if status == "lost" {
+            let count = self.consecutive_losses.entry(description).or_default();
+            *count = count.saturating_add(1);
+        } else {
+            self.consecutive_losses.remove(&description);
+        }
+    }
+
+    fn subagent_notice(&mut self, command_id: &'a str, notice: &'a TaskNotice, children: &HashMap<&str, &str>) {
+        let id = notice.session_id.as_str();
+        if notice.kind == "subagent" || (!id.is_empty() && children.contains_key(id)) {
+            let description = children.get(id).copied().unwrap_or(&notice.title);
+            let incident = command_id.strip_prefix("task:").and_then(|s| s.rsplit_once(':'));
+            let key = incident.map_or_else(|| report_id(command_id, id), |(task, _)| ("task", task));
+            self.subagent_outcome(key, description, &notice.status);
+        }
+    }
+}
+
+fn report_id<'a>(command_id: &'a str, child_id: &'a str) -> (&'static str, &'a str) {
+    // Local deliveries and receipts share an ID. Remote deliveries add one
+    // more `subagent:` prefix and may report one turn to multiple waiters.
+    if command_id.is_empty() {
+        return ("child", child_id);
+    }
+    let id = command_id.trim_start_matches("subagent:");
+    if let Some(incident) = liveness_report_id(id, child_id) {
+        return ("report", incident);
+    }
+    if !child_id.is_empty()
+        && let Some(tail) = id.strip_prefix(child_id).and_then(|s| s.strip_prefix(':'))
+        && let Some((seq, _)) = tail.split_once(':')
+        && seq.parse::<u64>().is_ok()
+    {
+        return ("report", &id[..child_id.len() + 1 + seq.len()]);
+    }
+    ("report", id)
+}
+
+/// A liveness command's stable incident ID, without its waiter suffix or
+/// the worker's notice prefix. Keep the child ID intact (it may contain ':').
+pub(crate) fn liveness_report_id<'a>(command_id: &'a str, child_id: &str) -> Option<&'a str> {
+    let id = command_id.trim_start_matches("subagent:");
+    let prefix = "liveness:lost:";
+    let tail = id.strip_prefix(prefix)?.strip_prefix(child_id)?.strip_prefix(':')?;
+    let incident = tail.split_once(':').map_or(tail, |(incident, _)| incident);
+    (!child_id.is_empty() && !incident.is_empty()).then(|| &id[..prefix.len() + child_id.len() + 1 + incident.len()])
+}
+
+/// A structured loss already represents these exact background waiters.
+/// Their later task terminal events are lifecycle records, not new outcomes.
+pub(crate) fn liveness_covered_tasks(events: &[SessionEvent]) -> HashSet<&str> {
+    let mut notices = HashSet::new();
+    let mut links = HashMap::new();
+    let mut not_yet_linked = HashSet::new();
+    let mut covered = HashSet::new();
+    for e in events {
+        match &e.kind {
+            Some(Kind::SubagentSpawned(s)) if !s.call_id.is_empty() => {
+                let call = (s.child_session_id.as_str(), s.call_id.as_str());
+                let task = s.background_task_id.as_str();
+                links.insert(call, task);
+                if not_yet_linked.remove(&call) && !task.is_empty() {
+                    covered.insert(task);
+                }
+            }
+            Some(Kind::NoticeQueued(n)) => {
+                if let Some(t) = &n.task_notice
+                    && t.status == "lost"
+                    && let Some(id) = liveness_report_id(&n.command_id, &t.session_id)
+                {
+                    notices.insert(id);
+                }
+            }
+            Some(Kind::SubagentReported(r))
+                if r.status == "lost"
+                    && !r.call_id.is_empty()
+                    && liveness_report_id(&r.command_id, &r.child_session_id).is_some_and(|id| notices.contains(id)) =>
+            {
+                let call = (r.child_session_id.as_str(), r.call_id.as_str());
+                match links.get(&call) {
+                    Some(&task) if !task.is_empty() => {
+                        covered.insert(task);
+                    }
+                    None => {
+                        not_yet_linked.insert(call);
+                    } // The head replied before the launch link was journaled.
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    covered
 }
 
 fn normalized(text: &str) -> String {
@@ -126,6 +236,7 @@ pub(crate) fn evaluate(
     };
     // A side chat can inherit history. Its parent is not spending this chat's budget.
     let events = &events[events.iter().rposition(|e| matches!(&e.kind, Some(Kind::Started(_)))).unwrap_or(0)..];
+    let structured_losses = liveness_covered_tasks(events);
 
     let mut chain = Chain::default();
     let mut notices = HashMap::new();
@@ -144,12 +255,18 @@ pub(crate) fn evaluate(
     for event in events {
         match &event.kind {
             Some(Kind::Notice(n)) if n.quiet && n.title == CONTINUED_TITLE => {
-                chain = Chain::default();
+                chain.reset();
                 wake = None;
                 tokens = 0;
             }
             Some(Kind::NoticeQueued(n)) if !n.command_id.is_empty() => {
                 notices.insert(n.command_id.as_str(), n);
+                // The guard runs before a queued notice becomes model input.
+                // Count the outcome here so the second loss cannot itself wake
+                // the model into another retry.
+                if let Some(notice) = &n.task_notice {
+                    chain.subagent_notice(&n.command_id, notice, &child_descriptions);
+                }
             }
             Some(Kind::User(u)) if u.blocked.is_empty() => {
                 let queued = notices.get(u.command_id.as_str());
@@ -164,6 +281,7 @@ pub(crate) fn evaluate(
                         notice_input = true;
                     }
                     if let Some(n) = u.task_notice.as_ref().or_else(|| queued.and_then(|q| q.task_notice.as_ref())) {
+                        chain.subagent_notice(&u.command_id, n, &child_descriptions);
                         if failed(&n.status) {
                             chain.failure(child_descriptions.get(n.session_id.as_str()).copied().unwrap_or(n.title.as_str()));
                         } else if matches!(n.status.as_str(), "completed" | "finished") {
@@ -176,7 +294,7 @@ pub(crate) fn evaluate(
                         }
                     }
                 } else {
-                    chain = Chain::default();
+                    chain.reset();
                     wake = None;
                     if active.is_none() {
                         direct_input = true;
@@ -229,14 +347,14 @@ pub(crate) fn evaluate(
                     chain.launch(wake.as_mut(), &s.description);
                 }
             }
-            Some(Kind::SubagentReported(r)) if failed(&r.status) => {
+            Some(Kind::SubagentReported(r)) => {
                 if let Some(description) = child_descriptions.get(r.child_session_id.as_str()) {
-                    chain.failure(description);
-                }
-            }
-            Some(Kind::SubagentReported(r)) if r.status == "completed" => {
-                if let Some(description) = child_descriptions.get(r.child_session_id.as_str()) {
-                    chain.success(description);
+                    chain.subagent_outcome(report_id(&r.command_id, &r.child_session_id), description, &r.status);
+                    if failed(&r.status) {
+                        chain.failure(description);
+                    } else if r.status == "completed" {
+                        chain.success(description);
+                    }
                 }
             }
             Some(Kind::BackgroundTask(t)) if t.state == "started" => {
@@ -247,22 +365,33 @@ pub(crate) fn evaluate(
                     }
                 }
             }
-            Some(Kind::BackgroundTask(t)) if failed(&t.state) || (t.state == "finished" && t.exit_code != 0) => {
+            Some(Kind::BackgroundTask(t)) => {
+                if structured_losses.contains(t.task_id.as_str()) {
+                    continue;
+                }
                 let description = background_descriptions.get(t.task_id.as_str()).copied().unwrap_or(t.description.as_str());
-                chain.failure(description);
-            }
-            Some(Kind::BackgroundTask(t)) if t.state == "finished" && t.exit_code == 0 => {
-                let description = background_descriptions.get(t.task_id.as_str()).copied().unwrap_or(t.description.as_str());
-                chain.success(description);
+                let status = if t.state == "finished" && t.exit_code != 0 { "failed" } else { t.state.as_str() };
+                if t.kind == "agent" || t.native_type == "local_agent" {
+                    chain.subagent_outcome(("task", &t.task_id), description, status);
+                }
+                if failed(status) {
+                    chain.failure(description);
+                } else if status == "finished" {
+                    chain.success(description);
+                }
             }
             _ => {}
         }
     }
 
-    if let Some((description, _)) = chain.relaunches.iter().find(|(_, count)| **count > failure_relaunch_limit) {
+    let repeated =
+        chain.consecutive_losses.iter().find(|(_, count)| **count >= 2).map(|(description, _)| ("loss", description)).or_else(|| {
+            chain.relaunches.iter().find(|(_, count)| **count > failure_relaunch_limit).map(|(description, _)| ("failure", description))
+        });
+    if let Some((kind, description)) = repeated {
         let short: String = description.chars().take(120).collect();
         let suffix = if short.len() < description.len() { "…" } else { "" };
-        return Some(format!("paused: repeated failure of {short}{suffix}"));
+        return Some(format!("paused: repeated {kind} of {short}{suffix}"));
     }
     if chain.no_progress != 0 && chain.no_progress >= no_progress_limit {
         return Some(format!("paused: no progress in {} wakes", chain.no_progress));
@@ -276,7 +405,9 @@ pub(crate) fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use c6_proto::{BackgroundTask, Notice, NoticeQueued, Rewound, SubagentSpawned, TurnEnded, TurnStarted, Usage, UserMessage};
+    use c6_proto::{
+        BackgroundTask, Notice, NoticeQueued, Rewound, SubagentReported, SubagentSpawned, TurnEnded, TurnStarted, Usage, UserMessage,
+    };
 
     const NOW: i64 = 10 * HOUR_MS;
 
@@ -334,6 +465,30 @@ mod tests {
             }));
         }
 
+        fn queue_subagent(&mut self, id: &str, child: &str, title: &str, status: &str) {
+            self.push(Kind::NoticeQueued(NoticeQueued {
+                command_id: id.into(),
+                wake: true,
+                task_notice: Some(TaskNotice {
+                    kind: "subagent".into(),
+                    session_id: child.into(),
+                    title: title.into(),
+                    status: status.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+        }
+
+        fn receipt(&mut self, id: &str, child: &str, status: &str) {
+            self.push(Kind::SubagentReported(SubagentReported {
+                command_id: id.into(),
+                child_session_id: child.into(),
+                status: status.into(),
+                ..Default::default()
+            }));
+        }
+
         fn background(&mut self, id: &str, description: &str, state: &str, exit_code: i32) {
             self.push(Kind::BackgroundTask(BackgroundTask {
                 task_id: id.into(),
@@ -351,6 +506,133 @@ mod tests {
         fn reason(&self, no_progress: u32, retries: u32, tokens: u64) -> Option<String> {
             evaluate(&self.0, NOW, no_progress, retries, tokens)
         }
+    }
+
+    #[test]
+    fn structured_loss_covers_only_its_waiter_and_survives_generic_terminal_event() {
+        let mut log = Log::default();
+        log.user("start");
+        let link = |task: &str| {
+            Kind::SubagentSpawned(SubagentSpawned {
+                child_session_id: "child:remote".into(),
+                call_id: "call".into(),
+                background_task_id: task.into(),
+                description: "Check server".into(),
+                ..Default::default()
+            })
+        };
+        log.push(link("bg1"));
+        log.push(link("bg2"));
+        log.queue_subagent("subagent:liveness:lost:child:remote:incident-a", "child:remote", "Check server", "lost");
+        log.push(Kind::SubagentReported(SubagentReported {
+            command_id: "liveness:lost:child:remote:incident-a:call".into(),
+            child_session_id: "child:remote".into(),
+            call_id: "call".into(),
+            status: "lost".into(),
+        }));
+        log.push(Kind::BackgroundTask(BackgroundTask {
+            task_id: "bg2".into(),
+            kind: "agent".into(),
+            description: "Check server".into(),
+            state: "finished".into(),
+            exit_code: 1,
+            ..Default::default()
+        }));
+        assert_eq!(liveness_covered_tasks(&log.0), HashSet::from(["bg2"]));
+        assert_eq!(log.reason(5, 3, 100), None, "the notice and receipt are one loss");
+        log.queue_subagent("subagent:liveness:lost:child:remote:incident-b", "child:remote", "Check server", "lost");
+        assert_eq!(log.reason(5, 3, 100).as_deref(), Some("paused: repeated loss of Check server"));
+    }
+
+    #[test]
+    fn second_subagent_loss_holds_the_notice_before_delivery() {
+        let mut log = Log::default();
+        log.user("start");
+        log.start();
+        log.spawn("first", "Check  server", "");
+        log.end();
+
+        let first = "subagent:subagent:first:7:first-call";
+        log.queue_subagent(first, "first", "Different display title", "lost");
+        assert_eq!(log.reason(5, 3, 100), None, "the first loss can wake the retry");
+        log.receipt("subagent:first:7:first-call", "first", "lost");
+        log.receipt("subagent:first:7:another-waiter", "first", "lost");
+        log.queue_subagent(first, "first", "Different display title", "lost");
+        log.user(first); // Delivery of a queued notice is logged as User.
+        assert_eq!(log.reason(5, 3, 100), None, "the queue, receipt and delivery are one loss");
+
+        log.start();
+        log.spawn("retry", "Check server", "");
+        log.end();
+        log.queue_subagent("subagent:local:retry:4", "retry", "Another title", "lost");
+        assert_eq!(log.reason(5, 3, 100).as_deref(), Some("paused: repeated loss of Check server"));
+
+        log.user("intervene");
+        log.receipt("subagent:local:retry:4", "retry", "lost");
+        log.queue_subagent("subagent:local:third:4", "third", "Check server", "lost");
+        assert_eq!(log.reason(5, 3, 100), None, "direct input clears the streak even if an old receipt arrives later");
+    }
+
+    #[test]
+    fn liveness_loss_counts_once_across_waiters() {
+        let mut log = Log::default();
+        let child = "child:remote";
+        log.spawn(child, "Check server", "");
+        log.receipt("liveness:lost:child:remote:ad1887cb-6c3d-435f-a642-269ce4fcabc2:first-call", child, "lost");
+        log.queue_subagent(
+            "subagent:liveness:lost:child:remote:ad1887cb-6c3d-435f-a642-269ce4fcabc2:second-call",
+            child,
+            "Different display title",
+            "lost",
+        );
+        assert_eq!(log.reason(5, 3, 100), None, "different waiters reported the same incident");
+
+        log.queue_subagent(
+            "subagent:liveness:lost:child:remote:d59d8516-eeaf-44e5-ab4a-9d4d3cb9d09b:first-call",
+            child,
+            "Different display title",
+            "lost",
+        );
+        assert_eq!(log.reason(5, 3, 100).as_deref(), Some("paused: repeated loss of Check server"));
+    }
+
+    #[test]
+    fn only_consecutive_losses_of_the_same_description_hold_wakes() {
+        for intervening in ["completed", "failed"] {
+            let mut log = Log::default();
+            log.spawn("first", "Check server", "");
+            log.receipt("subagent:local:first:2", "first", "lost");
+            log.queue_subagent("subagent:local:other:4", "other", "Check database", "lost");
+            assert_eq!(log.reason(5, 3, 100), None, "different descriptions have separate streaks");
+
+            log.spawn("retry", "Check server", "");
+            log.receipt("subagent:local:retry:3", "retry", intervening);
+            log.queue_subagent("subagent:local:retry:4", "retry", "Check server", "lost");
+            // The receipt came first; its late delivery cannot end a new streak.
+            log.queue_subagent("subagent:local:retry:3", "retry", "Check server", intervening);
+            assert_eq!(log.reason(5, 3, 100), None, "{intervening} breaks the first loss streak");
+
+            log.queue_subagent("subagent:local:next:4", "next", "Check server", "lost");
+            assert_eq!(log.reason(5, 3, 100).as_deref(), Some("paused: repeated loss of Check server"));
+        }
+    }
+
+    #[test]
+    fn background_subagent_loss_and_its_notice_count_once() {
+        let mut log = Log::default();
+        let lost_task = |id: &str| BackgroundTask {
+            task_id: id.into(),
+            description: "Check server".into(),
+            kind: "claude_code".into(),
+            native_type: "local_agent".into(),
+            state: "lost".into(),
+            ..Default::default()
+        };
+        log.push(Kind::BackgroundTask(lost_task("one")));
+        log.queue_subagent("task:one:lost", "", "Check server", "lost");
+        assert_eq!(log.reason(5, 3, 100), None);
+        log.push(Kind::BackgroundTask(lost_task("two")));
+        assert_eq!(log.reason(5, 3, 100).as_deref(), Some("paused: repeated loss of Check server"));
     }
 
     #[test]

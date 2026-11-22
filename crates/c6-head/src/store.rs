@@ -1361,6 +1361,21 @@ impl Store {
                         .bind(&t.task_id)
                         .execute(&mut *tx)
                         .await?;
+                    if t.kind == "agent" {
+                        // A detached Task or SendMessage has a launch tool
+                        // result already; the parent's terminal task callback
+                        // (including synthetic loss on reload) settles its wait.
+                        let suffix = format!(":{}", t.task_id);
+                        sqlx::query(
+                            "UPDATE remote_delegations SET state = 'reported' WHERE parent_id = ? AND state = 'waiting' \
+                            AND command_id LIKE 'subagent:local-wait:delegation:%' AND substr(command_id, -length(?)) = ?",
+                        )
+                        .bind(session_id)
+                        .bind(&suffix)
+                        .bind(&suffix)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
                 }
                 Some(Kind::Memory(m)) => crate::memory::apply(&mut tx, session_id, m).await?,
                 Some(Kind::Usage(u)) => crate::usage::record(&mut tx, session_id, ev.seq, ev.ts_ms, u).await?,
@@ -1378,10 +1393,44 @@ impl Store {
                         done.push(p.command_id.clone());
                     }
                 }
+                // A parent's pre-enqueue record. No child FK is needed: a
+                // newly created local child's journal may sync second.
+                Some(Kind::SubagentReported(r)) if r.status == "waiting" && r.command_id.starts_with(crate::remote::LOCAL_WAIT_PREFIX) => {
+                    let now = c6_core::now_ms();
+                    let inserted = sqlx::query(
+                        "INSERT OR IGNORE INTO remote_delegations (command_id, child_id, parent_id, call_id, state, created_at) \
+                        VALUES (?, ?, ?, ?, 'waiting', ?)",
+                    )
+                    .bind(&r.command_id)
+                    .bind(&r.child_session_id)
+                    .bind(session_id)
+                    .bind(&r.call_id)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await?;
+                    if inserted.rows_affected() != 0 {
+                        // An earlier loss may have been delivered before this
+                        // parent record synced. Re-observe rather than leaving
+                        // the newly visible waiter behind an old incident.
+                        sqlx::query(
+                            "UPDATE liveness_incidents SET resolved_at = ? WHERE session_id = ? AND kind = 'lost' AND resolved_at IS NULL",
+                        )
+                        .bind(now)
+                        .bind(&r.child_session_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+                Some(Kind::ToolResult(r)) => {
+                    settle_foreground_local_waits(&mut tx, session_id, Some(&r.call_id)).await?;
+                }
                 // A remote subagent's report reached its parent.
                 Some(Kind::SubagentReported(r)) => done.push(r.command_id.clone()),
                 Some(Kind::TurnStarted(_)) => status = "running".into(),
                 Some(Kind::TurnEnded(t)) => {
+                    // Recovery/cancellation may close a turn without its
+                    // outstanding callback. Background waiters outlive it.
+                    settle_foreground_local_waits(&mut tx, session_id, None).await?;
                     // Commit the report obligation with the turn end, not
                     // in its downstream hook. This includes turns resumed
                     // by the child's own task notices, with no waiting call.
@@ -1594,6 +1643,19 @@ impl Store {
     }
 }
 
+async fn settle_foreground_local_waits(tx: &mut sqlx::SqliteConnection, parent: &str, call: Option<&str>) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE remote_delegations SET state = 'reported' WHERE parent_id = ?1 AND state = 'waiting' \
+        AND (?2 IS NULL OR call_id = ?2) AND command_id LIKE 'subagent:local-wait:delegation:%' \
+        AND instr(substr(command_id, length('subagent:local-wait:delegation:') + 1), ':') = 0",
+    )
+    .bind(parent)
+    .bind(call)
+    .execute(tx)
+    .await?;
+    Ok(())
+}
+
 /// Subagent sessions are created by the worker. Accept one when its first
 /// event names a parent session that belongs to the same worker.
 async fn create_subagent_session(
@@ -1783,6 +1845,35 @@ impl Store {
     /// transaction. A stable report id makes replay safe even after ack.
     pub async fn enqueue_subagent_report(&self, c: &NewCommand<'_>, inputs: &[String]) -> anyhow::Result<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(tail) = c.id.strip_prefix("liveness:lost:") {
+            use prost::Message;
+            let cmd = c6_proto::SessionCommand::decode(c.data.as_slice())?;
+            let Some(c6_proto::session_command::Kind::DelegationEnded(ended)) = cmd.kind else {
+                anyhow::bail!("liveness loss must be a delegation report");
+            };
+            let (incident, _) = tail
+                .strip_prefix(&ended.child_session_id)
+                .and_then(|s| s.strip_prefix(':'))
+                .and_then(|s| s.split_once(':'))
+                .ok_or_else(|| anyhow::anyhow!("invalid liveness report ID"))?;
+            // The child can continue after we read the report's obligations
+            // and digest. Check the observation under the same write lock
+            // that inserts the report and retires its exact waiters.
+            let current: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM liveness_incidents i JOIN sessions s ON s.id = i.session_id \
+                 WHERE i.id = ? AND i.session_id = ? AND i.kind = 'lost' AND i.resolved_at IS NULL \
+                   AND i.last_seq = s.last_seq AND s.archived = 0 AND s.observed = 0 \
+                   AND (i.worker_id IS NULL OR (i.worker_id = s.worker_id AND i.ownership_epoch = s.ownership_epoch)))",
+            )
+            .bind(incident)
+            .bind(&ended.child_session_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !current {
+                tx.rollback().await?;
+                return Ok(());
+            }
+        }
         let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM commands WHERE id = ?)").bind(c.id).fetch_one(&mut *tx).await?;
         if !exists {
             insert_command(&mut tx, c, false).await?;

@@ -3,7 +3,7 @@
 //! worker. The head holds the link: it sends the subagent its parent's
 //! messages, and the parent how each of the subagent's turns ended.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use c6_api as api;
 use c6_core::WorkerId;
@@ -63,16 +63,22 @@ pub async fn for_session(st: &HeadState, parent: &SessionRow, what: &str, params
         }
         "state" => {
             let child = own_child(st, parent, &s("to")).await?;
-            Ok(json!({"running": child.status == "running", "status": child.status, "end_reason": child.end_reason}))
+            let waiting = child.status == "idle" && has_counted_background(st, &child.id).await?;
+            // `running` describes the foreground turn, not whether the child
+            // has more work. SendMessage uses it to choose steer vs new turn.
+            let status = if waiting { "waiting" } else { child.status.as_str() };
+            Ok(json!({"running": child.status == "running", "status": status, "end_reason": child.end_reason}))
         }
         "peek" => {
             let child = own_child(st, parent, &s("to")).await?;
-            let status = if child.status == "running" { "running".to_owned() } else { state_of(&child) };
-            Ok(json!({"text": digest(st, &child.id, &status).await?}))
+            let status = state_of(st, &child).await?;
+            Ok(json!({"text": digest(st, &child.id, status).await?}))
         }
         _ => Err(bad_request(format!("unknown method session.subagent_{what}"))),
     }
 }
+
+pub(crate) const LOCAL_WAIT_PREFIX: &str = "subagent:local-wait:delegation:";
 
 /// One of `parent`'s remote subagents, by session id.
 async fn own_child(st: &HeadState, parent: &SessionRow, to: &str) -> anyhow::Result<SessionRow> {
@@ -83,18 +89,27 @@ async fn own_child(st: &HeadState, parent: &SessionRow, to: &str) -> anyhow::Res
 }
 
 /// A subagent's state as its digest names it.
-fn state_of(s: &SessionRow) -> String {
+async fn state_of(st: &HeadState, s: &SessionRow) -> anyhow::Result<&'static str> {
     if s.status == "running" {
-        return "running".into();
+        return Ok("running");
     }
-    match s.end_reason.as_str() {
+    if s.status == "idle" && has_counted_background(st, &s.id).await? {
+        return Ok("waiting");
+    }
+    Ok(match s.end_reason.as_str() {
         "" => "not started",
         "completed" => "completed",
         "interrupted" => "interrupted",
         "worker_restarted" => "lost",
         _ => "failed",
-    }
-    .into()
+    })
+}
+
+async fn has_counted_background(st: &HeadState, session_id: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM running_tasks WHERE session_id = ? AND counted = 1)")
+        .bind(session_id)
+        .fetch_one(st.store.pool())
+        .await?)
 }
 
 /// What a subagent did, from the head's copy of its log.
@@ -103,7 +118,7 @@ async fn digest(st: &HeadState, child_id: &str, status: &str) -> anyhow::Result<
     let mut states = HashMap::new();
     for id in c6_worker::spawned_children(&events) {
         if let Some(s) = st.store.session(&id).await? {
-            states.insert(id, state_of(&s));
+            states.insert(id, state_of(st, &s).await?.to_owned());
         }
     }
     Ok(c6_worker::digest_text(&events, child_id, status, "", &states))
@@ -176,6 +191,50 @@ pub(crate) fn turn_report_id(child: &str, seq: u64) -> String {
     format!("subagent:turn:{child}:{seq}")
 }
 
+fn turn_report_seq(child: &str, id: &str) -> Option<u64> {
+    let (prefix, seq) = id.strip_prefix("subagent:turn:")?.rsplit_once(':')?;
+    (prefix == child).then_some(())?;
+    seq.parse::<u64>().ok().filter(|&seq| seq != 0)
+}
+
+/// A background-only completion has no TurnEnded of its own. Revisit the
+/// latest deferred turn unless the child is working on a new turn.
+pub(crate) async fn background_ended(st: &HeadState, session_id: &str) {
+    if let Err(e) = flush_pending_turn(st, session_id).await {
+        warn!(session = %session_id, "checking a remote subagent's deferred report: {e:#}");
+    }
+}
+
+async fn flush_pending_turn(st: &HeadState, child: &str) -> anyhow::Result<()> {
+    let Some(session) = st.store.session(child).await? else { return Ok(()) };
+    if session.parent_id.is_none() || session.remote_template.is_empty() || session.status == "running" {
+        return Ok(());
+    }
+    let pending = st.store.waiting_delegations(child).await?;
+    if let Some(seq) = pending.iter().filter_map(|(id, _)| turn_report_seq(child, id)).max() {
+        let events = st.store.events_after(child, seq - 1, 1).await?;
+        if let Some(event) = events.first().filter(|event| event.seq == seq)
+            && let Some(session_event::Kind::TurnEnded(t)) = &event.kind
+        {
+            turn_ended(st, child, seq, t.reason).await;
+        }
+    } else if !pending.is_empty() {
+        // Older logs can have an input obligation but no per-turn marker.
+        let mut taken = false;
+        for event in st.store.events_after(child, 0, i64::MAX).await? {
+            match event.kind {
+                Some(session_event::Kind::User(u)) if pending.iter().any(|(id, _)| id == &u.command_id) => taken = true,
+                Some(session_event::Kind::TurnEnded(t)) if taken => {
+                    turn_ended(st, child, event.seq, t.reason).await;
+                    taken = false;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Ingest commits the child's events before running its hooks. If the
 /// head stopped between those operations, replay outstanding obligations
 /// from that durable log rather than waiting for another child turn.
@@ -183,21 +242,7 @@ pub async fn recover(st: &HeadState) -> anyhow::Result<()> {
     let children: Vec<String> =
         sqlx::query_scalar("SELECT DISTINCT child_id FROM remote_delegations WHERE state = 'waiting'").fetch_all(st.store.pool()).await?;
     for child in children {
-        let pending = st.store.waiting_delegations(&child).await?;
-        let events = st.store.events_after(&child, 0, i64::MAX).await?;
-        let mut taken = false;
-        for event in events {
-            match event.kind {
-                Some(session_event::Kind::User(u)) if pending.iter().any(|(id, _)| id == &u.command_id) => taken = true,
-                Some(session_event::Kind::TurnEnded(t))
-                    if taken || pending.iter().any(|(id, _)| id == &turn_report_id(&child, event.seq)) =>
-                {
-                    turn_ended(st, &child, event.seq, t.reason).await;
-                    taken = false;
-                }
-                _ => {}
-            }
-        }
+        flush_pending_turn(st, &child).await?;
         // Rejections are committed before their hook too.
         let rejected_inputs: Vec<(String, String)> = sqlx::query_as("SELECT d.command_id, coalesce(c.error, 'input rejected') FROM remote_delegations d JOIN commands c ON c.id = d.command_id WHERE d.child_id = ? AND d.state = 'waiting' AND c.state = 'rejected'")
             .bind(&child).fetch_all(st.store.pool()).await?;
@@ -211,7 +256,24 @@ pub async fn recover(st: &HeadState) -> anyhow::Result<()> {
 async fn relay(st: &HeadState, child_id: &str, end_seq: u64, reason: i32) -> anyhow::Result<()> {
     let Some(child) = st.store.session(child_id).await? else { return Ok(()) };
     let Some(parent_id) = child.parent_id.clone().filter(|_| !child.remote_template.is_empty()) else { return Ok(()) };
-    let events = st.store.since_last_turn(child_id, end_seq).await?;
+    if child.status == "running" || has_counted_background(st, child_id).await? {
+        // Keep the turn marker and the inputs it took. An ended foreground
+        // turn is not the end of a child with outstanding background work.
+        return Ok(());
+    }
+    let pending = st.store.waiting_delegations(child_id).await?;
+    let mut earlier: Vec<_> = pending.iter().filter_map(|(id, _)| turn_report_seq(child_id, id)).collect();
+    if earlier.iter().any(|&seq| seq > end_seq) {
+        // Ingest commits an entire batch before running its hooks. Only the
+        // newest end should flush this group if several landed together.
+        return Ok(());
+    }
+    earlier.retain(|&seq| seq < end_seq);
+    earlier.sort_unstable();
+    let mut events = Vec::new();
+    for seq in earlier.iter().copied().chain(std::iter::once(end_seq)) {
+        events.extend(st.store.since_last_turn(child_id, seq).await?);
+    }
     let mut taken = Vec::new();
     let mut said = Vec::new();
     let mut delegated = false;
@@ -238,6 +300,7 @@ async fn relay(st: &HeadState, child_id: &str, end_seq: u64, reason: i32) -> any
                     ));
                 }
             }
+            Some(session_event::Kind::TurnEnded(_)) if e.seq != end_seq => report.clear(),
             Some(session_event::Kind::Assistant(a)) => {
                 let text: Vec<&str> = a
                     .blocks
@@ -255,16 +318,52 @@ async fn relay(st: &HeadState, child_id: &str, end_seq: u64, reason: i32) -> any
         }
     }
     taken.push(turn_report_id(child_id, end_seq));
-    let settled: Vec<(String, String)> =
-        st.store.waiting_delegations(child_id).await?.into_iter().filter(|(cmd, _)| taken.contains(cmd)).collect();
-    if taken.len() == 1 && settled.is_empty() {
+    taken.extend(earlier.iter().map(|seq| turn_report_id(child_id, *seq)));
+    let settled: Vec<(String, String)> = pending.into_iter().filter(|(cmd, _)| taken.contains(cmd)).collect();
+    if settled.is_empty() {
         return Ok(());
     }
-    let reason = TurnEndReason::try_from(reason).unwrap_or(TurnEndReason::Unspecified);
+    let mut reason = TurnEndReason::try_from(reason).unwrap_or(TurnEndReason::Unspecified);
+    // If the last background task finished without another foreground turn,
+    // don't tell the parent only what the child said before that task ended.
+    let mut task_outcomes = Vec::new();
+    if child.last_seq as u64 > end_seq {
+        for e in st.store.events_after(child_id, end_seq, i64::MAX).await? {
+            if let Some(session_event::Kind::BackgroundTask(t)) = e.kind
+                && t.state != "started"
+                && (t.notify || t.kind == "claude_code")
+            {
+                if reason == TurnEndReason::Completed {
+                    reason = match t.state.as_str() {
+                        "lost" => TurnEndReason::WorkerRestarted,
+                        "stopped" | "stopped_by_user" => TurnEndReason::Interrupted,
+                        "failed" => TurnEndReason::Error,
+                        _ if t.exit_code != 0 => TurnEndReason::Error,
+                        _ => reason,
+                    };
+                }
+                task_outcomes.push(format!("{} ({}): {}", t.description, t.task_id, t.state));
+            }
+        }
+    }
+    let task_outcomes = (!task_outcomes.is_empty()).then(|| format!("Background work ended:\n{}", task_outcomes.join("\n")));
+    if reason == TurnEndReason::Completed
+        && let Some(tasks) = &task_outcomes
+    {
+        report = if report.is_empty() { tasks.clone() } else { format!("{report}\n\n{tasks}") };
+    }
     let digest = if reason == TurnEndReason::Completed && !report.trim().is_empty() {
         String::new()
     } else {
-        digest(st, child_id, c6_worker::status_of(reason, &report)).await?
+        let mut progress = digest(st, child_id, c6_worker::status_of(reason, &report)).await?;
+        if let Some(tasks) = task_outcomes {
+            if !report.is_empty() {
+                report.push_str("\n\n");
+            }
+            report.push_str(&tasks);
+            progress.push_str(&format!("\n{tasks}"));
+        }
+        progress
     };
     let ended = |call_id: &str, said: Vec<String>, wake: bool| DelegationEnded {
         call_id: call_id.to_owned(),
@@ -276,23 +375,43 @@ async fn relay(st: &HeadState, child_id: &str, end_seq: u64, reason: i32) -> any
         wake,
         task_notice: Some(c6_worker::task_report_notice(&child.title, child_id, reason, &report)),
     };
-    let (steers, calls): (Vec<_>, Vec<_>) = settled.into_iter().partition(|(_, call)| call.is_empty());
-    let mut steers: Vec<String> = steers.into_iter().map(|(cmd, _)| cmd).collect();
+    let (steers, calls) = group_obligations(settled);
     if calls.is_empty() {
         let id = format!("subagent:{child_id}:{end_seq}:notice");
         let wake = wake || delegated || automatic || said.is_empty();
         send(st, &parent_id, &id, &steers, ended("", said, wake)).await?;
     }
-    for (command_id, call_id) in calls {
+    let last_call = calls.keys().next_back().cloned();
+    let mut steers = steers;
+    for (call_id, mut inputs) in calls {
         let id = format!("subagent:{child_id}:{end_seq}:{call_id}");
         // A turn's normal waiter also covers steers it took. Steers still
         // queued for the next turn retain their own obligations.
-        let mut inputs = std::mem::take(&mut steers);
-        inputs.push(command_id);
+        // Retire the turn markers with the last waiter, so a crash sending
+        // the preceding reports leaves the turns discoverable on startup.
+        if Some(&call_id) == last_call.as_ref() {
+            inputs.append(&mut steers);
+        }
         send(st, &parent_id, &id, &inputs, ended(&call_id, Vec::new(), false)).await?;
     }
     clear_delivery_failure(st, child_id, &end_seq.to_string()).await;
+    for seq in earlier {
+        clear_delivery_failure(st, child_id, &seq.to_string()).await;
+    }
     Ok(())
+}
+
+fn group_obligations(pending: Vec<(String, String)>) -> (Vec<String>, BTreeMap<String, Vec<String>>) {
+    let mut steers = Vec::new();
+    let mut calls = BTreeMap::<String, Vec<String>>::new();
+    for (cmd, call) in pending {
+        if call.is_empty() {
+            steers.push(cmd);
+        } else {
+            calls.entry(call).or_default().push(cmd);
+        }
+    }
+    (steers, calls)
 }
 
 /// A command for a remote subagent was rejected: calls waiting on it (or,
@@ -360,6 +479,150 @@ pub(crate) async fn recovery_notice(
     .await
 }
 
+/// Lose the dependency as well as notifying the parent. Remote tool waiters
+/// take this as an error result; otherwise the parent's durable notice path
+/// wakes it (including when a local worker never recorded its own result).
+pub(crate) async fn liveness_notice(st: &HeadState, child: &SessionRow, incident: &str, cause: &str) -> anyhow::Result<()> {
+    let (Some(parent), Some(original_call)) = (child.parent_id.as_deref(), child.parent_call_id.as_deref()) else {
+        return Ok(());
+    };
+    let prefix = format!("liveness:lost:{}:{incident}:", child.id);
+    // Include only obligations that existed at the observation. In particular,
+    // retrying an old report must not settle a newly queued continuation.
+    let pending = sqlx::query_as(
+        "SELECT command_id, call_id FROM remote_delegations WHERE child_id = ?1 AND state = 'waiting' \
+         AND created_at <= COALESCE((SELECT observed_at FROM liveness_incidents WHERE id = ?2), ?3) AND parent_id = ?4",
+    )
+    .bind(&child.id)
+    .bind(incident)
+    .bind(c6_core::now_ms())
+    .bind(parent)
+    .fetch_all(st.store.pool())
+    .await?;
+    let (mut steers, mut calls) = group_obligations(pending);
+    if child.remote_template.is_empty() {
+        let events = st.store.events_after(&child.id, 0, i64::MAX).await?;
+        let tracked: Vec<String> = sqlx::query_scalar(
+            "SELECT command_id FROM remote_delegations WHERE child_id = ? AND parent_id = ? AND command_id LIKE 'subagent:local-wait:%'",
+        )
+        .bind(&child.id)
+        .bind(parent)
+        .fetch_all(st.store.pool())
+        .await?;
+        let tracked: std::collections::HashSet<_> = tracked.into_iter().collect();
+        // Include foreground and legacy local waiters as well. Registered
+        // background waits are authoritative even before the child's User.
+        for call in local_pending_calls(&events, &child.id, child.last_seq as u64, |u| {
+            tracked.contains(&format!("subagent:local-wait:{}", u.command_id))
+        }) {
+            calls.entry(call).or_default();
+        }
+    }
+    if calls.is_empty() {
+        // The last command in a multi-waiter report retires all the remaining
+        // obligations. Do not send an extra fallback on replay after commit.
+        let sent: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM commands WHERE substr(id, 1, length(?)) = ?)")
+            .bind(&prefix)
+            .bind(&prefix)
+            .fetch_one(st.store.pool())
+            .await?;
+        if sent && steers.is_empty() {
+            return Ok(());
+        }
+        let call = if child.remote_template.is_empty() && child.last_seq <= 1 { original_call.to_owned() } else { String::new() };
+        calls.insert(call, Vec::new());
+    }
+    let progress = digest(st, &child.id, "lost").await?;
+    let template = crate::prompts::get(st, "session.liveness_lost", &child.realm).await;
+    let text = api::prompts::fill(&template, &[("child", &child.id), ("reason", cause), ("progress", &progress)]);
+    let reason = TurnEndReason::WorkerRestarted; // The existing wire classification for “lost”; the prompt carries the actual cause.
+    let last_call = calls.keys().next_back().cloned();
+    for (call_id, mut inputs) in calls {
+        if Some(&call_id) == last_call.as_ref() {
+            inputs.append(&mut steers);
+        }
+        let id = format!("{prefix}{call_id}");
+        send(
+            st,
+            parent,
+            &id,
+            &inputs,
+            DelegationEnded {
+                call_id,
+                child_session_id: child.id.clone(),
+                reason: reason as i32,
+                task_notice: Some(c6_worker::task_report_notice(&child.title, &child.id, reason, &text)),
+                digest: text.clone(),
+                wake: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn local_pending_calls(
+    events: &[c6_proto::SessionEvent],
+    child: &str,
+    through: u64,
+    tracked: impl Fn(&c6_proto::UserMessage) -> bool,
+) -> std::collections::BTreeSet<String> {
+    let prefix = format!("subagent:local:{child}:");
+    let reported = events
+        .iter()
+        .filter(|e| e.seq <= through)
+        .filter_map(|e| match &e.kind {
+            Some(session_event::Kind::SubagentReported(r)) => r.command_id.strip_prefix(&prefix)?.parse::<u64>().ok(),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    events
+        .iter()
+        .filter(|e| e.seq > reported && e.seq <= through)
+        .filter_map(|e| match &e.kind {
+            Some(session_event::Kind::User(u)) if !u.delegated_by.is_empty() && u.blocked.is_empty() && !tracked(u) => {
+                Some(u.delegated_by.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A wakeable, ordinary notice, not a failed child or a completed dependency.
+/// Use a reserved synthetic source (not a real child or the parent itself)
+/// so the notice never satisfies a Task group or competes for a tool waiter.
+pub(crate) async fn silence_notice(st: &HeadState, parent: &SessionRow, incident: &str, pending: &str) -> anyhow::Result<()> {
+    let template = crate::prompts::get(st, "session.liveness_silence", &parent.realm).await;
+    let text = api::prompts::fill(&template, &[("pending", pending)]);
+    let id = format!("liveness:silence:{}:{incident}", parent.id);
+    send(
+        st,
+        &parent.id,
+        &id,
+        &[],
+        DelegationEnded {
+            child_session_id: id.clone(),
+            // DelegationEnded has no neutral wire reason. Use a success
+            // envelope so the receipt is not counted as a failed relaunch.
+            reason: TurnEndReason::Completed as i32,
+            task_notice: Some(c6_proto::TaskNotice {
+                kind: "liveness".into(),
+                title: "Pending subagents".into(),
+                status: "waiting".into(),
+                markdown: text.clone(),
+                ..Default::default()
+            }),
+            report: text,
+            said: vec!["Liveness notice (no subagent completion):".into()],
+            wake: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 /// Queues `ended` for the parent: delivered when its worker is connected,
 /// and again until the parent's log says it got it.
 async fn send(st: &HeadState, parent_id: &str, id: &str, inputs: &[String], ended: DelegationEnded) -> anyhow::Result<()> {
@@ -376,4 +639,49 @@ async fn send(st: &HeadState, parent_id: &str, id: &str, inputs: &[String], ende
         .await?;
     st.registry.deliver(worker_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_loss_includes_idle_background_waiters_but_not_settled_or_new_inputs() {
+        use c6_proto::{SessionEvent, SubagentReported, UserMessage};
+        let events = [
+            session_event::Kind::User(UserMessage { delegated_by: "settled".into(), ..Default::default() }),
+            session_event::Kind::TurnEnded(Default::default()),
+            session_event::Kind::SubagentReported(SubagentReported { command_id: "subagent:local:child:2".into(), ..Default::default() }),
+            session_event::Kind::User(UserMessage { delegated_by: "waiting-a".into(), ..Default::default() }),
+            session_event::Kind::TurnEnded(Default::default()),
+            session_event::Kind::User(UserMessage { delegated_by: "waiting-b".into(), ..Default::default() }),
+            session_event::Kind::User(UserMessage { delegated_by: "new-input".into(), ..Default::default() }),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| SessionEvent { seq: i as u64 + 1, kind: Some(kind), ..Default::default() })
+        .collect::<Vec<_>>();
+        assert_eq!(local_pending_calls(&events, "child", 6, |_| false).into_iter().collect::<Vec<_>>(), ["waiting-a", "waiting-b"]);
+    }
+
+    #[test]
+    fn deferred_markers_identify_the_child_and_turn() {
+        assert_eq!(turn_report_seq("child", &turn_report_id("child", 42)), Some(42));
+        assert_eq!(turn_report_seq("other", &turn_report_id("child", 42)), None);
+        assert_eq!(turn_report_seq("child", "subagent:turn:child:0"), None);
+        assert_eq!(turn_report_seq("child", "subagent:input:child:42"), None);
+    }
+
+    #[test]
+    fn one_report_can_retire_multiple_obligations_for_the_same_waiter() {
+        let (steers, calls) = group_obligations(
+            [("turn-1", ""), ("input-1", "call-a"), ("input-2", "call-b"), ("input-3", "call-a"), ("turn-2", "")]
+                .into_iter()
+                .map(|(input, call)| (input.into(), call.into()))
+                .collect(),
+        );
+        assert_eq!(steers, ["turn-1", "turn-2"]);
+        assert_eq!(calls["call-a"], ["input-1", "input-3"]);
+        assert_eq!(calls["call-b"], ["input-2"]);
+    }
 }

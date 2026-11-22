@@ -655,8 +655,8 @@ mod tests {
         let (src_tx, _src_rx) = tokio::sync::mpsc::channel(8);
         let (dst_tx, _dst_rx) = tokio::sync::mpsc::channel(8);
         let capabilities = vec![c6_proto::SESSION_MOVE_CAPABILITY.to_owned()];
-        let source_conn = st.registry.attach(source, now_ms(), src_tx, capabilities.clone(), "worker");
-        let target_conn = st.registry.attach(target, now_ms(), dst_tx, capabilities, "worker");
+        let source_conn = st.registry.attach(source, now_ms(), src_tx, capabilities.clone(), "worker").await;
+        let target_conn = st.registry.attach(target, now_ms(), dst_tx, capabilities, "worker").await;
         sqlx::query(
             "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, last_seq) \
              VALUES ('session', ?, 'move', '/source', '', '', 'idle', 1, 1, 1)",
@@ -760,7 +760,7 @@ mod tests {
         let head = crate::start(config).await.unwrap();
         let st = &head.state;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let live = st.registry.attach(target, now_ms(), tx, vec![c6_proto::SESSION_MOVE_CAPABILITY.to_owned()], "worker");
+        let live = st.registry.attach(target, now_ms(), tx, vec![c6_proto::SESSION_MOVE_CAPABILITY.to_owned()], "worker").await;
         let message = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap().unwrap();
         let Some(c6_proto::head_msg::Msg::RpcRequest(rpc)) = message.msg else { panic!("expected activation request") };
         assert_eq!(rpc.method, "move.activate");
@@ -784,7 +784,8 @@ mod tests {
         assert_eq!(st.store.events_after("session", 0, 10).await.unwrap(), vec![placed]);
 
         let (source_tx, mut source_rx) = tokio::sync::mpsc::channel(8);
-        let source_live = st.registry.attach(source, now_ms(), source_tx, vec![c6_proto::SESSION_MOVE_CAPABILITY.to_owned()], "worker");
+        let source_live =
+            st.registry.attach(source, now_ms(), source_tx, vec![c6_proto::SESSION_MOVE_CAPABILITY.to_owned()], "worker").await;
         let message = tokio::time::timeout(Duration::from_secs(6), source_rx.recv()).await.unwrap().unwrap().unwrap();
         let Some(c6_proto::head_msg::Msg::RpcRequest(rpc)) = message.msg else { panic!("expected source retirement request") };
         assert_eq!(rpc.method, "move.retire");

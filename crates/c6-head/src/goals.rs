@@ -138,6 +138,11 @@ async fn set_state(st: &HeadState, session: &str, state: &str, why: &str) -> any
     Ok(())
 }
 
+/// Announce the goal transition after the fenced liveness transaction commits.
+pub(crate) fn liveness_lost(st: &HeadState, session: &crate::store::SessionRow, why: &str) {
+    tell(st, session, "goal needs you", why, true);
+}
+
 async fn bump_turns(st: &HeadState, session: &str) -> anyhow::Result<()> {
     sqlx::query("UPDATE goals SET turns = turns + 1, updated_at = ? WHERE session_id = ?")
         .bind(now_ms())

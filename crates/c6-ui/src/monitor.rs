@@ -1,6 +1,6 @@
 //! The activity panel (docs/activity.md): what's going on now. Model calls
 //! as they stream, sessions running, and what each connector's sync is
-//! doing; all kept in the head's memory, gone on a restart.
+//! doing, plus the head's durable session liveness incidents.
 
 use leptos::prelude::*;
 use serde_json::Value;
@@ -61,9 +61,10 @@ pub fn ActivityPage() -> impl IntoView {
         <main class="mx-auto max-w-6xl space-y-6 px-4 py-5">
             <header class="space-y-1">
                 <h1 class="text-xl font-semibold">"Activity"</h1>
-                <p class="text-sm text-muted">"What's going on now: model calls as they happen, sessions running, and each connector's sync. Kept in the head's memory only (the last 200 calls); a restart clears it."</p>
+                <p class="text-sm text-muted">"See model calls as they happen, running sessions, session liveness incidents, and connector syncs. The head keeps the last 200 model calls in memory; liveness incidents survive a restart."</p>
             </header>
             {move || data.get().and_then(Result::err).map(|e| view! { <ErrorBox message=e /> })}
+            <crate::activity::LivenessIncidents liveness=Signal::derive(move || get("liveness")) now />
 
             <section class="space-y-2">
                 <div class="flex flex-wrap items-baseline gap-3">

@@ -851,7 +851,7 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     // A legacy worker can run Claude Code but cannot confirm native-memory
     // reset. Advertising only the old capability must not bypass the gate.
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
-    let legacy = head.state.registry.attach(worker_id, 0, tx, vec!["claude_code".into()], "worker");
+    let legacy = head.state.registry.attach(worker_id, 0, tx, vec!["claude_code".into()], "worker").await;
     rejected_rewind().await;
     drop(legacy);
     let worker = WorkerProcess::start(state.path()).await;

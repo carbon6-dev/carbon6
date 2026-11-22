@@ -203,6 +203,7 @@ impl TaskLossCause {
 }
 
 pub(crate) enum ActorMsg {
+    HealthProbe(tokio::sync::oneshot::Sender<()>),
     FreezeMove {
         move_id: String,
         epoch: u64,
@@ -226,10 +227,14 @@ pub(crate) enum ActorMsg {
     /// what is needed to pick the variant of a custom command it invokes.
     Input(Box<PendingInput>, Option<ModelSpec>, Box<CommandChoice>),
     Interrupt,
+    /// The parent cancelled its wait; stop the child's counted work too.
+    InterruptDelegation,
     /// Send now for an input already with the agent (its command id).
     SendNow(String),
     /// A background task started or ended.
     Task(c6_tools::TaskEvent),
+    /// All task callbacks submitted before a delegated turn ended precede this.
+    TaskFence(tokio::sync::oneshot::Sender<()>),
     /// A background task whose outcome was missing from the loaded journal.
     Lost {
         cause: TaskLossCause,
@@ -322,7 +327,31 @@ enum RecoveryAction {
 #[derive(Default)]
 struct RecoveryGate {
     epoch: u64,
+    active: std::sync::atomic::AtomicBool,
+    activity: Arc<std::sync::atomic::AtomicI32>,
+    probe: Mutex<ActorProbe>,
     request: Mutex<Option<RecoveryRequest>>,
+}
+
+const ACTOR_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct ActorProbe {
+    pending: Option<(tokio::time::Instant, tokio::sync::oneshot::Receiver<()>)>,
+}
+
+impl ActorProbe {
+    /// Never await an acknowledgment or enqueue a second outstanding probe.
+    fn timed_out(&mut self, tx: &mpsc::UnboundedSender<ActorMsg>, now: tokio::time::Instant) -> bool {
+        if let Some((sent, ack)) = &mut self.pending
+            && matches!(ack.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty))
+        {
+            return now.saturating_duration_since(*sent) >= ACTOR_PROBE_TIMEOUT;
+        }
+        let (reply, ack) = tokio::sync::oneshot::channel();
+        self.pending = tx.send(ActorMsg::HealthProbe(reply)).ok().map(|()| (now, ack));
+        false
+    }
 }
 
 struct RecoveryRequest {
@@ -600,6 +629,58 @@ impl SessionManager {
     /// How many sessions are in the middle of a turn.
     pub fn running(&self) -> usize {
         self.actors.lock().unwrap().values().filter(|a| !a.tx.is_closed() && a.running.load(std::sync::atomic::Ordering::SeqCst)).count()
+    }
+
+    /// Snapshot the worker's actors without waiting on the journal or actor
+    /// mailboxes. A nonblocking mailbox probe detects a stuck run loop.
+    pub(crate) fn liveness_report(&self) -> c6_proto::SessionLivenessReport {
+        use c6_proto::{SessionActivityKind, SessionActorState, SessionLiveness};
+        use std::sync::atomic::Ordering;
+
+        let actors = self.actors.lock().unwrap().clone();
+        let held = if actors.values().any(|a| a.claude_code.load(Ordering::Acquire)) {
+            crate::claude_code::held_liveness(&self.claude_dir().join("held"))
+        } else {
+            HashMap::new()
+        };
+        let now = tokio::time::Instant::now();
+        let sessions = actors
+            .into_iter()
+            .map(|(session_id, a)| {
+                let (state, reason) = if a.tx.is_closed() {
+                    (SessionActorState::Stopped, "The worker's session actor exited")
+                } else if a.recovery.active.load(Ordering::Acquire) {
+                    (SessionActorState::Recovering, "The worker is recovering the session journal")
+                } else if a.recovery.probe.lock().unwrap().timed_out(&a.tx, now) {
+                    (SessionActorState::Unresponsive, "The session actor has not answered its mailbox probe for 30 seconds")
+                } else if a.running.load(Ordering::SeqCst) {
+                    (SessionActorState::Running, "")
+                } else {
+                    (SessionActorState::Idle, "")
+                };
+                let held_process = if a.claude_code.load(Ordering::Acquire) { held.get(&session_id).copied() } else { None };
+                SessionLiveness {
+                    session_id,
+                    ownership_epoch: a.recovery.epoch,
+                    actor_state: state as i32,
+                    reason: reason.into(),
+                    activity_kind: if matches!(state, SessionActorState::Running | SessionActorState::Unresponsive) {
+                        a.recovery.activity.load(Ordering::Relaxed)
+                    } else {
+                        SessionActivityKind::Unspecified as i32
+                    },
+                    running_background_tasks: a
+                        .tools
+                        .background
+                        .list()
+                        .iter()
+                        .filter(|t| t.running && crate::subagent::counted_background(t.notify, t.kind.as_str()))
+                        .count() as u32,
+                    held_process: held_process.unwrap_or_default() as i32,
+                }
+            })
+            .collect();
+        c6_proto::SessionLivenessReport { sessions }
     }
 
     /// Whether the session's actor is running a turn.
@@ -902,7 +983,7 @@ impl SessionManager {
             // whose parents already durably recorded the report. An actor
             // is needed only for an actual undelivered obligation.
             let undelivered = pending.iter().any(|(id, end, inputs)| {
-                let outcome = last_turn_outcome(&events[..=*end]);
+                let outcome = local_report_outcome(&events[..=*end]);
                 let status = crate::subagent::status_of(outcome.reason, &outcome.report);
                 !inputs.iter().any(|u| LocalReportCall::of(u).is_some_and(|call| call.recorded(&parent, &session_id, status)))
                     && !parent.iter().any(|e| {
@@ -1843,19 +1924,10 @@ impl SessionManager {
                 }
             });
         }
-        {
-            // Background tasks report to the actor.
-            let (task_tx, mut task_rx) = mpsc::unbounded_channel();
-            session_tools.background.set_sink(Some(task_tx));
-            let actor_tx = tx.clone();
-            tokio::spawn(async move {
-                while let Some(ev) = task_rx.recv().await {
-                    if actor_tx.send(ActorMsg::Task(ev)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+        let (task_tx, task_rx) = mpsc::unbounded_channel();
+        let (task_fence, fence_rx) = mpsc::unbounded_channel();
+        session_tools.background.set_sink(Some(task_tx));
+        tokio::spawn(forward_tasks(task_rx, fence_rx, tx.clone()));
         let spec_default = spec.clone();
         let claude_code = Arc::new(std::sync::atomic::AtomicBool::new(started.tool_profile == crate::claude_code::PROFILE));
         let actor = Actor {
@@ -1869,6 +1941,7 @@ impl SessionManager {
             conv: Some(conv),
             turns,
             writer,
+            task_fence,
             link: self.link.clone(),
             inbox: Arc::new(Mutex::new(Inbox::default())),
             // Files on an SSH target are not checkpointed.
@@ -1899,7 +1972,7 @@ impl SessionManager {
             stopping: false,
             stopped_until: None,
         };
-        let recovery = Arc::new(RecoveryGate { epoch, ..Default::default() });
+        let recovery = Arc::new(RecoveryGate { epoch, activity: actor.writer.activity.clone(), ..Default::default() });
         let handle = Handle {
             tx,
             recovery: recovery.clone(),
@@ -2357,9 +2430,8 @@ fn set_subagent_default(spec: &mut CreateSession, model: Option<ModelSpec>) {
     spec.subagent_model.clear();
 }
 
-/// A local turn's report belongs to its consumed inputs, not to an
-/// in-memory background task or a queued input for a later turn. The
-/// receipt is appended only after its waiter or parent's journal took it.
+/// Only consumed inputs in a quiescent work interval are ready to report.
+/// The receipt is appended after its waiter or parent's journal took it.
 fn pending_local_reports<'a>(sid: &str, events: &'a [SessionEvent]) -> Vec<(String, usize, Vec<&'a c6_proto::UserMessage>)> {
     let Some(boundary) = events.iter().position(|e| {
         matches!(&e.kind,
@@ -2374,26 +2446,11 @@ fn pending_local_reports<'a>(sid: &str, events: &'a [SessionEvent]) -> Vec<(Stri
             _ => None,
         })
         .collect();
-    let mut pending = Vec::new();
-    let mut start = boundary + 1;
-    for (end, event) in events.iter().enumerate().skip(start) {
-        if !matches!(event.kind, Some(session_event::Kind::TurnEnded(_))) {
-            continue;
-        }
-        let id = format!("subagent:local:{sid}:{}", event.seq);
-        let inputs: Vec<_> = events[start..end]
-            .iter()
-            .filter_map(|e| match &e.kind {
-                Some(session_event::Kind::User(u)) if u.blocked.is_empty() && u.command != "compact" => Some(u),
-                _ => None,
-            })
-            .collect();
-        if !received.contains(id.as_str()) && !inputs.is_empty() {
-            pending.push((id, end, inputs));
-        }
-        start = end + 1;
-    }
-    pending
+    let id = |seq| format!("subagent:local:{sid}:{seq}");
+    crate::subagent::local_report_windows(events, boundary + 1, |seq| received.contains(id(seq).as_str()))
+        .into_iter()
+        .map(|(seq, finish, inputs)| (id(seq), finish, inputs))
+        .collect()
 }
 
 /// A successful channel send is not durable delivery. On recovery, look
@@ -2773,6 +2830,12 @@ fn last_turn_outcome(events: &[SessionEvent]) -> Outcome {
     out
 }
 
+fn local_report_outcome(events: &[SessionEvent]) -> Outcome {
+    let mut outcome = last_turn_outcome(events);
+    crate::subagent::local_background_outcome(events, &mut outcome);
+    outcome
+}
+
 /// A side chat's branched-from conversation, made portable when the side
 /// chat runs on a different model than produced any of it.
 fn seed_events(spec: &CreateSession) -> Vec<SessionEvent> {
@@ -2935,16 +2998,58 @@ impl Inbox {
     }
 }
 
+type TaskFenceSender = mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>;
+
 /// Keep input ownership in the actor until the turn's User append commits.
 /// Both turn implementations also accept inputs mid-turn through callbacks.
 struct TurnSink {
     writer: Arc<Writer>,
     inbox: Arc<Mutex<Inbox>>,
+    task_fence: Option<TaskFenceSender>,
+}
+
+/// Background starts are sent synchronously by the tool before it returns,
+/// but normally make an asynchronous hop to the actor. Drain that hop before
+/// forwarding a fence. The actor acks only after journaling the callbacks
+/// ahead of it, so the head can trust its task projection at TurnEnded.
+async fn forward_tasks(
+    mut tasks: mpsc::UnboundedReceiver<c6_tools::TaskEvent>,
+    mut fences: mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>>,
+    actor: mpsc::UnboundedSender<ActorMsg>,
+) {
+    loop {
+        let msg = tokio::select! {
+            event = tasks.recv() => {
+                let Some(event) = event else { return };
+                ActorMsg::Task(event)
+            }
+            fence = fences.recv() => {
+                let Some(fence) = fence else { return };
+                while let Ok(event) = tasks.try_recv() {
+                    if actor.send(ActorMsg::Task(event)).is_err() {
+                        return;
+                    }
+                }
+                ActorMsg::TaskFence(fence)
+            }
+        };
+        if actor.send(msg).is_err() {
+            return;
+        }
+    }
 }
 
 #[async_trait]
 impl EventSink for TurnSink {
     async fn append(&self, kind: session_event::Kind) -> anyhow::Result<u64> {
+        if matches!(&kind, session_event::Kind::TurnEnded(_))
+            && let Some(fence) = &self.task_fence
+        {
+            let (ack, ready) = tokio::sync::oneshot::channel();
+            fence.send(ack).map_err(|_| anyhow::anyhow!("background task relay stopped before the delegation ended"))?;
+            ready.await?;
+        }
+        self.writer.observe_activity(&kind);
         let input = match &kind {
             session_event::Kind::User(u) => Some(u.command_id.clone()),
             _ => None,
@@ -2980,6 +3085,7 @@ struct Actor {
     conv: Option<Conversation>,
     turns: u64,
     writer: Arc<Writer>,
+    task_fence: TaskFenceSender,
     link: Arc<HeadLink>,
     journal: Arc<Journal>,
     tools: Vec<Arc<dyn Tool>>,
@@ -3098,6 +3204,7 @@ impl Actor {
         loop {
             let mut recoverable = true;
             self.run(&mut rx, &mut running, &mut recoverable).await;
+            gate.active.store(recoverable && !rx.is_closed(), std::sync::atomic::Ordering::Release);
             if let Some((task, cancel)) = running.take() {
                 cancel.cancel();
                 task.abort();
@@ -3108,6 +3215,9 @@ impl Actor {
                 return;
             }
             self.recover_supervised(&gate).await;
+            // Time spent in deliberate recovery is not mailbox silence.
+            gate.probe.lock().unwrap().pending = None;
+            gate.active.store(false, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -3484,6 +3594,7 @@ impl Actor {
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => return,
+                    Some(ActorMsg::HealthProbe(reply)) => { let _ = reply.send(()); }
                     // Another session's agent wrote (docs/background.md §6): a
                     // notice, not your message (no commands, mentions or hooks).
                     Some(ActorMsg::Input(input, _, _)) if !input.from_session_id.is_empty() => {
@@ -3592,10 +3703,18 @@ impl Actor {
                             }
                         }
                     }
-                    Some(ActorMsg::Interrupt) => {
+                    Some(msg @ (ActorMsg::Interrupt | ActorMsg::InterruptDelegation)) => {
                         if let Some((_, cancel)) = running.as_ref() {
                             cancel.cancel();
                             self.stopping |= self.runs_claude_code();
+                        }
+                        if matches!(msg, ActorMsg::InterruptDelegation) {
+                            let background = &self.session_tools.background;
+                            for task in background.list() {
+                                if task.running && crate::subagent::counted_background(task.notify, task.kind.as_str()) {
+                                    background.kill_by_user(&task.id);
+                                }
+                            }
                         }
                     }
                     Some(ActorMsg::SendNow(command_id)) => {
@@ -3703,6 +3822,9 @@ impl Actor {
                                 return;
                             }
                         }
+                    }
+                    Some(ActorMsg::TaskFence(ack)) => {
+                        let _ = ack.send(());
                     }
                     Some(ActorMsg::Task(ev)) => {
                         let state = match ev.state {
@@ -4106,6 +4228,19 @@ impl Actor {
     /// call waited on goes to its parent as a notice.
     async fn settle_delegations(&mut self) -> anyhow::Result<()> {
         let Some(d) = self.spec.delegation.clone() else { return Ok(()) };
+        if self.running_flag.load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .session_tools
+                .background
+                .list()
+                .iter()
+                .any(|task| task.running && crate::subagent::counted_background(task.notify, task.kind.as_str()))
+        {
+            // Live tasks can precede their durable start callback. The turn
+            // end or terminal task event will recheck locally, without polling.
+            self.local_report_retry_at = None;
+            return Ok(());
+        }
         let sid = self.writer.session_id.clone();
         // Recheck a handoff even if this actor never runs another turn, and
         // retry any journal operation below that failed transiently.
@@ -4136,7 +4271,7 @@ impl Actor {
             let (settled, still): (Vec<_>, Vec<_>) =
                 std::mem::take(&mut self.waiting).into_iter().partition(|(id, _)| inputs.iter().any(|u| &u.command_id == id));
             self.waiting = still;
-            let outcome = last_turn_outcome(&events[..=end]);
+            let outcome = local_report_outcome(&events[..=end]);
             let status = crate::subagent::status_of(outcome.reason, &outcome.report);
             let calls: Vec<_> = inputs.iter().filter_map(|u| LocalReportCall::of(u)).collect();
             let after = InlineChildReport::check_after(&calls, parent, self.local_report_parent.after);
@@ -4270,6 +4405,30 @@ impl Actor {
             child_session_id: ended.child_session_id.clone(),
             status: crate::subagent::status_of(reason, &ended.report).into(),
         };
+        if reported.status == "lost"
+            && let Some(incident) = crate::notice_guard::liveness_report_id(&reported.command_id, &reported.child_session_id)
+            && let Some(notice) = ended.task_notice.as_ref().filter(|n| n.status == "lost" && n.session_id == reported.child_session_id)
+        {
+            // Persist the structured outcome before releasing a waiter. The
+            // background runner only returns a string error and would otherwise
+            // replace this with a generic failure. The terminal task event still
+            // records its lifecycle, but cannot deliver this incident again.
+            let input = PendingInput {
+                command_id: format!("subagent:{incident}"),
+                text: ended.digest.clone(),
+                command: "task-notification".into(),
+                task_notice: Some(notice.clone()),
+                ..Default::default()
+            };
+            self.notice(input, busy, true).await?;
+            self.writer.append(session_event::Kind::SubagentReported(reported)).await?;
+            if !ended.call_id.is_empty()
+                && let Some(waiter) = self.manager.take_remote_wait(&self.writer.session_id, &ended.call_id)
+            {
+                let _ = waiter.send(ended);
+            }
+            return Ok(());
+        }
         let waiter = if ended.call_id.is_empty() { None } else { self.manager.take_remote_wait(&self.writer.session_id, &ended.call_id) };
         let unanswered = match waiter {
             Some(tx) => tx.send(ended).err(),
@@ -4706,20 +4865,35 @@ impl Actor {
     async fn write_pending_task_event(&mut self, busy: bool) -> anyhow::Result<()> {
         let Some(pending) = self.pending_task_event.as_ref() else { return Ok(()) };
         let record = pending.record.clone();
+        let completed = record.state != "started" && crate::subagent::counted_background(record.notify, &record.kind);
         let withdrawn = self.withdrawn.contains(&record.task_id);
+        let covered = if record.state != "started" && record.kind == "agent" && pending.notice.is_some() {
+            // Also check the durable receipt on recovery, when the original
+            // waiter may be gone and the callback is a synthetic task loss.
+            let events = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
+            crate::notice_guard::liveness_covered_tasks(&events).contains(record.task_id.as_str())
+        } else {
+            false
+        };
         let command_id = format!("task:{}:{}", record.task_id, record.state);
-        let task_notice = (!withdrawn).then(|| background_task_notice(&record, &pending.output));
+        let task_notice = (!withdrawn && !covered).then(|| background_task_notice(&record, &pending.output));
         let notice = pending.notice.clone();
         let wake = pending.wake;
         if !pending.logged {
             self.writer.append(session_event::Kind::BackgroundTask(record)).await?;
             self.pending_task_event.as_mut().expect("retained callback").logged = true;
         }
-        if !withdrawn && let Some(text) = notice {
+        if !withdrawn
+            && !covered
+            && let Some(text) = notice
+        {
             let input = PendingInput { command_id, text, command: "task-notification".into(), task_notice, ..Default::default() };
             self.notice(input, busy, wake).await?;
         }
         self.pending_task_event = None;
+        if completed && !busy {
+            self.settle_delegations().await?;
+        }
         Ok(())
     }
 
@@ -5551,6 +5725,7 @@ impl Actor {
     }
 
     fn start_turn(&mut self) -> (TurnTask, CancellationToken) {
+        self.writer.set_activity(c6_proto::SessionActivityKind::Unspecified);
         self.turns += 1;
         let turn = self.turns;
         let cancel = CancellationToken::new();
@@ -5637,8 +5812,9 @@ impl Actor {
         // Claude Code's calls of carbon6's tools are held to the session's policies.
         let policies = self.policies.clone();
         let trim_spec = self.spec.clone();
+        let task_fence = (subagent || self.spec.depth > 0).then(|| self.task_fence.clone());
         let task = tokio::spawn(async move {
-            let sink: Arc<dyn EventSink> = Arc::new(TurnSink { writer: writer.clone(), inbox: inbox.clone() });
+            let sink: Arc<dyn EventSink> = Arc::new(TurnSink { writer: writer.clone(), inbox: inbox.clone(), task_fence });
             if !claude_code {
                 cfg.context_window = link.context_window(&on_behalf_of, &model).await;
                 // As the window the connection says, not the model's default.
@@ -5748,6 +5924,7 @@ impl Actor {
                     &tools,
                     &session_tools,
                     &sink,
+                    &writer,
                     &mut conv,
                     &inbox,
                     &c,
@@ -5956,6 +6133,7 @@ async fn run_session_turn(
     tools: &[Arc<dyn Tool>],
     session_tools: &Arc<SessionTools>,
     sink: &Arc<dyn EventSink>,
+    writer: &Arc<Writer>,
     conv: &mut Conversation,
     inbox: &Mutex<Inbox>,
     cancel: &CancellationToken,
@@ -5989,7 +6167,7 @@ async fn run_session_turn(
     };
     let client: Arc<dyn c6_llm::ModelClient> =
         match checked.and_then(|g| Ok(c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?)) {
-            Ok(_) => Arc::new(crate::link::LinkedClient::new(link.clone(), session_id, connection_id)),
+            Ok(_) => Arc::new(crate::link::LinkedClient::new(link.clone(), session_id, connection_id).track_activity(writer)),
             Err(e) => {
                 sink.append(session_event::Kind::TurnStarted(TurnStarted { turn, ..Default::default() })).await?;
                 sink.append(session_event::Kind::Error(ErrorEvent { message: format!("cannot reach the model: {e:#}") })).await?;
@@ -6615,6 +6793,8 @@ pub(crate) struct Writer {
     /// `next_seq` as of the last append, read without waiting on one: what
     /// streamed text is stamped with.
     logged: std::sync::atomic::AtomicU64,
+    activity: Arc<std::sync::atomic::AtomicI32>,
+    outstanding_tools: Mutex<HashSet<String>>,
 }
 
 impl Writer {
@@ -6627,7 +6807,35 @@ impl Writer {
             next_seq: tokio::sync::Mutex::new(next_seq),
             ownership_epoch: 0,
             logged: std::sync::atomic::AtomicU64::new(next_seq),
+            activity: Default::default(),
+            outstanding_tools: Default::default(),
         }
+    }
+
+    pub(crate) fn set_activity(&self, kind: c6_proto::SessionActivityKind) {
+        let mut tools = self.outstanding_tools.lock().unwrap();
+        tools.clear();
+        self.activity.store(kind as i32, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn observe_activity(&self, event: &session_event::Kind) {
+        use c6_proto::{SessionActivityKind, content_block};
+        let mut tools = self.outstanding_tools.lock().unwrap();
+        match event {
+            session_event::Kind::Assistant(m) => {
+                if m.stop_reason != "interrupted" {
+                    tools.extend(m.blocks.iter().filter_map(|b| match &b.block {
+                        Some(content_block::Block::ToolUse(call)) => Some(call.id.clone()),
+                        _ => None,
+                    }));
+                }
+            }
+            session_event::Kind::ToolResult(r) if tools.remove(&r.call_id) => {}
+            session_event::Kind::TurnEnded(_) => tools.clear(),
+            _ => return,
+        }
+        let kind = if tools.is_empty() { SessionActivityKind::Unspecified } else { SessionActivityKind::Tool };
+        self.activity.store(kind as i32, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -11054,6 +11262,95 @@ mod writer_tests {
 
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn mailbox_probe_times_out_without_queuing_a_duplicate_and_recovers_on_ack() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut probe = ActorProbe::default();
+        let now = tokio::time::Instant::now;
+        assert!(!probe.timed_out(&tx, now()));
+        let ActorMsg::HealthProbe(reply) = rx.try_recv().unwrap() else { panic!("expected a health probe") };
+
+        tokio::time::advance(ACTOR_PROBE_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(!probe.timed_out(&tx, now()));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(probe.timed_out(&tx, now()));
+        assert!(rx.try_recv().is_err());
+
+        reply.send(()).unwrap();
+        assert!(!probe.timed_out(&tx, now()));
+        assert!(matches!(rx.try_recv(), Ok(ActorMsg::HealthProbe(_))));
+    }
+
+    #[tokio::test]
+    async fn activity_stays_tool_until_all_calls_finish() {
+        use c6_proto::{ContentBlock, SessionActivityKind, ToolResult, ToolUse, content_block};
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let writer = Writer::new("s".into(), journal, Arc::new(HeadLink::default()), 1);
+        let activity = || SessionActivityKind::try_from(writer.activity.load(Ordering::Relaxed)).unwrap();
+        let result = |id: &str| session_event::Kind::ToolResult(ToolResult { call_id: id.into(), ..Default::default() });
+        writer.set_activity(SessionActivityKind::Model);
+        assert_eq!(activity(), SessionActivityKind::Model);
+        writer.observe_activity(&session_event::Kind::Assistant(AssistantMessage {
+            blocks: ["first", "second"]
+                .into_iter()
+                .map(|id| ContentBlock {
+                    block: Some(content_block::Block::ToolUse(ToolUse { id: id.into(), ..Default::default() })),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }));
+        assert_eq!(activity(), SessionActivityKind::Tool);
+        writer.observe_activity(&result("second"));
+        writer.observe_activity(&result("second"));
+        assert_eq!(activity(), SessionActivityKind::Tool);
+        writer.observe_activity(&result("first"));
+        assert_eq!(activity(), SessionActivityKind::Unspecified);
+        writer.set_activity(SessionActivityKind::Model);
+        writer.observe_activity(&result("unrelated"));
+        assert_eq!(activity(), SessionActivityKind::Model);
+    }
+
+    #[tokio::test]
+    async fn delegated_turn_end_waits_for_background_start_to_be_journaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let started = SessionEvent { seq: 1, kind: Some(session_event::Kind::Started(SessionStarted::default())), ..Default::default() };
+        journal.create_session("s", &CreateSession::default(), &started).await.unwrap();
+        let writer = Arc::new(Writer::new("s".into(), journal.clone(), Arc::new(HeadLink::default()), 2));
+        let (task_tx, task_rx) = mpsc::unbounded_channel();
+        let (fence, fence_rx) = mpsc::unbounded_channel();
+        let (actor_tx, mut actor_rx) = mpsc::unbounded_channel();
+        let background = c6_tools::Background::default();
+        background.set_sink(Some(task_tx));
+        let (task_id, _) = background.start_agent("nested work", true);
+        let sink = TurnSink { writer: writer.clone(), inbox: Arc::default(), task_fence: Some(fence) };
+        sink.start_turn(1, &[]).await.unwrap();
+        let end = tokio::spawn(async move {
+            sink.append(session_event::Kind::TurnEnded(TurnEnded { turn: 1, reason: TurnEndReason::Completed as i32 })).await
+        });
+        let forwarder = tokio::spawn(forward_tasks(task_rx, fence_rx, actor_tx));
+        let Some(ActorMsg::Task(task)) = actor_rx.recv().await else { panic!("start must precede the fence") };
+        assert_eq!(task.id, task_id);
+        let Some(ActorMsg::TaskFence(ack)) = actor_rx.recv().await else { panic!("expected the turn's fence") };
+        assert!(!end.is_finished());
+        let task_seq = writer
+            .append(session_event::Kind::BackgroundTask(BackgroundTask {
+                task_id,
+                state: "started".into(),
+                notify: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        ack.send(()).unwrap();
+        assert!(end.await.unwrap().unwrap() > task_seq);
+        forwarder.await.unwrap();
+    }
+
     #[tokio::test]
     async fn initial_turn_failure_keeps_the_whole_unsent_batch() {
         for fail_boundary in [false, true] {
@@ -11073,7 +11370,7 @@ mod writer_tests {
                 inbox.lock().unwrap().push(input.clone(), None);
             }
             assert_eq!(inbox.lock().unwrap().drain(), inputs);
-            let sink = TurnSink { writer: writer.clone(), inbox: inbox.clone() };
+            let sink = TurnSink { writer: writer.clone(), inbox: inbox.clone(), task_fence: None };
             let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
             let mut fault = sqlx::SqliteConnection::connect_with(&opts).await.unwrap();
             let trigger = if fail_boundary {

@@ -2768,6 +2768,17 @@ async fn ingest_batch(
         publish_queue(st, &batch.session_id).await;
     }
     if !ing.events.is_empty() {
+        crate::liveness::progress(st, &batch.session_id).await;
+        for event in &ing.events {
+            if let Some(session_event::Kind::SubagentReported(r)) = &event.kind
+                && r.status == "waiting"
+                && r.command_id.starts_with(crate::remote::LOCAL_WAIT_PREFIX)
+            {
+                // This wait is new work for the child, even if its mailbox
+                // never acknowledged it. Don't reuse an earlier stop report.
+                crate::liveness::progress(st, &r.child_session_id).await;
+            }
+        }
         st.registry.bump();
     }
     // A turn that ended is worth a look; one that started isn't any more.
@@ -2802,6 +2813,9 @@ async fn ingest_batch(
                 _ => {}
             }
         }
+    }
+    if ing.events.iter().any(|e| matches!(&e.kind, Some(c6_proto::session_event::Kind::BackgroundTask(t)) if t.state != "started")) {
+        crate::remote::background_ended(st, &batch.session_id).await;
     }
     if ing.events.iter().any(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::Usage(_)))) {
         crate::usage::after_calls(st, &batch.session_id).await;
@@ -2942,6 +2956,7 @@ pub async fn on_ephemeral(st: &HeadState, worker_id: WorkerId, ev: EphemeralEven
     if !st.store.session_routable(&ev.session_id, worker_id, epoch).await.unwrap_or(false) {
         return;
     }
+    crate::liveness::progress(st, &ev.session_id).await;
     match &ev.kind {
         // Claude Code's report of its subscription's limits.
         Some(c6_proto::ephemeral_event::Kind::RateLimit(r)) => crate::quotas::from_claude_code(st, &ev.session_id, &r.json).await,
@@ -3874,7 +3889,7 @@ mod input_compatibility_tests {
             if capable {
                 capabilities.push("user_input_prompt_v1".into());
             }
-            let guard = st.registry.attach(worker, now_ms(), tx, capabilities, "worker");
+            let guard = st.registry.attach(worker, now_ms(), tx, capabilities, "worker").await;
             for (has_mention, text) in [(true, format!("Read [@Pager](c6:work:{work})")), (false, "No reference any more".into())] {
                 let caller = crate::realms::Caller { browser: true, ..Default::default() };
                 let reply = async {
@@ -3946,7 +3961,7 @@ mod input_compatibility_tests {
         assert_eq!(pending_of(st, "session", "take").await.unwrap().unwrap().1, input);
         assert_eq!(st.store.message_attachments("session", "take").await.unwrap(), Some(input.attachments.clone()));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let guard = st.registry.attach(worker, now_ms(), tx, vec!["queue_ops".into()], "worker");
+        let guard = st.registry.attach(worker, now_ms(), tx, vec!["queue_ops".into()], "worker").await;
         let reply = async {
             let message = rx.recv().await.unwrap().unwrap();
             let Some(c6_proto::head_msg::Msg::RpcRequest(request)) = message.msg else { panic!("queue RPC") };

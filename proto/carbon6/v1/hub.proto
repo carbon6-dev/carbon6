@@ -139,6 +139,49 @@ message Ping {
   uint64 nonce = 1;
   // Round-trip time measured on the previous ping, for display on the head.
   uint32 last_rtt_us = 2;
+  // Absent on older workers. An omitted session is unknown, not stopped.
+  SessionLivenessReport liveness = 3;
+}
+
+message SessionLivenessReport {
+  repeated SessionLiveness sessions = 1;
+}
+
+message SessionLiveness {
+  string session_id = 1;
+  uint64 ownership_epoch = 2;
+  SessionActorState actor_state = 3;
+  string reason = 4;
+  SessionActivityKind activity_kind = 5;
+  HeldProcessState held_process = 6;
+  // Running background tasks tracked by the local runtime (all kinds).
+  uint32 running_background_tasks = 7;
+}
+
+enum SessionActorState {
+  SESSION_ACTOR_STATE_UNSPECIFIED = 0;
+  SESSION_ACTOR_STATE_IDLE = 1;
+  SESSION_ACTOR_STATE_RUNNING = 2;
+  SESSION_ACTOR_STATE_RECOVERING = 3;
+  SESSION_ACTOR_STATE_STOPPED = 4;
+  // Actor has not reached its mailbox loop recently; not proof of exit.
+  SESSION_ACTOR_STATE_UNRESPONSIVE = 5;
+}
+
+enum SessionActivityKind {
+  SESSION_ACTIVITY_KIND_UNSPECIFIED = 0;
+  SESSION_ACTIVITY_KIND_MODEL = 1;
+  SESSION_ACTIVITY_KIND_TOOL = 2;
+}
+
+enum HeldProcessState {
+  HELD_PROCESS_STATE_UNSPECIFIED = 0;
+  HELD_PROCESS_STATE_NONE = 1;
+  // A held Claude Code wrapper and its keeper appear live on this worker.
+  HELD_PROCESS_STATE_RUNNING = 2;
+  // The wrapper exited or the recorded keeper no longer owns the group.
+  // Does not prove that every descendant stopped.
+  HELD_PROCESS_STATE_EXITED = 3;
 }
 
 message Pong {

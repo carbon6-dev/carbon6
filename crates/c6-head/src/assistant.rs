@@ -76,7 +76,7 @@ pub async fn start(st: Arc<HeadState>, router: axum::Router) -> anyhow::Result<(
     }
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::channel::<Result<HeadMsg, tonic::Status>>(256);
-        let guard = st.registry.attach(id, now_ms(), tx, vec!["assistant".into()], "head");
+        let guard = st.registry.attach(id, now_ms(), tx, vec!["assistant".into()], "head").await;
         let mut delivered: i64 = 0;
         guard.deliver.notify_one();
         loop {

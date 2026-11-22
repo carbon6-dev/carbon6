@@ -279,7 +279,8 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                 in_flight.retain(|n, _| nonce - n < 16);
                 // Never block the read loop on a ping; the read deadline
                 // catches a dead connection.
-                if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(WorkerMsg { msg: Some(worker_msg::Msg::Ping(Ping { nonce, last_rtt_us })) }) {
+                let liveness = Some(worker.sessions.liveness_report());
+                if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(WorkerMsg { msg: Some(worker_msg::Msg::Ping(Ping { nonce, last_rtt_us, liveness })) }) {
                     return Ended::Retry(anyhow::anyhow!("outbound stream closed"));
                 }
             }

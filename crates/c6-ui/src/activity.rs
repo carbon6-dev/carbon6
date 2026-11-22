@@ -9,6 +9,57 @@ use crate::api;
 use crate::util::{ErrorBox, ago, now_ms};
 use crate::workspace::{Go, How, Tracked, View, use_workspace};
 
+/// Head observations are separate from the session journal. Keep resolved
+/// incidents visible here alongside current losses.
+#[component]
+pub(crate) fn LivenessIncidents(liveness: Signal<serde_json::Value>, now: RwSignal<i64>) -> impl IntoView {
+    let incidents = Memo::new(move |_| liveness.with(|snapshot| snapshot["incidents"].as_array().cloned()));
+    view! {
+        {move || incidents.with(|incidents| incidents.as_ref().map(|incidents| {
+            view! {
+                <section class="space-y-2">
+                    <h2 class="text-[11px] font-semibold uppercase tracking-wide text-muted">"Session liveness"</h2>
+                    <ul class="divide-y divide-zinc-100 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
+                        {incidents.is_empty().then(|| view! { <li class="px-3 py-2 text-sm text-muted">"No liveness incidents recorded."</li> })}
+                        {incidents.iter().map(|incident| {
+                            let session = incident["session_id"].as_str().unwrap_or_default();
+                            let realm = incident["realm"].as_str().unwrap_or_default();
+                            let title = incident["title"].as_str().filter(|t| !t.is_empty()).unwrap_or(session).to_owned();
+                            let session = api::enc(session);
+                            let href = if realm == "root" {
+                                format!("/{}/sessions/{session}", crate::place::CONSOLE)
+                            } else {
+                                format!("/r/{}/sessions/{session}", api::enc(realm))
+                            };
+                            let resolved = incident["resolved_at"].as_i64();
+                            let (kind, tone) = match (incident["kind"].as_str(), resolved.is_some()) {
+                                (Some("lost"), false) => ("Work lost", "text-red-700 dark:text-red-400"),
+                                (Some("lost"), true) => ("Work lost", "text-muted"),
+                                (Some("silence"), _) => ("Pending work", "text-muted"),
+                                _ => ("Incident", "text-muted"),
+                            };
+                            let cause = incident["cause"].as_str().unwrap_or_default().to_owned();
+                            let observed = incident["observed_at"].as_i64();
+                            view! {
+                                <li class="space-y-0.5 px-3 py-2 text-sm">
+                                    <div class="flex flex-wrap items-baseline gap-x-2">
+                                        <span class=tone>{kind}</span>
+                                        <a href=href class="font-medium underline">{title}</a>
+                                        <span class="text-xs text-muted">{realm.to_owned()}</span>
+                                        {observed.map(|t| view! { <span class="text-xs text-muted">{move || format!("Observed {}", ago(now.get() - t))}</span> })}
+                                        {resolved.map(|t| view! { <span class="text-xs text-muted">{move || format!("Resolved {}", ago(now.get() - t))}</span> })}
+                                    </div>
+                                    <p class="break-words text-muted">{cause}</p>
+                                </li>
+                            }
+                        }).collect_view()}
+                    </ul>
+                </section>
+            }
+        }))}
+    }
+}
+
 fn dot(status: SessionStatus, tracked: Tracked) -> &'static str {
     match (status, tracked) {
         (_, Tracked::Approval) => "h-2 w-2 shrink-0 animate-pulse rounded-full bg-amber-500",

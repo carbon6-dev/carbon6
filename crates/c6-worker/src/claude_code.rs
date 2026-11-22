@@ -350,7 +350,7 @@ struct HeldMeta {
 }
 
 /// Observes leader exit without taking reaping away from `Process::wait_exit`.
-/// Signal zero alone cannot distinguish our exited, unreaped child from a live
+/// A PID lookup alone cannot distinguish our exited, unreaped child from a live
 /// wrapper. A detached wrapper is no longer our child; ESRCH then proves exit.
 /// This is not group absence or authority to signal any remaining descendants.
 fn held_leader_exited(pid: Pid) -> bool {
@@ -362,7 +362,51 @@ fn held_leader_exited(pid: Pid) -> bool {
         libc::waitid(libc::P_PID, pid.as_raw() as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) == 0
             && info.si_pid() == pid.as_raw()
     };
-    exited || matches!(nix::sys::signal::kill(pid, None), Err(nix::errno::Errno::ESRCH))
+    exited || matches!(nix::unistd::getpgid(Some(pid)), Err(nix::errno::Errno::ESRCH))
+}
+
+/// `waitid` cannot see the zombie of a wrapper inherited from another worker.
+/// Call only while the recorded keeper still proves ownership of this group.
+fn held_leader_zombie(pid: Pid) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let pid = pid.as_raw();
+        let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else { return false };
+        // The comm field can contain spaces and parentheses.
+        let Some(end) = stat.iter().rposition(|&b| b == b')') else { return false };
+        let mut fields = stat[end + 1..].split(|b| b.is_ascii_whitespace()).filter(|s| !s.is_empty());
+        fields.next() == Some(&b"Z"[..]) && fields.nth(1).and_then(|s| std::str::from_utf8(s).ok()?.parse().ok()) == Some(pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use nix::libc;
+        let pid = pid.as_raw();
+        // SAFETY: proc_bsdinfo contains only integers and byte arrays.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        // SAFETY: info is writable storage of the exact ABI size. A nonzero
+        // arg enables zombie lookup in PROC_PIDTBSDINFO.
+        let returned =
+            unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 1, std::ptr::from_mut(&mut info).cast(), DARWIN_BSDINFO_SIZE) };
+        darwin_zombie_member(
+            returned,
+            pid,
+            pid,
+            DarwinGroupMember {
+                pid: info.pbi_pid,
+                pgid: info.pbi_pgid,
+                status: info.pbi_status,
+                flags: info.pbi_flags,
+                start_sec: info.pbi_start_tvsec,
+                start_usec: info.pbi_start_tvusec,
+            },
+        )
+        .is_some()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// Follows a held process's output file from `offset`: each JSON line, with
@@ -1156,6 +1200,51 @@ pub(crate) fn held_record_owned(held: &Path, conversation: &str) -> bool {
 fn held_group_owned(meta: &HeldMeta, dir: &Path) -> bool {
     meta.conversation == meta.launch.conversation
         && (is_claude_for(meta.pgid, &meta.conversation) || keeper_holds_fifo(Pid::from_raw(meta.keeper), Pid::from_raw(meta.pgid), dir))
+}
+
+/// Snapshot persisted held runtimes without attaching, reaping, or signalling.
+/// A replacement's retired records are cleanup-only. Multiple current records
+/// for one session are ambiguous without the actor's selected conversation.
+pub(crate) fn held_liveness(held: &Path) -> HashMap<String, c6_proto::HeldProcessState> {
+    use c6_proto::HeldProcessState::{Exited, Running, Unspecified};
+
+    let mut states = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(held) else { return states };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Ok(data) = std::fs::read(dir.join("meta.json")) else { continue };
+        let Ok(meta) = serde_json::from_slice::<HeldMeta>(&data) else { continue };
+        if meta.session.is_empty() || !matches!(dir.join("retiring").try_exists(), Ok(false)) {
+            continue;
+        }
+        let leader = Pid::from_raw(meta.pgid);
+        let keeper = Pid::from_raw(meta.keeper);
+        let state = if meta.conversation.is_empty() || meta.conversation != meta.launch.conversation || meta.pgid <= 0 || meta.keeper <= 0 {
+            Unspecified
+        } else if matches!(nix::unistd::getpgid(Some(leader)), Err(nix::errno::Errno::ESRCH)) {
+            // The recorded leader PID is absent, regardless of remaining group members.
+            Exited
+        } else if keeper_holds_fifo(keeper, leader, &dir) {
+            // The original keeper pins the group identity across the probe:
+            // neither a reused leader PID nor unrelated descendants prove anything.
+            let exited = held_leader_exited(leader) || held_leader_zombie(leader);
+            if !keeper_holds_fifo(keeper, leader, &dir) {
+                Unspecified
+            } else if exited {
+                Exited
+            } else if nix::unistd::getpgid(Some(leader)) == Ok(leader) {
+                Running
+            } else {
+                Unspecified
+            }
+        } else {
+            Unspecified
+        };
+        if matches!(dir.join("retiring").try_exists(), Ok(false)) && dir.join("meta.json").is_file() {
+            states.entry(meta.session).and_modify(|state| *state = Unspecified).or_insert(state);
+        }
+    }
+    states
 }
 
 /// SIGSTOP delivery is asynchronous. Observe the stopped state before the
@@ -8328,11 +8417,19 @@ while True:
             keeper_holds_fifo(keeper, pg, &record).then_some(())
         })
         .await;
-        // Kill only the wrapper, bypassing its final exit-code write. Reap it
-        // as a previous worker could have done, leaving its keeper to attach.
+        use c6_proto::HeldProcessState::{Exited, Running};
+        assert_eq!(held_liveness(&held).get("s"), Some(&Running));
+        // Kill only the wrapper, bypassing its final exit-code write. The
+        // heartbeat must detect exit before the owning child reaps it.
         nix::sys::signal::kill(pg, Signal::SIGKILL).unwrap();
+        c6_testkit::eventually("the unreaped held leader to report exited", async || {
+            (held_liveness(&held).get("s") == Some(&Exited)).then_some(())
+        })
+        .await;
+        assert!(keeper_holds_fifo(keeper, pg, &record));
         c6_testkit::within("the dead held wrapper to be reaped", p.wait_exit()).await;
         assert!(held_leader_exited(pg));
+        assert_eq!(held_liveness(&held).get("s"), Some(&Exited));
         assert!(!record.join("code").exists());
         assert!(keeper_holds_fifo(keeper, pg, &record), "leader death must not mean group absence");
         drop(p);

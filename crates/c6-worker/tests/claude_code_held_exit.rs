@@ -2,7 +2,7 @@
 //! Own binary: C6_CLAUDE_BIN is process-global; no real CLI or live services.
 use c6_api::{Event, EventKind, TurnEndReason};
 use c6_head::HeadConfig;
-use c6_testkit::eventually;
+use c6_testkit::{MockLlm, Reply, eventually, eventually_or, within};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use nix::{
     sys::signal::{Signal, kill, killpg},
@@ -192,6 +192,157 @@ done
         })
         .await;
     }
+    held_subagent_exit_wakes_parent(&head, &http, &api, &worker, &cc, &held).await;
     stop.cancel();
     head.shutdown().await.unwrap();
+}
+
+// Keep this scenario in the same isolated test: the fixture's Claude path is
+// process-global. The real worker observes the killed wrapper and authors the
+// terminal event; the parent must hear it over the normal notice path.
+async fn held_subagent_exit_wakes_parent(
+    head: &c6_head::Head,
+    http: &reqwest::Client,
+    api: &str,
+    child_worker: &Worker,
+    cc: &Value,
+    held: &std::path::Path,
+) {
+    let mock = MockLlm::start().await;
+    let model: Value = http
+        .post(format!("{api}/connections"))
+        .json(&json!({"name":"mock","base_url":mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let parent_state = tempfile::tempdir().unwrap();
+    let e = c6_head::api::new_enrollment(&head.state, Some("held-exit-parent")).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(parent_state.path()).unwrap();
+    let parent_worker = Worker::open(parent_state.path(), Identity::load(parent_state.path()).unwrap()).await.unwrap();
+    let parent_worker_id = parent_worker.identity.meta.worker_id.0;
+    let (tx, mut rx) = watch::channel(ConnState::Connecting);
+    let stop = CancellationToken::new();
+    let _stop_on_drop = stop.clone().drop_guard();
+    tokio::spawn(conn::run(parent_worker, tx, stop));
+    within("the parent worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+
+    let child_dir = tempfile::tempdir().unwrap();
+    nix::unistd::mkfifo(&child_dir.path().join("gate"), nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+    let response = http
+        .put(format!("{api}/settings/templates"))
+        .json(&json!([{
+            "name":"held-child", "workers":[child_worker.identity.meta.worker_name], "cwd":child_dir.path().canonicalize().unwrap(),
+            "connection":cc["id"], "model":"default", "agents":true, "prompt":"{{input}}"
+        }]))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success(), "{}", response.text().await.unwrap());
+    let prompt = "Delegate the held exit test in the background.";
+    mock.push_about(
+        prompt,
+        Reply::ToolCalls(vec![("task".into(), json!({
+        "description":"Run the held child", "template":"held-child", "prompt":"Work until the fixture exits", "run_in_background":true
+    }).to_string())]),
+    );
+    mock.push_about(prompt, Reply::Text("I will wait for its report.".into()));
+    let project = tempfile::tempdir().unwrap();
+    let parent: c6_api::Session = http
+        .post(format!("{api}/sessions"))
+        .json(&json!({
+            "worker_id":parent_worker_id,"cwd":project.path(),"connection_id":model["id"],"model":"m","prompt":prompt
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let events =
+        async |id: &str| -> Vec<Event> { http.get(format!("{api}/sessions/{id}/events")).send().await.unwrap().json().await.unwrap() };
+    let child = eventually_or(
+        "the held child link and completed parent turn",
+        async || {
+            let ev = events(&parent.id).await;
+            if !ev.iter().any(|e| matches!(e.kind, EventKind::TurnEnded { reason: TurnEndReason::Completed, .. })) {
+                return None;
+            }
+            ev.into_iter().find_map(|e| match e.kind {
+                EventKind::SubagentSpawned { child_session_id, remote: Some(_), .. } => Some(child_session_id),
+                _ => None,
+            })
+        },
+        || mock.log(),
+    )
+    .await;
+    eventually("the held child to record progress while still running", async || {
+        events(&child)
+            .await
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::Assistant { blocks, .. } if format!("{blocks:?}").contains("Working.")))
+            .then_some(())
+    })
+    .await;
+    let wrapper = eventually("the live wrapper of this particular child", async || {
+        for entry in std::fs::read_dir(held).ok()?.flatten() {
+            let Some(meta) =
+                std::fs::read(entry.path().join("meta.json")).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            else {
+                continue;
+            };
+            if meta["session"] == child {
+                let pg = i32::try_from(meta["pgid"].as_i64()?).ok()?;
+                assert!(pg > 0);
+                let pid = Pid::from_raw(pg);
+                assert!(kill(pid, None).is_ok());
+                return Some(pid);
+            }
+        }
+        None
+    })
+    .await;
+    eventually("the parent opening's naming attempt to finish", async || {
+        head.state.store.setting(&format!("session_naming:{}", parent.id)).await.unwrap().is_none().then_some(())
+    })
+    .await;
+    mock.push_about_all(&[&child, "Working."], Reply::Text("I received the failed child's report.".into()));
+    kill(wrapper, Signal::SIGTERM).unwrap();
+    let (notice_seq, text, notice) = eventually_or(
+        "the failure notice in the parent's journal",
+        async || {
+            events(&parent.id).await.into_iter().find_map(|e| match e.kind {
+                EventKind::User { command, text, task_notice, .. } if command == "task-notification" => Some((e.seq, text, task_notice)),
+                _ => None,
+            })
+        },
+        || mock.log(),
+    )
+    .await;
+    assert!(text.contains(&child) && text.contains("Working."), "{text}");
+    let notice = notice.expect("the failed child has a structured report for the parent");
+    // The normal native failure path may use a generic background-task card.
+    // The notice text above must still identify the child and its progress.
+    assert_eq!(notice.status, "failed");
+    let reason = eventually_or(
+        "the parent's acknowledgement turn to end",
+        async || {
+            events(&parent.id).await.into_iter().filter(|e| e.seq > notice_seq).find_map(|e| match e.kind {
+                EventKind::TurnEnded { reason, .. } => Some(reason),
+                _ => None,
+            })
+        },
+        || mock.log(),
+    )
+    .await;
+    assert_eq!(reason, TurnEndReason::Completed, "parent acknowledged the failed child");
+    let ev = events(&child).await;
+    assert!(ev.iter().any(|e| matches!(e.kind, EventKind::TurnEnded { reason: TurnEndReason::Error, .. })), "{ev:?}");
+    assert!(head.state.store.waiting_delegations(&child).await.unwrap().is_empty());
 }

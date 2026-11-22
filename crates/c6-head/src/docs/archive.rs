@@ -639,7 +639,7 @@ mod tests {
         super::super::set_archived(st, "home", &stale, true).await.unwrap();
         st.store.set_archived("cleanup", true).await.unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let connection = st.registry.attach("00000000-0000-0000-0000-000000000001".parse().unwrap(), 0, tx, Vec::new(), "worker");
+        let connection = st.registry.attach("00000000-0000-0000-0000-000000000001".parse().unwrap(), 0, tx, Vec::new(), "worker").await;
 
         let answered = answer(st, &asked, "Allow").await;
         let saved = crate::decisions::get(st, answered.id).await.unwrap().unwrap();
@@ -682,7 +682,7 @@ mod tests {
         let asked = batch(st, std::slice::from_ref(&id)).await;
         st.store.set_archived("cleanup", true).await.unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let connection = st.registry.attach("00000000-0000-0000-0000-000000000001".parse().unwrap(), 0, tx, Vec::new(), "worker");
+        let connection = st.registry.attach("00000000-0000-0000-0000-000000000001".parse().unwrap(), 0, tx, Vec::new(), "worker").await;
         // Make the approved realm temporarily unavailable so dispatch
         // fails before archive_many can return any per-document result.
         sqlx::query("UPDATE realms SET id = 'home-unavailable' WHERE id = 'home'").execute(&st.store.pool).await.unwrap();

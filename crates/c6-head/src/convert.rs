@@ -270,6 +270,7 @@ pub fn session(r: &SessionRow, head: Option<WorkerId>) -> api::Session {
         },
         archived: r.archived != 0,
         error: r.error.clone(),
+        liveness_loss: None,
         effort: r.effort.clone(),
         parent_id: r.parent_id.clone(),
         parent_call_id: r.parent_call_id.clone(),

@@ -94,6 +94,21 @@ pub const DEFAULTS: &[Prompt] = &[
         default: "Automatic recovery stopped. Queued messages and notices are held. Open the session to retry or restart its agent. Reason: {{reason}}",
     },
     Prompt {
+        name: "session.liveness_lost",
+        description: "Failure notice for lost work. Substitutions: {{child}}, {{reason}}, {{progress}}.",
+        default: "Subagent {{child}} is lost: {{reason}}. Do not wait for a report that cannot arrive. Its last recorded work follows:\n{{progress}}\nContinue it with SendMessage using its session id, or restart the work after checking whether its old process is still alive. A loss is not permission to run duplicate work.",
+    },
+    Prompt {
+        name: "session.liveness_silence",
+        description: "Notice when a pending subagent tree has made no progress. Substitutions: {{pending}}.",
+        default: "Your pending subagents have made no recorded progress for the configured silence window. Check what is blocking them rather than waiting indefinitely. Still pending:\n{{pending}}",
+    },
+    Prompt {
+        name: "session.liveness_notification",
+        description: "User notification for a liveness incident. Substitutions: {{child}}, {{reason}}.",
+        default: "Session {{child}} needs attention: {{reason}}. Its recorded work is preserved. Open the session to continue or restart it; check for surviving work before restarting.",
+    },
+    Prompt {
         name: "session.subagent_recovery_stuck",
         description: "Notice to the parent agent when its child needs manual journal recovery. Substitutions: {{child}}, {{reason}}.",
         default: "Subagent {{child}} could not recover its session automatically. Its unfinished work is not a result. Its queued messages are held until the user retries or restarts its agent. Reason: {{reason}}",

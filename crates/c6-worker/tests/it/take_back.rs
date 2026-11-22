@@ -161,9 +161,9 @@ fn user(command: &str) -> session_event::Kind {
 
 type Inbox = tokio::sync::mpsc::Receiver<Result<c6_proto::HeadMsg, tonic::Status>>;
 
-fn attach<'a>(f: &'a Fixture, capabilities: &[&str]) -> (c6_head::registry::ConnGuard<'a>, Inbox) {
+async fn attach<'a>(f: &'a Fixture, capabilities: &[&str]) -> (c6_head::registry::ConnGuard<'a>, Inbox) {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
-    (f.head.state.registry.attach(f.worker, now_ms(), tx, capabilities.iter().map(|s| (*s).into()).collect(), "worker"), rx)
+    (f.head.state.registry.attach(f.worker, now_ms(), tx, capabilities.iter().map(|s| (*s).into()).collect(), "worker").await, rx)
 }
 
 async fn cancellation(rx: &mut Inbox, session: &str, command: &str) -> RpcRequest {
@@ -201,7 +201,7 @@ async fn confirmed_take_back_uses_durable_identity_and_cancels_only_that_message
     let f = f.restart().await;
     assert_eq!(f.events("s").await, before);
     assert_eq!(f.queued("s").await, ["earlier", "target", "later"], "command identity survives a head restart");
-    let (guard, mut rx) = attach(&f, &["queue_ops"]);
+    let (guard, mut rx) = attach(&f, &["queue_ops"]).await;
     let (response, ()) = within("take-back confirmation", async {
         tokio::join!(f.take_back("s", "target"), async {
             answer(&guard, cancellation(&mut rx, "s", "target").await, "cancelled");
@@ -227,7 +227,7 @@ async fn take_back_refuses_taken_in_flight_and_unconfirmed_worker_ownership() {
         f.queue("s", "target").await;
         f.queue("s", "later").await;
         let before = f.events("s").await;
-        let (guard, mut rx) = attach(&f, &["queue_ops"]);
+        let (guard, mut rx) = attach(&f, &["queue_ops"]).await;
         let (response, ()) = within("worker ownership answer", async {
             tokio::join!(f.take_back("s", "target"), async {
                 answer(&guard, cancellation(&mut rx, "s", "target").await, state);
@@ -252,7 +252,7 @@ async fn cancel_and_pull_refuse_pending_without_retiring_target_or_asking_about_
         f.queue("s", "target").await;
         f.queue("s", "later").await;
         let before = f.events("s").await;
-        let (guard, mut rx) = attach(&f, &["queue_ops"]);
+        let (guard, mut rx) = attach(&f, &["queue_ops"]).await;
         let request = if pull {
             f.http.post(format!("{}/sessions/s/queue/target/pull", f.api()))
         } else {
@@ -290,7 +290,7 @@ async fn take_back_does_not_claim_success_when_delivery_wins_the_confirmation_ra
     f.session("s").await;
     f.queue("s", "target").await;
     f.queue("s", "later").await;
-    let (guard, mut rx) = attach(&f, &["queue_ops"]);
+    let (guard, mut rx) = attach(&f, &["queue_ops"]).await;
     let (response, ()) = within("delivery versus cancellation", async {
         tokio::join!(f.take_back("s", "target"), async {
             let req = cancellation(&mut rx, "s", "target").await;
@@ -323,12 +323,12 @@ async fn take_back_refuses_offline_old_and_disconnected_workers_without_retiring
     let before = f.events("s").await;
     assert!(error(f.take_back("s", "target").await, StatusCode::SERVICE_UNAVAILABLE).await.contains("worker is not connected"));
     {
-        let (_guard, mut rx) = attach(&f, &[]);
+        let (_guard, mut rx) = attach(&f, &[]).await;
         assert!(error(f.take_back("s", "target").await, StatusCode::CONFLICT).await.contains("update it"));
         assert!(rx.try_recv().is_err(), "an old worker is never asked an unsupported method");
     }
     {
-        let (guard, mut rx) = attach(&f, &["queue_ops"]);
+        let (guard, mut rx) = attach(&f, &["queue_ops"]).await;
         let (response, ()) = within("disconnect during cancellation", async {
             tokio::join!(f.take_back("s", "target"), async {
                 cancellation(&mut rx, "s", "target").await;
@@ -351,7 +351,7 @@ async fn take_back_accepts_cancellation_across_replacement_without_a_cross_resta
     f.queue("s", "target").await;
     f.queue("s", "later").await;
     let before = f.events("s").await;
-    let (guard, mut rx) = attach(&f, &["queue_ops"]);
+    let (guard, mut rx) = attach(&f, &["queue_ops"]).await;
     let mut replacement = None;
     let mut selected = None;
     let (response, ()) = within("worker replacement during cancellation", async {
@@ -360,7 +360,7 @@ async fn take_back_accepts_cancellation_across_replacement_without_a_cross_resta
             // Script the inherited restart gap: a replacement delivery
             // loop selects the row before retirement. Inbox.seen only
             // protects the process that actually answered cancellation.
-            replacement = Some(attach(&f, &["queue_ops"]));
+            replacement = Some(attach(&f, &["queue_ops"]).await);
             selected = f.head.state.store.pending_commands(f.worker, 0).await.unwrap().into_iter().find(|row| row.id == "target");
             assert!(selected.is_some(), "replacement selected target while it was still pending");
             answer(&guard, req, "cancelled");
@@ -416,7 +416,7 @@ async fn take_back_validates_same_session_and_input_command_identity() {
         })
         .await
         .unwrap();
-    let (guard, mut rx) = attach(&f, &["queue_ops"]);
+    let (guard, mut rx) = attach(&f, &["queue_ops"]).await;
     for invalid in ["foreign", "not-an-input", "unknown", "1"] {
         assert_eq!(error(f.take_back("s", invalid).await, StatusCode::CONFLICT).await, "The agent has this message");
     }
@@ -436,7 +436,7 @@ async fn normal_transcript_ingestion_is_already_taken_even_with_later_pending_in
     f.record("s", user("taken")).await;
     f.queue("s", "later").await;
     let before = f.events("s").await;
-    let (guard, mut rx) = attach(&f, &["queue_ops"]);
+    let (guard, mut rx) = attach(&f, &["queue_ops"]).await;
     assert_eq!(error(f.take_back("s", "taken").await, StatusCode::CONFLICT).await, "The agent has this message");
     assert_eq!(f.queued("s").await, ["later"]);
     assert_eq!(f.events("s").await, before);
@@ -472,7 +472,7 @@ async fn recorded_input_is_taken_even_with_stale_pending_metadata_or_a_blocking_
         let f = f.restart().await;
         sqlx::query("DELETE FROM activity WHERE session_id = 's'").execute(f.head.state.store.pool()).await.unwrap();
         let before = f.events("s").await;
-        let (guard, mut rx) = attach(&f, &["queue_ops"]);
+        let (guard, mut rx) = attach(&f, &["queue_ops"]).await;
         assert_eq!(error(f.take_back("s", "taken").await, StatusCode::CONFLICT).await, "The agent has this message");
         assert_eq!(f.queued("s").await, ["taken", "later"]);
         assert_eq!(f.events("s").await, before);
@@ -490,7 +490,7 @@ async fn take_back_refuses_a_lost_pending_retirement_race() {
     f.queue("s", "target").await;
     f.queue("s", "later").await;
     let before = f.events("s").await;
-    let (guard, mut rx) = attach(&f, &["queue_ops"]);
+    let (guard, mut rx) = attach(&f, &["queue_ops"]).await;
     let (response, ()) = within("another queue operation wins retirement", async {
         tokio::join!(f.take_back("s", "target"), async {
             let req = cancellation(&mut rx, "s", "target").await;
@@ -537,7 +537,7 @@ async fn take_back_never_retires_input_on_a_bad_worker_answer() {
         let f = Fixture::new().await;
         f.session("s").await;
         f.queue("s", "target").await;
-        let (guard, mut rx) = attach(&f, &["queue_ops"]);
+        let (guard, mut rx) = attach(&f, &["queue_ops"]).await;
         let (response, ()) = within("bad cancellation answer", async {
             tokio::join!(f.take_back("s", "target"), async {
                 answer(&guard, cancellation(&mut rx, "s", "target").await, state);
