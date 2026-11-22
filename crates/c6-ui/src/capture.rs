@@ -454,6 +454,13 @@ fn picked(session: &str) -> Option<Picked> {
     Some(Picked { seq, text, x: rect.left() + rect.width() / 2.0, y: rect.top() })
 }
 
+fn in_capture(ev: &web_sys::MouseEvent) -> bool {
+    use wasm_bindgen::JsCast;
+    ev.target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .is_some_and(|e| e.closest("[data-selection-capture]").ok().flatten().is_some())
+}
+
 /// Select words in a transcript entry: a small popover offers Quote (into
 /// the message box), To-do and Ask next, each keeping a link to the entry
 /// (docs/capture.md §5).
@@ -469,10 +476,25 @@ pub fn SelectionCapture(session: String, on_quote: Callback<String>) -> impl Int
         if noting.get_untracked().is_some() {
             return;
         }
-        at.set(picked(&sid.get_value()));
-        note.set(None);
+        // Setting an equal pick would redraw the popover and lose the
+        // click that is about to land on one of its buttons.
+        let p = picked(&sid.get_value());
+        if at.get_untracked() != p {
+            at.set(p);
+            note.set(None);
+        }
     };
-    let up = window_event_listener(leptos::ev::mouseup, move |_| check());
+    // Only a press that starts and ends on the popover is not a new
+    // selection. A drag from the transcript can end over the old popover.
+    let pressed_inside = StoredValue::new(false);
+    let down = window_event_listener(leptos::ev::mousedown, move |ev| pressed_inside.set_value(in_capture(&ev)));
+    let up = window_event_listener(leptos::ev::mouseup, move |ev| {
+        let inside = pressed_inside.get_value() && in_capture(&ev);
+        pressed_inside.set_value(false);
+        if !inside {
+            check();
+        }
+    });
     let keys = window_event_listener(leptos::ev::keyup, move |ev| {
         if ev.key() == "Escape" {
             at.set(None);
@@ -482,6 +504,7 @@ pub fn SelectionCapture(session: String, on_quote: Callback<String>) -> impl Int
         }
     });
     on_cleanup(move || {
+        down.remove();
         up.remove();
         keys.remove();
     });
