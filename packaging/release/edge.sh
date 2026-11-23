@@ -35,6 +35,27 @@ gh release create edge-next --repo "$repo" --prerelease --latest=false --target 
 if gh release view edge --repo "$repo" >/dev/null 2>&1; then
     gh release delete edge --repo "$repo" --cleanup-tag --yes
 fi
-gh release edit edge-next --repo "$repo" --tag edge --target "$sha"
+gh release edit edge-next --repo "$repo" --tag edge --target "$sha" --draft=false --prerelease --latest=false
+
+# GitHub moves the release to its new tag a moment after the edit returns.
+# Deleting `edge-next`'s tag before then leaves the release with no tag, and
+# GitHub turns an untagged release into a draft nothing can download (it
+# happened on 2026-11-23). So wait until `edge` is the published release.
+published() {
+    [ "$(gh release view edge --repo "$repo" --json tagName,isDraft -q '"\(.tagName) \(.isDraft)"' 2>/dev/null)" = "edge false" ]
+}
+for _ in $(seq 60); do published && break; sleep 2; done
+published || { echo "edge did not become the published release" >&2; exit 1; }
 gh api -X DELETE "repos/$repo/git/refs/tags/edge-next" >/dev/null 2>&1 || true
-echo "Published edge $version"
+
+# Then look where machines look: its release.json, publicly, naming this build.
+url="https://github.com/$repo/releases/download/edge/release.json"
+for _ in $(seq 30); do
+    if curl -fsSL "$url" | grep -qF "\"$version\""; then
+        echo "Published edge $version"
+        exit 0
+    fi
+    sleep 5
+done
+echo "$url does not offer $version: machines on the edge channel won't see it" >&2
+exit 1
