@@ -18,6 +18,20 @@ use crate::{Worker, move_files};
 struct Descriptor {
     source: move_files::Source,
     from: SessionPlaceWire,
+    #[serde(default)]
+    settings_current: bool,
+}
+
+impl Descriptor {
+    fn apply_legacy_settings(&self, spec: &mut CreateSession, events: &[SessionEvent]) {
+        // Only legacy exporters send the raw spec. Replaying the full history
+        // over an effective spec could undo newer settings from Restore.
+        if !self.settings_current {
+            for event in events {
+                crate::journal::apply_notice_settings_snapshot(spec, event);
+            }
+        }
+    }
 }
 
 // Prost deliberately does not derive serde for the wire protocol.
@@ -85,6 +99,7 @@ pub(crate) async fn handle(worker: &Arc<Worker>, method: &str, p: Value) -> Resu
             let source = tokio::task::spawn_blocking(move || move_files::describe(&cwd, repo, native)).await??;
             Ok(serde_json::to_value(Descriptor {
                 source,
+                settings_current: true,
                 from: SessionPlaceWire {
                     cwd: started.cwd,
                     repo_root: started.repo_root,
@@ -187,12 +202,7 @@ pub(crate) async fn handle(worker: &Arc<Worker>, method: &str, p: Value) -> Resu
                 "imported history differs from the released source"
             );
             let mut events = batch.events;
-            // Legacy exporters send the original stored spec. Fold their
-            // durable settings before making this import the new baseline;
-            // unlike Restore, this spec did not come from current head settings.
-            for event in &events {
-                crate::journal::apply_notice_settings_snapshot(&mut spec, event);
-            }
+            descriptor.apply_legacy_settings(&mut spec, &events);
             // Persist the exact event before importing its incarnation. A
             // replay cannot change its timestamp, notice or runtime prompt.
             let receipt = prepared.metadata_dir.join("place.pb");
@@ -284,5 +294,50 @@ pub(crate) async fn handle(worker: &Arc<Worker>, method: &str, p: Value) -> Resu
             Ok(json!({}))
         }
         _ => anyhow::bail!("unknown session move operation"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_descriptor() -> Value {
+        json!({
+            "source": {"repo": null, "native_resume": null},
+            "from": {"cwd": "/source", "repo_root": "", "worktree_branch": "", "repo": "", "worker_id": "source"},
+        })
+    }
+
+    fn historical_settings() -> [SessionEvent; 1] {
+        [SessionEvent {
+            seq: 2,
+            kind: Some(c6_proto::session_event::Kind::Notice(c6_proto::Notice {
+                title: "Notice settings refreshed".into(),
+                quiet: true,
+                message: json!({"notice_quiet_seconds": 6, "max_subagent_depth": 7}).to_string(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }]
+    }
+
+    #[test]
+    fn legacy_move_folds_settings_from_history() {
+        let descriptor: Descriptor = serde_json::from_value(legacy_descriptor()).unwrap();
+        assert!(!descriptor.settings_current);
+        let mut spec = CreateSession::default();
+        descriptor.apply_legacy_settings(&mut spec, &historical_settings());
+        assert_eq!((spec.notice_quiet_seconds, spec.max_subagent_depth), (6, 7));
+    }
+
+    #[test]
+    fn current_move_preserves_effective_settings_over_history() {
+        let mut wire = legacy_descriptor();
+        wire["settings_current"] = json!(true);
+        let descriptor: Descriptor = serde_json::from_value(wire).unwrap();
+        let effective = CreateSession { notice_quiet_seconds: 19, max_subagent_depth: 2, ..Default::default() };
+        let mut spec = effective.clone();
+        descriptor.apply_legacy_settings(&mut spec, &historical_settings());
+        assert_eq!(spec, effective);
     }
 }

@@ -9617,7 +9617,9 @@ mod notice_tests {
             std::fs::write(Path::new(&spec.cwd).join("new-result"), "a genuinely changed file").unwrap();
             mock.push(c6_testkit::Reply::Text("The file change is new progress.".into()));
         }
-        let _clock = pause_clock();
+        // Failed reports are eligible immediately. Keep real time for the
+        // deciding workspace probe: this test checks the hold and its release,
+        // not a merge or backoff deadline.
         let actor = manager.actor("held").await.unwrap().unwrap();
         actor
             .send(ActorMsg::ChildReport {
@@ -9634,11 +9636,9 @@ mod notice_tests {
                 inline: None,
             })
             .unwrap();
-        tokio::time::advance(MAX_WAIT + TICK).await;
         barrier(&manager, "still-paused").await;
         if file_changed {
-            tokio::time::advance(TICK).await;
-            let (events, request) = completed_batch_after(&manager, &mock, initial).await;
+            let (events, request) = completed_batch_in_real_time_after(&manager, &mock, initial).await;
             assert!(request.contains("report #1."));
             assert!(!events.iter().any(|event| matches!(&event.kind,
                 Some(Kind::NoticeQueued(n)) if n.reason.starts_with("paused:")
@@ -9682,8 +9682,7 @@ mod notice_tests {
         };
         tx.send(ActorMsg::NoticeLimits(limits)).unwrap();
         barrier(&manager, "limits-refreshed").await;
-        tokio::time::advance(TICK).await;
-        let (events, request) = completed_batch_after(&manager, &mock, initial).await;
+        let (events, request) = completed_batch_in_real_time_after(&manager, &mock, initial).await;
         assert!(request.contains("report #1."), "raising the threshold should deliver the held failure without Continue");
         let marker =
             events.iter().find(|e| matches!(&e.kind, Some(Kind::Notice(n)) if n.quiet && n.title == "Notice settings refreshed")).unwrap();
@@ -9737,7 +9736,9 @@ mod notice_tests {
             ]);
         }
         let initial = append_seed(&manager.journal, 1, history).await;
-        let _clock = pause_clock();
+        // Wait for the deciding fingerprint on real time; a process scan can
+        // need a retry while parallel tests exec Git. Freeze only once the
+        // actor has recorded the backoff whose clock behavior we assert.
         let tx = manager.actor("held").await.unwrap().unwrap();
         tx.send(ActorMsg::ChildReport {
             command_id: "pending-duplicate".into(),
@@ -9755,12 +9756,16 @@ mod notice_tests {
         })
         .await;
 
+        let _clock = pause_clock();
         tokio::time::advance(MAX_WAIT + TICK).await;
         assert_waiting_after(&manager, &mock, 1, initial).await;
 
         mock.push(c6_testkit::Reply::Text("No further action.".into()));
         tokio::time::advance(MAX_WAIT + TICK).await;
-        let (events, request) = completed_batch_after(&manager, &mock, initial).await;
+        // The deadline has elapsed. The next scheduling pass fingerprints
+        // again, so let external I/O retries run while waiting for delivery.
+        tokio::time::resume();
+        let (events, request) = completed_batch_in_real_time_after(&manager, &mock, initial).await;
         assert!(request.contains(evidence), "the next model input should explain the warning");
         assert!(events.iter().any(|e| matches!(&e.kind, Some(Kind::User(u)) if u.text == "Report ready." && u.prompt.contains(evidence))));
     }
