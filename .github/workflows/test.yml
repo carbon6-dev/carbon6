@@ -28,7 +28,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Document text converters
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y poppler-utils unrtf
+        # A stalled mirror once held this step for the job's whole hour: give
+        # up on a connection quickly and try again, and never wait long.
+        timeout-minutes: 10
+        run: sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update && sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y poppler-utils unrtf
       # Lints don't depend on the OS: once, on Linux.
       - name: The code is formatted (cargo fmt), every target passes clippy without warnings (and the web UI for wasm), and the tests' lint
         if: runner.os == 'Linux'
@@ -55,7 +58,10 @@ jobs:
       - uses: ./.github/actions/rust
       - uses: Swatinem/rust-cache@v2
       - name: Document text converters
-        run: sudo apt-get update && sudo apt-get install -y poppler-utils unrtf
+        # A stalled mirror once held this step for the job's whole hour: give
+        # up on a connection quickly and try again, and never wait long.
+        timeout-minutes: 10
+        run: sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update && sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y poppler-utils unrtf
       - name: A git identity, for tests that commit
         run: git config --global user.email test@c6 && git config --global user.name test
       # cargo test here: nextest's process per test, on top of a busy loop
