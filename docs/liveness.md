@@ -65,18 +65,20 @@ error policy. Silence alone never cancels an in-flight model request.
 A lost child yields a failure notice through the existing durable notice path.
 The notice carries its session id, last message and progress, and the editable
 prompt tells the parent to continue it with SendMessage or restart, not wait.
-Failures bypass merge/group delays. Existing spending and no-progress guards
-remain authoritative: a guarded failure must notify the user, not disappear.
-Repeated losses must escalate to the user instead of authorizing infinite
-relaunch. Continuation starts a new observation generation; stale reports must
+Failures bypass merge/group delays, not the adaptive repetition guard
+(docs/runaway-guards.md). A lost-child notification remains visible even when
+its parent's wake is held. Repeated equivalent failures first warn the agent,
+then back off, and only persistent repetition pauses for the user.
+Continuation starts a new observation generation; stale reports must
 not immediately lose a newly resumed child.
 
 Incidents and report command ids are durable and idempotent across sweeps and
 head restarts. A loss also sends a user notification, even when the parent's
-notice wake is guarded or offline. The second consecutive loss of the same
-normalized task description pauses unattended notice wakes; multiple waiters
-on one incident count only once. Success or direct user input clears that
-streak. Existing notice token and no-progress guards remain in force.
+notice wake is guarded or offline. Repeated losses of the same normalized task
+description and error contribute evidence to the adaptive loop guard; multiple
+waiters on one incident count only once. Success, genuinely new reports or direct
+user input clear the streak. There is no default spending pause or fixed
+second-loss stop; an explicitly enabled hourly spending cap still applies.
 
 Before enqueueing a local delegated input, the parent journals its exact
 wait obligation. The head can therefore identify the waiting call even if

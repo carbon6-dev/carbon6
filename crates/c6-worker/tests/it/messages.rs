@@ -55,13 +55,18 @@ async fn a_session_messages_another_on_another_worker() {
         .await
         .unwrap();
     let defaults: c6_api::SubagentLimits = http.get(format!("{api}/settings/subagent-limits")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(defaults.max_message_hops, 4);
-    assert_eq!(c6_api::SubagentLimits::default().max_message_hops, 4);
+    assert_eq!(defaults.max_message_hops, 50);
+    assert_eq!(defaults.messages_per_hour, 0);
+    assert_eq!(defaults.max_depth, 5);
+    assert_eq!(defaults.max_running, 0);
+    assert_eq!(c6_api::SubagentLimits::default().max_message_hops, 50);
     let missing_fields: c6_api::SubagentLimits = serde_json::from_value(json!({})).unwrap();
-    assert_eq!(missing_fields.max_message_hops, 4, "older settings keep the same default");
+    assert_eq!(missing_fields, defaults, "omitted settings use the new defaults");
     // A chain of one: a reply to a session message is refused.
     let limits = json!({"max_depth": 3, "max_running": 16, "auto_turns_per_hour": 20, "claude_code_idle_minutes": 15, "max_message_hops": 1, "messages_per_hour": 30});
     assert!(http.put(format!("{api}/settings/subagent-limits")).json(&limits).send().await.unwrap().status().is_success());
+    let saved: c6_api::SubagentLimits = http.get(format!("{api}/settings/subagent-limits")).send().await.unwrap().json().await.unwrap();
+    assert_eq!((saved.max_depth, saved.max_running, saved.max_message_hops, saved.messages_per_hour), (3, 16, 1, 30));
     let events =
         async |id: &str| -> Vec<Event> { http.get(format!("{api}/sessions/{id}/events")).send().await.unwrap().json().await.unwrap() };
     let idle = async |id: &str, turns: usize| {

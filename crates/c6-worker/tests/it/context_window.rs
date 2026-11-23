@@ -82,7 +82,8 @@ async fn connection_context_window_round_trips_and_validates() {
 async fn worker(head: &c6_head::Head, dir: &std::path::Path) -> (Arc<Worker>, CancellationToken) {
     let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(dir).unwrap();
-    let worker = Worker::open(dir, Identity::load(dir).unwrap()).await.unwrap();
+    let worker =
+        Worker::open_with_resource_sampler(dir, Identity::load(dir).unwrap(), c6_worker::ResourceMeasurement::default).await.unwrap();
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));

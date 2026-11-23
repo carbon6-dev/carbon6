@@ -180,7 +180,7 @@ impl RestartableWorker {
         let runtime = tokio::task::spawn_blocking(move || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
                 let identity = c6_worker::Identity::load(&state).unwrap();
-                let worker = Worker::open(&state, identity).await.unwrap();
+                let worker = Worker::open_with_resource_sampler(&state, identity, c6_worker::ResourceMeasurement::default).await.unwrap();
                 ready.send(worker.clone()).ok().expect("test waiting for worker");
                 conn::run(worker, tx, stop).await.unwrap();
             });

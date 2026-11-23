@@ -1392,6 +1392,9 @@ async fn drop_own_setting(
         return Err(ApiErr(StatusCode::BAD_REQUEST, "root's is the default every realm inherits; change it instead".into()));
     };
     st.store.drop_own_setting(key, r).await?;
+    if key == crate::sessions::SUBAGENT_LIMITS {
+        crate::sessions::refresh_notice_limits(&st, None).await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1958,14 +1961,20 @@ async fn put_subagent_limits(State(st): State<Arc<HeadState>>, Json(l): Json<api
     if !(1..=8).contains(&l.max_depth) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "the depth is 1 to 8".into()));
     }
-    if !(1..=64).contains(&l.max_running) {
-        return Err(ApiErr(StatusCode::BAD_REQUEST, "the number running at once is 1 to 64".into()));
+    if l.max_running > 64 {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "the number running at once is 0 (no count cap) to 64".into()));
     }
     if l.notice_quiet_seconds == 0 || l.notice_max_wait_seconds < l.notice_quiet_seconds {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "the notice quiet period must be positive and no longer than the maximum wait".into()));
     }
-    if l.notice_no_progress_limit == 0 || l.notice_failure_relaunch_limit == 0 || l.notice_tokens_per_hour == 0 {
-        return Err(ApiErr(StatusCode::BAD_REQUEST, "the notice progress, relaunch and token limits must be positive".into()));
+    if l.notice_no_progress_limit == 0 || l.notice_failure_relaunch_limit == 0 {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "the loop warning evidence thresholds must be positive".into()));
+    }
+    if !(1..=10).contains(&l.notice_loop_backoff_rounds) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "the notice loop guard uses 1 to 10 backoff rounds".into()));
+    }
+    if !(1..=3600).contains(&l.notice_loop_backoff_max_seconds) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "the notice loop backoff maximum is 1 to 3600 seconds".into()));
     }
     if !(1..=1440).contains(&l.claude_code_idle_minutes) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "an idle Claude Code process stays up 1 to 1440 minutes".into()));
@@ -1983,13 +1992,13 @@ async fn put_subagent_limits(State(st): State<Arc<HeadState>>, Json(l): Json<api
             return Err(ApiErr(StatusCode::BAD_REQUEST, format!("{label} is 1 to {max} seconds")));
         }
     }
-    if !(1..=32).contains(&l.max_message_hops) {
-        return Err(ApiErr(StatusCode::BAD_REQUEST, "a chain of session messages is 1 to 32 long".into()));
+    if !(1..=1000).contains(&l.max_message_hops) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "a chain of session messages is 1 to 1000 long".into()));
     }
-    if !(1..=1000).contains(&l.messages_per_hour) {
-        return Err(ApiErr(StatusCode::BAD_REQUEST, "a session sends 1 to 1000 messages an hour".into()));
+    if l.messages_per_hour > 1000 {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "the hourly session message cap is 0 (off) to 1000".into()));
     }
-    st.store.set_setting(crate::sessions::SUBAGENT_LIMITS, &serde_json::to_string(&l).map_err(anyhow::Error::from)?).await?;
+    st.store.set_setting(crate::sessions::SUBAGENT_LIMITS, &l.to_stored_json().map_err(anyhow::Error::from)?).await?;
     crate::sessions::refresh_notice_limits(&st, None).await?;
     Ok(StatusCode::NO_CONTENT)
 }

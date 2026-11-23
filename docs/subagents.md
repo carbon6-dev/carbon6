@@ -195,10 +195,14 @@ This comes from `history_from_events`. A tool call that was cut off gets its rep
 ## 7. Nesting
 
 - **Limits (settings):**
-  - `max_subagent_depth`: the main agent is depth 0, its subagents depth 1, and so on.
-  - `max_running_subagents` per tree: the number running at once below one top-level session.
+  - `max_depth` (`max_subagent_depth` on the worker): the main agent is depth 0, its subagents depth 1, and so on. Default: 5.
+  - `max_running` (`max_running_subagents` on the worker): an optional count cap per tree. Default: 0, meaning no count cap.
 
-  At the depth limit, the subagent isn't given `Task` or `SendMessage`. Over the running limit, `Task` returns an error saying how many are running. A named agent whose tool list leaves out `Task` can't nest, whatever its depth.
+  At the depth limit, the subagent isn't given `Task` or `SendMessage`. If you set an explicit running cap, `Task` refuses a launch above it and tells the agent how many are running. A named agent whose tool list leaves out `Task` can't nest, whatever its depth.
+
+  Independently of the count cap, a worker can hold a subagent launch or continuation when it detects low memory headroom or high system load. The transcript shows “Queued: worker busy” and the launch is retried as headroom returns. This is a best-effort check on the worker, not a memory limit or an OOM guarantee; it does not measure the SSH host or predict the resource use of later tools.
+
+  Saved settings that match the previous defaults adopt the new defaults on upgrade. Custom caps stay in effect, and you can explicitly set an old value again after upgrading.
 - **Inheritance:**
   - Every level gets the root's tool hooks (not Stop), secrets, publisher, memory and notice sinks, as `subagent::Parent` does now.
   - Every level stays in the root's realm and keeps its labels.
@@ -208,7 +212,7 @@ This comes from `history_from_events`. A tool call that was cut off gets its rep
   - Reports and notices go up one level.
   - `SendMessage` goes down one level.
   - You can reach any level from the UI.
-- **Notice chains.** A report bubbling up through idle subagents can set off a chain of turns. Work descended from a direct user turn remains expected, but progress and spending guards still apply at each level. Quiet user reports do not wake an idle parent.
+- **Notice chains.** Distinct reports can keep waking an idle parent; there is no fixed wake limit. For repeated activity without progress, the [runaway guard](notices.md) warns the agent, then slows delivery, then pauses with evidence if the loop persists. Quiet user reports do not wake an idle parent. The default session-message ceiling is 50 hops as a last resort; the deprecated hourly message cap and the optional hourly notice token cap are off by default.
 
 ## 8. Claude Code sessions
 
@@ -298,7 +302,7 @@ As built: all six steps on 2026-10-14.
 4. **Continuing:** a separate `SendMessage` tool rather than `resume` on `Task`.
 5. **Claude Code subagents** are shown read-only.
 6. **Subagents can start subagents.**
-7. **Default limits:** `max_subagent_depth` = 3 and `max_running_subagents` = 16 per tree.
+7. **Default limits:** `max_subagent_depth` = 5 and `max_running_subagents` = 0 (no count cap) per tree.
 
 ## Background tasks: completion and inspection
 

@@ -23,6 +23,8 @@ mod notice_guard;
 mod place_files;
 pub mod policy;
 pub mod pty;
+mod resource_pressure;
+pub use resource_pressure::Measurement as ResourceMeasurement;
 pub mod rpc;
 pub mod session;
 mod subagent;
@@ -99,6 +101,20 @@ pub struct Worker {
 
 impl Worker {
     pub async fn open(state_dir: &Path, identity: Identity) -> anyhow::Result<Arc<Self>> {
+        Self::open_with_gate(state_dir, identity, resource_pressure::Gate::default()).await
+    }
+
+    /// Constructor for in-process tests that require deterministic measurements.
+    #[doc(hidden)]
+    pub async fn open_with_resource_sampler(
+        state_dir: &Path,
+        identity: Identity,
+        sample: impl Fn() -> ResourceMeasurement + Send + Sync + 'static,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::open_with_gate(state_dir, identity, resource_pressure::Gate::new(sample)).await
+    }
+
+    async fn open_with_gate(state_dir: &Path, identity: Identity, gate: resource_pressure::Gate) -> anyhow::Result<Arc<Self>> {
         c6_llm::install_crypto_provider();
         c6_core::create_private_dir(state_dir)?;
         let lock_path = state_dir.join("c6w.lock");
@@ -113,7 +129,8 @@ impl Worker {
         // What its kit runs make on the container runtime carries its id.
         c6_tools::kits::set_owner(&identity.meta.worker_id.to_string());
         let link = Arc::new(link::HeadLink::default());
-        let sessions = session::SessionManager::new(journal.clone(), link.clone(), state_dir.join("worktrees"));
+        let mut sessions = session::SessionManager::new(journal.clone(), link.clone(), state_dir.join("worktrees"));
+        sessions.launch_pressure = Arc::new(gate);
         sessions.recover().await?;
         // Keep the journal small: idle, fully synced sessions can be restored
         // from the head when they are used again.

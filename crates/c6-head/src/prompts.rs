@@ -51,6 +51,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: c6_agent::SESSION_MESSAGE_NOTE,
     },
     Prompt {
+        name: "session.notice_loop_warning",
+        description: "Added to an automatic notice when the session may be stuck in a loop. Substitution: {{evidence}}.",
+        default: c6_agent::NOTICE_LOOP_WARNING,
+    },
+    Prompt {
         name: "session.subagent_partial",
         description: "Told to an agent after the summary of a subagent that did not finish.",
         default: c6_agent::SUBAGENT_PARTIAL,

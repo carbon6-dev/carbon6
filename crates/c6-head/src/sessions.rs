@@ -518,6 +518,8 @@ async fn create_assistant_with_origin(
         notice_no_progress_limit: limits.notice_no_progress_limit,
         notice_failure_relaunch_limit: limits.notice_failure_relaunch_limit,
         notice_tokens_per_hour: limits.notice_tokens_per_hour,
+        notice_loop_backoff_rounds: limits.notice_loop_backoff_rounds,
+        notice_loop_backoff_max_seconds: limits.notice_loop_backoff_max_seconds,
         session_recovery_seconds: limits.session_recovery_seconds,
         ..Default::default()
     };
@@ -724,6 +726,8 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         notice_no_progress_limit: limits.notice_no_progress_limit,
         notice_failure_relaunch_limit: limits.notice_failure_relaunch_limit,
         notice_tokens_per_hour: limits.notice_tokens_per_hour,
+        notice_loop_backoff_rounds: limits.notice_loop_backoff_rounds,
+        notice_loop_backoff_max_seconds: limits.notice_loop_backoff_max_seconds,
         claude_code_idle_minutes: limits.claude_code_idle_minutes,
         session_recovery_seconds: limits.session_recovery_seconds,
         claude_code: Some(claude_code_choice(st, &row.realm).await?),
@@ -1769,8 +1773,8 @@ pub async fn message_from(st: &HeadState, from: &SessionRow, params: &Value) -> 
             limits.max_message_hops
         )));
     }
-    let now = now_ms();
-    {
+    if limits.messages_per_hour != 0 {
+        let now = now_ms();
         let mut sent = st.messages_sent.lock().unwrap();
         let times = sent.entry(from.id.clone()).or_default();
         while times.front().is_some_and(|t| now - t > 3_600_000) {
@@ -1943,7 +1947,7 @@ pub async fn subagent_limits(st: &HeadState, realm: Option<&str>) -> anyhow::Res
         Some(r) => st.store.setting_for(SUBAGENT_LIMITS, r).await?,
         None => st.store.setting(SUBAGENT_LIMITS).await?,
     };
-    Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default())
+    Ok(raw.and_then(|raw| api::SubagentLimits::from_stored_json(&raw).ok()).unwrap_or_default())
 }
 
 /// Refresh every live session, including descendants. Resolve each realm's
@@ -1968,6 +1972,10 @@ pub async fn refresh_notice_limits(st: &HeadState, worker: Option<WorkerId>) -> 
                 notice_no_progress_limit: limits.notice_no_progress_limit,
                 notice_failure_relaunch_limit: limits.notice_failure_relaunch_limit,
                 notice_tokens_per_hour: limits.notice_tokens_per_hour,
+                notice_loop_backoff_rounds: limits.notice_loop_backoff_rounds,
+                notice_loop_backoff_max_seconds: limits.notice_loop_backoff_max_seconds,
+                max_subagent_depth: Some(limits.max_depth),
+                max_running_subagents: Some(limits.max_running),
             })),
         };
         // Offline sessions receive the latest settings when restored. Do not
@@ -2667,6 +2675,10 @@ pub async fn release_notices(st: &HeadState, session_id: &str) -> anyhow::Result
                 notice_no_progress_limit: limits.notice_no_progress_limit,
                 notice_failure_relaunch_limit: limits.notice_failure_relaunch_limit,
                 notice_tokens_per_hour: limits.notice_tokens_per_hour,
+                notice_loop_backoff_rounds: limits.notice_loop_backoff_rounds,
+                notice_loop_backoff_max_seconds: limits.notice_loop_backoff_max_seconds,
+                max_subagent_depth: Some(limits.max_depth),
+                max_running_subagents: Some(limits.max_running),
             }),
         })),
     };

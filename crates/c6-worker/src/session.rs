@@ -35,6 +35,7 @@ pub struct SessionManager {
     loads: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Delegations running per top-level session (for its limit).
     working: Arc<Mutex<HashMap<String, usize>>>,
+    pub(crate) launch_pressure: Arc<crate::resource_pressure::Gate>,
     /// The MCP server that gives Claude Code sessions carbon6's subagents
     /// (started on first use; `None` if it could not start).
     bridge: Arc<tokio::sync::OnceCell<Option<Arc<crate::mcp_bridge::Bridge>>>>,
@@ -277,7 +278,7 @@ pub(crate) enum ActorMsg {
     /// expansion, mentions or prompt hooks) and say how its turn ended.
     /// Without a sender it joins the running turn (or starts one), and the
     /// report goes to the parent as a notice unless a call waits on it.
-    Delegate(Box<PendingInput>, Option<tokio::sync::oneshot::Sender<Outcome>>),
+    Delegate(Box<PendingInput>, Option<tokio::sync::oneshot::Sender<Outcome>>, Option<crate::resource_pressure::Admission>),
     /// What a subagent did in a turn no call waited on, for its parent.
     ChildReport {
         command_id: String,
@@ -641,6 +642,11 @@ impl SessionManager {
             actors: Arc::default(),
             loads: Arc::default(),
             working: Arc::default(),
+            launch_pressure: if cfg!(test) {
+                Arc::new(crate::resource_pressure::Gate::new(crate::ResourceMeasurement::default))
+            } else {
+                Arc::default()
+            },
             bridge: Arc::default(),
             remote_waits: Arc::default(),
         }
@@ -732,11 +738,11 @@ impl SessionManager {
         &self.journal
     }
 
-    /// Counts a delegation in `root`'s tree, if fewer than `max` run.
+    /// Counts a delegation in `root`'s tree, if fewer than `max` run; zero is unlimited.
     pub(crate) fn working(&self, root: &str, max: usize) -> Option<Working> {
         let mut c = self.working.lock().unwrap();
         let n = c.entry(root.to_owned()).or_default();
-        if *n >= max {
+        if max != 0 && *n >= max {
             return None;
         }
         *n += 1;
@@ -1211,6 +1217,9 @@ impl SessionManager {
                 self.create(&cmd.session_id, &cmd.command_id, spec).await
             }
             Some(session_command::Kind::Input(input)) => {
+                if let Some(reason) = self.journal.command_rejection(&cmd.command_id).await.map_err(internal)? {
+                    return Err(reason);
+                }
                 if self.journal.is_applied(&cmd.command_id).await.map_err(internal)? {
                     return Ok(());
                 }
@@ -1374,8 +1383,13 @@ impl SessionManager {
                 ack.await.unwrap_or_else(|_| Err("parent stopped before recording the report".into()))
             }
             Some(session_command::Kind::UpdateNoticeLimits(limits)) => {
-                let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
-                actor.send(ActorMsg::NoticeLimits(limits)).map_err(|_| "session stopped before refreshing settings")?;
+                // A trimmed/lost cache gets current settings in its Restore
+                // spec. Rejecting this ephemeral command as unknown would
+                // consume the head's restore cooldown before a queued input
+                // can trigger the actual restoration.
+                if let Some(actor) = self.actor(&cmd.session_id).await.map_err(internal)? {
+                    actor.send(ActorMsg::NoticeLimits(limits)).map_err(|_| "session stopped before refreshing settings")?;
+                }
                 Ok(())
             }
             Some(session_command::Kind::ReleaseNotices(release)) => {
@@ -1561,7 +1575,7 @@ impl SessionManager {
         } else {
             let built = own_runtime(&self.link, session_id, &spec, &local, &labels, system_prompt, "startup").await;
             setup_errors = built.errors;
-            let names = built.tools.iter().map(|t| t.spec().name).collect();
+            let names = visible_tool_names(&spec, &built.tools);
             session_tools = built.tools;
             (built.profile.as_str().to_owned(), names, built.prompt)
         };
@@ -1950,9 +1964,13 @@ impl SessionManager {
             None if started.tool_profile == crate::claude_code::PROFILE => Vec::new(),
             None => {
                 let built = self.session_tool_set(session_id, &spec, &started, ToolProfile::parse(&started.tool_profile)).await.tools;
-                // A subagent keeps the tools it started with.
+                // A local subagent keeps the tools it was authorized to
+                // start with, including any hidden by the old depth limit.
                 match &delegation {
-                    Some(_) => built.into_iter().filter(|t| started.tools.contains(&t.spec().name)).collect(),
+                    Some(_) => {
+                        let saved = crate::subagent::saved_tools(&spec, &started);
+                        built.into_iter().filter(|t| saved.contains(&t.spec().name)).collect()
+                    }
                     None => built,
                 }
             }
@@ -2093,6 +2111,7 @@ impl SessionManager {
             notice_deadline: None,
             notice_ready: HashSet::new(),
             notice_pause: None,
+            notice_warning: None,
             deferred: Vec::new(),
             unrecorded_notices: Vec::new(),
             pending_task_event: None,
@@ -2106,6 +2125,7 @@ impl SessionManager {
             remote_receipts: Vec::new(),
             manager: self.clone(),
             subagent_default: Arc::new(Mutex::new(crate::subagent::SubagentDefault::of(&spec_default))),
+            launch_limits: Arc::new(Mutex::new(crate::subagent::LaunchLimits::of(&spec_default))),
             running_flag: Arc::default(),
             claude_code: claude_code.clone(),
             claude: None,
@@ -2138,21 +2158,6 @@ impl SessionManager {
 /// carbon6's own loop, everything before it is a marked transcript at the
 /// start of the conversation, not native history.
 fn conversation_from_log(spec: &mut CreateSession, events: &[SessionEvent]) -> Conversation {
-    // Continue snapshots are durable, so raising a limit also survives reload.
-    if let Some(limits) = events.iter().rev().find_map(|e| match &e.kind {
-        Some(session_event::Kind::Notice(n))
-            if n.quiet && (n.title == crate::notice_guard::CONTINUED_TITLE || n.title == "Notice settings refreshed") =>
-        {
-            serde_json::from_str::<c6_api::SubagentLimits>(&n.message).ok()
-        }
-        _ => None,
-    }) {
-        spec.notice_quiet_seconds = limits.notice_quiet_seconds;
-        spec.notice_max_wait_seconds = limits.notice_max_wait_seconds;
-        spec.notice_no_progress_limit = limits.notice_no_progress_limit;
-        spec.notice_failure_relaunch_limit = limits.notice_failure_relaunch_limit;
-        spec.notice_tokens_per_hour = limits.notice_tokens_per_hour;
-    }
     let seed = seed_events(spec);
     let seed_len = seed.len();
     let all = [seed, events.to_vec()].concat();
@@ -3241,6 +3246,7 @@ struct Actor {
     notice_deadline: Option<tokio::time::Instant>,
     notice_ready: HashSet<String>,
     notice_pause: Option<String>,
+    notice_warning: Option<String>,
     /// Notices waiting for a merge/group barrier or explicit input, and
     /// whether each may start an unattended turn.
     deferred: Vec<(PendingInput, bool)>,
@@ -3270,6 +3276,8 @@ struct Actor {
     /// The default for its subagents (as in `spec`), shared with a running
     /// turn's subagent runner.
     subagent_default: crate::subagent::SharedDefault,
+    // The active turn can make another Task call after settings change.
+    launch_limits: Arc<Mutex<crate::subagent::LaunchLimits>>,
     /// Shared with the manager: a turn is running.
     running_flag: Arc<std::sync::atomic::AtomicBool>,
     /// Shared with the manager: it runs Claude Code now.
@@ -3491,6 +3499,7 @@ impl Actor {
         }
         self.conv = Some(conversation_from_log(&mut spec, &events));
         self.spec = spec;
+        *self.launch_limits.lock().unwrap() = crate::subagent::LaunchLimits::of(&self.spec);
         if let Some(started) = events.iter().find_map(|e| match &e.kind {
             Some(session_event::Kind::Started(s)) => Some(s.clone()),
             _ => None,
@@ -3524,6 +3533,7 @@ impl Actor {
         self.notice_deadline = None;
         self.notice_ready.clear();
         self.notice_pause = None;
+        self.notice_warning = None;
         self.noticed = noticed.into_iter().collect();
         // A background completion has no head redelivery. If its event or
         // notice write failed, finish it before taking another callback.
@@ -3615,6 +3625,8 @@ impl Actor {
         let mut adoption = None::<HeldAdoptionRecovery>;
         let adoption_budget = recovery_budget(self.spec.session_recovery_seconds);
         let adoption_writer = self.writer.clone();
+        let mut launch_queued = false;
+        let mut launch_admission = None::<(String, crate::resource_pressure::Admission)>;
         self.rewinds = recover_rewind_queue(self.runs_claude_code(), std::mem::take(&mut self.rewinds), reset);
         loop {
             while running.is_none()
@@ -3700,7 +3712,29 @@ impl Actor {
                     return;
                 }
             }
-            if !rewind_blocked && !adoption_blocked && running.is_none() && !handoff_waits && !self.inbox.lock().unwrap().queue.is_empty() {
+            let can_start =
+                !rewind_blocked && !adoption_blocked && running.is_none() && !handoff_waits && !self.inbox.lock().unwrap().queue.is_empty();
+            // Gate every worker-dispatched child turn, including direct
+            // inputs and notice wakes. A fresh Runner admission is good
+            // once, and only while its input is still queued.
+            let pressure = if can_start && crate::subagent::depth_of(&self.spec) > 0 {
+                let admitted = launch_admission.take().is_some_and(|(id, admission)| {
+                    self.inbox.lock().unwrap().queue.iter().any(|(input, _)| input.command_id == id) && admission.redeem()
+                });
+                if admitted { None } else { self.manager.launch_pressure.try_start().err() }
+            } else {
+                None
+            };
+            if let Some(pressure) = pressure {
+                if !launch_queued {
+                    launch_queued = true;
+                    pressure.announce(&self.writer).await;
+                }
+            } else {
+                launch_queued = false;
+            }
+            let launch_retry = pressure.map(|_| crate::resource_pressure::retry_at());
+            if can_start && pressure.is_none() {
                 let switch = self.inbox.lock().unwrap().next_switch();
                 if let Some((command_id, model)) = switch {
                     self.handoff_announced = false;
@@ -3743,13 +3777,16 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::Input(mut input, model, choice)) => {
-                        if let Err(e) = self.continue_notices().await {
-                            error!(session = %self.writer.session_id, "continuing notice wakes: {e:#}");
-                            return;
+                        let direct = input.delegated_by.is_empty()
+                            && !matches!(input.command.as_str(), "task-notification" | "stop-hook");
+                        if direct {
+                            if let Err(e) = self.continue_notices(false).await {
+                                error!(session = %self.writer.session_id, "continuing notice wakes: {e:#}");
+                                return;
+                            }
+                            // Your message resets an earlier session-message chain.
+                            self.session_tools.set_message_hops(0);
                         }
-                        // Your message: what the agent does from now on is not
-                        // a session message's chain.
-                        self.session_tools.set_message_hops(0);
                         // Claude Code's carbon6 tools as they are set now
                         // (its process is started again with them when they
                         // changed: `Launch::tools`).
@@ -3805,7 +3842,7 @@ impl Actor {
                                 input.prompt = format!("{}\n\n<user-prompt-submit-hook>\n{context}\n</user-prompt-submit-hook>", input.model_text());
                             }
                         }
-                        let held = std::mem::take(&mut self.deferred);
+                        let held = if direct { std::mem::take(&mut self.deferred) } else { Vec::new() };
                         let command_id = input.command_id.clone();
                         // Send now in carbon6's own loop: the turn stops (it takes
                         // no input once stopping), and this starts the next. A
@@ -3837,6 +3874,13 @@ impl Actor {
                         if let Some((_, cancel)) = running.as_ref() {
                             cancel.cancel();
                             self.stopping |= self.runs_claude_code();
+                        } else if launch_queued {
+                            // An interrupt while waiting for worker headroom
+                            // must not leave the parent's launch running later.
+                            if let Err(error) = self.interrupt_queued_launch().await {
+                                error!(session = %self.writer.session_id, %error, "stopping a queued subagent launch");
+                                return;
+                            }
                         }
                         if matches!(msg, ActorMsg::InterruptDelegation) {
                             let background = &self.session_tools.background;
@@ -3857,7 +3901,10 @@ impl Actor {
                             cancel.cancel();
                         }
                     }
-                    Some(ActorMsg::Delegate(input, done)) => {
+                    Some(ActorMsg::Delegate(input, done, admission)) => {
+                        if running.is_none() && let Some(admission) = admission {
+                            launch_admission = Some((input.command_id.clone(), admission));
+                        }
                         if let Some(done) = done {
                             self.waiting.push((input.command_id.clone(), done));
                         }
@@ -3923,11 +3970,11 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::NoticeLimits(limits)) => {
-                        self.spec.notice_quiet_seconds = limits.notice_quiet_seconds;
-                        self.spec.notice_max_wait_seconds = limits.notice_max_wait_seconds;
-                        self.spec.notice_no_progress_limit = limits.notice_no_progress_limit;
-                        self.spec.notice_failure_relaunch_limit = limits.notice_failure_relaunch_limit;
-                        self.spec.notice_tokens_per_hour = limits.notice_tokens_per_hour;
+                        let previous = crate::subagent::LaunchLimits::of(&self.spec);
+                        crate::subagent::LaunchLimits::apply_notice_limits(&mut self.spec, &limits);
+                        if previous == crate::subagent::LaunchLimits::of(&self.spec) {
+                            continue;
+                        }
                         // A settings edit is not Continue: retain all evidence
                         // and usage, and reevaluate the held batch immediately.
                         let refresh = async {
@@ -3939,10 +3986,15 @@ impl Actor {
                                     "notice_no_progress_limit": limits.notice_no_progress_limit,
                                     "notice_failure_relaunch_limit": limits.notice_failure_relaunch_limit,
                                     "notice_tokens_per_hour": limits.notice_tokens_per_hour,
+                                    "notice_loop_backoff_rounds": limits.notice_loop_backoff_rounds,
+                                    "notice_loop_backoff_max_seconds": limits.notice_loop_backoff_max_seconds,
+                                    "max_subagent_depth": limits.max_subagent_depth,
+                                    "max_running_subagents": limits.max_running_subagents,
                                 }).to_string(),
                                 priority: "low".into(),
                                 quiet: true,
                             })).await?;
+                            *self.launch_limits.lock().unwrap() = crate::subagent::LaunchLimits::of(&self.spec);
                             self.schedule_notices().await
                         }.await;
                         if let Err(e) = refresh {
@@ -3951,7 +4003,7 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::ReleaseNotices) => {
-                        if let Err(e) = self.continue_notices().await {
+                        if let Err(e) = self.continue_notices(true).await {
                             error!(session = %self.writer.session_id, "continuing notice wakes: {e:#}");
                             return;
                         }
@@ -4269,6 +4321,7 @@ impl Actor {
                         if released { return; }
                     }
                 },
+                _ = tokio::time::sleep_until(launch_retry.unwrap_or_else(tokio::time::Instant::now)), if launch_retry.is_some() => {}
                 _ = tokio::time::sleep_until(self.local_report_retry_at.unwrap_or_else(tokio::time::Instant::now)), if self.local_report_retry_at.is_some() => {
                     if let Err(e) = self.settle_delegations().await {
                         warn!(session = %self.writer.session_id, "retrying a subagent's report: {e:#}");
@@ -4286,6 +4339,9 @@ impl Actor {
                             let sink: Arc<dyn EventSink> = self.writer.clone();
                             match self.claude.as_mut().expect("checked").idle_line(v, &sink).await {
                                 Ok(true) => {
+                                    // The external CLI has already started native
+                                    // work; this attaches a recorder, not a dispatch.
+                                    launch_admission = None;
                                     *running = Some(self.start_turn());
                                     self.running_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                                 }
@@ -4632,8 +4688,10 @@ impl Actor {
     }
 
     /// A durable acknowledgement resets the guard after an explicit Continue.
-    async fn continue_notices(&mut self) -> anyhow::Result<()> {
-        if self.notice_pause.take().is_some() {
+    async fn continue_notices(&mut self, explicit: bool) -> anyhow::Result<()> {
+        let paused = self.notice_pause.take().is_some();
+        let warning = self.notice_warning.take().is_some();
+        if paused || (explicit && (warning || !self.deferred.is_empty())) {
             self.writer
                 .append(session_event::Kind::Notice(c6_proto::Notice {
                     title: crate::notice_guard::CONTINUED_TITLE.into(),
@@ -4643,6 +4701,10 @@ impl Actor {
                         "notice_no_progress_limit": self.spec.notice_no_progress_limit,
                         "notice_failure_relaunch_limit": self.spec.notice_failure_relaunch_limit,
                         "notice_tokens_per_hour": self.spec.notice_tokens_per_hour,
+                        "notice_loop_backoff_rounds": self.spec.notice_loop_backoff_rounds,
+                        "notice_loop_backoff_max_seconds": self.spec.notice_loop_backoff_max_seconds,
+                        "max_subagent_depth": self.spec.max_subagent_depth,
+                        "max_running_subagents": self.spec.max_running_subagents,
                     })
                     .to_string(),
                     priority: "low".into(),
@@ -4677,38 +4739,20 @@ impl Actor {
     async fn schedule_notices(&mut self) -> anyhow::Result<()> {
         self.notice_deadline = None;
         self.notice_ready.clear();
+        self.notice_warning = None;
         if self.deferred.is_empty() {
             return Ok(());
         }
-        let raw = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
-        let pause = crate::notice_guard::evaluate(
-            &raw,
-            c6_core::now_ms(),
-            if self.spec.notice_no_progress_limit == 0 {
-                c6_api::DEFAULT_NOTICE_NO_PROGRESS_LIMIT
-            } else {
-                self.spec.notice_no_progress_limit
-            },
-            if self.spec.notice_failure_relaunch_limit == 0 {
-                c6_api::DEFAULT_NOTICE_FAILURE_RELAUNCH_LIMIT
-            } else {
-                self.spec.notice_failure_relaunch_limit
-            },
-            if self.spec.notice_tokens_per_hour == 0 { c6_api::DEFAULT_NOTICE_TOKENS_PER_HOUR } else { self.spec.notice_tokens_per_hour },
-        );
-        if let Some(reason) = &pause
-            && self.notice_pause.as_ref() != Some(reason)
-        {
-            self.writer
-                .append(session_event::Kind::Notice(c6_proto::Notice {
-                    title: format!("{} paused", self.started.title),
-                    message: format!("{reason}. Continue with Deliver now or your next message; raise the limit in Agents → Limits."),
-                    priority: "normal".into(),
-                    quiet: false,
-                }))
-                .await?;
-        }
-        self.notice_pause = pause;
+        let mut raw = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
+        let now_ms = c6_core::now_ms();
+        use crate::notice_guard::{Guard, Limits};
+        let limits = Limits {
+            tokens_per_hour: self.spec.notice_tokens_per_hour,
+            evidence_observations: self.spec.notice_no_progress_limit,
+            failure_observations: self.spec.notice_failure_relaunch_limit,
+            rounds: self.spec.notice_loop_backoff_rounds,
+            max_seconds: self.spec.notice_loop_backoff_max_seconds,
+        };
         let events = c6_agent::effective_events(&raw);
         let mut groups: HashMap<String, Vec<&c6_proto::SubagentSpawned>> = HashMap::new();
         let mut children = HashMap::new();
@@ -4848,7 +4892,8 @@ impl Actor {
             .collect();
         let merge_at =
             (arrivals.iter().max().copied().unwrap_or(now) + quiet).min(arrivals.iter().min().copied().unwrap_or(now) + max_wait);
-        let mut updates = Vec::new();
+        let mut candidates = Vec::new();
+        let mut eligible = HashSet::new();
         let count = self.deferred.len();
         let mut represented = HashSet::new();
         for (input, wake) in &mut self.deferred {
@@ -4899,7 +4944,7 @@ impl Actor {
                 }
                 let waiting = if ready {
                     "collecting reports for delivery".into()
-                } else if representative && self.notice_pause.is_none() {
+                } else if representative {
                     let linked_calls: HashSet<_> = members.iter().map(|s| s.call_id.as_str()).collect();
                     let mut descriptions: Vec<_> = members
                         .iter()
@@ -4933,32 +4978,108 @@ impl Actor {
                 let failure = input.task_notice.as_ref().is_some_and(|t| matches!(t.status.as_str(), "failed" | "lost" | "error"));
                 (true, failure, format!("merging {count} reports"))
             };
-            let deliver = if *wake && ready && self.notice_pause.is_none() {
-                self.notice_ready.insert(input.command_id.clone());
-                let at = if immediate { now } else { merge_at };
-                self.notice_deadline = Some(self.notice_deadline.map_or(at, |old| old.min(at)));
-                if representative { c6_core::now_ms() + at.saturating_duration_since(now).as_millis() as i64 } else { 0 }
+            let at = (*wake && ready).then_some(if immediate { now } else { merge_at });
+            if at.is_some() {
+                eligible.insert(input.command_id.clone());
+            }
+            let reason = if !*wake {
+                "waiting for your next message".into()
+            } else if representative || member.is_some() {
+                waiting
             } else {
-                0
+                "merging reports".into()
             };
-            let reason = self.notice_pause.clone().unwrap_or_else(|| {
-                if !*wake {
-                    "waiting for your next message".into()
-                } else if representative || member.is_some() {
-                    waiting
-                } else {
-                    "merging reports".into()
+            candidates.push((Self::queued_notice(input, *wake, reason, 0), at, representative));
+        }
+
+        // A fresh report behind an unfinished group cannot be delivered with
+        // this batch and therefore cannot clear a loop hold on the batch.
+        let mut guard = crate::notice_guard::evaluate(&raw, now_ms, limits, &eligible);
+        let repetition_hold = matches!(&guard, Guard::Warn(_) | Guard::Backoff { .. })
+            || matches!(&guard, Guard::Pause(reason) if !reason.starts_with("paused: spending limit"));
+        if repetition_hold && self.started.ssh_target.is_empty() {
+            // Shells and delegated children can change files without an Edit
+            // tool event. Before intervening, check the current contents,
+            // not merely the checkpoint from before its last completed turn.
+            match self.checkpoints.fingerprint().await {
+                Ok(tree) => {
+                    let previous = raw.iter().rev().find_map(|event| match &event.kind {
+                        Some(session_event::Kind::Notice(n)) if n.quiet && n.title == crate::notice_guard::WORKSPACE_TREE_TITLE => {
+                            Some(n.message.as_str())
+                        }
+                        Some(session_event::Kind::Checkpoint(c)) if c.error.is_empty() && !c.tree_id.is_empty() => Some(c.tree_id.as_str()),
+                        _ => None,
+                    });
+                    if previous != Some(tree.as_str()) {
+                        self.writer
+                            .append(session_event::Kind::Notice(c6_proto::Notice {
+                                title: crate::notice_guard::WORKSPACE_TREE_TITLE.into(),
+                                message: tree,
+                                priority: "low".into(),
+                                quiet: true,
+                            }))
+                            .await?;
+                        raw = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
+                        guard = crate::notice_guard::evaluate(&raw, now_ms, limits, &eligible);
+                    }
                 }
-            });
-            let updated = Self::queued_notice(input, *wake, reason, deliver);
-            if previous.get(&input.command_id) != Some(&updated) {
-                updates.push(updated);
+                Err(error) => warn!(session = %self.writer.session_id, %error, "checking file progress before a repetition hold"),
             }
         }
+        let (pause, backoff) = match guard {
+            Guard::Proceed => (None, None),
+            Guard::Pause(reason) => (Some(reason), None),
+            Guard::Warn(evidence) => {
+                self.notice_warning = Some(evidence);
+                (None, None)
+            }
+            Guard::Backoff { until_ms, evidence } => {
+                self.notice_warning = Some(evidence);
+                (None, Some(until_ms))
+            }
+        };
+        if let Some(reason) = &pause
+            && self.notice_pause.as_ref() != Some(reason)
+        {
+            self.writer
+                .append(session_event::Kind::Notice(c6_proto::Notice {
+                    title: format!("{} paused", self.started.title),
+                    message: if reason.starts_with("paused: spending limit") {
+                        format!("{reason}. Continue with Deliver now or your next message; change the cap in Agents → Limits.")
+                    } else {
+                        format!("{reason}. Continue with Deliver now or your next message.")
+                    },
+                    priority: "normal".into(),
+                    quiet: false,
+                }))
+                .await?;
+        }
+        self.notice_pause = pause;
+
         // Scheduling snapshots supersede earlier ones by command_id on
         // replay; only a User event is a delivery receipt.
-        for n in updates {
-            self.writer.append(session_event::Kind::NoticeQueued(n)).await?;
+        for (mut updated, at, representative) in candidates {
+            if let Some(reason) = &self.notice_pause {
+                updated.reason.clone_from(reason);
+            } else if let Some(at) = at {
+                self.notice_ready.insert(updated.command_id.clone());
+                let at = backoff.map_or(at, |until| {
+                    let delay = until.saturating_sub(now_ms).clamp(0, limits.max_delay_ms());
+                    at.max(now + std::time::Duration::from_millis(delay as u64))
+                });
+                self.notice_deadline = Some(self.notice_deadline.map_or(at, |old| old.min(at)));
+                if representative {
+                    updated.deliver_at_ms = now_ms + at.saturating_duration_since(now).as_millis() as i64;
+                }
+                if backoff.is_some_and(|until| until > now_ms)
+                    && let Some(evidence) = &self.notice_warning
+                {
+                    updated.reason = format!("collecting reports; slowing automatic delivery after {evidence}");
+                }
+            }
+            if previous.get(&updated.command_id) != Some(&updated) {
+                self.writer.append(session_event::Kind::NoticeQueued(updated)).await?;
+            }
         }
         Ok(())
     }
@@ -4973,8 +5094,12 @@ impl Actor {
         }
         // Only release eligible members: unrelated groups keep their barrier.
         let mut waiting = Vec::new();
-        for (n, wake) in std::mem::take(&mut self.deferred) {
+        let mut warning = self.notice_warning.take();
+        for (mut n, wake) in std::mem::take(&mut self.deferred) {
             if self.notice_ready.contains(&n.command_id) || !wake {
+                if wake && let Some(evidence) = warning.take() {
+                    add_notice_loop_warning(&self.spec, &mut n, &evidence);
+                }
                 self.notice_arrivals.remove(&n.command_id);
                 self.inbox.lock().unwrap().push(n, None);
             } else {
@@ -5026,12 +5151,16 @@ impl Actor {
             self.session_tools.set_message_hops(input.hops);
         }
         if busy || !self.inbox.lock().unwrap().queue.is_empty() {
-            self.notice_arrivals.clear();
-            self.notice_deadline = None;
-            self.notice_ready.clear();
             let mut inbox = self.inbox.lock().unwrap();
-            for (held, _) in std::mem::take(&mut self.deferred) {
-                inbox.push(held, None);
+            // A delegated or other independently started turn can accept new
+            // input, but does not get to flush a guarded backlog as a side effect.
+            if self.notice_pause.is_none() && self.notice_warning.is_none() {
+                self.notice_arrivals.clear();
+                self.notice_deadline = None;
+                self.notice_ready.clear();
+                for (held, _) in std::mem::take(&mut self.deferred) {
+                    inbox.push(held, None);
+                }
             }
             inbox.push(input, None);
             return Ok(());
@@ -5820,7 +5949,7 @@ impl Actor {
             let built = own_runtime(&self.link, &self.on_behalf_of, &spec, &cwd, &labels, base, "resume").await;
             let handoff = c6_proto::Handoff {
                 tool_profile: built.profile.as_str().to_owned(),
-                tools: built.tools.iter().map(|t| t.spec().name).collect(),
+                tools: visible_tool_names(&spec, &built.tools),
                 system_prompt: built.prompt,
                 claude_session_id: String::new(),
                 native: false,
@@ -5920,6 +6049,47 @@ impl Actor {
         claude_code_system_prompt(&self.spec, &labels, tools)
     }
 
+    async fn interrupt_queued_launch(&mut self) -> anyhow::Result<()> {
+        // An explicit local delegation may already have a waiter even
+        // though its admission expired before dispatch. Settle it without
+        // dropping or publishing a head command it never had.
+        {
+            let mut inbox = self.inbox.lock().unwrap();
+            let mut waiting = std::mem::take(&mut self.waiting);
+            for (id, done) in waiting.drain(..) {
+                if matches!(inbox.remove(&id), QueueOp::Cancelled) {
+                    let _ = done.send(Outcome { reason: TurnEndReason::Interrupted, report: String::new(), error: String::new() });
+                } else {
+                    self.waiting.push((id, done));
+                }
+            }
+        }
+        // Head-created inputs have UUID command IDs. Leave internal inputs
+        // (e.g. a background report) in the inbox for the next turn.
+        let ids: Vec<_> = self
+            .inbox
+            .lock()
+            .unwrap()
+            .queue
+            .iter()
+            .filter(|(input, _)| uuid::Uuid::parse_str(&input.command_id).is_ok())
+            .map(|(input, _)| input.command_id.clone())
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let reason = "subagent was stopped while queued for worker headroom";
+        let session = &self.writer.session_id;
+        let epoch = self.writer.ownership_epoch;
+        self.journal.reject_queued_launches(session, epoch, &ids, reason).await?;
+        let mut inbox = self.inbox.lock().unwrap();
+        for id in &ids {
+            inbox.remove(id);
+            self.link.reject_owned(session, id, reason, epoch);
+        }
+        Ok(())
+    }
+
     fn start_turn(&mut self) -> (TurnTask, CancellationToken) {
         self.writer.set_activity(c6_proto::SessionActivityKind::Unspecified);
         self.turns += 1;
@@ -5951,6 +6121,7 @@ impl Actor {
             log: self.writer.clone(),
             manager: self.manager.clone(),
             default: self.subagent_default.clone(),
+            limits: self.launch_limits.clone(),
         };
         let (writer, link, tools, session_tools, inbox, c) =
             (self.writer.clone(), self.link.clone(), self.tools.clone(), self.session_tools.clone(), self.inbox.clone(), cancel.clone());
@@ -6031,12 +6202,12 @@ impl Actor {
                 let checkpoint = match if remote_session {
                     Err(anyhow::anyhow!("files on an SSH target are not checkpointed"))
                 } else {
-                    checkpoints.snapshot().await
+                    checkpoints.snapshot_with_tree().await
                 } {
-                    Ok(commit) => Checkpoint { commit, error: String::new() },
+                    Ok((commit, tree_id)) => Checkpoint { commit, tree_id, ..Default::default() },
                     Err(e) => {
                         warn!(session = %writer.session_id, "no checkpoint: {e:#}");
-                        Checkpoint { commit: String::new(), error: format!("{e:#}") }
+                        Checkpoint { error: format!("{e:#}"), ..Default::default() }
                     }
                 };
                 if let Err(e) = sink.append(session_event::Kind::Checkpoint(checkpoint)).await {
@@ -6376,8 +6547,9 @@ async fn run_session_turn(
         return Ok(());
     }
     let mut pending = || inbox.lock().unwrap().drain();
+    let visible = delegation_tools_for_turn(&sub.spec, tools);
     session_tools.set_subagents(Some(Arc::new(crate::subagent::Runner::new(sub, tools))));
-    let result = run_turn(turn, cfg, client.as_ref(), tools, session_tools, sink, conv, &mut pending, cancel).await;
+    let result = run_turn(turn, cfg, client.as_ref(), &visible, session_tools, sink, conv, &mut pending, cancel).await;
     session_tools.set_subagents(None);
     result?;
     Ok(())
@@ -6969,14 +7141,20 @@ pub(crate) async fn build_tools(
         tools.extend(set.tools().await);
     }
     tools.retain(|t| c6_tools::tool_allowed(&spec.tools, &t.spec().name));
-    // At the depth limit (a remote subagent deep in its tree), no more.
-    if !crate::subagent::may_delegate(spec, crate::subagent::depth_of(spec)) {
-        tools.retain(|t| !c6_tools::Task::is_task(&t.spec().name) && !c6_tools::SendMessage::is_send(&t.spec().name));
-    }
     if !tools.iter().any(|t| t.spec().name == SkillTool::tool_name(profile == ToolProfile::Claude)) {
         skills.clear();
     }
     BuiltTools { tools, skills, errors }
+}
+
+fn delegation_tools_for_turn(spec: &CreateSession, tools: &[Arc<dyn Tool>]) -> Vec<Arc<dyn Tool>> {
+    let allowed = crate::subagent::may_delegate(spec, crate::subagent::depth_of(spec));
+    tools.iter().filter(|t| allowed || !crate::subagent::delegation_tool(&t.spec().name)).cloned().collect()
+}
+
+pub(crate) fn visible_tool_names(spec: &CreateSession, tools: &[Arc<dyn Tool>]) -> Vec<String> {
+    let allowed = crate::subagent::may_delegate(spec, crate::subagent::depth_of(spec));
+    tools.iter().map(|t| t.spec().name).filter(|name| allowed || !crate::subagent::delegation_tool(name)).collect()
 }
 
 /// The single writer of one session's log.
@@ -7317,6 +7495,16 @@ pub(crate) fn spec_prompt(spec: &CreateSession, name: &str, default: &str) -> St
         .unwrap_or_else(|| default.to_owned())
 }
 
+/// Add the advisory to the model input only, not the user's displayed report.
+fn add_notice_loop_warning(spec: &CreateSession, input: &mut PendingInput, evidence: &str) {
+    let warning = spec_prompt(spec, "session.notice_loop_warning", c6_agent::NOTICE_LOOP_WARNING).replace("{{evidence}}", evidence);
+    if input.prompt.is_empty() {
+        input.prompt.clone_from(&input.text);
+    }
+    input.prompt.push_str("\n\n");
+    input.prompt.push_str(&warning);
+}
+
 /// What the model is told when its conversation is compacted.
 pub(crate) fn compact_prompts(spec: &CreateSession) -> c6_agent::CompactPrompts {
     c6_agent::CompactPrompts {
@@ -7474,9 +7662,10 @@ mod route_tool_tests {
             let built = own_runtime(&HeadLink::default(), "s", &spec, dir.path(), &[], String::new(), "startup").await;
             assert_eq!(built.profile, ToolProfile::Codex);
             assert!(built.errors.is_empty(), "{:?}", built.errors);
-            let task = built.tools.iter().find(|t| c6_tools::Task::is_task(&t.spec().name));
+            let visible = delegation_tools_for_turn(&spec, &built.tools);
+            let task = visible.iter().find(|t| c6_tools::Task::is_task(&t.spec().name));
             assert_eq!(task.is_some(), depth < 2);
-            assert_eq!(built.tools.iter().any(|t| c6_tools::SendMessage::is_send(&t.spec().name)), depth < 2);
+            assert_eq!(visible.iter().any(|t| c6_tools::SendMessage::is_send(&t.spec().name)), depth < 2);
             for name in ["bash_output", "kill_shell"] {
                 assert!(built.tools.iter().any(|t| t.spec().name == name), "{name} stays available at depth {depth}");
             }
@@ -7497,7 +7686,11 @@ mod route_tool_tests {
         }
         let limited = CreateSession { delegation: Some(c6_proto::Delegation { depth: 2, ..Default::default() }), ..spec.clone() };
         let built = build_tools(&limited, dir.path(), ToolProfile::Codex, &[], &[]).await;
-        assert!(!built.tools.iter().any(|t| c6_tools::Task::is_task(&t.spec().name) || c6_tools::SendMessage::is_send(&t.spec().name)));
+        assert!(
+            !delegation_tools_for_turn(&limited, &built.tools)
+                .iter()
+                .any(|t| c6_tools::Task::is_task(&t.spec().name) || c6_tools::SendMessage::is_send(&t.spec().name))
+        );
         let restricted = CreateSession { tools: vec!["BashOutput".into(), "KillShell".into()], ..spec };
         let built = build_tools(&restricted, dir.path(), ToolProfile::Codex, &[], &[]).await;
         assert_eq!(built.tools.iter().map(|t| t.spec().name).collect::<Vec<_>>(), ["bash_output", "kill_shell"]);
@@ -8445,7 +8638,9 @@ mod notice_tests {
         let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
         let model =
             ModelSpec { connection_id: "mock".into(), connection_kind: "openai_compat".into(), model: "m".into(), ..Default::default() };
-        let spec = CreateSession { model: Some(model.clone()), cwd: dir.path().display().to_string(), ..Default::default() };
+        let cwd = dir.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        let spec = CreateSession { model: Some(model.clone()), cwd: cwd.display().to_string(), ..Default::default() };
         let events = [ev(
             1,
             c6_core::now_ms(),
@@ -8460,6 +8655,35 @@ mod notice_tests {
         let manager =
             SessionManager::new(journal, Arc::new(HeadLink::local(Arc::new(Head(mock.base_url())))), dir.path().join("worktrees"));
         (dir, manager, mock)
+    }
+
+    #[tokio::test]
+    async fn settings_refresh_does_not_reject_or_recreate_a_missing_cache() {
+        let (_dir, manager, _mock) = idle_session().await;
+        manager
+            .handle(SessionCommand {
+                command_id: "ephemeral-settings".into(),
+                session_id: "trimmed".into(),
+                kind: Some(session_command::Kind::UpdateNoticeLimits(c6_proto::NoticeLimits::default())),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!manager.journal.has_session("trimmed").await.unwrap());
+        assert!(manager.live("trimmed").is_none());
+    }
+
+    #[tokio::test]
+    async fn unchanged_settings_refresh_does_not_extend_the_journal() {
+        let (_dir, manager, _mock) = idle_session().await;
+        let actor = manager.actor("held").await.unwrap().unwrap();
+        actor.send(ActorMsg::NoticeLimits(c6_proto::NoticeLimits::default())).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        actor.send(ActorMsg::TaskFence(tx)).unwrap();
+        c6_testkit::within("the unchanged settings to be handled", rx).await.unwrap();
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        assert!(!events.iter().any(|e| matches!(&e.kind,
+            Some(session_event::Kind::Notice(n)) if n.title == "Notice settings refreshed")));
     }
 
     // External I/O (SQLite and the mock server) must progress without
@@ -9330,14 +9554,27 @@ mod notice_tests {
     }
 
     #[tokio::test]
-    async fn repeated_failure_notifies_and_holds_until_continue() {
+    async fn repeated_failure_notifies_and_holds_until_limits_are_raised() {
+        repeated_failure_hold(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_file_changed_on_the_deciding_wake_prevents_a_repetition_hold() {
+        repeated_failure_hold(true).await;
+    }
+
+    async fn repeated_failure_hold(file_changed: bool) {
         use session_event::Kind;
 
         const DESCRIPTION: &str = "Run the same failing task";
-        const PAUSED: &str = "paused: repeated failure of Run the same failing task";
+        const PAUSED: &str =
+            "paused: still repeating the same failure after relaunching a task (7 observations; source: Run the same failing task)";
         let (_dir, manager, mock) = idle_session().await;
-        let mut history = vec![user("direct-request")];
-        for launch in 0..=4 {
+        let (spec, _) = manager.journal.load_session("held").await.unwrap().unwrap();
+        let checkpoints = Checkpoints::new(&manager.state_dir, "held", Path::new(&spec.cwd));
+        let baseline = checkpoints.fingerprint().await.unwrap();
+        let mut history = vec![Kind::Checkpoint(Checkpoint { tree_id: baseline, ..Default::default() }), user("direct-request")];
+        for launch in 0..=8 {
             if launch != 0 {
                 let command_id = format!("task:retry-{}:failed", launch - 1);
                 let task_notice = Some(c6_proto::TaskNotice {
@@ -9374,10 +9611,43 @@ mod notice_tests {
             ]);
         }
         let initial = append_seed(&manager.journal, 1, history).await;
+        if file_changed {
+            // Model a shell write on the last completed wake: no Edit tool
+            // event or subsequent start-of-turn checkpoint describes it.
+            std::fs::write(Path::new(&spec.cwd).join("new-result"), "a genuinely changed file").unwrap();
+            mock.push(c6_testkit::Reply::Text("The file change is new progress.".into()));
+        }
         let _clock = pause_clock();
-        enqueue_reports(&manager, 1..2, true).await;
+        let actor = manager.actor("held").await.unwrap().unwrap();
+        actor
+            .send(ActorMsg::ChildReport {
+                command_id: "loop-trigger".into(),
+                text: "report #1.".into(),
+                task_notice: Some(c6_proto::TaskNotice {
+                    title: DESCRIPTION.into(),
+                    status: "failed".into(),
+                    markdown: "Same failure.".into(),
+                    ..Default::default()
+                }),
+                wake: true,
+                recorded: tokio::sync::oneshot::channel().0,
+                inline: None,
+            })
+            .unwrap();
         tokio::time::advance(MAX_WAIT + TICK).await;
         barrier(&manager, "still-paused").await;
+        if file_changed {
+            tokio::time::advance(TICK).await;
+            let (events, request) = completed_batch_after(&manager, &mock, initial).await;
+            assert!(request.contains("report #1."));
+            assert!(!events.iter().any(|event| matches!(&event.kind,
+                Some(Kind::NoticeQueued(n)) if n.reason.starts_with("paused:")
+            )));
+            assert!(events.iter().any(|event| matches!(&event.kind,
+                Some(Kind::Notice(n)) if n.quiet && n.title == crate::notice_guard::WORKSPACE_TREE_TITLE
+            )));
+            return;
+        }
         assert_waiting_after(&manager, &mock, 1, initial).await;
 
         let events = manager.journal.events_after("held", initial, u32::MAX).await.unwrap();
@@ -9397,32 +9667,114 @@ mod notice_tests {
             1
         );
 
-        mock.push(c6_testkit::Reply::Text("Continued after the pause.".into()));
+        mock.push(c6_testkit::Reply::Text("Delivered after the settings refresh.".into()));
         let tx = manager.actor("held").await.unwrap().unwrap();
         let limits = c6_proto::NoticeLimits {
             notice_quiet_seconds: 7,
             notice_max_wait_seconds: 41,
             notice_no_progress_limit: 8,
-            notice_failure_relaunch_limit: 6,
+            notice_failure_relaunch_limit: 20,
             notice_tokens_per_hour: 7_000_000,
+            notice_loop_backoff_rounds: 4,
+            notice_loop_backoff_max_seconds: 200,
+            max_subagent_depth: Some(4),
+            max_running_subagents: Some(0),
         };
         tx.send(ActorMsg::NoticeLimits(limits)).unwrap();
+        barrier(&manager, "limits-refreshed").await;
+        tokio::time::advance(TICK).await;
         let (events, request) = completed_batch_after(&manager, &mock, initial).await;
-        assert!(request.contains("report #1."), "the held report should reach the model after Continue");
+        assert!(request.contains("report #1."), "raising the threshold should deliver the held failure without Continue");
         let marker =
             events.iter().find(|e| matches!(&e.kind, Some(Kind::Notice(n)) if n.quiet && n.title == "Notice settings refreshed")).unwrap();
         let delivery = events.iter().find(|e| matches!(&e.kind, Some(Kind::User(u)) if u.text == "report #1.")).unwrap();
-        assert!(marker.seq < delivery.seq, "the refreshed settings must be durable before automatically releasing the report");
-        assert_eq!(crate::notice_guard::evaluate(&events, c6_core::now_ms(), 8, 6, 7_000_000), None);
+        assert!(marker.seq < delivery.seq, "the refreshed settings must be durable before automatic delivery");
+        assert!(
+            !events.iter().any(|e| matches!(&e.kind, Some(Kind::Notice(n)) if n.quiet && n.title == crate::notice_guard::CONTINUED_TITLE)),
+            "refreshing limits must not masquerade as Continue or reset the guard"
+        );
 
-        let (mut spec, events) = manager.journal.load_session("held").await.unwrap().unwrap();
-        assert_ne!(spec.notice_quiet_seconds, limits.notice_quiet_seconds, "the imported spec precedes the refresh");
-        let _ = conversation_from_log(&mut spec, &events);
+        let (spec, _) = manager.journal.load_session("held").await.unwrap().unwrap();
         assert_eq!(spec.notice_quiet_seconds, limits.notice_quiet_seconds);
         assert_eq!(spec.notice_max_wait_seconds, limits.notice_max_wait_seconds);
         assert_eq!(spec.notice_no_progress_limit, limits.notice_no_progress_limit);
         assert_eq!(spec.notice_failure_relaunch_limit, limits.notice_failure_relaunch_limit);
         assert_eq!(spec.notice_tokens_per_hour, limits.notice_tokens_per_hour);
+        assert_eq!(spec.notice_loop_backoff_rounds, limits.notice_loop_backoff_rounds);
+        assert_eq!(spec.notice_loop_backoff_max_seconds, limits.notice_loop_backoff_max_seconds);
+        assert_eq!(spec.max_subagent_depth, 4);
+        assert_eq!(spec.max_running_subagents, 0);
+    }
+
+    #[tokio::test]
+    async fn loop_backoff_defers_automatic_delivery_and_warns_the_model() {
+        use session_event::Kind;
+
+        let (_dir, manager, mock) = idle_session().await;
+        let make_notice = || c6_proto::TaskNotice {
+            title: "same source".into(),
+            status: "completed".into(),
+            markdown: "The result is unchanged.".into(),
+            ..Default::default()
+        };
+        let (spec, _) = manager.journal.load_session("held").await.unwrap().unwrap();
+        let checkpoints = Checkpoints::new(&manager.state_dir, "held", Path::new(&spec.cwd));
+        let mut history = vec![Kind::Checkpoint(Checkpoint { tree_id: checkpoints.fingerprint().await.unwrap(), ..Default::default() })];
+        // The default warns on five matching observations. A sixth begins
+        // the first backoff, regardless of how many notices the turn took.
+        for turn in 1..=7 {
+            let command_id = format!("duplicate-{turn}");
+            history.extend([
+                Kind::NoticeQueued(c6_proto::NoticeQueued {
+                    command_id: command_id.clone(),
+                    wake: true,
+                    task_notice: Some(make_notice()),
+                    ..Default::default()
+                }),
+                Kind::User(c6_proto::UserMessage { command_id, task_notice: Some(make_notice()), ..Default::default() }),
+                started_turn(turn),
+                ended_turn(turn),
+            ]);
+        }
+        let initial = append_seed(&manager.journal, 1, history).await;
+        let _clock = pause_clock();
+        let tx = manager.actor("held").await.unwrap().unwrap();
+        tx.send(ActorMsg::ChildReport {
+            command_id: "pending-duplicate".into(),
+            text: "Report ready.".into(),
+            task_notice: Some(make_notice()),
+            wake: true,
+            recorded: tokio::sync::oneshot::channel().0,
+            inline: None,
+        })
+        .unwrap();
+        let evidence = "near-identical reports from the same source (6 observations; source: same source)";
+        let reason = format!("collecting reports; slowing automatic delivery after {evidence}");
+        logged(&manager, |events| {
+            events.iter().any(|e| matches!(&e.kind, Some(Kind::NoticeQueued(n)) if n.reason == reason && n.deliver_at_ms > 0))
+        })
+        .await;
+
+        tokio::time::advance(MAX_WAIT + TICK).await;
+        assert_waiting_after(&manager, &mock, 1, initial).await;
+
+        mock.push(c6_testkit::Reply::Text("No further action.".into()));
+        tokio::time::advance(MAX_WAIT + TICK).await;
+        let (events, request) = completed_batch_after(&manager, &mock, initial).await;
+        assert!(request.contains(evidence), "the next model input should explain the warning");
+        assert!(events.iter().any(|e| matches!(&e.kind, Some(Kind::User(u)) if u.text == "Report ready." && u.prompt.contains(evidence))));
+    }
+
+    #[test]
+    fn notice_loop_warning_is_editable_without_changing_report_text() {
+        let mut input = PendingInput { text: "Display report".into(), prompt: "Expanded report".into(), ..Default::default() };
+        let spec = CreateSession {
+            prompts_json: serde_json::json!({"session.notice_loop_warning": "Loop advisory: {{evidence}}"}).to_string(),
+            ..Default::default()
+        };
+        add_notice_loop_warning(&spec, &mut input, "7 repeated results");
+        assert_eq!(input.text, "Display report");
+        assert_eq!(input.prompt, "Expanded report\n\nLoop advisory: 7 repeated results");
     }
 
     #[tokio::test]
@@ -10481,7 +10833,7 @@ for line in sys.stdin:
                     ..Default::default()
                 }),
             ),
-            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, error: String::new() })),
+            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, ..Default::default() })),
             user(3, "withdraw this"),
         ];
         manager.journal.import("s", &CreateSession::default(), &events).await.unwrap();
@@ -10836,7 +11188,7 @@ for line in sys.stdin:
         link.seq = 3;
         let events = [
             ev(1, session_event::Kind::Started(started)),
-            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, error: String::new() })),
+            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, ..Default::default() })),
             link,
             user(4, "target"),
         ];
@@ -10942,7 +11294,7 @@ for line in sys.stdin:
                     ..Default::default()
                 }),
             ),
-            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, error: String::new() })),
+            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, ..Default::default() })),
             link,
             user(4, "target"),
         ];
@@ -11055,7 +11407,7 @@ for line in sys.stdin:
                     ..Default::default()
                 }),
             ),
-            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, error: String::new() })),
+            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, ..Default::default() })),
             link,
             user(4, "target"),
         ];
@@ -11150,7 +11502,7 @@ for line in sys.stdin:
                     ..Default::default()
                 }),
             ),
-            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, error: String::new() })),
+            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, ..Default::default() })),
             link,
             user(4, "target"),
         ];
@@ -11908,7 +12260,7 @@ mod inbox_tests {
         sqlx::query(trigger).execute(&mut fault).await.unwrap();
         let (done, outcome) = tokio::sync::oneshot::channel();
         let delegated = PendingInput { delegated_by: "parent-call".into(), ..input("delegated-input", "do not redeliver me") };
-        child.tx.send(ActorMsg::Delegate(Box::new(delegated), Some(done))).unwrap();
+        child.tx.send(ActorMsg::Delegate(Box::new(delegated), Some(done), None)).unwrap();
 
         c6_testkit::eventually("delegate ran into the failed append", async || {
             let attempted = if fail_turn_start {

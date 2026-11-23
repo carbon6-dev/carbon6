@@ -223,7 +223,13 @@ async fn held_subagent_exit_wakes_parent(
     let parent_state = tempfile::tempdir().unwrap();
     let e = c6_head::api::new_enrollment(&head.state, Some("held-exit-parent")).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(parent_state.path()).unwrap();
-    let parent_worker = Worker::open(parent_state.path(), Identity::load(parent_state.path()).unwrap()).await.unwrap();
+    let parent_worker = Worker::open_with_resource_sampler(
+        parent_state.path(),
+        Identity::load(parent_state.path()).unwrap(),
+        c6_worker::ResourceMeasurement::default,
+    )
+    .await
+    .unwrap();
     let parent_worker_id = parent_worker.identity.meta.worker_id.0;
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();

@@ -2218,7 +2218,7 @@ pub struct SubagentLimits {
     /// none of their own.
     #[serde(default = "default_subagent_depth")]
     pub max_depth: u32,
-    /// How many subagents may work at once below one top-level session.
+    /// How many subagents may work at once below one top-level session. Zero has no count cap.
     #[serde(default = "default_running_subagents")]
     pub max_running: u32,
     /// Collect notices until this many seconds have passed without another notice.
@@ -2227,13 +2227,20 @@ pub struct SubagentLimits {
     /// Don't defer a batch longer than this while collecting notices.
     #[serde(default = "default_notice_max_wait_seconds")]
     pub notice_max_wait_seconds: u32,
-    /// Pause automatic delivery after this many notice turns without progress.
+    /// Repeated evidence without progress before warning about a possible loop.
+    /// This is not a cap on notice turns.
     #[serde(default = "default_notice_no_progress_limit")]
     pub notice_no_progress_limit: u32,
-    /// Pause automatic delivery after this many launches following failures.
+    /// Repeated evidence of the same failure before warning about a retry loop.
     #[serde(default = "default_notice_failure_relaunch_limit")]
     pub notice_failure_relaunch_limit: u32,
-    /// Hourly token budget for automatically started notice turns.
+    /// Backoff rounds for persistent repetition before asking the user.
+    #[serde(default = "default_notice_loop_backoff_rounds")]
+    pub notice_loop_backoff_rounds: u32,
+    /// Maximum delay, in seconds, for any one loop backoff round.
+    #[serde(default = "default_notice_loop_backoff_max_seconds")]
+    pub notice_loop_backoff_max_seconds: u32,
+    /// Optional hourly token cap for automatically started notice turns. Zero disables it.
     #[serde(default = "default_notice_tokens_per_hour")]
     pub notice_tokens_per_hour: u64,
     /// How long an idle Claude Code process with no background tasks stays
@@ -2255,31 +2262,67 @@ pub struct SubagentLimits {
     /// Report pending descendants after this many seconds of tree-wide silence.
     #[serde(default = "default_liveness_tree_silence_seconds")]
     pub liveness_tree_silence_seconds: u32,
-    /// Longest chain of messages between sessions (default 4). A send adds
+    /// Last-resort ceiling on a chain of messages between sessions (default 50). A send adds
     /// one to the last session message delivered; direct UI or HTTP API
     /// input resets the session's count to 0. Sends beyond this limit are refused.
     #[serde(default = "default_max_message_hops")]
     pub max_message_hops: u32,
-    /// How many messages one session may send other sessions per hour.
+    /// Deprecated optional cap on messages one session sends per hour. Zero disables it.
     #[serde(default = "default_messages_per_hour")]
     pub messages_per_hour: u32,
 }
 
-pub const DEFAULT_SUBAGENT_DEPTH: u32 = 3;
-pub const DEFAULT_RUNNING_SUBAGENTS: u32 = 16;
+pub const DEFAULT_SUBAGENT_DEPTH: u32 = 5;
+pub const DEFAULT_RUNNING_SUBAGENTS: u32 = 0;
 pub const DEFAULT_NOTICE_QUIET_SECONDS: u32 = 3;
 pub const DEFAULT_NOTICE_MAX_WAIT_SECONDS: u32 = 30;
 pub const DEFAULT_NOTICE_NO_PROGRESS_LIMIT: u32 = 5;
 pub const DEFAULT_NOTICE_FAILURE_RELAUNCH_LIMIT: u32 = 3;
-pub const DEFAULT_NOTICE_TOKENS_PER_HOUR: u64 = 5_000_000;
+pub const DEFAULT_NOTICE_LOOP_BACKOFF_ROUNDS: u32 = 3;
+pub const DEFAULT_NOTICE_LOOP_BACKOFF_MAX_SECONDS: u32 = 900;
+pub const DEFAULT_NOTICE_TOKENS_PER_HOUR: u64 = 0;
 pub const DEFAULT_CLAUDE_CODE_IDLE_MINUTES: u32 = 15;
 pub const DEFAULT_SESSION_RECOVERY_SECONDS: u32 = 180;
 pub const DEFAULT_LIVENESS_SWEEP_SECONDS: u32 = 30;
 pub const DEFAULT_LIVENESS_WORKER_GRACE_SECONDS: u32 = 30;
 pub const DEFAULT_LIVENESS_MODEL_SILENCE_SECONDS: u32 = 600;
 pub const DEFAULT_LIVENESS_TREE_SILENCE_SECONDS: u32 = 1800;
-pub const DEFAULT_MAX_MESSAGE_HOPS: u32 = 4;
-pub const DEFAULT_MESSAGES_PER_HOUR: u32 = 30;
+pub const DEFAULT_MAX_MESSAGE_HOPS: u32 = 50;
+pub const DEFAULT_MESSAGES_PER_HOUR: u32 = 0;
+
+impl SubagentLimits {
+    /// Write a storage marker so a new PUT may intentionally choose an old default.
+    pub fn to_stored_json(&self) -> serde_json::Result<String> {
+        let mut value = serde_json::to_value(self)?;
+        value["adaptive_guard_settings"] = true.into();
+        serde_json::to_string(&value)
+    }
+
+    /// Migrate each old default independently, leaving custom caps and unrelated settings alone.
+    pub fn from_stored_json(raw: &str) -> serde_json::Result<Self> {
+        let value: serde_json::Value = serde_json::from_str(raw)?;
+        let legacy = value.get("adaptive_guard_settings").and_then(serde_json::Value::as_bool) != Some(true);
+        let mut limits: Self = serde_json::from_value(value)?;
+        if legacy {
+            if limits.max_depth == 3 {
+                limits.max_depth = DEFAULT_SUBAGENT_DEPTH;
+            }
+            if limits.max_running == 16 {
+                limits.max_running = DEFAULT_RUNNING_SUBAGENTS;
+            }
+            if limits.notice_tokens_per_hour == 5_000_000 {
+                limits.notice_tokens_per_hour = DEFAULT_NOTICE_TOKENS_PER_HOUR;
+            }
+            if limits.max_message_hops == 4 {
+                limits.max_message_hops = DEFAULT_MAX_MESSAGE_HOPS;
+            }
+            if limits.messages_per_hour == 30 {
+                limits.messages_per_hour = DEFAULT_MESSAGES_PER_HOUR;
+            }
+        }
+        Ok(limits)
+    }
+}
 
 fn default_max_message_hops() -> u32 {
     DEFAULT_MAX_MESSAGE_HOPS
@@ -2303,6 +2346,14 @@ fn default_notice_no_progress_limit() -> u32 {
 
 fn default_notice_failure_relaunch_limit() -> u32 {
     DEFAULT_NOTICE_FAILURE_RELAUNCH_LIMIT
+}
+
+fn default_notice_loop_backoff_rounds() -> u32 {
+    DEFAULT_NOTICE_LOOP_BACKOFF_ROUNDS
+}
+
+fn default_notice_loop_backoff_max_seconds() -> u32 {
+    DEFAULT_NOTICE_LOOP_BACKOFF_MAX_SECONDS
 }
 
 fn default_notice_tokens_per_hour() -> u64 {
@@ -2350,6 +2401,8 @@ impl Default for SubagentLimits {
             notice_max_wait_seconds: DEFAULT_NOTICE_MAX_WAIT_SECONDS,
             notice_no_progress_limit: DEFAULT_NOTICE_NO_PROGRESS_LIMIT,
             notice_failure_relaunch_limit: DEFAULT_NOTICE_FAILURE_RELAUNCH_LIMIT,
+            notice_loop_backoff_rounds: DEFAULT_NOTICE_LOOP_BACKOFF_ROUNDS,
+            notice_loop_backoff_max_seconds: DEFAULT_NOTICE_LOOP_BACKOFF_MAX_SECONDS,
             notice_tokens_per_hour: DEFAULT_NOTICE_TOKENS_PER_HOUR,
             claude_code_idle_minutes: DEFAULT_CLAUDE_CODE_IDLE_MINUTES,
             session_recovery_seconds: DEFAULT_SESSION_RECOVERY_SECONDS,
@@ -2381,13 +2434,48 @@ mod notice_settings_tests {
         assert_eq!(json["notice_max_wait_seconds"], 30);
         assert_eq!(json["notice_no_progress_limit"], 5);
         assert_eq!(json["notice_failure_relaunch_limit"], 3);
-        assert_eq!(json["notice_tokens_per_hour"], 5_000_000);
+        assert_eq!(json["notice_loop_backoff_rounds"], 3);
+        assert_eq!(json["notice_loop_backoff_max_seconds"], 900);
+        assert_eq!(json["notice_tokens_per_hour"], 0);
         assert_eq!(json["liveness_sweep_seconds"], 30);
         assert_eq!(json["liveness_worker_grace_seconds"], 30);
         assert_eq!(json["liveness_model_silence_seconds"], 600);
         assert_eq!(json["liveness_tree_silence_seconds"], 1800);
         json["notice_tokens_per_hour"] = 10_000_000_000u64.into();
         assert_eq!(serde_json::from_value::<SubagentLimits>(json).unwrap().notice_tokens_per_hour, 10_000_000_000);
+    }
+
+    #[test]
+    fn old_fixed_defaults_migrate_without_changing_other_settings() {
+        let settings = SubagentLimits::from_stored_json(
+            r#"{"max_depth":3,"max_running":16,"notice_tokens_per_hour":5000000,"max_message_hops":4,"messages_per_hour":30,"notice_quiet_seconds":7}"#,
+        )
+        .unwrap();
+        assert_eq!(settings, SubagentLimits { notice_quiet_seconds: 7, ..Default::default() });
+        assert_eq!(settings.max_depth, 5);
+        assert_eq!(settings.max_running, 0);
+        assert_eq!(settings.max_message_hops, 50);
+        assert_eq!(settings.messages_per_hour, 0);
+        assert_eq!(settings.notice_tokens_per_hour, 0);
+    }
+
+    #[test]
+    fn custom_caps_survive_migration_and_new_settings_can_choose_old_values() {
+        let custom = SubagentLimits::from_stored_json(
+            r#"{"max_depth":3,"max_running":12,"notice_tokens_per_hour":999999999999,"max_message_hops":20,"messages_per_hour":90}"#,
+        )
+        .unwrap();
+        assert_eq!(custom.max_depth, 5);
+        assert_eq!(custom.max_running, 12);
+        assert_eq!(custom.notice_tokens_per_hour, 999_999_999_999);
+        assert_eq!(custom.max_message_hops, 20);
+        assert_eq!(custom.messages_per_hour, 90);
+
+        let old_values: SubagentLimits = serde_json::from_str(
+            r#"{"max_depth":3,"max_running":16,"notice_tokens_per_hour":5000000,"max_message_hops":4,"messages_per_hour":30}"#,
+        )
+        .unwrap();
+        assert_eq!(SubagentLimits::from_stored_json(&old_values.to_stored_json().unwrap()).unwrap(), old_values);
     }
 
     #[test]

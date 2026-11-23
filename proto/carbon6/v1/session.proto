@@ -244,6 +244,8 @@ message Checkpoint {
   string commit = 1;
   // Set when no snapshot could be taken (the turn runs anyway).
   string error = 2;
+  // Stable content identity already computed by the checkpoint operation.
+  string tree_id = 3;
 }
 
 // The conversation was rewound: events from `to_seq` up to this one no
@@ -655,7 +657,13 @@ message NoticeLimits {
   uint32 notice_max_wait_seconds = 2;
   uint32 notice_no_progress_limit = 3;
   uint32 notice_failure_relaunch_limit = 4;
+  // Opt-in hard cap on notice-only turns. Zero disables it.
   uint64 notice_tokens_per_hour = 5;
+  uint32 notice_loop_backoff_rounds = 6;
+  uint32 notice_loop_backoff_max_seconds = 7;
+  // Absent from older heads. In particular, a present zero count means unlimited.
+  optional uint32 max_subagent_depth = 8;
+  optional uint32 max_running_subagents = 9;
 }
 
 // Sets the session's default for its subagents (unset `model`: the
@@ -798,7 +806,7 @@ message CreateSession {
   // With `worktree`: how it is made (docs/dev-starts.md §2); unset: a
   // `c6/<id>` branch from HEAD.
   WorktreeSpec worktree_spec = 36;
-  // Automatic notice delivery settings. 0: use the default.
+  // Automatic notice delivery settings. 0: use the default, except for the cap.
   uint32 notice_quiet_seconds = 37;
   uint32 notice_max_wait_seconds = 38;
   uint32 notice_no_progress_limit = 39;
@@ -806,6 +814,8 @@ message CreateSession {
   uint64 notice_tokens_per_hour = 41;
   // Time allowed for automatic journal recovery. 0: use the default.
   uint32 session_recovery_seconds = 42;
+  uint32 notice_loop_backoff_rounds = 43;
+  uint32 notice_loop_backoff_max_seconds = 44;
 }
 
 // How a new git worktree is made: the branch ({{id}} is the session's

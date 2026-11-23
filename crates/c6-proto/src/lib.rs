@@ -87,6 +87,10 @@ mod tests {
                 notice_no_progress_limit: 5,
                 notice_failure_relaunch_limit: 3,
                 notice_tokens_per_hour: 10_000_000_000,
+                notice_loop_backoff_rounds: 3,
+                notice_loop_backoff_max_seconds: 900,
+                max_subagent_depth: Some(5),
+                max_running_subagents: Some(0),
             }),
         };
         assert_eq!(ReleaseNotices::decode(release.encode_to_vec().as_slice()).unwrap(), release);

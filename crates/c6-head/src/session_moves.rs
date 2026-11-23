@@ -525,6 +525,7 @@ impl Move<'_> {
         ensure!(failed.rows_affected() == 1, "move rollback lost its state fence");
         crate::agent_ops::finish_placement_command(&mut tx, &self.row.session_id, &self.row.id, Err(reason)).await?;
         tx.commit().await?;
+        self.refresh_notice_limits(self.source).await;
         self.st.registry.deliver(self.source);
         self.st.registry.bump();
         self.st.attention.changed();
@@ -556,9 +557,17 @@ impl Move<'_> {
         self.rpc(self.target, "move.activate", json!({})).await?;
         self.remove_staging().await?;
         self.save("done", None).await?;
+        self.refresh_notice_limits(self.target).await;
         self.st.registry.deliver(self.target);
         self.st.registry.bump();
         Ok(())
+    }
+
+    async fn refresh_notice_limits(&self, worker: WorkerId) {
+        // Settings edits skip gated sessions. Refresh once the owner is routable again.
+        if let Err(error) = crate::sessions::refresh_notice_limits(self.st, Some(worker)).await {
+            tracing::warn!(move_id = %self.row.id, %worker, "refreshing session settings after move: {error:#}");
+        }
     }
 
     fn staging(&self) -> anyhow::Result<PathBuf> {
@@ -763,21 +772,29 @@ mod tests {
         let head = crate::start(config).await.unwrap();
         let st = &head.state;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let live = st.registry.attach(target, now_ms(), tx, vec![c6_proto::SESSION_MOVE_CAPABILITY.to_owned()], "worker").await;
+        let capabilities = vec![c6_proto::SESSION_MOVE_CAPABILITY.to_owned(), "notice_settings_v1".to_owned()];
+        let live = st.registry.attach(target, now_ms(), tx, capabilities, "worker").await;
         let message = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap().unwrap();
         let Some(c6_proto::head_msg::Msg::RpcRequest(rpc)) = message.msg else { panic!("expected activation request") };
         assert_eq!(rpc.method, "move.activate");
         let params: Value = serde_json::from_slice(&rpc.params_json).unwrap();
         assert_eq!(params["move_id"], id);
         assert_eq!(params["target_epoch"], 3);
+        let configured = c6_api::SubagentLimits { notice_quiet_seconds: 7, max_running: 12, ..Default::default() };
+        st.store.set_setting(crate::sessions::SUBAGENT_LIMITS, &configured.to_stored_json().unwrap()).await.unwrap();
+        crate::sessions::refresh_notice_limits(st, None).await.unwrap();
+        assert!(matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)), "settings must be gated during activation");
+
         live.rpc_response(c6_proto::RpcResponse { id: rpc.id, result_json: b"{}".to_vec(), error: String::new() });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while status(st, &id).await.unwrap().unwrap().state != "done" {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), live.deliver.notified()).await.unwrap();
+        let message = rx.try_recv().expect("settings must be sent before waking queue delivery").unwrap();
+        let Some(c6_proto::head_msg::Msg::Command(command)) = message.msg else { panic!("expected settings command") };
+        assert_eq!(command.session_id, "session");
+        assert_eq!(command.ownership_epoch, 3);
+        let Some(c6_proto::session_command::Kind::UpdateNoticeLimits(limits)) = command.kind else { panic!("expected notice limits") };
+        assert_eq!(limits.notice_quiet_seconds, configured.notice_quiet_seconds);
+        assert_eq!(limits.max_running_subagents, Some(configured.max_running));
+        assert_eq!(status(st, &id).await.unwrap().unwrap().state, "done");
         let (owner, epoch, seq): (String, i64, i64) =
             sqlx::query_as("SELECT worker_id, ownership_epoch, last_seq FROM sessions WHERE id = 'session'")
                 .fetch_one(&st.store.pool)

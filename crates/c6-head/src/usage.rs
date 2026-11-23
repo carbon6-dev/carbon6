@@ -461,6 +461,65 @@ pub async fn after_calls(st: &HeadState, session_id: &str) {
     if let Err(e) = enforce(st, session_id).await {
         warn!(session = %session_id, "checking budgets: {e:#}");
     }
+    if let Err(e) = crate::quotas::after_calls(st, session_id, c6_core::now_ms()).await {
+        warn!(session = %session_id, "checking plan forecast: {e:#}");
+    }
+}
+
+/// Which calls were in notice-started turns? A notice delivered into an
+/// attended turn doesn't make it unattended, and direct input ends the
+/// unattended portion. Reject incomplete attribution rather than guessing.
+pub(crate) fn unattended_calls(events: &[c6_proto::SessionEvent]) -> std::collections::HashSet<i64> {
+    use c6_proto::session_event::Kind;
+    use std::collections::HashSet;
+    let mut queue = HashSet::new();
+    let mut notice = false;
+    let mut direct = false;
+    let mut turn = None;
+    let mut unattended = false;
+    let mut calls = HashSet::new();
+    for event in events {
+        match &event.kind {
+            Some(Kind::Started(_)) => {
+                queue.clear();
+                notice = false;
+                direct = false;
+                turn = None;
+                unattended = false;
+                calls.clear();
+            }
+            Some(Kind::NoticeQueued(n)) if !n.command_id.is_empty() => {
+                queue.insert(n.command_id.as_str());
+            }
+            Some(Kind::User(u)) if u.blocked.is_empty() => {
+                let task_notification = u.command == "task-notification" && (u.origin_recorded || u.task_notice.is_some());
+                let notice_input = !u.human_origin
+                    && u.api_origin.is_none()
+                    && (queue.remove(u.command_id.as_str()) || task_notification || !u.from_session_id.is_empty());
+                if turn.is_none() {
+                    notice |= notice_input;
+                    direct |= !notice_input;
+                } else if !notice_input {
+                    unattended = false;
+                }
+            }
+            Some(Kind::TurnStarted(t)) => {
+                turn = Some(t.turn);
+                unattended = notice && !direct;
+                notice = false;
+                direct = false;
+            }
+            Some(Kind::TurnEnded(t)) if turn == Some(t.turn) => {
+                turn = None;
+                unattended = false;
+            }
+            Some(Kind::Usage(_)) if unattended => {
+                calls.insert(event.seq as i64);
+            }
+            _ => {}
+        }
+    }
+    calls
 }
 
 async fn enforce(st: &HeadState, session_id: &str) -> anyhow::Result<()> {
@@ -645,6 +704,44 @@ pub async fn report(st: &HeadState, days: u32, filter: &[String], realm: Option<
 mod tests {
     use super::*;
     use crate::store::Store;
+
+    #[test]
+    fn plan_awareness_identifies_notice_started_calls_from_the_journal() {
+        use c6_proto::session_event::Kind;
+        use c6_proto::{NoticeQueued, TurnEnded, TurnStarted, Usage, UserMessage};
+        let direct = || Kind::User(UserMessage { human_origin: true, ..Default::default() });
+        let report = || Kind::User(UserMessage { command_id: "report".into(), ..Default::default() });
+        let start = |turn| Kind::TurnStarted(TurnStarted { turn, ..Default::default() });
+        let end = |turn| Kind::TurnEnded(TurnEnded { turn, ..Default::default() });
+        let usage = || Kind::Usage(Usage::default());
+        let queue = || Kind::NoticeQueued(NoticeQueued { command_id: "report".into(), ..Default::default() });
+        let events = [
+            direct(),
+            start(1),
+            queue(),
+            report(),
+            usage(),
+            end(1), // notice joins a direct turn
+            queue(),
+            report(),
+            start(2),
+            usage(),
+            direct(),
+            usage(),
+            end(2), // attended again after direct input
+            queue(),
+            report(),
+            direct(),
+            start(3),
+            usage(),
+            end(3), // merged with human input
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| c6_proto::SessionEvent { seq: (i + 1) as u64, ts_ms: i as i64, kind: Some(kind) })
+        .collect::<Vec<_>>();
+        assert_eq!(unattended_calls(&events), [10].into());
+    }
 
     fn usage_event(seq: i64) -> c6_proto::SessionEvent {
         c6_proto::SessionEvent {

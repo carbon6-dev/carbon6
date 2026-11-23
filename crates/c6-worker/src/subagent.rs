@@ -21,17 +21,66 @@ use tracing::info;
 use crate::journal::Journal;
 use crate::session::{Outcome, SessionManager, Writer};
 
-/// How deep subagents nest (the session itself is depth 0) and how many
-/// delegations may run at once in one tree, unless the spec says.
-fn limits(spec: &CreateSession) -> (u32, usize) {
-    let depth = if spec.max_subagent_depth == 0 { c6_api::DEFAULT_SUBAGENT_DEPTH } else { spec.max_subagent_depth };
-    let running = if spec.max_running_subagents == 0 { c6_api::DEFAULT_RUNNING_SUBAGENTS } else { spec.max_running_subagents };
-    (depth, running as usize)
+/// The live realm settings a running delegate consults and passes to a
+/// new local child, which may not have existed during the head's refresh.
+#[derive(Clone, PartialEq)]
+pub(crate) struct LaunchLimits {
+    pub depth: u32,
+    pub running: u32,
+    notices: c6_proto::NoticeLimits,
+}
+
+impl LaunchLimits {
+    pub(crate) fn of(spec: &CreateSession) -> Self {
+        Self {
+            depth: spec.max_subagent_depth,
+            running: spec.max_running_subagents,
+            notices: c6_proto::NoticeLimits {
+                notice_quiet_seconds: spec.notice_quiet_seconds,
+                notice_max_wait_seconds: spec.notice_max_wait_seconds,
+                notice_no_progress_limit: spec.notice_no_progress_limit,
+                notice_failure_relaunch_limit: spec.notice_failure_relaunch_limit,
+                notice_tokens_per_hour: spec.notice_tokens_per_hour,
+                notice_loop_backoff_rounds: spec.notice_loop_backoff_rounds,
+                notice_loop_backoff_max_seconds: spec.notice_loop_backoff_max_seconds,
+                max_subagent_depth: Some(spec.max_subagent_depth),
+                max_running_subagents: Some(spec.max_running_subagents),
+            },
+        }
+    }
+
+    fn allows(&self, depth: u32) -> bool {
+        depth < if self.depth == 0 { c6_api::DEFAULT_SUBAGENT_DEPTH } else { self.depth }
+    }
+
+    fn inherit(&self, spec: &mut CreateSession) {
+        Self::apply_notice_limits(spec, &self.notices);
+    }
+
+    pub(crate) fn apply_notice_limits(spec: &mut CreateSession, limits: &c6_proto::NoticeLimits) {
+        spec.notice_quiet_seconds = limits.notice_quiet_seconds;
+        spec.notice_max_wait_seconds = limits.notice_max_wait_seconds;
+        spec.notice_no_progress_limit = limits.notice_no_progress_limit;
+        spec.notice_failure_relaunch_limit = limits.notice_failure_relaunch_limit;
+        spec.notice_tokens_per_hour = limits.notice_tokens_per_hour;
+        spec.notice_loop_backoff_rounds = limits.notice_loop_backoff_rounds;
+        spec.notice_loop_backoff_max_seconds = limits.notice_loop_backoff_max_seconds;
+        if let Some(depth) = limits.max_subagent_depth {
+            spec.max_subagent_depth = depth;
+        }
+        if let Some(running) = limits.max_running_subagents {
+            spec.max_running_subagents = running;
+        }
+    }
 }
 
 /// Whether a session at `depth` may start or continue subagents.
 pub(crate) fn may_delegate(spec: &CreateSession, depth: u32) -> bool {
-    depth < limits(spec).0
+    LaunchLimits::of(spec).allows(depth)
+}
+
+pub(crate) fn delegation_tool(name: &str) -> bool {
+    Task::is_task(name) || SendMessage::is_send(name)
 }
 
 /// A session's default for its subagents: from the head (a routing rule,
@@ -64,6 +113,7 @@ pub struct Parent {
     pub log: Arc<Writer>,
     pub manager: SessionManager,
     pub default: SharedDefault,
+    pub(crate) limits: Arc<std::sync::Mutex<LaunchLimits>>,
 }
 
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -165,32 +215,27 @@ impl Runner {
     }
 }
 
-/// What a subagent's journaled spec says about its agent (a reloaded
-/// subagent keeps the tools its `SessionStarted` lists).
-#[derive(serde::Serialize, serde::Deserialize)]
+/// A local subagent's durable named-agent policy and tools hidden by depth
+/// at launch. Neither a deeper limit nor a reload widens its tool policy.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct AgentJson {
+    #[serde(default)]
     name: String,
     #[serde(default)]
     tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hidden_delegation_tools: Vec<String>,
 }
 
 /// The tools a subagent has, of its parent's: those its named agent
-/// allows, and none that start or continue subagents at the depth limit.
-fn filter_tools(
-    spec: &CreateSession,
-    tools: Vec<Arc<dyn Tool>>,
-    parent: Option<(&[Arc<dyn Tool>], bool)>,
-    agent: Option<&AgentDef>,
-    depth: u32,
-) -> Vec<Arc<dyn Tool>> {
+/// allows. Depth limits apply at turn and invocation time, not to the stored inventory.
+fn filter_tools(tools: Vec<Arc<dyn Tool>>, parent: Option<(&[Arc<dyn Tool>], bool)>, agent: Option<&AgentDef>) -> Vec<Arc<dyn Tool>> {
     tools
         .into_iter()
         .filter(|t| {
             let name = t.spec().name;
-            let delegates = Task::is_task(&name) || SendMessage::is_send(&name);
             // What a subagent finds goes back to its parent, not into task cards.
-            !(delegates && !may_delegate(spec, depth))
-                && !c6_tools::knowledge::is_task_card(&name)
+            !c6_tools::knowledge::is_task_card(&name)
                 // Nor into messages to other sessions, sent in its top-level
                 // session's name (docs/background.md §6).
                 && !c6_tools::messages::is_message_tool(&name)
@@ -209,6 +254,16 @@ fn filter_tools(
 pub(crate) fn agent_tools(spec: &CreateSession) -> Option<Vec<String>> {
     let d = spec.delegation.as_ref()?;
     serde_json::from_str::<AgentJson>(&d.agent_json).ok().map(|a| a.tools).filter(|t| !t.is_empty())
+}
+
+/// Augment Started.tools only with tools the child was authorized to use at
+/// creation. Old journals recorded no hidden tools; keep those conservative.
+pub(crate) fn saved_tools(spec: &CreateSession, started: &SessionStarted) -> Vec<String> {
+    let mut tools = started.tools.clone();
+    if let Some(agent) = spec.delegation.as_ref().and_then(|d| serde_json::from_str::<AgentJson>(&d.agent_json).ok()) {
+        tools.extend(agent.hidden_delegation_tools.into_iter().filter(|name| delegation_tool(name)));
+    }
+    tools
 }
 
 /// Both lists' tools (an empty list allows any); `None` when no tool is
@@ -246,6 +301,7 @@ impl Subagents for Runner {
     ) -> Result<String, String> {
         let child_id = uuid::Uuid::now_v7().to_string();
         let p = &self.parent;
+        self.check_depth()?;
         let depth = depth_of(&p.spec) + 1;
         let root = p.spec.delegation.as_ref().map_or(p.session_id.as_str(), |d| d.root_session_id.as_str()).to_owned();
         let default = p.default.lock().unwrap().clone();
@@ -255,7 +311,9 @@ impl Subagents for Runner {
         // On Claude Code: a Claude Code session of its own, with Claude Code's
         // tools and prompt (carbon6's tools reach it over the bridge).
         let on_claude_code = model_spec.connection_kind == "claude_code";
-        let _working = self.permit(&root)?;
+        let admission = self.wait_for_headroom(&cancel).await?;
+        let limits = self.check_depth()?;
+        let _working = self.permit(&root, limits.running as usize)?;
         let provider = Provider::from_kind(&model_spec.connection_kind).unwrap_or(Provider::OpenAiChat);
         let info = model_info(provider, &model_spec.model);
         let profile = info.tool_profile;
@@ -264,9 +322,7 @@ impl Subagents for Runner {
             parent_session_id: p.session_id.clone(),
             parent_call_id: parent_call_id.to_owned(),
             root_session_id: root,
-            agent_json: agent
-                .map(|a| serde_json::to_string(&AgentJson { name: a.name.clone(), tools: a.tools.clone() }).unwrap_or_default())
-                .unwrap_or_default(),
+            agent_json: String::new(),
             depth,
             observed: false,
         };
@@ -308,7 +364,7 @@ impl Subagents for Runner {
         let (tools, skills) = if on_claude_code {
             (Vec::new(), None)
         } else if p.started.tool_profile == profile.as_str() {
-            (filter_tools(&p.spec, self.tools.clone(), None, agent, depth), None)
+            (filter_tools(self.tools.clone(), None, agent), None)
         } else {
             let built = p.manager.session_tool_set(&child_id, &spec, &p.started, profile).await;
             for e in &built.errors {
@@ -317,7 +373,7 @@ impl Subagents for Runner {
             // A named parent may already have narrowed its tools.
             // Changing profiles must not give its descendants those tools back.
             let parent = (!claude_code_parent).then_some((self.tools.as_slice(), search_allowed));
-            (filter_tools(&p.spec, built.tools, parent, agent, depth), Some(built.skills))
+            (filter_tools(built.tools, parent, agent), Some(built.skills))
         };
         let mut system_prompt = match &skills {
             None => crate::session::without_task_cards(&p.started.system_prompt),
@@ -361,24 +417,6 @@ impl Subagents for Runner {
         } else {
             system_prompt = crate::session::prompt_for_tools(&spec, &system_prompt, &tools, profile);
         }
-        let started = SessionStarted {
-            title: match agent {
-                Some(a) => format!("{description} ({})", a.name),
-                None => description.to_owned(),
-            },
-            parent_session_id: p.session_id.clone(),
-            parent_call_id: parent_call_id.to_owned(),
-            tools: tools.iter().map(|t| t.spec().name).collect(),
-            hosted_search_off: !search_allowed,
-            system_prompt,
-            model: Some(model_spec.clone()),
-            tool_profile: if on_claude_code { crate::claude_code::PROFILE.to_owned() } else { profile.as_str().to_owned() },
-            context_window,
-            agent: agent.map(|a| a.name.clone()).unwrap_or_default(),
-            depth,
-            ..p.started.clone()
-        };
-
         // The parent's log links to the child before the child's exists.
         p.log
             .append(session_event::Kind::SubagentSpawned(SubagentSpawned {
@@ -394,6 +432,38 @@ impl Subagents for Runner {
             }))
             .await
             .map_err(|e| format!("{e:#}"))?;
+
+        // Setup may have awaited I/O. Inherit from the running actor,
+        // not from the spec that was copied when this turn began.
+        p.limits.lock().unwrap().inherit(&mut spec);
+        let visible_names = crate::session::visible_tool_names(&spec, &tools);
+        let hidden_delegation_tools: Vec<_> = tools.iter().map(|t| t.spec().name).filter(|name| !visible_names.contains(name)).collect();
+        if agent.is_some() || !hidden_delegation_tools.is_empty() {
+            let metadata = AgentJson {
+                name: agent.map(|a| a.name.clone()).unwrap_or_default(),
+                tools: agent.map(|a| a.tools.clone()).unwrap_or_default(),
+                hidden_delegation_tools,
+            };
+            spec.delegation.as_mut().unwrap().agent_json = serde_json::to_string(&metadata).unwrap_or_default();
+        }
+        let started = SessionStarted {
+            title: match agent {
+                Some(a) => format!("{description} ({})", a.name),
+                None => description.to_owned(),
+            },
+            parent_session_id: p.session_id.clone(),
+            parent_call_id: parent_call_id.to_owned(),
+            tools: visible_names,
+            hosted_search_off: !search_allowed,
+            system_prompt,
+            model: Some(model_spec.clone()),
+            tool_profile: if on_claude_code { crate::claude_code::PROFILE.to_owned() } else { profile.as_str().to_owned() },
+            context_window,
+            agent: agent.map(|a| a.name.clone()).unwrap_or_default(),
+            depth,
+            ..p.started.clone()
+        };
+
         let child = p.manager.start_subagent(&child_id, spec, started, tools).await.map_err(|e| format!("{e:#}"))?;
         info!(parent = %p.session_id, child = %child_id, %description, "subagent started");
 
@@ -411,7 +481,7 @@ impl Subagents for Runner {
             delegated_by: parent_call_id.to_owned(),
             ..Default::default()
         };
-        self.delegate(&child_id, &child, input, cancel).await
+        self.delegate(&child_id, &child, input, cancel, admission).await
     }
 
     async fn running(&self, to: &str) -> Result<bool, String> {
@@ -436,9 +506,7 @@ impl Subagents for Runner {
     ) -> Result<String, String> {
         let p = &self.parent;
         let depth = depth_of(&p.spec);
-        if !may_delegate(&p.spec, depth) {
-            return Err("this session is as deep as subagents nest; it may not start more".into());
-        }
+        self.check_depth()?;
         // Waiting before it starts: its first turn may end at once.
         let rx = p.manager.wait_remote(&p.session_id, parent_call_id);
         let params = serde_json::json!({"call_id": parent_call_id, "template": template, "on": on, "prompt": prompt,
@@ -487,6 +555,7 @@ impl Subagents for Runner {
         cancel: CancellationToken,
     ) -> Result<Option<String>, String> {
         let p = &self.parent;
+        self.check_depth()?;
         let spawn = self.resolve_spawn(to).await?;
         let child_id = &spawn.child_session_id;
         if spawn.remote.is_some() {
@@ -526,15 +595,17 @@ impl Subagents for Runner {
         // Running: the message joins its turn; the report comes as it would.
         let running = p.manager.is_running(child_id);
         if running && background.is_none() {
-            child.send(crate::session::ActorMsg::Delegate(Box::new(input), None)).map_err(|_| format!("subagent {to} stopped"))?;
+            child.send(crate::session::ActorMsg::Delegate(Box::new(input), None, None)).map_err(|_| format!("subagent {to} stopped"))?;
             return Ok(None);
         }
         let root = p.spec.delegation.as_ref().map_or(p.session_id.as_str(), |d| d.root_session_id.as_str()).to_owned();
-        let _working = self.permit(&root)?;
+        let admission = self.wait_for_headroom(&cancel).await?;
+        let limits = self.check_depth()?;
+        let _working = self.permit(&root, limits.running as usize)?;
         // A background invocation has its own waiter even if the child
         // became busy since the tool checked. Link that waiter before input.
         self.link_continuation(&spawn, call_id, background).await?;
-        self.delegate(child_id, &child, input, cancel).await.map(Some)
+        self.delegate(child_id, &child, input, cancel, admission).await.map(Some)
     }
 
     async fn peek(&self, to: &str) -> Result<String, String> {
@@ -552,9 +623,22 @@ impl Subagents for Runner {
 }
 
 impl Runner {
+    fn check_depth(&self) -> Result<LaunchLimits, String> {
+        let limits = self.parent.limits.lock().unwrap().clone();
+        if !limits.allows(depth_of(&self.parent.spec)) {
+            return Err("this session is as deep as subagents nest; it may not start or continue subagents".into());
+        }
+        Ok(limits)
+    }
+
+    async fn wait_for_headroom(&self, cancel: &CancellationToken) -> Result<crate::resource_pressure::Admission, String> {
+        let p = &self.parent;
+        let writer = p.log.as_ref();
+        p.manager.launch_pressure.wait(cancel, move |pressure| pressure.announce(writer)).await
+    }
+
     /// Counts a delegation against its tree's limit while it runs.
-    fn permit(&self, root: &str) -> Result<crate::session::Working, String> {
-        let max = limits(&self.parent.spec).1;
+    fn permit(&self, root: &str, max: usize) -> Result<crate::session::Working, String> {
         self.parent.manager.working(root, max).ok_or_else(|| {
             format!("{max} subagents are already working in this session; wait for one to finish (or stop one) before starting another")
         })
@@ -650,6 +734,7 @@ impl Runner {
         child: &tokio::sync::mpsc::UnboundedSender<crate::session::ActorMsg>,
         input: PendingInput,
         cancel: CancellationToken,
+        admission: crate::resource_pressure::Admission,
     ) -> Result<String, String> {
         let p = &self.parent;
         let call_id = input.delegated_by.clone();
@@ -672,7 +757,7 @@ impl Runner {
             .map_err(|e| format!("could not record the local subagent wait: {e:#}"))?;
         let (tx, rx) = tokio::sync::oneshot::channel();
         child
-            .send(crate::session::ActorMsg::Delegate(Box::new(input), Some(tx)))
+            .send(crate::session::ActorMsg::Delegate(Box::new(input), Some(tx), Some(admission)))
             .map_err(|_| "the subagent stopped before it started".to_owned())?;
         // Stopping the parent's turn (or this background task) stops the
         // subagent's turn; its log keeps what it did. The delegation's
@@ -1480,6 +1565,64 @@ mod tests {
         assert_eq!(both(&v(&["Read"]), &v(&["shell"])), None);
     }
 
+    #[tokio::test]
+    async fn running_delegate_reads_live_limits_and_reload_keeps_saved_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let link = Arc::new(crate::link::HeadLink::default());
+        let manager = SessionManager::new(journal.clone(), link.clone(), dir.path().join("worktrees"));
+        let mut spec = CreateSession {
+            max_subagent_depth: 1,
+            max_running_subagents: 1,
+            delegation: Some(Delegation {
+                depth: 1,
+                agent_json: r#"{"name":"finder","tools":["Read","Task"],"hidden_delegation_tools":["Task"]}"#.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let started = SessionStarted { tools: vec!["Read".into()], ..Default::default() };
+        assert_eq!(saved_tools(&spec, &started), ["Read", "Task"]);
+        assert_eq!(agent_tools(&spec).unwrap(), ["Read", "Task"]);
+        let limits = Arc::new(std::sync::Mutex::new(LaunchLimits::of(&spec)));
+        let runner = Runner::new(
+            Parent {
+                session_id: "child".into(),
+                spec: spec.clone(),
+                started: started.clone(),
+                log: Arc::new(Writer::new("child".into(), journal, link, 2)),
+                manager,
+                default: SharedDefault::default(),
+                limits: limits.clone(),
+            },
+            &[],
+        );
+        assert!(runner.check_depth().is_err());
+        let mut edited = spec.clone();
+        let update = c6_proto::NoticeLimits {
+            notice_quiet_seconds: 7,
+            notice_max_wait_seconds: 42,
+            notice_no_progress_limit: 13,
+            notice_failure_relaunch_limit: 9,
+            notice_tokens_per_hour: 10_000_000_000,
+            notice_loop_backoff_rounds: 2,
+            notice_loop_backoff_max_seconds: 120,
+            max_subagent_depth: Some(2),
+            max_running_subagents: Some(0),
+        };
+        LaunchLimits::apply_notice_limits(&mut edited, &update);
+        *limits.lock().unwrap() = LaunchLimits::of(&edited);
+        assert_eq!(runner.check_depth().unwrap().running, 0);
+        assert_eq!(runner.parent.spec.max_running_subagents, 1, "the turn still carries the old spawn spec");
+        let mut inherited = runner.parent.spec.clone();
+        limits.lock().unwrap().inherit(&mut inherited);
+        assert_eq!(LaunchLimits::of(&inherited).notices, update);
+        *limits.lock().unwrap() = LaunchLimits::of(&spec);
+        assert!(runner.check_depth().is_err());
+        spec.delegation.as_mut().unwrap().agent_json = r#"{"name":"finder","tools":["Read","Task"]}"#.into();
+        assert_eq!(saved_tools(&spec, &started), ["Read"], "old journals do not gain tools whose launch authorization is unknown");
+    }
+
     #[test]
     fn hosted_search_respects_parent_and_named_agent_tools() {
         let mut parent = CreateSession::default();
@@ -1504,7 +1647,12 @@ mod tests {
         assert!(!web_search_allowed(&parent, &started, Some(&agent)));
         parent.tools.clear();
         parent.delegation = Some(Delegation {
-            agent_json: serde_json::to_string(&AgentJson { name: "finder".into(), tools: vec!["Read".into(), "Task".into()] }).unwrap(),
+            agent_json: serde_json::to_string(&AgentJson {
+                name: "finder".into(),
+                tools: vec!["Read".into(), "Task".into()],
+                ..Default::default()
+            })
+            .unwrap(),
             ..Default::default()
         });
         assert!(!web_search_allowed(&parent, &started, None), "an older named parent's list still applies");
@@ -1528,11 +1676,11 @@ mod tests {
         assert!(crate::session::has_tool(&child_tools, "web_search"));
         let started = SessionStarted::default();
         let allowed = web_search_allowed(&parent, &started, None);
-        let filtered = filter_tools(&child, child_tools.clone(), Some((&built.tools, allowed)), None, 1);
+        let filtered = filter_tools(child_tools.clone(), Some((&built.tools, allowed)), None);
         assert!(crate::session::has_tool(&filtered, "web_search"));
-        let filtered = filter_tools(&child, child_tools.clone(), Some((&built.tools, false)), None, 1);
+        let filtered = filter_tools(child_tools.clone(), Some((&built.tools, false)), None);
         assert!(!crate::session::has_tool(&filtered, "web_search"));
-        let filtered = filter_tools(&child, child_tools.clone(), Some((&child_tools, false)), None, 1);
+        let filtered = filter_tools(child_tools.clone(), Some((&child_tools, false)), None);
         assert!(crate::session::has_tool(&filtered, "web_search"), "a parent's function search also passes the cap");
     }
 

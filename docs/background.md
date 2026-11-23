@@ -344,8 +344,8 @@ message_session ─► HeadCall session.message {session_id, to, message, hops}
 
 - The target exists and is in the sender's realm. Other realms are refused until grants cover messaging.
 - The target is not the sender, not archived, not `observed`, not a subagent and not failed. A subagent's turns report to its parent, which would be told about work it never asked for. Side chats may be messaged.
-- **Hops.** A session's hop count is that of the last session message delivered to it (`SessionTools::message_hops`), even if delivered during a running turn; a message it sends carries one more. Your next direct message resets it to 0 (direct HTTP API input does too). The default `max_message_hops` is **4**: hops 1–4 are allowed, and hop 5 is refused, so two agents cannot keep waking each other. This is a chain limit, separate from the hourly sending allowance.
-- **Rate.** At most `messages_per_hour` (default 30) per sending session in the last hour. The head keeps a live window in memory and rebuilds it from the last hour's durable message commands on startup, so restarting the head does not reset the allowance. Queued/offline, delivered, rejected and withdrawn sends count; replaying an input after restoring a worker's session does not count again. Startup reads the existing command rows once; no migration or per-send history scan is needed. The text is capped at 20,000 characters.
+- **Hops.** A session's hop count is that of the last session message delivered to it (`SessionTools::message_hops`), even if delivered during a running turn; a message it sends carries one more. Your next direct message resets it to 0 (direct HTTP API input does too). The default `max_message_hops` is **50**, a last-resort chain ceiling. Actual repeated exchanges are warned, slowed and eventually paused by the adaptive guard (docs/runaway-guards.md).
+- **Rate.** There is no hourly message cap by default (`messages_per_hour: 0`). An explicit legacy cap still applies per sending session in the last hour. The head keeps that live window in memory and rebuilds it from durable commands on startup. Queued/offline, delivered, rejected and withdrawn sends count; replaying an input after restoring a worker's session does not count again. The text is capped at 20,000 characters.
 
 ### UI
 
@@ -360,11 +360,13 @@ message_session ─► HeadCall session.message {session_id, to, message, hops}
 | Settings → Agents → Limits (built) | `claude_code_idle_minutes` | 15 |
 | Settings → Agents → Limits | `notice_quiet_seconds` | 3 |
 | Settings → Agents → Limits | `notice_max_wait_seconds` | 30 |
-| Settings → Agents → Limits | `notice_no_progress_limit` | 5 |
-| Settings → Agents → Limits | `notice_failure_relaunch_limit` | 3 |
-| Settings → Agents → Limits | `notice_tokens_per_hour` | 5,000,000 |
-| Settings → Agents → Limits (built) | `max_message_hops` | 4 |
-| Settings → Agents → Limits (built) | `messages_per_hour` | 30 |
+| Settings → Agents → Limits | `notice_no_progress_limit` (repeated evidence before warning) | 5 |
+| Settings → Agents → Limits | `notice_failure_relaunch_limit` (same-failure evidence before warning) | 3 |
+| Settings → Agents → Limits | `notice_loop_backoff_rounds` | 3 |
+| Settings → Agents → Limits | `notice_loop_backoff_max_seconds` | 900 |
+| Settings → Agents → Limits | `notice_tokens_per_hour` (optional hard cap) | 0 (off) |
+| Settings → Agents → Limits (built) | `max_message_hops` | 50 |
+| Legacy explicit setting | `messages_per_hour` | 0 (off) |
 | Settings → Prompts (built) | `session.message_received` | that it comes from another agent, and to reply only when needed |
 | Settings → Agents → Tools in Claude Code sessions (built) | `claude-code-tools.native_all` | off: Claude Code keeps only its coding tools (§4) |
 

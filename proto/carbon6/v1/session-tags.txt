@@ -423,3 +423,10 @@ carbon6.v1.Usage 9 string resolved_connection_name
 carbon6.v1.Usage 10 string alias_connection_name
 carbon6.v1.CredentialRequest 5 bool supports_alias
 carbon6.v1.SessionCommand 23 NoticeLimits update_notice_limits
+carbon6.v1.Checkpoint 3 string tree_id
+carbon6.v1.CreateSession 43 uint32 notice_loop_backoff_rounds
+carbon6.v1.CreateSession 44 uint32 notice_loop_backoff_max_seconds
+carbon6.v1.NoticeLimits 6 uint32 notice_loop_backoff_rounds
+carbon6.v1.NoticeLimits 7 uint32 notice_loop_backoff_max_seconds
+carbon6.v1.NoticeLimits 8 optional:uint32 max_subagent_depth
+carbon6.v1.NoticeLimits 9 optional:uint32 max_running_subagents

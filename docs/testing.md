@@ -18,6 +18,15 @@ cookie nor widens a scoped token's authority. Usage/activity cursor rollback,
 bounded retention, and backup snapshot-pin tests cover the other maintenance
 writers. None uses a scheduling sleep to establish contention.
 
+## Informational plan forecasts
+
+`cargo test --locked -p c6-head --lib plan_awareness` uses mocked quota
+windows and explicit timestamps, never a live provider or a sleep. It covers
+stale data, reset rollover, how shared usage calibrates a target-only forecast,
+how direct input affects notice-started usage, and exhaustion before versus at
+reset. The SQLite fixture races two claims and reopens the database to verify
+the notice is claimed only once per session.
+
 ## Restarted heads release their listening sockets
 
 Same-address worker integration tests keep their bound sockets in

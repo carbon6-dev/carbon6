@@ -400,12 +400,13 @@ pub async fn start_subagent(
         return Err(bad_request(format!("subagents nest at most {max_depth} deep; this session may not start more")));
     }
     let root = parent.root_id.clone().unwrap_or_else(|| parent.id.clone());
-    let max_running = if limits.max_running == 0 { api::DEFAULT_RUNNING_SUBAGENTS } else { limits.max_running } as i64;
-    let running = st.store.running_subagents(&root).await?;
-    if running >= max_running {
-        return Err(bad_request(format!(
-            "{running} subagents are already working in this session; wait for one to finish (or stop one) before starting another"
-        )));
+    if limits.max_running != 0 {
+        let running = st.store.running_subagents(&root).await?;
+        if running >= i64::from(limits.max_running) {
+            return Err(bad_request(format!(
+                "{running} subagents are already working in this session; wait for one to finish (or stop one) before starting another"
+            )));
+        }
     }
     let (targets, errors) = targets(st, name, &t, &realm, Some(parent)).await?;
     let names: Vec<String> = targets.iter().map(target_name).collect();

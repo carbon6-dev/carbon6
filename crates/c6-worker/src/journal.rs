@@ -415,6 +415,21 @@ impl Journal {
             .flatten())
     }
 
+    pub(crate) async fn reject_queued_launches(&self, session: &str, epoch: u64, ids: &[String], reason: &str) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        check_ownership_in(&mut tx, session, epoch).await?;
+        for id in ids {
+            sqlx::query("INSERT OR IGNORE INTO applied_commands (command_id, session_id, rejection) VALUES (?, ?, ?)")
+                .bind(id)
+                .bind(session)
+                .bind(reason)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Confirm one reset and every retry authorized before its confirmation
     /// atomically. A retry waiting in the actor's mailbox must not reset again
     /// over resumed input, or lose its durable ownership to another retry.
@@ -1000,12 +1015,50 @@ async fn events_after_in(tx: &mut sqlx::SqliteConnection, session_id: &str, afte
 }
 
 async fn load_session_in(tx: &mut sqlx::SqliteConnection, session_id: &str) -> anyhow::Result<Option<(CreateSession, Vec<SessionEvent>)>> {
-    let Some(row) = sqlx::query("SELECT spec FROM sessions WHERE id = ?").bind(session_id).fetch_optional(&mut *tx).await? else {
+    let Some(row) =
+        sqlx::query("SELECT spec, imported_through FROM sessions WHERE id = ?").bind(session_id).fetch_optional(&mut *tx).await?
+    else {
         return Ok(None);
     };
-    let spec = CreateSession::decode(row.get::<Vec<u8>, _>("spec").as_slice())?;
+    let mut spec = CreateSession::decode(row.get::<Vec<u8>, _>("spec").as_slice())?;
+    let imported_through = row.get::<i64, _>("imported_through") as u64;
     let events = events_after_in(tx, session_id, 0, u32::MAX).await?;
+    // A restored spec already reflects the head's current settings. Only
+    // snapshots written after import can supersede it; the full log remains
+    // available to replay notice guard acknowledgements and other history.
+    for event in events.iter().filter(|event| event.seq > imported_through) {
+        apply_notice_settings_snapshot(&mut spec, event);
+    }
     Ok(Some((spec, events)))
+}
+
+pub(crate) fn apply_notice_settings_snapshot(spec: &mut CreateSession, event: &SessionEvent) {
+    #[derive(serde::Deserialize)]
+    struct Snapshot {
+        #[serde(flatten)]
+        notice: c6_api::SubagentLimits,
+        max_subagent_depth: Option<u32>,
+        max_running_subagents: Option<u32>,
+    }
+    let Some(session_event::Kind::Notice(notice)) = &event.kind else { return };
+    if !notice.quiet || (notice.title != crate::notice_guard::CONTINUED_TITLE && notice.title != "Notice settings refreshed") {
+        return;
+    }
+    let Ok(snapshot) = serde_json::from_str::<Snapshot>(&notice.message) else { return };
+    let limits = snapshot.notice;
+    if let Some(depth) = snapshot.max_subagent_depth {
+        spec.max_subagent_depth = depth;
+    }
+    if let Some(running) = snapshot.max_running_subagents {
+        spec.max_running_subagents = running;
+    }
+    spec.notice_quiet_seconds = limits.notice_quiet_seconds;
+    spec.notice_max_wait_seconds = limits.notice_max_wait_seconds;
+    spec.notice_no_progress_limit = limits.notice_no_progress_limit;
+    spec.notice_failure_relaunch_limit = limits.notice_failure_relaunch_limit;
+    spec.notice_tokens_per_hour = limits.notice_tokens_per_hour;
+    spec.notice_loop_backoff_rounds = limits.notice_loop_backoff_rounds;
+    spec.notice_loop_backoff_max_seconds = limits.notice_loop_backoff_max_seconds;
 }
 
 async fn import_in(tx: &mut sqlx::SqliteConnection, session_id: &str, spec: &CreateSession, events: &[SessionEvent]) -> anyhow::Result<()> {
@@ -1027,7 +1080,12 @@ async fn import_in(tx: &mut sqlx::SqliteConnection, session_id: &str, spec: &Cre
         write_event_in(tx, session_id, event).await?;
     }
     let last = events.last().map(|e| e.seq).unwrap_or(0) as i64;
-    sqlx::query("UPDATE sessions SET acked_seq = ? WHERE id = ?").bind(last).bind(session_id).execute(tx).await?;
+    sqlx::query("UPDATE sessions SET acked_seq = ?, imported_through = ? WHERE id = ?")
+        .bind(last)
+        .bind(last)
+        .bind(session_id)
+        .execute(tx)
+        .await?;
     Ok(())
 }
 
@@ -1431,6 +1489,61 @@ mod ownership_tests {
         assert_eq!(journal.ownership("s").await.unwrap(), (4, false, "move".into()));
         assert_eq!(journal.events_after_owned("s", 0, 10, 4).await.unwrap(), [event(1), event(2)]);
         assert_eq!(journal.load_session_owned("s").await.unwrap().unwrap(), (spec, vec![event(1), event(2)], 4));
+    }
+
+    #[tokio::test]
+    async fn imported_notice_limits_win_over_history_but_not_new_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+        let journal = Journal::open(&path).await.unwrap();
+        let refresh = "Notice settings refreshed";
+        let continued = crate::notice_guard::CONTINUED_TITLE;
+        let snapshot = |seq, title: &str, quiet_seconds, depth, count| SessionEvent {
+            kind: Some(session_event::Kind::Notice(c6_proto::Notice {
+                title: title.into(),
+                quiet: true,
+                message: serde_json::json!({
+                    "notice_quiet_seconds": quiet_seconds,
+                    "max_subagent_depth": depth,
+                    "max_running_subagents": count,
+                })
+                .to_string(),
+                ..Default::default()
+            })),
+            ..event(seq)
+        };
+        let history = [event(1), snapshot(2, refresh, 3, 4, 5), snapshot(3, continued, 6, 7, 8)];
+        let spec = CreateSession { notice_quiet_seconds: 19, max_subagent_depth: 2, max_running_subagents: 0, ..Default::default() };
+        // Older move exporters send the original spec, not the effective
+        // settings. The destination folds its snapshots before importing.
+        let mut exported = CreateSession::default();
+        for event in &history {
+            apply_notice_settings_snapshot(&mut exported, event);
+        }
+        journal.import_owned("old-export", &exported, &history, 2, "old-move").await.unwrap();
+        journal.activate_ownership("old-export", 2, "old-move").await.unwrap();
+        let (loaded, _, _) = journal.load_session_owned("old-export").await.unwrap().unwrap();
+        assert_eq!((loaded.notice_quiet_seconds, loaded.max_subagent_depth, loaded.max_running_subagents), (6, 7, 8));
+        journal.import("restored", &spec, &history).await.unwrap();
+        journal.import_owned("moved", &spec, &history, 4, "move").await.unwrap();
+        journal.activate_ownership("moved", 4, "move").await.unwrap();
+        assert!(journal.unacked().await.unwrap().is_empty());
+        drop(journal);
+
+        let journal = Journal::open(&path).await.unwrap();
+        for (id, epoch) in [("restored", 0), ("moved", 4)] {
+            assert_eq!(journal.load_session_owned(id).await.unwrap().unwrap(), (spec.clone(), history.to_vec(), epoch));
+            let later = snapshot(4, refresh, 11, 3, 0);
+            journal.append_owned(id, &later, epoch).await.unwrap();
+            if epoch != 0 {
+                // Retrying adoption must preserve the current settings and event tail.
+                journal.import_owned(id, &spec, &history, epoch, "move").await.unwrap();
+            }
+            journal.set_acked_owned(id, later.seq, epoch).await.unwrap();
+            let (loaded, events) = journal.load_session(id).await.unwrap().unwrap();
+            assert_eq!((loaded.notice_quiet_seconds, loaded.max_subagent_depth, loaded.max_running_subagents), (11, 3, 0));
+            assert_eq!(events, [history.to_vec(), vec![later]].concat());
+        }
     }
 
     #[tokio::test]

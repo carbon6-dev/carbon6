@@ -187,6 +187,12 @@ pub(crate) async fn handle(worker: &Arc<Worker>, method: &str, p: Value) -> Resu
                 "imported history differs from the released source"
             );
             let mut events = batch.events;
+            // Legacy exporters send the original stored spec. Fold their
+            // durable settings before making this import the new baseline;
+            // unlike Restore, this spec did not come from current head settings.
+            for event in &events {
+                crate::journal::apply_notice_settings_snapshot(&mut spec, event);
+            }
             // Persist the exact event before importing its incarnation. A
             // replay cannot change its timestamp, notice or runtime prompt.
             let receipt = prepared.metadata_dir.join("place.pb");

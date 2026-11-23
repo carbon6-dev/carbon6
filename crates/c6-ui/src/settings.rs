@@ -4202,7 +4202,7 @@ fn SubagentLimitsSetting() -> impl IntoView {
             status.set(Some(
                 api::put_setting("subagent-limits", v)
                     .await
-                    .map(|_| "Saved. Liveness checks use the new limits; Continue applies notice limits to a paused session."),
+                    .map(|_| "Saved. Running sessions use the new notice guard settings at their next delivery decision."),
             ));
         });
     };
@@ -4212,7 +4212,7 @@ fn SubagentLimitsSetting() -> impl IntoView {
             <div>
                 <h2 class="font-medium">"Limits"</h2>
                 <p class="text-sm text-muted">
-                    "Subagents can start subagents of their own, down to this depth: 1 lets a session start subagents that start none. Below one session, at most this many work at once; one more is refused until another finishes."
+                    "Subagents can start subagents of their own, up to a depth of 5 by default. A depth of 1 lets a session start subagents that start none. There is no default count cap on subagents working at once."
                 </p>
             </div>
             <div class="grid gap-2 @lg/settings:grid-cols-2">
@@ -4222,15 +4222,15 @@ fn SubagentLimitsSetting() -> impl IntoView {
                         prop:value=move || setting.with(|s| s.max_depth.to_string()) on:input=move |ev| setting.update(|s| s.max_depth = number(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-muted">"Working at once (1–64)"</span>
-                    <input type="number" min="1" max="64" class=format!("{INPUT} py-1")
+                    <span class="text-xs text-muted">"Working at once per session tree (0 = no count cap)"</span>
+                    <input type="number" min="0" max="64" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.max_running.to_string()) on:input=move |ev| setting.update(|s| s.max_running = number(&ev)) />
                 </label>
             </div>
             <div>
                 <h3 class="font-medium">"Automatic notice delivery"</h3>
                 <p class="text-sm text-muted">
-                    "An idle session collects notices, like task completions and subagent reports, into one turn. It waits for the quiet period, up to the maximum wait. Automatic delivery pauses when a progress, failure or token limit is reached. You can still deliver the notices yourself."
+                    "An idle session collects task completions, subagent reports and other notices into one turn. Distinct reports can keep waking a busy session; there is no fixed turn cap."
                 </p>
             </div>
             <div class="grid gap-2 @lg/settings:grid-cols-2">
@@ -4244,19 +4244,37 @@ fn SubagentLimitsSetting() -> impl IntoView {
                     <input type="number" min="1" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.notice_max_wait_seconds.to_string()) on:input=move |ev| setting.update(|s| s.notice_max_wait_seconds = number(&ev)) />
                 </label>
+            </div>
+            <div>
+                <h3 class="font-medium">"Runaway guard"</h3>
+                <p class="text-sm text-muted">
+                    "When the same pattern repeats without progress, the guard warns the agent first. Slowed means it is waiting longer between automatic wakes; no action is needed and notices are kept. Paused means the repetition continued despite slowing down, or an optional token cap was reached. Open the session to see why and continue."
+                </p>
+            </div>
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
                 <label class="space-y-0.5">
-                    <span class="text-xs text-muted">"Notice turns without progress"</span>
+                    <span class="text-xs text-muted">"Repeated evidence without progress before warning"</span>
                     <input type="number" min="1" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.notice_no_progress_limit.to_string()) on:input=move |ev| setting.update(|s| s.notice_no_progress_limit = number(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-muted">"Relaunches after failures"</span>
+                    <span class="text-xs text-muted">"Repeated evidence of the same failure before warning"</span>
                     <input type="number" min="1" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.notice_failure_relaunch_limit.to_string()) on:input=move |ev| setting.update(|s| s.notice_failure_relaunch_limit = number(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-muted">"Tokens per hour"</span>
-                    <input type="number" min="1" class=format!("{INPUT} py-1")
+                    <span class="text-xs text-muted">"Backoff rounds before pausing a persistent loop (1–10)"</span>
+                    <input type="number" min="1" max="10" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.notice_loop_backoff_rounds.to_string()) on:input=move |ev| setting.update(|s| s.notice_loop_backoff_rounds = number(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Maximum delay per backoff round (seconds)"</span>
+                    <input type="number" min="1" max="3600" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.notice_loop_backoff_max_seconds.to_string()) on:input=move |ev| setting.update(|s| s.notice_loop_backoff_max_seconds = number(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Hourly token cap on automatic wakes (0 = off)"</span>
+                    <input type="number" min="0" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.notice_tokens_per_hour.to_string()) on:input=move |ev| setting.update(|s| s.notice_tokens_per_hour = event_target_value(&ev).trim().parse::<u64>().unwrap_or(0)) />
                 </label>
             </div>
@@ -4273,17 +4291,17 @@ fn SubagentLimitsSetting() -> impl IntoView {
                 </label>
             </div>
             <p class="text-sm text-muted">
-                "An agent can message another session of its realm. Each send adds one to the last session message it received. The default chain limit is 4; a chain longer than the configured limit is refused, so two agents can't keep waking each other. Your next message resets the count to 0. A session sends at most this many messages an hour."
+                "Agents can message other sessions in their realm. The chain ceiling (50 by default) is a last resort. Each send adds one to the last session message received; your next direct message resets the chain. The hourly cap is a legacy option, off by default."
             </p>
             <div class="grid gap-2 @lg/settings:grid-cols-2">
                 <label class="space-y-0.5">
-                    <span class="text-xs text-muted">"Longest chain of messages (1–32)"</span>
-                    <input type="number" min="1" max="32" class=format!("{INPUT} py-1")
+                    <span class="text-xs text-muted">"Message chain ceiling (1–1000)"</span>
+                    <input type="number" min="1" max="1000" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.max_message_hops.to_string()) on:input=move |ev| setting.update(|s| s.max_message_hops = number(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-muted">"Messages per session per hour (1–1000)"</span>
-                    <input type="number" min="1" max="1000" class=format!("{INPUT} py-1")
+                    <span class="text-xs text-muted">"Legacy hourly messages cap per session (0 = off)"</span>
+                    <input type="number" min="0" max="1000" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.messages_per_hour.to_string()) on:input=move |ev| setting.update(|s| s.messages_per_hour = number(&ev)) />
                 </label>
             </div>

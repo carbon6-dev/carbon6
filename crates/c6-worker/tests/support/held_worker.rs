@@ -28,7 +28,10 @@ impl HeldWorker {
         fixture.thread = Some(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             rt.block_on(async {
-                let worker = Worker::open(&state, Identity::load(&state).unwrap()).await.unwrap();
+                let worker =
+                    Worker::open_with_resource_sampler(&state, Identity::load(&state).unwrap(), c6_worker::ResourceMeasurement::default)
+                        .await
+                        .unwrap();
                 let id = worker.identity.meta.worker_id.to_string();
                 let (tx, mut rx) = watch::channel(ConnState::Connecting);
                 tokio::spawn(conn::run(worker, tx, CancellationToken::new()));

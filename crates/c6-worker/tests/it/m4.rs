@@ -69,7 +69,13 @@ async fn subagents_mcp_skills_and_otlp() {
     let http = reqwest::Client::new();
     let enrollment = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
     enroll::enroll(&enrollment.token).await.unwrap().save(worker_dir.path()).unwrap();
-    let worker = Worker::open(worker_dir.path(), Identity::load(worker_dir.path()).unwrap()).await.unwrap();
+    let worker = Worker::open_with_resource_sampler(
+        worker_dir.path(),
+        Identity::load(worker_dir.path()).unwrap(),
+        c6_worker::ResourceMeasurement::default,
+    )
+    .await
+    .unwrap();
     let (tx, mut rx) = watch::channel(ConnState::Connecting);
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));

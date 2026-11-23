@@ -20,7 +20,7 @@
 //! A notification (event `quota`) goes out when a window passes 80% and
 //! 95%, and when it is used up, once per window.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -48,6 +48,9 @@ const FRESH_MS: i64 = 60_000;
 const KEEP_EVERY: Duration = Duration::from_secs(60);
 /// Warn when a window passes these.
 const THRESHOLDS: [f64; 2] = [80.0, 95.0];
+const MINUTE_MS: i64 = 60_000;
+const PROJECTION_MIN_MS: i64 = 5 * MINUTE_MS;
+const PROJECTION_MAX_MS: i64 = 30 * MINUTE_MS;
 /// A header snapshot's first successful recording, per connection per process.
 static CHATGPT_HEADERS_LOGGED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
@@ -55,6 +58,8 @@ static CHATGPT_HEADERS_LOGGED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(
 #[derive(Default)]
 pub struct Quotas {
     by_connection: Mutex<HashMap<String, api::ConnectionQuota>>,
+    /// Recent observed utilization, separate from snapshots restored for display.
+    observations: Mutex<HashMap<(String, String), VecDeque<PlanSample>>>,
     /// What was already said: connection, window, the window's reset and
     /// the threshold (100 for used up).
     told: Mutex<HashSet<(String, String, i64, u32)>>,
@@ -80,6 +85,251 @@ impl Quotas {
     pub fn get(&self, connection: &str) -> Option<api::ConnectionQuota> {
         self.by_connection.lock().unwrap().get(connection).cloned()
     }
+
+    fn observe(&self, quota: &api::ConnectionQuota) {
+        let mut observations = self.observations.lock().unwrap();
+        for window in &quota.windows {
+            // Model-specific or overage windows can't be calibrated against
+            // the connection's whole stream of usage.
+            if !matches!(window.name.as_str(), "day" | "week")
+                && !window.name.strip_suffix(['h', 'm']).is_some_and(|n| n.parse::<u32>().is_ok())
+            {
+                continue;
+            }
+            let at = window.origin.as_ref().map_or(quota.updated_at, |o| o.observed_at);
+            // A partial snapshot can contain untouched, previously restored
+            // windows. Never give them a new observation timestamp.
+            if at != quota.updated_at || (quota.source == "claude_code" && window.origin.is_none()) {
+                continue;
+            }
+            let key = (quota.connection_id.clone(), window.name.clone());
+            let Some(reset) = window.resets_at.filter(|t| *t > at) else {
+                observations.remove(&key);
+                continue;
+            };
+            let used = window.used_percent;
+            if !used.is_finite() || !(0.0..100.0).contains(&used) || window.status == "rejected" {
+                observations.remove(&key);
+                continue;
+            }
+            let source = window.origin.as_ref().map_or(quota.source.as_str(), |o| o.source.as_str());
+            let account = window.origin.as_ref().and_then(|o| o.account_id.as_deref());
+            let samples = observations.entry(key).or_default();
+            if let Some(last) = samples.back() {
+                if at <= last.at {
+                    continue;
+                }
+                if last.reset != reset || last.source != source || last.account.as_deref() != account || used < last.used {
+                    samples.clear();
+                } else if at / MINUTE_MS == last.at / MINUTE_MS {
+                    samples.pop_back();
+                }
+            }
+            samples.retain(|s| at.saturating_sub(s.at) <= PROJECTION_MAX_MS);
+            samples.push_back(PlanSample { at, reset, used, source: source.into(), account: account.map(str::to_owned) });
+        }
+    }
+
+    fn plan_trends(&self, quota: &api::ConnectionQuota, now: i64) -> Vec<PlanTrend> {
+        if !quota.error.is_empty() {
+            return Vec::new();
+        }
+        let observations = self.observations.lock().unwrap();
+        let mut trends = Vec::new();
+        for window in &quota.windows {
+            let Some(samples) = observations.get(&(quota.connection_id.clone(), window.name.clone())) else { continue };
+            let Some(latest) = samples.back() else { continue };
+            let at = window.origin.as_ref().map_or(quota.updated_at, |o| o.observed_at);
+            if latest.at != at
+                || window.resets_at != Some(latest.reset)
+                || latest.used != window.used_percent
+                || !(0..=PROJECTION_MIN_MS).contains(&now.saturating_sub(at))
+                || latest.reset <= now
+            {
+                continue;
+            }
+            // Use the longest recent sample, not a short spike.
+            let baseline = samples.front().unwrap();
+            let delta = latest.used - baseline.used;
+            if latest.at - baseline.at >= PROJECTION_MIN_MS && delta >= 1.0 {
+                trends.push(PlanTrend {
+                    window: window.name.clone(),
+                    start: baseline.at,
+                    end: latest.at,
+                    reset: latest.reset,
+                    used: latest.used,
+                    delta,
+                });
+            }
+        }
+        trends
+    }
+}
+
+struct PlanSample {
+    at: i64,
+    reset: i64,
+    used: f64,
+    source: String,
+    account: Option<String>,
+}
+
+struct PlanTrend {
+    window: String,
+    start: i64,
+    end: i64,
+    reset: i64,
+    used: f64,
+    delta: f64,
+}
+
+impl PlanTrend {
+    /// Calibrate plan points/token against measured utilization; neither
+    /// provider publishes a fixed token or dollar denominator for these plans.
+    fn forecast(&self, now: i64, sample_tokens: f64, unattended_tokens: f64) -> Option<(f64, f64)> {
+        if sample_tokens <= 0.0 || unattended_tokens <= 0.0 || self.reset <= now {
+            return None;
+        }
+        let rate = (self.delta / sample_tokens) * unattended_tokens * (60 * MINUTE_MS) as f64 / (now - self.start) as f64;
+        let hours = (100.0 - self.used) / rate;
+        (rate.is_finite() && hours < (self.reset - now) as f64 / (60 * MINUTE_MS) as f64).then_some((rate, hours))
+    }
+}
+
+/// Check after a committed Usage event, not during a model call. A quota
+/// report can arrive before the worker has journaled the corresponding call.
+pub(crate) async fn after_calls(st: &HeadState, session_id: &str, now: i64) -> anyhow::Result<()> {
+    if st.quotas.observations.lock().unwrap().is_empty() {
+        return Ok(());
+    }
+    let Some(connection) =
+        sqlx::query_scalar::<_, String>("SELECT connection_id FROM usage WHERE session_id = ? ORDER BY seq DESC LIMIT 1")
+            .bind(session_id)
+            .fetch_optional(&st.store.pool)
+            .await?
+    else {
+        return Ok(());
+    };
+    let Some(quota) = st.quotas.get(&connection) else { return Ok(()) };
+    let trends = st.quotas.plan_trends(&quota, now);
+    if trends.is_empty()
+        || sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM plan_awareness WHERE session_id = ?)")
+            .bind(session_id)
+            .fetch_one(&st.store.pool)
+            .await?
+    {
+        return Ok(());
+    }
+    let mut events = sqlx::query_scalar::<_, Vec<u8>>("SELECT data FROM events WHERE session_id = ? ORDER BY seq DESC LIMIT 1024")
+        .bind(session_id)
+        .fetch_all(&st.store.pool)
+        .await?;
+    events.reverse();
+    use prost::Message;
+    let events = events.iter().map(|e| c6_proto::SessionEvent::decode(e.as_slice())).collect::<Result<Vec<_>, _>>()?;
+    let auto = crate::usage::unattended_calls(&c6_agent::effective_events(&events));
+    if auto.len() < 2 {
+        return Ok(());
+    }
+    let start = trends.iter().map(|t| t.start).min().unwrap_or(now);
+    // Limit work even on a high-volume head. An incomplete sample is not evidence.
+    let usage = sqlx::query_as::<_, PlanUsage>(
+        "SELECT session_id, seq, ts, model, input, output, cache_read, cache_write FROM usage \
+         WHERE ts > ? AND ts <= ? AND connection_id = ? ORDER BY ts, seq LIMIT 2049",
+    )
+    .bind(start)
+    .bind(now)
+    .bind(&connection)
+    .fetch_all(&st.store.pool)
+    .await?;
+    if usage.len() > 2048 {
+        return Ok(());
+    }
+    let forecast = trends
+        .iter()
+        .filter_map(|t| {
+            let (rate, hours) = forecast_usage(t, now, session_id, &usage, &auto)?;
+            Some((t, rate, hours))
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2));
+    let Some((trend, rate, _)) = forecast else { return Ok(()) };
+    let Some(session) = st.store.session(session_id).await? else { return Ok(()) };
+    if session.archived != 0 {
+        return Ok(());
+    }
+    let Some(conn) = st.store.connection(&connection).await? else { return Ok(()) };
+    if !claim_plan_notice(&st.store.pool, session_id).await? {
+        return Ok(());
+    }
+    let title = if session.title.trim().is_empty() { session_id } else { session.title.as_str() };
+    st.notifier.send(crate::notify::Note {
+        event: "quota",
+        title: format!("{title} may use up the {} plan window on {}", trend.window, conn.name),
+        message: format!("At its recent unattended pace, this session is estimated to use ~{rate:.1}% of the window an hour; resets {}. The window is shared and this is only an estimate.", in_words(trend.reset - now)),
+        priority: "low",
+        session_id: Some(session_id.to_owned()),
+        labels: session.all_labels(),
+        ..Default::default()
+    });
+    Ok(())
+}
+
+async fn claim_plan_notice(pool: &sqlx::SqlitePool, session_id: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query("INSERT OR IGNORE INTO plan_awareness (session_id) SELECT id FROM sessions WHERE id = ?")
+        .bind(session_id)
+        .execute(pool)
+        .await?
+        .rows_affected()
+        == 1)
+}
+
+#[derive(sqlx::FromRow)]
+struct PlanUsage {
+    session_id: String,
+    seq: i64,
+    ts: i64,
+    model: String,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+}
+
+impl PlanUsage {
+    fn tokens(&self) -> f64 {
+        [self.input, self.output, self.cache_read, self.cache_write].into_iter().map(|n| n.max(0) as f64).sum()
+    }
+}
+
+fn forecast_usage(trend: &PlanTrend, now: i64, session_id: &str, usage: &[PlanUsage], auto: &HashSet<i64>) -> Option<(f64, f64)> {
+    let latest = usage.iter().rfind(|call| call.session_id == session_id)?;
+    if !auto.contains(&latest.seq) || now - latest.ts > PROJECTION_MIN_MS || latest.model.is_empty() {
+        return None;
+    }
+    let (mut sample_tokens, mut unattended_tokens, mut sampled, mut unattended) = (0.0, 0.0, 0, 0);
+    for call in usage.iter().filter(|u| u.ts > trend.start) {
+        // Calibrate the aggregate plan delta against all known consumers on
+        // the connection, but don't equate tokens across different models.
+        if call.model != latest.model {
+            return None;
+        }
+        let tokens = call.tokens();
+        if tokens == 0.0 {
+            continue;
+        }
+        if call.ts <= trend.end {
+            sample_tokens += tokens;
+            sampled += 1;
+        }
+        if call.session_id == session_id && auto.contains(&call.seq) {
+            unattended_tokens += tokens;
+            unattended += 1;
+        }
+    }
+    if sampled < 2 || unattended < 2 {
+        return None;
+    }
+    trend.forecast(now, sample_tokens, unattended_tokens)
 }
 
 /// Claude Code's `rate_limit_info`: the windows it names (`unifiedWindows`,
@@ -212,6 +462,7 @@ fn order(name: &str) -> (u8, String) {
 
 /// Keeps a connection's windows and says what passed a threshold.
 fn record(st: &HeadState, q: api::ConnectionQuota, name: &str) {
+    st.quotas.observe(&q);
     let mut notes = Vec::new();
     {
         let mut told = st.quotas.told.lock().unwrap();
@@ -305,7 +556,9 @@ pub async fn from_claude_code(st: &HeadState, session_id: &str, json: &str) {
     }
     // Merge: a report about one window keeps the others it didn't name.
     let mut merged = st.quotas.get(&c.id).filter(|q| q.source == "claude_code").map(|q| q.windows).unwrap_or_default();
-    for w in windows {
+    let observed_at = now_ms();
+    for mut w in windows {
+        w.origin = Some(api::QuotaOrigin { source: "claude_code".into(), observed_at, ..Default::default() });
         match merged.iter_mut().find(|x| x.name == w.name) {
             Some(x) => *x = w,
             None => merged.push(w),
@@ -316,7 +569,7 @@ pub async fn from_claude_code(st: &HeadState, session_id: &str, json: &str) {
         connection_id: c.id.clone(),
         source: "claude_code".into(),
         windows: merged,
-        updated_at: now_ms(),
+        updated_at: observed_at,
         error: String::new(),
         ..Default::default()
     };
@@ -794,6 +1047,230 @@ async fn list(
 
 #[cfg(test)]
 mod tests {
+    use super::{MINUTE_MS, PlanUsage, Quotas, claim_plan_notice, forecast_usage};
+
+    fn mock_plan(at: i64, reset: i64, used: f64) -> c6_api::ConnectionQuota {
+        c6_api::ConnectionQuota {
+            connection_id: "plan".into(),
+            updated_at: at * MINUTE_MS,
+            source: "chatgpt".into(),
+            windows: vec![c6_api::QuotaWindow {
+                name: "5h".into(),
+                used_percent: used,
+                resets_at: Some(reset * MINUTE_MS),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn mock_usage(ts: i64, seq: i64, session: &str) -> PlanUsage {
+        PlanUsage {
+            session_id: session.into(),
+            seq,
+            ts: ts * MINUTE_MS,
+            model: "mock".into(),
+            input: 80,
+            output: 10,
+            cache_read: 10,
+            cache_write: 0,
+        }
+    }
+
+    #[test]
+    fn plan_awareness_uses_only_unattended_rate_and_projects_strictly_before_reset() {
+        let quotas = Quotas::default();
+        let now = 20 * MINUTE_MS;
+        let rows = [mock_usage(12, 1, "s"), mock_usage(15, 2, "s"), mock_usage(20, 3, "s")];
+        let unattended = [2, 3].into();
+        let quota = mock_plan(20, 90, 60.0);
+        assert!(quotas.plan_trends(&quota, now).is_empty(), "a display-only snapshot supplies no pace");
+        quotas.observe(&mock_plan(10, 90, 50.0));
+        quotas.observe(&quota);
+        let trends = quotas.plan_trends(&quota, now);
+        let [trend] = trends.as_slice() else { panic!("expected one trend") };
+        let (rate, hours) = forecast_usage(trend, now, "s", &rows, &unattended).unwrap();
+        assert!((rate - 40.0).abs() < 1e-9 && (hours - 1.0).abs() < 1e-9);
+        assert!(forecast_usage(trend, now, "s", &rows, &[1, 2].into()).is_none());
+        let at_reset = super::PlanTrend { reset: 80 * MINUTE_MS, window: "5h".into(), ..*trend };
+        assert!(forecast_usage(&at_reset, now, "s", &rows, &unattended).is_none());
+    }
+
+    #[test]
+    fn plan_awareness_calibrates_shared_usage_but_forecasts_only_the_target() {
+        let now = 20 * MINUTE_MS;
+        let quotas = Quotas::default();
+        quotas.observe(&mock_plan(10, 150, 50.0));
+        let latest = mock_plan(20, 150, 60.0);
+        quotas.observe(&latest);
+        let trends = quotas.plan_trends(&latest, now);
+        let [trend] = trends.as_slice() else { panic!("expected one trend") };
+        let mut rows = [mock_usage(12, 2, "other"), mock_usage(15, 2, "s"), mock_usage(19, 3, "s"), mock_usage(20, 3, "other")];
+        // Other calls share the connection and model and even overlap the
+        // target's sequence numbers. The last call is also from another session.
+        let unattended = [2, 3].into();
+        let (rate, hours) = forecast_usage(trend, now, "s", &rows, &unattended).unwrap();
+        assert!((rate - 30.0).abs() < 1e-9 && (hours - 4.0 / 3.0).abs() < 1e-9);
+        assert!(forecast_usage(trend, now, "s", &rows, &[2].into()).is_none(), "latest target call was attended");
+        rows[3].model = "another-model".into();
+        assert!(forecast_usage(trend, now, "s", &rows, &unattended).is_none());
+    }
+
+    #[test]
+    fn plan_awareness_rejects_short_stale_noisy_or_rolled_over_windows() {
+        let quotas = Quotas::default();
+        quotas.observe(&mock_plan(10, 60, 40.0));
+        for (at, reset, used) in [(14, 60, 45.0), (20, 120, 47.0), (28, 120, 47.5)] {
+            let snapshot = mock_plan(at, reset, used);
+            quotas.observe(&snapshot);
+            assert!(quotas.plan_trends(&snapshot, at * MINUTE_MS).is_empty());
+        }
+        let fresh = mock_plan(30, 120, 57.0);
+        quotas.observe(&fresh);
+        assert_eq!(quotas.plan_trends(&fresh, 30 * MINUTE_MS).len(), 1);
+        assert!(quotas.plan_trends(&fresh, 36 * MINUTE_MS).is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_awareness_claim_is_durable_and_only_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("head.db");
+        let store = crate::store::Store::open(&path).await.unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at) \
+                     VALUES ('plan-test', 'worker', 'Test', '', 'plan', 'mock', 'idle', 0, 0)",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let (first, second) = tokio::join!(claim_plan_notice(&store.pool, "plan-test"), claim_plan_notice(&store.pool, "plan-test"));
+        assert_ne!(first.unwrap(), second.unwrap());
+        store.pool.close().await;
+        let restarted = crate::store::Store::open(&path).await.unwrap();
+        assert!(!claim_plan_notice(&restarted.pool, "plan-test").await.unwrap());
+        assert!(!claim_plan_notice(&restarted.pool, "does-not-exist").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn plan_awareness_sends_one_informational_webhook() {
+        use c6_proto::session_event::Kind;
+        use c6_proto::{NoticeQueued, SessionEvent, TurnEnded, TurnStarted, Usage, UserMessage};
+        use prost::Message;
+
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let hook_path = "/";
+        let hook = Router::new().route(
+            hook_path,
+            axum::routing::post(move |Json(body): Json<Value>| {
+                let sent = sent.clone();
+                async move {
+                    sent.send(body).unwrap();
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hook_server = tokio::spawn(async move { axum::serve(listener, hook).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        let channels = json!([{ "name": "test", "kind": "webhook", "url": url, "events": ["quota", "failed"] }]);
+        st.store.set_setting(crate::notify::CHANNELS, &channels.to_string()).await.unwrap();
+        // Inject quota observations locally; the background poll must never
+        // contact a provider or replace these snapshots.
+        st.quotas.endpoint_disabled.lock().unwrap().insert("plan".into());
+        st.store
+            .insert_connection(&crate::store::ConnectionRow {
+                id: "plan".into(),
+                name: "Mock plan".into(),
+                kind: "chatgpt".into(),
+                base_url: String::new(),
+                api_key: None,
+                default_model: None,
+                context_window: None,
+                created_at: 0,
+                realms: "[]".into(),
+                members: "[]".into(),
+                subagent_model: None,
+                compact_at: None,
+            })
+            .await
+            .unwrap();
+
+        let mut tx = st.store.pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, last_seq) \
+                     VALUES ('plan-test', ?, 'Nightly audit', '', 'plan', 'mock', 'idle', 0, ?, 10)",
+        )
+        .bind(c6_core::WorkerId::new().to_string())
+        .bind(20 * MINUTE_MS)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let mut seq = 0;
+        for (turn, minute) in [(1, 15), (2, 20)] {
+            let command_id = format!("notice-{turn}");
+            for kind in [
+                Kind::NoticeQueued(NoticeQueued { command_id: command_id.clone(), ..Default::default() }),
+                Kind::User(UserMessage { command_id, ..Default::default() }),
+                Kind::TurnStarted(TurnStarted { turn, ..Default::default() }),
+                Kind::Usage(Usage { model: "mock".into(), input_tokens: 100, ..Default::default() }),
+                Kind::TurnEnded(TurnEnded { turn, ..Default::default() }),
+            ] {
+                seq += 1;
+                let event = SessionEvent { seq, ts_ms: minute * MINUTE_MS, kind: Some(kind) };
+                sqlx::query("INSERT INTO events (session_id, seq, ts, data) VALUES ('plan-test', ?, ?, ?)")
+                    .bind(seq as i64)
+                    .bind(event.ts_ms)
+                    .bind(event.encode_to_vec())
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                if let Some(Kind::Usage(usage)) = &event.kind {
+                    crate::usage::record(&mut tx, "plan-test", seq, event.ts_ms, usage).await.unwrap();
+                }
+            }
+        }
+        tx.commit().await.unwrap();
+
+        record(st, mock_plan(10, 90, 50.0), "Mock plan");
+        record(st, mock_plan(20, 90, 60.0), "Mock plan");
+        for _ in 0..2 {
+            super::after_calls(st, "plan-test", 20 * MINUTE_MS).await.unwrap();
+        }
+        // A FIFO marker proves there was no duplicate ahead of it without
+        // sleeping and guessing how long the notifier might take.
+        st.notifier.send(crate::notify::Note { event: "failed", title: "notification barrier".into(), ..Default::default() });
+        let note = c6_testkit::within("the plan forecast webhook", received.recv()).await.unwrap();
+        assert_eq!(note["event"], "quota");
+        assert_eq!(note["title"], "Nightly audit may use up the 5h plan window on Mock plan");
+        assert_eq!(note["session_id"], "plan-test");
+        assert_eq!(note["priority"], "low");
+        assert_eq!(note["approve_url"], Value::Null);
+        assert!(note["message"].as_str().unwrap().contains("~60.0% of the window an hour; resets in 1h 10m"));
+        let marker = c6_testkit::within("the plan forecast notification barrier", received.recv()).await.unwrap();
+        assert_eq!(marker["title"], "notification barrier");
+        assert_eq!(st.store.session("plan-test").await.unwrap().unwrap().status, "idle");
+        let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plan_awareness WHERE session_id = 'plan-test'")
+            .fetch_one(&st.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(claims, 1);
+
+        head.shutdown().await.unwrap();
+        hook_server.abort();
+    }
+
     #[tokio::test]
     async fn alias_quota_refresh_uses_only_accounts_from_the_ending_turn() {
         let dir = tempfile::tempdir().unwrap();

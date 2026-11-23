@@ -3942,9 +3942,20 @@ struct WaitingNotice {
     hold: c6_api::NoticeHoldReason,
 }
 
+fn notice_backoff_evidence(hold: c6_api::NoticeHoldReason, reason: &str) -> Option<&str> {
+    // Slowed delivery remains an automatic hold, including for older clients.
+    if hold == c6_api::NoticeHoldReason::Collecting {
+        reason.strip_prefix("collecting reports; slowing automatic delivery after ")
+    } else {
+        None
+    }
+}
+
 fn notice_waiting_line(hold: c6_api::NoticeHoldReason, reason: &str) -> String {
     match hold {
-        c6_api::NoticeHoldReason::Collecting => "Collecting reports; delivering automatically in a few seconds.".into(),
+        c6_api::NoticeHoldReason::Collecting => notice_backoff_evidence(hold, reason)
+            .map(|evidence| format!("Automatic delivery is slowed: {evidence}"))
+            .unwrap_or_else(|| "Collecting reports; delivering automatically in a few seconds.".into()),
         c6_api::NoticeHoldReason::Group => {
             if reason.starts_with("The agent is waiting for its group ") {
                 reason.into()
@@ -4088,7 +4099,8 @@ fn WaitingNotices(
         (!w.is_empty() && !blocked.get()).then(|| {
             let n = w.len();
             let needs_you = w.iter().any(|notice| notice.hold.needs_you());
-            let paused = w.iter().any(|notice| notice.reason.starts_with("paused:"));
+            let paused = w.iter().any(|notice| notice.hold.needs_you() && notice.reason.starts_with("paused:"));
+            let slowed = w.iter().any(|notice| notice_backoff_evidence(notice.hold, &notice.reason).is_some());
             let spending = w.iter().any(|notice| notice.reason.starts_with("paused:") && notice.reason.contains("spending"));
             let reasons: Vec<String> = w.iter().map(|notice| notice_waiting_line(notice.hold, &notice.reason)).fold(Vec::new(), |mut lines, line| {
                 if !lines.contains(&line) {
@@ -4104,15 +4116,19 @@ fn WaitingNotices(
                 }>
                     <div class="flex flex-wrap items-center gap-3">
                         <span class="min-w-0 flex-1">
-                            {if needs_you {
+                            {if paused {
+                                format!("Paused · Needs you — {n} {} held", if n == 1 { "notice" } else { "notices" })
+                            } else if needs_you {
                                 format!("Needs you — {n} {} held", if n == 1 { "notice" } else { "notices" })
+                            } else if slowed {
+                                "Slowed — the agent wakes automatically; no action needed.".into()
                             } else {
                                 "The agent wakes automatically; no action needed.".into()
                             }}
                         </span>
                         {spending.then(|| view! {
                             <Go to=View::Settings { note: None, section: "agents".into() } class=BUTTON_QUIET
-                                title="Change notice limits, then select Continue to apply them here">"Raise limit"</Go>
+                                title="Change the optional token cap; select Continue to resume delivery">"Raise limit"</Go>
                         })}
                         <button class=if needs_you { BUTTON } else { "text-xs text-muted underline underline-offset-2 hover:text-zinc-900 dark:hover:text-zinc-100" }
                             on:click=deliver title=if needs_you { "Start a turn with these notices now" } else { "Optional: deliver the available reports before the rest finish" }>
@@ -9014,6 +9030,9 @@ mod tests {
     fn notice_wording_distinguishes_optional_delivery_from_required_action() {
         let notice_waiting_line = |reason: &str| super::notice_waiting_line(c6_api::NoticeHoldReason::parse(reason), reason);
         assert_eq!(notice_waiting_line("merging 2 reports"), "Collecting reports; delivering automatically in a few seconds.");
+        let slowed = "collecting reports; slowing automatic delivery after repeated identical reports";
+        assert!(!c6_api::NoticeHoldReason::parse(slowed).needs_you());
+        assert_eq!(notice_waiting_line(slowed), "Automatic delivery is slowed: repeated identical reports");
         let line = notice_waiting_line("waiting for 5 of 5 in group da-audit (4 finished)");
         assert!(line.contains("4 of 5 finished; waiting for 1"), "{line}");
         assert!(line.contains("continues automatically"));

@@ -201,12 +201,25 @@ impl Checkpoints {
 
     /// Snapshots the work tree; returns the commit.
     pub async fn snapshot(&self) -> anyhow::Result<String> {
+        self.snapshot_with_tree().await.map(|(commit, _)| commit)
+    }
+
+    /// Also retain the tree already computed for the snapshot. Unlike commit
+    /// IDs this is stable when no files changed, with no extra Git scan.
+    pub async fn snapshot_with_tree(&self) -> anyhow::Result<(String, String)> {
         let lock = self.lock().await?;
         let tree = self.tree(&lock).await?;
         let commit = self.git(&["commit-tree", &tree, "-m", "carbon6 checkpoint"], &lock).await?;
         // A ref keeps it from being garbage-collected.
         self.git(&["update-ref", &format!("refs/checkpoints/{commit}"), &commit], &lock).await?;
-        Ok(commit)
+        Ok((commit, tree))
+    }
+
+    /// A content-only probe before a repetition hold. No checkpoint commit is
+    /// created, and the user's Git index and refs remain untouched.
+    pub async fn fingerprint(&self) -> anyhow::Result<String> {
+        let lock = self.lock().await?;
+        self.tree(&lock).await
     }
 
     /// Puts the work tree back to `commit`: changed and deleted files come
@@ -231,6 +244,24 @@ impl Checkpoints {
 mod tests {
     use super::*;
     use crate::checkpoint_process::{OwnershipUncertain, conclusive};
+
+    #[tokio::test]
+    async fn snapshot_tree_changes_only_when_files_change() {
+        if !c6_testkit::have("git") {
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("result"), "first").unwrap();
+        let checkpoints = Checkpoints::new(state.path(), "tree-progress", work.path());
+        let (commit, first) = checkpoints.snapshot_with_tree().await.unwrap();
+        assert!(!commit.is_empty() && !first.is_empty());
+        assert_eq!(checkpoints.snapshot_with_tree().await.unwrap().1, first);
+        std::fs::write(work.path().join("result"), "changed").unwrap();
+        assert_ne!(checkpoints.snapshot_with_tree().await.unwrap().1, first);
+        checkpoints.restore(&commit).await.unwrap();
+        assert_eq!(checkpoints.snapshot_with_tree().await.unwrap().1, first);
+    }
 
     #[tokio::test]
     async fn startup_recovers_stale_index_locks() {

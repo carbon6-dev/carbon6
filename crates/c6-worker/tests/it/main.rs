@@ -95,7 +95,13 @@ mod workflows;
 pub async fn open_worker(state: &std::path::Path) -> std::sync::Arc<c6_worker::Worker> {
     let deadline = tokio::time::Instant::now() + c6_testkit::wait::deadline();
     loop {
-        match c6_worker::Worker::open(state, c6_worker::Identity::load(state).unwrap()).await {
+        match c6_worker::Worker::open_with_resource_sampler(
+            state,
+            c6_worker::Identity::load(state).unwrap(),
+            c6_worker::ResourceMeasurement::default,
+        )
+        .await
+        {
             Ok(w) => return w,
             Err(e) if format!("{e}").contains("already running") && tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await
