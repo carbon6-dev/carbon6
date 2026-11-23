@@ -9407,16 +9407,13 @@ mod notice_tests {
             notice_tokens_per_hour: 7_000_000,
         };
         tx.send(ActorMsg::NoticeLimits(limits)).unwrap();
-        tx.send(ActorMsg::ReleaseNotices).unwrap();
         let (events, request) = completed_batch_after(&manager, &mock, initial).await;
         assert!(request.contains("report #1."), "the held report should reach the model after Continue");
-        let marker = events
-            .iter()
-            .find(|e| matches!(&e.kind, Some(Kind::Notice(n)) if n.quiet && n.title == crate::notice_guard::CONTINUED_TITLE))
-            .unwrap();
+        let marker =
+            events.iter().find(|e| matches!(&e.kind, Some(Kind::Notice(n)) if n.quiet && n.title == "Notice settings refreshed")).unwrap();
         let delivery = events.iter().find(|e| matches!(&e.kind, Some(Kind::User(u)) if u.text == "report #1.")).unwrap();
-        assert!(marker.seq < delivery.seq, "Continue must reset the guard durably before delivering the report");
-        assert_eq!(crate::notice_guard::evaluate(&events, c6_core::now_ms(), 5, 3, 5_000_000), None);
+        assert!(marker.seq < delivery.seq, "the refreshed settings must be durable before automatically releasing the report");
+        assert_eq!(crate::notice_guard::evaluate(&events, c6_core::now_ms(), 8, 6, 7_000_000), None);
 
         let (mut spec, events) = manager.journal.load_session("held").await.unwrap().unwrap();
         assert_ne!(spec.notice_quiet_seconds, limits.notice_quiet_seconds, "the imported spec precedes the refresh");
