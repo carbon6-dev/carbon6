@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -328,6 +329,7 @@ enum RecoveryAction {
 struct RecoveryGate {
     epoch: u64,
     active: std::sync::atomic::AtomicBool,
+    adopting: std::sync::atomic::AtomicBool,
     activity: Arc<std::sync::atomic::AtomicI32>,
     probe: Mutex<ActorProbe>,
     request: Mutex<Option<RecoveryRequest>>,
@@ -369,7 +371,7 @@ struct RecoveryPause {
 
 impl RecoveryPause {
     fn new(gate: Arc<RecoveryGate>, writer: &Writer, reason: &str) -> Self {
-        warn!(session = %writer.session_id, %reason, "automatic journal recovery exhausted");
+        warn!(session = %writer.session_id, %reason, "automatic session recovery exhausted");
         let id = uuid::Uuid::now_v7().to_string();
         *gate.request.lock().unwrap() = Some(RecoveryRequest { incident: id.clone(), ready: None });
         let (updated, state) = tokio::sync::watch::channel(Some(reason.to_owned()));
@@ -377,10 +379,24 @@ impl RecoveryPause {
         Self { id, gate, reason: updated }
     }
 
-    async fn wait_action(&self) -> RecoveryAction {
+    fn action_receiver(&self) -> tokio::sync::oneshot::Receiver<RecoveryAction> {
         let (ready, action) = tokio::sync::oneshot::channel();
         self.gate.request.lock().unwrap().as_mut().expect("this incident is active").ready = Some(ready);
-        action.await.expect("the gate retains its sender until a user acts")
+        action
+    }
+
+    async fn wait_action(&self) -> RecoveryAction {
+        self.action_receiver().await.expect("the gate retains its sender until a user acts")
+    }
+
+    fn update_reason(&self, reason: &str) {
+        self.reason.send_if_modified(|old| {
+            if old.as_deref() == Some(reason) {
+                return false;
+            }
+            *old = Some(reason.to_owned());
+            true
+        });
     }
 }
 
@@ -489,6 +505,127 @@ async fn recovery_at_deadline<T>(
             attempt.await
         }
         result = &mut attempt => result,
+    }
+}
+
+fn recovery_budget(seconds: u32) -> Duration {
+    Duration::from_secs(u64::from(if seconds == 0 { c6_api::DEFAULT_SESSION_RECOVERY_SECONDS } else { seconds }))
+}
+
+fn next_recovery_backoff(backoff: Duration) -> Duration {
+    (backoff * 2).clamp(Duration::from_millis(100), Duration::from_secs(30))
+}
+
+/// Adoption has not lost a held reader's offset, so it retries the ownership
+/// check, not journal recovery's process retirement. Between attempts the
+/// mailbox stays usable for take-back, callbacks and explicit Rewind.
+struct HeldAdoptionRecovery {
+    gate: Arc<RecoveryGate>,
+    deadline: Option<tokio::time::Instant>,
+    retry_at: Option<tokio::time::Instant>,
+    backoff: Duration,
+    reason: String,
+    reported_failure: bool,
+    pause: Option<RecoveryPause>,
+    action: Option<tokio::sync::oneshot::Receiver<RecoveryAction>>,
+}
+
+impl HeldAdoptionRecovery {
+    fn new(gate: Arc<RecoveryGate>, budget: Duration) -> Self {
+        let now = tokio::time::Instant::now();
+        gate.adopting.store(true, Ordering::Release);
+        Self {
+            gate,
+            deadline: Some(now + budget),
+            retry_at: Some(now),
+            backoff: Duration::ZERO,
+            reason: "The worker has not finished checking ownership of the held Claude Code runtime; queued messages are held".into(),
+            reported_failure: false,
+            pause: None,
+            action: None,
+        }
+    }
+
+    async fn check(&mut self, writer: &Writer, attempt: impl std::future::Future<Output = anyhow::Result<()>>) -> bool {
+        let now = tokio::time::Instant::now();
+        if self.deadline.is_some_and(|until| now >= until) {
+            self.deadline = None;
+            self.retry_at = None;
+            self.pause.get_or_insert_with(|| RecoveryPause::new(self.gate.clone(), writer, &self.reason));
+        }
+        if self.retry_at.is_some_and(|at| now >= at) {
+            self.retry_at = None;
+            let result = if let Some(until) = self.deadline {
+                recovery_at_deadline(until, attempt, || {
+                    self.pause.get_or_insert_with(|| RecoveryPause::new(self.gate.clone(), writer, &self.reason));
+                })
+                .await
+            } else {
+                attempt.await
+            };
+            let Err(e) = result else { return true };
+            let reason: String =
+                format!("Claude Code could not be safely taken up; queued messages were not sent: {e:#}").chars().take(1000).collect();
+            if reason != self.reason {
+                warn!(session = %writer.session_id, %reason);
+                if let Some(pause) = &self.pause {
+                    pause.update_reason(&reason);
+                }
+                self.reason = reason;
+            }
+            if !self.reported_failure {
+                // Report the first refusal immediately, without turning
+                // retries into durable progress or rearming their deadline.
+                self.reported_failure = true;
+                let append = writer.append(session_event::Kind::Error(ErrorEvent { message: self.reason.clone() }));
+                let recorded = if let Some(until) = self.deadline {
+                    recovery_at_deadline(until, append, || {
+                        self.pause.get_or_insert_with(|| RecoveryPause::new(self.gate.clone(), writer, &self.reason));
+                    })
+                    .await
+                } else {
+                    append.await
+                };
+                if let Err(e) = recorded {
+                    // A failed diagnostic does not authorize retirement of a
+                    // held runtime. Recovery status can report without SQLite.
+                    warn!(session = %writer.session_id, "recording Claude Code adoption failure: {e:#}");
+                }
+            }
+            if let Some(until) = self.deadline {
+                let now = tokio::time::Instant::now();
+                if now >= until {
+                    self.deadline = None;
+                    self.pause.get_or_insert_with(|| RecoveryPause::new(self.gate.clone(), writer, &self.reason));
+                } else {
+                    self.backoff = next_recovery_backoff(self.backoff);
+                    self.retry_at = Some(until.min(now + self.backoff));
+                }
+            }
+        }
+        if self.deadline.is_none() && self.action.is_none() {
+            self.action = Some(self.pause.as_ref().expect("manual action requires an escalation").action_receiver());
+        }
+        false
+    }
+
+    fn resume(&mut self, action: RecoveryAction, budget: Duration) {
+        self.action = None;
+        let now = tokio::time::Instant::now();
+        if action == RecoveryAction::Restart {
+            self.deadline = Some(now + budget);
+            self.backoff = Duration::ZERO;
+        }
+        self.retry_at = Some(now);
+    }
+}
+
+impl Drop for HeldAdoptionRecovery {
+    fn drop(&mut self) {
+        if self.gate.adopting.load(Ordering::Acquire) {
+            self.gate.probe.lock().unwrap().pending = None;
+            self.gate.adopting.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -635,7 +772,6 @@ impl SessionManager {
     /// mailboxes. A nonblocking mailbox probe detects a stuck run loop.
     pub(crate) fn liveness_report(&self) -> c6_proto::SessionLivenessReport {
         use c6_proto::{SessionActivityKind, SessionActorState, SessionLiveness};
-        use std::sync::atomic::Ordering;
 
         let actors = self.actors.lock().unwrap().clone();
         let held = if actors.values().any(|a| a.claude_code.load(Ordering::Acquire)) {
@@ -651,6 +787,8 @@ impl SessionManager {
                     (SessionActorState::Stopped, "The worker's session actor exited")
                 } else if a.recovery.active.load(Ordering::Acquire) {
                     (SessionActorState::Recovering, "The worker is recovering the session journal")
+                } else if a.recovery.adopting.load(Ordering::Acquire) {
+                    (SessionActorState::Recovering, "The worker cannot yet confirm ownership of the held Claude Code runtime")
                 } else if a.recovery.probe.lock().unwrap().timed_out(&a.tx, now) {
                     (SessionActorState::Unresponsive, "The session actor has not answered its mailbox probe for 30 seconds")
                 } else if a.running.load(Ordering::SeqCst) {
@@ -3203,7 +3341,7 @@ impl Actor {
         let mut running = None;
         loop {
             let mut recoverable = true;
-            self.run(&mut rx, &mut running, &mut recoverable).await;
+            self.run(&mut rx, &mut running, &mut recoverable, &gate).await;
             gate.active.store(recoverable && !rx.is_closed(), std::sync::atomic::Ordering::Release);
             if let Some((task, cancel)) = running.take() {
                 cancel.cancel();
@@ -3222,8 +3360,7 @@ impl Actor {
     }
 
     async fn recover_supervised(&mut self, gate: &Arc<RecoveryGate>) {
-        let seconds = self.spec.session_recovery_seconds;
-        let budget = Duration::from_secs(u64::from(if seconds == 0 { c6_api::DEFAULT_SESSION_RECOVERY_SECONDS } else { seconds }));
+        let budget = recovery_budget(self.spec.session_recovery_seconds);
         let mut deadline = Some(tokio::time::Instant::now() + budget);
         let mut backoff = Duration::from_millis(100);
         let mut cli_retired = false;
@@ -3265,13 +3402,7 @@ impl Actor {
                     warn!(session = %writer.session_id, "waiting to recover its journal: {e:#}");
                     reason = format!("{e:#}").chars().take(1000).collect();
                     if let Some(paused) = &pause {
-                        paused.reason.send_if_modified(|old| {
-                            if old.as_ref() == Some(&reason) {
-                                return false;
-                            }
-                            *old = Some(reason.clone());
-                            true
-                        });
+                        paused.update_reason(&reason);
                     }
                 }
                 None => {}
@@ -3283,7 +3414,7 @@ impl Actor {
                 pause.get_or_insert_with(|| RecoveryPause::new(gate.clone(), &writer, &reason));
                 deadline = None;
             }
-            backoff = (backoff * 2).clamp(Duration::from_millis(100), Duration::from_secs(30));
+            backoff = next_recovery_backoff(backoff);
         }
     }
 
@@ -3415,6 +3546,7 @@ impl Actor {
         rx: &mut mpsc::UnboundedReceiver<ActorMsg>,
         running: &mut Option<(TurnTask, CancellationToken)>,
         recoverable: &mut bool,
+        gate: &Arc<RecoveryGate>,
     ) {
         // Seal callbacks from the failed run before the supervisor rebuilds
         // its cursor, including when the runtime aborts this actor task.
@@ -3473,7 +3605,9 @@ impl Actor {
         // Rewinds wait for the running turn to stop. Do not let a retry
         // replace the original receipt while cancellation is still pending.
         let mut rewind_blocked = matches!(&reset, Some((r, 0)) if !r.failure.is_empty());
-        let mut adoption_blocked = false;
+        let mut adoption = None::<HeldAdoptionRecovery>;
+        let adoption_budget = recovery_budget(self.spec.session_recovery_seconds);
+        let adoption_writer = self.writer.clone();
         self.rewinds = recover_rewind_queue(self.runs_claude_code(), std::mem::take(&mut self.rewinds), reset);
         loop {
             while running.is_none()
@@ -3492,6 +3626,9 @@ impl Actor {
                         return;
                     }
                 }
+                // An admitted Rewind owns its own safety barrier. It supersedes
+                // this adoption incident, never letting adoption bypass it.
+                adoption = None;
                 if let Err(e) = self.rewind(command_id.clone(), to_seq, restore).await {
                     error!(session = %self.writer.session_id, "rewinding: {e:#}");
                     if !self.runs_claude_code() && !e.is::<StopUnconfirmed>() {
@@ -3536,29 +3673,15 @@ impl Actor {
                 self.rewinds.pop_front();
                 rewind_blocked = false;
             }
-            if !rewind_blocked && running.is_none() {
-                match self.take_up_held().await {
-                    Ok(()) => adoption_blocked = false,
-                    Err(e) => {
-                        // Ownership uncertainty pauses input, not Rewind's
-                        // durable failure state. Recheck on the next mailbox
-                        // event: another session may simply be publishing or
-                        // removing its metadata. Never send until it succeeds.
-                        if !adoption_blocked
-                            && let Err(e) = self
-                                .writer
-                                .append(session_event::Kind::Error(ErrorEvent {
-                                    message: format!("Claude Code could not be safely taken up; queued messages were not sent: {e:#}"),
-                                }))
-                                .await
-                        {
-                            error!("recording Claude Code adoption failure: {e:#}");
-                            return;
-                        }
-                        adoption_blocked = true;
-                    }
+            if !rewind_blocked && running.is_none() && self.runs_claude_code() && self.claude.is_none() {
+                let recovery = adoption.get_or_insert_with(|| HeldAdoptionRecovery::new(gate.clone(), adoption_budget));
+                if recovery.check(&adoption_writer, self.take_up_held()).await {
+                    adoption = None;
                 }
             }
+            let adoption_blocked = adoption.is_some();
+            let adoption_retry_at = adoption.as_ref().and_then(|r| r.retry_at);
+            let waiting_for_adoption_action = adoption.as_ref().is_some_and(|r| r.action.is_some());
             let handoff_waits = running.is_none() && self.handoff_waits();
             if handoff_waits && !self.handoff_announced {
                 self.handoff_announced = true;
@@ -4171,10 +4294,10 @@ impl Actor {
                         return;
                     }
                 }
-                // A queued input must not require another command to recover
-                // after unrelated metadata publication/removal finishes. This
-                // wake only rechecks ownership; failed Rewinds never arm it.
-                _ = tokio::time::sleep(std::time::Duration::from_millis(250)), if adoption_blocked && !rewind_blocked && running.is_none() => {}
+                _ = tokio::time::sleep_until(adoption_retry_at.unwrap_or_else(tokio::time::Instant::now)), if adoption_retry_at.is_some() => {}
+                action = async { adoption.as_mut().unwrap().action.as_mut().unwrap().await }, if waiting_for_adoption_action => {
+                    adoption.as_mut().unwrap().resume(action.expect("the gate retains its sender until a user acts"), adoption_budget);
+                }
                 _ = self.link.wait_connected(), if waiting_to_wake && !self.link.is_connected() => {}
                 // Idle long enough, with no background tasks: close it.
                 _ = tokio::time::sleep_until(idle_until.unwrap_or_else(tokio::time::Instant::now)), if running.is_none() && idle_until.is_some() => {
@@ -8469,6 +8592,57 @@ mod notice_tests {
         join.await.unwrap().unwrap();
     }
 
+    #[tokio::test]
+    async fn held_adoption_stops_automatic_retries_and_reuses_the_incident_until_success() {
+        async fn fail() -> anyhow::Result<()> {
+            anyhow::bail!("metadata unreadable");
+        }
+        async fn no_attempt() -> anyhow::Result<()> {
+            panic!("unexpected adoption attempt");
+        }
+        let (_dir, manager, _mock) = idle_session().await;
+        manager.actor("held").await.unwrap().unwrap();
+        let _clock = pause_clock();
+        let gate = manager.actors.lock().unwrap().get("held").unwrap().recovery.clone();
+        let writer = Writer::new("held".into(), manager.journal.clone(), manager.link.clone(), 2);
+        let mut adoption = HeldAdoptionRecovery::new(gate.clone(), SECOND);
+        assert!(!adoption.check(&writer, fail()).await);
+        assert!(gate.adopting.load(Ordering::Acquire));
+        assert!(!adoption.check(&writer, no_attempt()).await, "mailbox activity cannot bypass backoff");
+        tokio::time::advance(SECOND).await;
+        assert!(!adoption.check(&writer, no_attempt()).await, "deadline must not start one more automatic attempt");
+        let incident = gate.request.lock().unwrap().as_ref().unwrap().incident.clone();
+        assert!(adoption.reason.contains("metadata unreadable"));
+
+        tokio::time::advance(10 * SECOND).await;
+        assert!(!adoption.check(&writer, no_attempt()).await, "paused adoption must wait for user action");
+        manager.recovery_action("held", gate.epoch, &incident, "retry").unwrap();
+        let action = adoption.action.as_mut().unwrap().await.unwrap();
+        adoption.resume(action, SECOND);
+        assert!(!adoption.check(&writer, fail()).await);
+        assert_eq!(gate.request.lock().unwrap().as_ref().unwrap().incident, incident);
+        assert!(!adoption.check(&writer, no_attempt()).await, "Retry only authorizes a single attempt");
+
+        manager.recovery_action("held", gate.epoch, &incident, "restart").unwrap();
+        let action = adoption.action.as_mut().unwrap().await.unwrap();
+        adoption.resume(action, SECOND);
+        assert!(!adoption.check(&writer, fail()).await);
+        tokio::time::advance(Duration::from_millis(100) + TICK).await;
+        assert!(adoption.check(&writer, async { Ok(()) }).await, "Restart allows bounded automatic retries");
+        drop(adoption);
+        assert!(!gate.adopting.load(Ordering::Acquire));
+        assert!(gate.request.lock().unwrap().is_none());
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(&e.kind, Some(session_event::Kind::Error(e)) if e.message.contains("metadata unreadable")))
+                .count(),
+            1,
+            "the initial failure is durable, but retries do not write another error"
+        );
+    }
+
     fn enqueue_test_report(actor: &Handle, number: usize) -> tokio::sync::oneshot::Receiver<()> {
         let (recorded, ack) = tokio::sync::oneshot::channel();
         let text = format!("report #{number}.");
@@ -9966,14 +10140,23 @@ for line in sys.stdin:
             .unwrap();
         leave_rewind_held(&manager, &spec, &bin, dir.path(), "s").await;
         leave_rewind_held(&manager, &spec, &bin, dir.path(), &fork).await;
-        let publishing = manager.claude_dir().join("held/another-session-publishing");
-        std::fs::create_dir(&publishing).unwrap();
+        let held = manager.claude_dir().join("held");
+        let (fork_record, _) = crate::claude_code::Process::held_record(&held, &fork).unwrap().unwrap();
+        // Two valid records claiming the selected fork must fail closed.
+        let conflicting = held.join("conflicting-record");
+        std::fs::create_dir(&conflicting).unwrap();
+        std::fs::copy(fork_record.join("meta.json"), conflicting.join("meta.json")).unwrap();
         let reopened = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
         let manager = SessionManager::new(reopened, Arc::default(), dir.path().join("worktrees"));
         manager.recover().await.unwrap();
         rewind_actor_barrier(&manager, "adoption-paused").await;
         let paused = manager.journal.events_after("s", 0, u32::MAX).await.unwrap();
-        assert!(paused.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::Error(e)) if e.message.contains("safely taken up"))));
+        assert!(
+            paused.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::Error(e)) if e.message.contains("Multiple held runtimes")))
+        );
+        let evidence = manager.liveness_report().sessions.into_iter().find(|s| s.session_id == "s").unwrap();
+        assert_eq!(evidence.actor_state, c6_proto::SessionActorState::Recovering as i32);
+        assert!(evidence.reason.contains("ownership of the held Claude Code runtime"));
         assert!(!manager.actor("s").await.unwrap().unwrap().is_closed());
         manager.actor("s").await.unwrap().unwrap().send(ActorMsg::Resume(1)).unwrap();
         rewind_actor_barrier(&manager, "stale-resume").await;
@@ -9990,9 +10173,9 @@ for line in sys.stdin:
         };
         manager.handle(command()).await.unwrap();
         rewind_actor_barrier(&manager, "queued-while-adoption-paused").await;
-        assert!(publishing.exists());
+        assert!(conflicting.exists());
         assert!(held_trace(dir.path()).iter().all(|v| v["kind"] == "spawn"));
-        std::fs::remove_dir(&publishing).unwrap();
+        std::fs::remove_dir_all(&conflicting).unwrap();
         // No command or mailbox barrier after removing the obstacle. The
         // adoption-only retry wake must itself release the pre-existing queue.
         c6_testkit::eventually("adoption retry wakes and completes the already queued input", async || {
@@ -11077,16 +11260,15 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn rewind_unknown_descendant_held_identity_fails_closed_without_cleanup() {
+    async fn rewind_ignores_unmapped_stubs_but_preserves_known_descendant_process_barriers() {
         let (_dir, manager) = rewind_test_manager().await;
         manager.journal.import("child", &CreateSession::default(), &rewind_child_events()).await.unwrap();
         let events = [rewind_child_link("child"), user(5, "target")];
         let record = manager.claude_dir().join("held/unknown-runtime");
         std::fs::create_dir_all(&record).unwrap();
-        // Even absent metadata may be an interrupted publication, not proof
-        // that no runtime exists. A missing child identity is likewise unsafe.
-        let error = manager.rewind_preflight("root", &events, 5, true).await.unwrap_err().to_string();
-        assert!(error.contains("child") && error.contains("unconfirmed Claude Code runtime"), "{error}");
+        // An unowned incomplete launch must not poison every other session.
+        // Skipping it never clears the durable barrier of a known child.
+        manager.rewind_preflight("root", &events, 5, true).await.unwrap();
         let meta = serde_json::json!({
             "session": "child", "conversation": "old-fork", "pgid": 0,
             "keeper": 0, "output_root": null, "token": null,
@@ -11096,19 +11278,25 @@ for line in sys.stdin:
         empty_session["session"] = serde_json::json!("");
         let mut missing_session = meta.clone();
         missing_session.as_object_mut().unwrap().remove("session");
-        for bytes in [
-            b"not json".to_vec(),
-            serde_json::to_vec(&missing_session).unwrap(),
-            serde_json::to_vec(&empty_session).unwrap(),
-            serde_json::to_vec(&meta).unwrap(),
-        ] {
+        for bytes in [b"not json".to_vec(), serde_json::to_vec(&missing_session).unwrap(), serde_json::to_vec(&empty_session).unwrap()] {
             std::fs::write(record.join("meta.json"), &bytes).unwrap();
             manager.rewind_preflight("root", &events, 5, false).await.unwrap();
+            manager.rewind_preflight("root", &events, 5, true).await.unwrap();
+            let pgid = nix::unistd::getpgrp().as_raw();
+            manager.journal.track_claude_process("child", pgid).await.unwrap();
             let error = manager.rewind_preflight("root", &events, 5, true).await.unwrap_err().to_string();
             assert!(error.contains("child") && error.contains("unconfirmed Claude Code runtime"), "{error}");
             assert_eq!(std::fs::read(record.join("meta.json")).unwrap(), bytes);
-            assert!(manager.journal.claude_processes("child").await.unwrap().is_empty());
+            assert_eq!(manager.journal.claude_processes("child").await.unwrap(), vec![pgid]);
+            manager.journal.untrack_claude_process("child", pgid).await.unwrap();
         }
+        // A record that identifies this child but cannot prove group absence
+        // remains fail-closed, even without a separately tracked PGID.
+        std::fs::write(record.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        manager.rewind_preflight("root", &events, 5, false).await.unwrap();
+        let error = manager.rewind_preflight("root", &events, 5, true).await.unwrap_err().to_string();
+        assert!(error.contains("child") && error.contains("unconfirmed Claude Code runtime"), "{error}");
+        assert!(manager.journal.claude_processes("child").await.unwrap().is_empty());
         let error = manager.rewind_children_stopped(&[rewind_child_link("")]).await.unwrap_err().to_string();
         assert!(error.contains("identity is unknown"), "{error}");
     }

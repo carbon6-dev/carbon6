@@ -30,6 +30,10 @@ The probe never waits in the heartbeat path; recovery has its own state and
 bound rather than inheriting a stale probe deadline.
 Heartbeats themselves are not progress. Durable events and streamed activity
 are progress; repeated recovery diagnostics do not restart the recovery bound.
+Held Claude Code adoption uses the same recovery budget: queued input stays
+unsent while ownership is uncertain, the first failure is recorded visibly,
+and bounded retries do not need another mailbox event. Exhaustion exposes the
+existing Retry/Restart recovery controls without bypassing ownership checks.
 
 The realm's subagent settings expose these bounds (in seconds):
 

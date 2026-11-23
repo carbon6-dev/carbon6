@@ -1161,6 +1161,415 @@ fn darwin_vnode_path(path: &[u8]) -> Option<&Path> {
     path.is_absolute().then_some(path)
 }
 
+const HELD_STUB_GRACE: Duration = Duration::from_secs(300);
+
+fn open_held_metadata(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Open nonblocking before checking the descriptor: even if an entry is
+    // replaced concurrently, opening a FIFO must not stall the scan.
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW).open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Held Claude Code metadata is not a regular file"));
+    }
+    Ok(file)
+}
+
+fn read_held_metadata(path: &Path) -> std::io::Result<HeldMeta> {
+    serde_json::from_reader(std::io::BufReader::new(open_held_metadata(path)?)).map_err(std::io::Error::other)
+}
+
+fn held_metadata_for_scan(dir: &Path) -> Option<HeldMeta> {
+    let path = dir.join("meta.json");
+    match read_held_metadata(&path) {
+        Ok(meta) => Some(meta),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            warn!(path = %path.display(), %error, "ignoring invalid or unreadable held Claude Code metadata");
+            None
+        }
+    }
+}
+
+/// Garbage-collect only unpublished launch remnants, never a recoverable or
+/// retired runtime. Unknown contents, inspection failures and recent writes
+/// all leave the directory alone. This is not evidence for signalling a PID.
+fn prune_held_stub(dir: &Path, now: std::time::SystemTime) -> bool {
+    prune_held_stub_with(dir, now, held_fifo_has_no_users)
+}
+
+fn prune_held_stub_with(dir: &Path, now: std::time::SystemTime, fifo_unused: impl FnOnce(u64, u64) -> bool) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    type FileStamp = (u64, u64, i64, i64);
+    type StubSnapshot = (Vec<(PathBuf, FileStamp)>, Option<std::fs::Metadata>);
+
+    fn stamp(m: &std::fs::Metadata) -> FileStamp {
+        (m.dev(), m.ino(), m.ctime(), m.ctime_nsec())
+    }
+
+    fn snapshot(dir: &Path, now: std::time::SystemTime) -> Option<StubSnapshot> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        let uid = unsafe { nix::libc::geteuid() };
+        let old = |m: &std::fs::Metadata| {
+            m.uid() == uid && m.modified().ok().and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age >= HELD_STUB_GRACE)
+        };
+        let meta = std::fs::symlink_metadata(dir).ok()?;
+        if !meta.is_dir() || !old(&meta) {
+            return None;
+        }
+        let mut entries = vec![(dir.to_owned(), stamp(&meta))];
+        let mut fifo = None;
+        let mut reserved = false;
+        let mut has_output = false;
+        for entry in std::fs::read_dir(dir).ok()? {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).ok()?;
+            if !old(&meta) {
+                return None;
+            }
+            match entry.file_name().to_str()? {
+                "in" if meta.file_type().is_fifo() && meta.mode() & 0o777 == 0o600 && meta.nlink() == 1 => fifo = Some(meta.clone()),
+                "out" | "err" if meta.is_file() && meta.len() == 0 => has_output = true,
+                "meta.json" | "meta.next" if meta.is_file() => {
+                    let reader = std::io::BufReader::new(open_held_metadata(&path).ok()?);
+                    match serde_json::from_reader::<_, HeldMeta>(reader) {
+                        Ok(meta) => {
+                            if meta.pgid != 0 || meta.keeper != 0 {
+                                return None;
+                            }
+                            reserved = true;
+                        }
+                        Err(error) if error.is_io() => return None,
+                        Err(_) => (),
+                    }
+                }
+                _ => return None,
+            }
+            entries.push((path, stamp(&meta)));
+        }
+        // Identity is published before mkfifo. A zero-PGID reservation with
+        // no runtime files therefore never spawned; once the FIFO exists,
+        // a crash may have preceded publication of a real process's PGID.
+        if reserved && (fifo.is_some() || has_output) {
+            return None;
+        }
+        entries.sort_unstable();
+        Some((entries, fifo))
+    }
+
+    let Some((before, fifo)) = snapshot(dir, now) else { return false };
+    if let Some(fifo) = fifo {
+        // Try a nonblocking write-only open without writing anything. ENXIO
+        // proves no reader (including one outside our process visibility).
+        // Inspect descriptor tables for writer-only opens as well.
+        use std::os::unix::fs::OpenOptionsExt;
+        if !matches!(
+            std::fs::OpenOptions::new().write(true).custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW).open(dir.join("in")),
+            Err(e) if e.raw_os_error() == Some(nix::libc::ENXIO)
+        ) || !fifo_unused(fifo.dev(), fifo.ino())
+        {
+            return false;
+        }
+        if !std::fs::symlink_metadata(dir.join("in"))
+            .is_ok_and(|m| m.file_type().is_fifo() && (m.dev(), m.ino()) == (fifo.dev(), fifo.ino()))
+        {
+            return false;
+        }
+    }
+    if !snapshot(dir, now).is_some_and(|(after, _)| before == after) {
+        return false;
+    }
+    // Never recursively delete a name that wasn't in the verified snapshot.
+    for (path, expected) in before.iter().filter(|(path, _)| path != dir) {
+        if !std::fs::symlink_metadata(path).is_ok_and(|m| stamp(&m) == *expected) || std::fs::remove_file(path).is_err() {
+            return false;
+        }
+    }
+    std::fs::remove_dir(dir).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn held_fifo_has_no_users(dev: u64, ino: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(procs) = std::fs::read_dir("/proc") else { return false };
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let uid = unsafe { nix::libc::geteuid() };
+    for proc in procs {
+        let Ok(proc) = proc else { return false };
+        if !proc.file_name().to_str().is_some_and(|name| name.parse::<u32>().is_ok()) {
+            continue;
+        }
+        let path = proc.path();
+        let stat = match std::fs::metadata(&path) {
+            Ok(stat) => stat,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return false,
+        };
+        if uid != 0 && stat.uid() != uid {
+            continue;
+        }
+        let fds = match std::fs::read_dir(path.join("fd")) {
+            Ok(fds) => fds,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return false,
+        };
+        for fd in fds {
+            let Ok(fd) = fd else { return false };
+            match std::fs::metadata(fd.path()) {
+                Ok(stat) if (stat.dev(), stat.ino()) == (dev, ino) => return false,
+                Ok(_) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(_) => return false,
+            }
+        }
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn held_fifo_has_no_users(dev: u64, ino: u64) -> bool {
+    use nix::libc;
+
+    const PROC_ALL_PIDS: u32 = 1;
+    const PROC_UID_ONLY: u32 = 4;
+    const PROC_PIDFDVNODEPATHINFO: i32 = 2;
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let mut pids = vec![0_i32; 16_384];
+    // SAFETY: the pointer and byte count describe writable storage; errno
+    // is thread-local. Refuse full buffers and unexpected kernel replies.
+    let (bytes, errno) = unsafe {
+        *libc::__error() = 0;
+        let bytes = libc::proc_listpids(
+            if uid == 0 { PROC_ALL_PIDS } else { PROC_UID_ONLY },
+            uid,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(pids.as_slice()) as i32,
+        );
+        (bytes, *libc::__error())
+    };
+    if errno != 0 || bytes <= 0 || bytes as usize >= std::mem::size_of_val(pids.as_slice()) || bytes % 4 != 0 {
+        return false;
+    }
+    // libproc may return only the number of entries that fit. Use the same
+    // conservative full-buffer check for every process descriptor table.
+    // SAFETY: proc_fdinfo contains only two integer fields.
+    let mut fds = vec![unsafe { std::mem::zeroed::<libc::proc_fdinfo>() }; 16_384];
+    let capacity = std::mem::size_of_val(fds.as_slice()) as i32;
+    for &pid in &pids[..bytes as usize / 4] {
+        if pid <= 0 {
+            return false;
+        }
+        let (bytes, errno) = unsafe {
+            *libc::__error() = 0;
+            let bytes = libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), capacity);
+            (bytes, *libc::__error())
+        };
+        if bytes == 0 && errno == libc::ESRCH {
+            continue;
+        }
+        if errno != 0 || bytes < 0 || bytes >= capacity || bytes % libc::PROC_PIDLISTFD_SIZE != 0 {
+            return false;
+        }
+        for fd in &fds[..(bytes / libc::PROC_PIDLISTFD_SIZE) as usize] {
+            if fd.proc_fdtype != libc::PROX_FDTYPE_VNODE as u32 {
+                continue;
+            }
+            // SAFETY: same integer-only ABI record used for keeper ownership.
+            let mut info: DarwinVnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+            let (bytes, errno) = unsafe {
+                *libc::__error() = 0;
+                let bytes = libc::proc_pidfdinfo(
+                    pid,
+                    fd.proc_fd,
+                    PROC_PIDFDVNODEPATHINFO,
+                    std::ptr::from_mut(&mut info).cast(),
+                    DARWIN_VNODE_FDINFO_SIZE as i32,
+                );
+                (bytes, *libc::__error())
+            };
+            if bytes == 0 && matches!(errno, libc::ESRCH | libc::EBADF) {
+                continue;
+            }
+            if bytes != DARWIN_VNODE_FDINFO_SIZE as i32 || errno != 0 {
+                return false;
+            }
+            let stat = &info.pvip.vip_vi.vi_stat;
+            // Darwin dev_t is signed while libproc exposes its u32 bits.
+            if stat.vst_dev == dev as u32 && stat.vst_ino == ino {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn held_fifo_has_no_users(_dev: u64, _ino: u64) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod held_stub_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::time::SystemTime;
+
+    #[tokio::test]
+    async fn failed_launch_preparation_removes_its_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let held = temp.path().join("held");
+        let result = Process::spawn_held(
+            &held,
+            "session",
+            Path::new("/bin/cat"),
+            Launch { conversation: "never-started".into(), ..Default::default() },
+            false,
+            &temp.path().join("missing-cwd"),
+            "default",
+            Arc::default(),
+            None,
+            None,
+        );
+        assert!(result.is_err());
+        assert!(!held.join("never-started").exists(), "failure before spawning must roll back the reservation");
+    }
+
+    #[test]
+    fn only_pre_fifo_zero_pid_reservations_are_reclaimable() {
+        let held = tempfile::tempdir().unwrap();
+        let dir = held.path().join("unstarted");
+        std::fs::create_dir(&dir).unwrap();
+        let meta = HeldMeta {
+            session: "s".into(),
+            conversation: "unstarted".into(),
+            pgid: 0,
+            keeper: 0,
+            output_root: None,
+            token: None,
+            launch: Launch { conversation: "unstarted".into(), ..Default::default() },
+        };
+        let bytes = serde_json::to_vec(&meta).unwrap();
+        std::fs::write(dir.join("meta.json"), &bytes).unwrap();
+        let now = SystemTime::now();
+        assert!(!prune_held_stub(&dir, now), "a young reservation may still be publishing");
+        assert!(prune_held_stub(&dir, now + HELD_STUB_GRACE), "no FIFO means no process could have started");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), bytes).unwrap();
+        nix::unistd::mkfifo(&dir.join("in"), nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        assert!(
+            !prune_held_stub(&dir, SystemTime::now() + HELD_STUB_GRACE),
+            "a FIFO with zero PGID may be in the post-spawn publication window"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_validates_exact_reservation_before_removing_an_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let held = temp.path().join("held");
+        let alias = held.join("old-storage-name");
+        std::fs::create_dir_all(&alias).unwrap();
+        let launch = Launch { conversation: "selected".into(), ..Default::default() };
+        let meta = HeldMeta {
+            session: "s".into(),
+            conversation: "selected".into(),
+            pgid: i32::MAX,
+            keeper: 0,
+            output_root: None,
+            token: None,
+            launch: launch.clone(),
+        };
+        std::fs::write(alias.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let exact = held.join("selected");
+        std::fs::create_dir(&exact).unwrap();
+        std::fs::write(exact.join("meta.json"), "invalid").unwrap();
+        assert!(
+            Process::spawn_held(&held, "s", Path::new("/bin/cat"), launch, false, temp.path(), "default", Arc::default(), None, None)
+                .is_err()
+        );
+        assert!(alias.join("meta.json").exists(), "invalid exact metadata must not partially delete the prior alias");
+        assert!(exact.exists());
+    }
+
+    fn stub(parent: &Path, name: &str) -> PathBuf {
+        let dir = parent.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("out"), []).unwrap();
+        std::fs::write(dir.join("err"), []).unwrap();
+        nix::unistd::mkfifo(&dir.join("in"), nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        dir
+    }
+
+    #[test]
+    fn preserves_young_stub_and_prunes_old_unowned_stub() {
+        let held = tempfile::tempdir().unwrap();
+        for malformed in [false, true] {
+            let dir = stub(held.path(), if malformed { "malformed" } else { "missing" });
+            if malformed {
+                std::fs::write(dir.join("meta.json"), b"not metadata").unwrap();
+            }
+            let now = SystemTime::now();
+            assert!(!prune_held_stub_with(&dir, now, |_, _| panic!("young stubs must not be inspected")));
+            assert!(dir.exists());
+            let fifo = std::fs::metadata(dir.join("in")).unwrap();
+            assert!(prune_held_stub_with(&dir, now + HELD_STUB_GRACE, |dev, ino| (dev, ino) == (fifo.dev(), fifo.ino())));
+            assert!(!dir.exists());
+        }
+    }
+
+    #[test]
+    fn preserves_old_stub_with_open_fifo_or_uncertain_ownership() {
+        let held = tempfile::tempdir().unwrap();
+        let dir = stub(held.path(), "live");
+        let now = SystemTime::now() + HELD_STUB_GRACE;
+        let read = std::fs::OpenOptions::new().read(true).custom_flags(nix::libc::O_NONBLOCK).open(dir.join("in")).unwrap();
+        let write = std::fs::OpenOptions::new().write(true).custom_flags(nix::libc::O_NONBLOCK).open(dir.join("in")).unwrap();
+        assert!(!prune_held_stub_with(&dir, now, |_, _| panic!("the kernel already found a reader")));
+        drop(read);
+        assert!(!prune_held_stub(&dir, now), "a writer-only open is live");
+        drop(write);
+        assert!(!prune_held_stub_with(&dir, now, |_, _| false), "inconclusive scans must preserve the FIFO");
+        assert!(dir.join("in").exists());
+    }
+
+    #[test]
+    fn stop_scan_ignores_missing_malformed_or_unreadable_metadata_without_removing_entries() {
+        let held = tempfile::tempdir().unwrap();
+        let missing = stub(held.path(), "missing");
+        let malformed = stub(held.path(), "malformed");
+        std::fs::write(malformed.join("meta.json"), b"not metadata").unwrap();
+        let unreadable = stub(held.path(), "unreadable");
+        std::fs::create_dir(unreadable.join("meta.json")).unwrap();
+        confirm_held_stopped(held.path(), "another-session").unwrap();
+        assert!(!prune_held_stub_with(&unreadable, SystemTime::now() + HELD_STUB_GRACE, |_, _| true));
+        assert!(missing.exists() && malformed.exists() && unreadable.join("meta.json").is_dir());
+    }
+
+    #[test]
+    fn scans_ignore_fifo_metadata_without_blocking() {
+        let held = tempfile::tempdir().unwrap();
+        let metadata = stub(held.path(), "invalid").join("meta.json");
+        nix::unistd::mkfifo(&metadata, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        let root = held.path().to_owned();
+        let (done, result) = std::sync::mpsc::channel();
+        let scan = std::thread::spawn(move || {
+            assert!(Process::held_record(&root, "unrelated").unwrap().is_none());
+            assert!(Process::held_sessions(&root).is_empty());
+            assert!(held_liveness(&root).is_empty());
+            confirm_held_stopped(&root, "unrelated").unwrap();
+            assert!(matches!(read_held_metadata(&metadata), Err(e) if e.kind() == std::io::ErrorKind::InvalidData));
+            done.send(()).unwrap();
+        });
+        result.recv_timeout(c6_testkit::wait::deadline()).expect("held scans must not block on FIFO metadata");
+        scan.join().unwrap();
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn darwin_vnode_fifo(returned: i32, dev: u32, ino: u64, mode: u16, path: &[u8], fifo: &Path) -> bool {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -1191,9 +1600,8 @@ fn darwin_vnode_fifo(returned: i32, dev: u32, ino: u64, mode: u16, path: &[u8], 
 #[cfg(test)]
 pub(crate) fn held_record_owned(held: &Path, conversation: &str) -> bool {
     let Ok(Some((dir, _))) = Process::held_record(held, conversation) else { return false };
-    std::fs::read(dir.join("meta.json"))
+    read_held_metadata(&dir.join("meta.json"))
         .ok()
-        .and_then(|data| serde_json::from_slice::<HeldMeta>(&data).ok())
         .is_some_and(|meta| keeper_holds_fifo(Pid::from_raw(meta.keeper), Pid::from_raw(meta.pgid), &dir) && held_group_owned(&meta, &dir))
 }
 
@@ -1212,8 +1620,7 @@ pub(crate) fn held_liveness(held: &Path) -> HashMap<String, c6_proto::HeldProces
     let Ok(entries) = std::fs::read_dir(held) else { return states };
     for entry in entries.flatten() {
         let dir = entry.path();
-        let Ok(data) = std::fs::read(dir.join("meta.json")) else { continue };
-        let Ok(meta) = serde_json::from_slice::<HeldMeta>(&data) else { continue };
+        let Ok(meta) = read_held_metadata(&dir.join("meta.json")) else { continue };
         if meta.session.is_empty() || !matches!(dir.join("retiring").try_exists(), Ok(false)) {
             continue;
         }
@@ -1792,7 +2199,8 @@ pub(crate) async fn replacement_admission<'a>(
 /// A descendant's completed turn is not proof that its held CLI stopped.
 /// Inspect all runtimes owned by the session, not just its selected branch.
 /// Do not attach, signal, or remove records here: require proven group absence.
-/// Unreadable/unknown metadata fails closed, as it does for rewind cleanup.
+/// Entries without readable, valid metadata cannot identify a runtime;
+/// known runtimes must still prove group absence.
 pub(crate) fn confirm_held_stopped(held: &Path, session: &str) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(held) {
         Ok(entries) => entries,
@@ -1804,18 +2212,11 @@ pub(crate) fn confirm_held_stopped(held: &Path, session: &str) -> anyhow::Result
         if !dir.is_dir() {
             continue;
         }
-        let data = std::fs::read(dir.join("meta.json")).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                anyhow::Error::new(error).context(StopUnconfirmed("Held Claude Code session identity is unknown (missing metadata)".into()))
-            } else {
-                error.into()
-            }
-        })?;
-        let meta: HeldMeta = serde_json::from_slice(&data)?;
-        anyhow::ensure!(!meta.session.is_empty(), StopUnconfirmed("Held Claude Code session identity is unknown".into()));
+        let Some(meta) = held_metadata_for_scan(&dir) else { continue };
         if meta.session != session {
             continue;
         }
+        anyhow::ensure!(!meta.session.is_empty(), StopUnconfirmed("Held Claude Code session identity is unknown".into()));
         anyhow::ensure!(meta.pgid > 0, StopUnconfirmed("Held Claude Code process group is unknown".into()));
         anyhow::ensure!(
             group_probe(Pid::from_raw(meta.pgid)) == Err(nix::errno::Errno::ESRCH),
@@ -1869,7 +2270,7 @@ async fn stop_session_held(
         if !dir.is_dir() {
             continue;
         }
-        let meta: HeldMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
+        let Some(meta) = held_metadata_for_scan(&dir) else { continue };
         if meta.session != session {
             continue;
         }
@@ -2232,11 +2633,21 @@ impl Process {
         if dir.try_exists()? && !prior.contains(&dir) {
             prior.push(dir.clone());
         }
+        let mut checked = Vec::new();
         for path in prior {
-            let meta: HeldMeta = serde_json::from_slice(&std::fs::read(path.join("meta.json"))?).map_err(std::io::Error::other)?;
+            let meta = read_held_metadata(&path.join("meta.json"))?;
+            if meta.session != session || meta.conversation != meta.launch.conversation {
+                return Err(std::io::Error::other(
+                    "Held Claude Code reservation belongs to a different session or has inconsistent identity",
+                ));
+            }
             if meta.pgid <= 0 || !matches!(group_probe(Pid::from_raw(meta.pgid)), Err(nix::errno::Errno::ESRCH)) {
                 return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "Held Claude Code group has not confirmed absence"));
             }
+            checked.push((path, meta));
+        }
+        // Validate every alias and exact-path reservation before deleting any.
+        for (path, meta) in checked {
             std::fs::remove_dir_all(&path)?;
             if let Some(root) = meta.output_root {
                 let _ = std::fs::remove_dir_all(root);
@@ -2246,6 +2657,35 @@ impl Process {
         // Reserve exclusively: another publisher after the absence check
         // cannot have its record or FIFO silently replaced.
         std::fs::create_dir(&dir)?;
+        struct Unstarted<'a>(Option<&'a Path>);
+        impl Drop for Unstarted<'_> {
+            fn drop(&mut self) {
+                if let Some(dir) = self.0 {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        }
+        let mut unstarted = Unstarted(Some(&dir));
+        // Publish identity before creating any FIFO or starting a process.
+        // A crash during preparation leaves a recognizable reservation, not
+        // an anonymous runtime that poisons every other session's lookup.
+        // Zero PGIDs deliberately keep this conversation fail-closed until
+        // the actual process identity has been published below.
+        let mut meta = HeldMeta {
+            session: session.to_owned(),
+            conversation: launch.conversation.clone(),
+            pgid: 0,
+            keeper: 0,
+            output_root: output_root.map(|r| r.0.clone()),
+            token: mcp.map(|m| m.token().to_owned()),
+            launch: launch.clone(),
+        };
+        let publish = |meta: &HeldMeta| -> std::io::Result<()> {
+            let tmp = dir.join("meta.next");
+            std::fs::write(&tmp, serde_json::to_vec(meta).map_err(std::io::Error::other)?)?;
+            std::fs::rename(tmp, dir.join("meta.json"))
+        };
+        publish(&meta)?;
         let fifo = dir.join("in");
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).map_err(std::io::Error::from)?;
         // The worker's end reads too, so opening it never waits; with it
@@ -2278,7 +2718,13 @@ impl Process {
         #[cfg(target_os = "macos")]
         let mut keeper_command = darwin_keeper_command(&fifo)?;
         let child = wrapped.spawn()?;
+        // From here on, even a failed keeper spawn must retain the record:
+        // a wrapper may be live and only ownership-aware cleanup may retire it.
+        unstarted.0 = None;
+        drop(unstarted);
         let pgid = child.id().map(|id| Pid::from_raw(id as i32));
+        meta.pgid = pgid.map_or(0, |p| p.as_raw());
+        publish(&meta)?;
         // Holds the pipe open while no worker does, so the process never
         // reads an end of its input by a restart; in its process group, so
         // stopping it stops the keeper too.
@@ -2311,16 +2757,8 @@ impl Process {
         });
         let keeper = keeper_pid;
         *stdin.try_lock().map_err(|_| std::io::Error::other("the session's Claude Code input is busy"))? = Some(ClaudeInput::Fifo(writer));
-        let meta = HeldMeta {
-            session: session.to_owned(),
-            conversation: launch.conversation.clone(),
-            pgid: pgid.map_or(0, |p| p.as_raw()),
-            keeper: keeper.as_raw(),
-            output_root: output_root.map(|r| r.0.clone()),
-            token: mcp.map(|m| m.token().to_owned()),
-            launch: launch.clone(),
-        };
-        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap_or_default())?;
+        meta.keeper = keeper.as_raw();
+        publish(&meta)?;
         std::fs::write(dir.join("offset"), "0")?;
         Ok((child, Held { dir, keeper, offset: Arc::new(std::sync::atomic::AtomicU64::new(0)), done: false, stop_on_drop: false }, pgid))
     }
@@ -2340,7 +2778,13 @@ impl Process {
             if !dir.is_dir() {
                 continue;
             }
-            let meta: HeldMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?).map_err(std::io::Error::other)?;
+            let Some(meta) = held_metadata_for_scan(&dir) else {
+                prune_held_stub(&dir, std::time::SystemTime::now());
+                continue;
+            };
+            if meta.pgid == 0 && prune_held_stub(&dir, std::time::SystemTime::now()) {
+                continue;
+            }
             if meta.conversation == conversation && meta.launch.conversation == conversation {
                 if found.is_some() {
                     return Err(std::io::Error::other("Multiple held runtimes claim the same Claude Code conversation"));
@@ -2354,9 +2798,23 @@ impl Process {
     /// The sessions previous workers left held processes for.
     pub(crate) fn held_sessions(held: &Path) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(held) else { return Vec::new() };
+        let now = std::time::SystemTime::now();
         entries
             .flatten()
-            .filter_map(|e| serde_json::from_slice::<HeldMeta>(&std::fs::read(e.path().join("meta.json")).ok()?).ok())
+            .filter_map(|entry| {
+                let dir = entry.path();
+                if !dir.is_dir() {
+                    return None;
+                }
+                let meta = held_metadata_for_scan(&dir);
+                if meta.as_ref().is_some_and(|m| m.pgid == 0) && prune_held_stub(&dir, now) {
+                    return None;
+                }
+                if meta.is_none() {
+                    prune_held_stub(&dir, now);
+                }
+                meta
+            })
             .map(|m| m.session)
             .collect()
     }
@@ -2375,7 +2833,7 @@ impl Process {
         observer: Option<Arc<Observer>>,
     ) -> Option<Self> {
         let (dir, _) = Self::held_record(held, conversation).ok()??;
-        let meta: HeldMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()?;
+        let meta = read_held_metadata(&dir.join("meta.json")).ok()?;
         if meta.conversation != conversation || meta.launch.conversation != conversation {
             return None;
         }
@@ -2495,7 +2953,7 @@ impl Process {
                 // this line, but must never skip the only proof of its branch.
                 let update = || -> std::io::Result<()> {
                     let path = h.dir.join("meta.json");
-                    let mut meta: HeldMeta = serde_json::from_slice(&std::fs::read(&path)?).map_err(std::io::Error::other)?;
+                    let mut meta = read_held_metadata(&path)?;
                     if meta.conversation != id || meta.launch.conversation != id {
                         meta.conversation = id.into();
                         meta.launch.conversation = id.into();
