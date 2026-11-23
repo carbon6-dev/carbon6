@@ -212,6 +212,16 @@ impl Registry {
         tx.is_some_and(|tx| tx.try_send(Ok(HeadMsg { msg: Some(head_msg::Msg::Command(cmd)) })).is_ok())
     }
 
+    /// Settings updates must not be dropped merely because the stream's
+    /// bounded queue is busy. Disconnection is retried on the next attach.
+    pub async fn send_settings(&self, worker_id: WorkerId, cmd: SessionCommand) -> bool {
+        let tx = self.conns.lock().unwrap().get(&worker_id).map(|c| c.tx.clone());
+        match tx {
+            Some(tx) => tx.send(Ok(HeadMsg { msg: Some(head_msg::Msg::Command(cmd)) })).await.is_ok(),
+            None => false,
+        }
+    }
+
     pub fn heartbeat(&self, worker_id: WorkerId, conn_id: u64, now: i64, rtt_us: Option<u32>) {
         let mut conns = self.conns.lock().unwrap();
         if let Some(c) = conns.get_mut(&worker_id).filter(|c| c.conn_id == conn_id) {
@@ -287,6 +297,23 @@ mod tests {
         assert_eq!(reg.get(id).unwrap().conn_id, second.conn_id);
         drop(second);
         assert!(reg.get(id).is_none());
+    }
+
+    #[tokio::test]
+    async fn settings_wait_for_space_instead_of_dropping_the_update() {
+        let reg = Registry::new(CancellationToken::new());
+        let id = WorkerId::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        let _connection = reg.attach(id, 1, tx, vec!["notice_settings_v1".into()], "worker").await;
+        assert!(reg.send_command(id, SessionCommand { command_id: "first".into(), ..Default::default() }));
+        let update = reg.send_settings(id, SessionCommand { command_id: "update".into(), ..Default::default() });
+        tokio::pin!(update);
+        assert!(futures::poll!(update.as_mut()).is_pending(), "the bounded stream is full");
+        let first = rx.recv().await.unwrap().unwrap();
+        assert!(matches!(first.msg, Some(head_msg::Msg::Command(command)) if command.command_id == "first"));
+        assert!(update.await);
+        let second = rx.recv().await.unwrap().unwrap();
+        assert!(matches!(second.msg, Some(head_msg::Msg::Command(command)) if command.command_id == "update"));
     }
 
     #[tokio::test]

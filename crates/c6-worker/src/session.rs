@@ -1373,6 +1373,11 @@ impl SessionManager {
                 // delivery failure from the head and the parent's queue.
                 ack.await.unwrap_or_else(|_| Err("parent stopped before recording the report".into()))
             }
+            Some(session_command::Kind::UpdateNoticeLimits(limits)) => {
+                let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
+                actor.send(ActorMsg::NoticeLimits(limits)).map_err(|_| "session stopped before refreshing settings")?;
+                Ok(())
+            }
             Some(session_command::Kind::ReleaseNotices(release)) => {
                 // Loading it delivers what it can; then the rest, now.
                 let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
@@ -2135,7 +2140,9 @@ impl SessionManager {
 fn conversation_from_log(spec: &mut CreateSession, events: &[SessionEvent]) -> Conversation {
     // Continue snapshots are durable, so raising a limit also survives reload.
     if let Some(limits) = events.iter().rev().find_map(|e| match &e.kind {
-        Some(session_event::Kind::Notice(n)) if n.quiet && n.title == crate::notice_guard::CONTINUED_TITLE => {
+        Some(session_event::Kind::Notice(n))
+            if n.quiet && (n.title == crate::notice_guard::CONTINUED_TITLE || n.title == "Notice settings refreshed") =>
+        {
             serde_json::from_str::<c6_api::SubagentLimits>(&n.message).ok()
         }
         _ => None,
@@ -3921,8 +3928,27 @@ impl Actor {
                         self.spec.notice_no_progress_limit = limits.notice_no_progress_limit;
                         self.spec.notice_failure_relaunch_limit = limits.notice_failure_relaunch_limit;
                         self.spec.notice_tokens_per_hour = limits.notice_tokens_per_hour;
-                        // Persist the refresh even if no guard was active.
-                        self.notice_pause = Some(String::new());
+                        // A settings edit is not Continue: retain all evidence
+                        // and usage, and reevaluate the held batch immediately.
+                        let refresh = async {
+                            self.writer.append(session_event::Kind::Notice(c6_proto::Notice {
+                                title: "Notice settings refreshed".into(),
+                                message: serde_json::json!({
+                                    "notice_quiet_seconds": limits.notice_quiet_seconds,
+                                    "notice_max_wait_seconds": limits.notice_max_wait_seconds,
+                                    "notice_no_progress_limit": limits.notice_no_progress_limit,
+                                    "notice_failure_relaunch_limit": limits.notice_failure_relaunch_limit,
+                                    "notice_tokens_per_hour": limits.notice_tokens_per_hour,
+                                }).to_string(),
+                                priority: "low".into(),
+                                quiet: true,
+                            })).await?;
+                            self.schedule_notices().await
+                        }.await;
+                        if let Err(e) = refresh {
+                            error!(session = %self.writer.session_id, "refreshing notice settings: {e:#}");
+                            return;
+                        }
                     }
                     Some(ActorMsg::ReleaseNotices) => {
                         if let Err(e) = self.continue_notices().await {

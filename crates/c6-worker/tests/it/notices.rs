@@ -159,6 +159,15 @@ fn shell_tasks(files: &[&str]) -> Reply {
 
 #[tokio::test]
 async fn a_spending_pause_survives_restart_and_delivers_held_notices_once() {
+    spending_pause(false).await;
+}
+
+#[tokio::test]
+async fn raising_a_limit_releases_a_running_sessions_hold_without_restart() {
+    spending_pause(true).await;
+}
+
+async fn spending_pause(refresh_only: bool) {
     const BUDGET: u64 = 30_000;
     const STEPS: usize = 32;
     const HELD: [&str; 2] = ["task:bg2:finished", "task:bg3:finished"];
@@ -204,14 +213,34 @@ async fn a_spending_pause_survives_restart_and_delivers_held_notices_once() {
     // Raise the limit to the actual prior spending, not a guessed prompt size.
     // Without Continue's acknowledgement, that amount alone exhausts the new
     // budget; with it, the short continuation and next wake have ample room.
+    if refresh_only {
+        env.mock.push(Reply::Text("The raised limit let me continue without a restart.".into()));
+    }
     env.http
         .put(format!("{}/settings/subagent-limits", env.api))
-        .json(&json!({"notice_quiet_seconds": 1, "notice_tokens_per_hour": unattended_spent}))
+        .json(&json!({"notice_quiet_seconds": 1, "notice_tokens_per_hour": if refresh_only { unattended_spent * 100 } else { unattended_spent }}))
         .send()
         .await
         .unwrap()
         .error_for_status()
         .unwrap();
+
+    if refresh_only {
+        let after = env.idle(&id, 3).await;
+        for cid in HELD {
+            assert_eq!(taken(&after, cid), 1, "the settings edit releases the held report automatically");
+        }
+        assert_eq!(env.mock.requests().len(), calls_before_continue + 1);
+        assert!(
+            !after[held.len()..].iter().any(|e| matches!(&e.kind,
+                EventKind::Notice { title, .. } if title == "Notice wakes continued"
+            )),
+            "a settings edit must not acknowledge or reset usage"
+        );
+        stop.cancel();
+        env.head.shutdown().await.unwrap();
+        return;
+    }
 
     stop.cancel();
     drop(worker);

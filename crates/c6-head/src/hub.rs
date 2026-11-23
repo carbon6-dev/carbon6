@@ -197,6 +197,12 @@ impl WorkerHub for HubSvc {
                 st.memex_feed.wake();
             }
             info!(worker = %worker_id, name = %row.name, version = %hello.version, "worker attached");
+            let settings = st.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::sessions::refresh_notice_limits(&settings, Some(worker_id)).await {
+                    tracing::warn!(worker = %worker_id, "refreshing session settings after reconnect: {e:#}");
+                }
+            });
             let reason = serve_worker(&st, &guard, &mut inbound, &tx, &hello.capabilities).await;
             st.store.touch_worker(worker_id, now_ms()).await.ok();
             info!(worker = %worker_id, %reason, "worker detached");

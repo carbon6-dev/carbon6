@@ -1946,6 +1946,39 @@ pub async fn subagent_limits(st: &HeadState, realm: Option<&str>) -> anyhow::Res
     Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default())
 }
 
+/// Refresh every live session, including descendants. Resolve each realm's
+/// effective setting separately so a root edit cannot overwrite an override.
+pub async fn refresh_notice_limits(st: &HeadState, worker: Option<WorkerId>) -> anyhow::Result<()> {
+    let sessions: Vec<SessionRow> = sqlx::query_as("SELECT * FROM sessions WHERE archived = 0").fetch_all(&st.store.pool).await?;
+    for session in sessions {
+        let worker_id: WorkerId = session.worker_id.parse()?;
+        if worker.is_some_and(|id| id != worker_id)
+            || !st.registry.get(worker_id).is_some_and(|live| live.capabilities.iter().any(|c| c == "notice_settings_v1"))
+        {
+            continue;
+        }
+        let limits = subagent_limits(st, Some(&session.realm)).await?;
+        let command = SessionCommand {
+            command_id: Uuid::now_v7().to_string(),
+            session_id: session.id.clone(),
+            ownership_epoch: session.ownership_epoch as u64,
+            kind: Some(session_command::Kind::UpdateNoticeLimits(c6_proto::NoticeLimits {
+                notice_quiet_seconds: limits.notice_quiet_seconds,
+                notice_max_wait_seconds: limits.notice_max_wait_seconds,
+                notice_no_progress_limit: limits.notice_no_progress_limit,
+                notice_failure_relaunch_limit: limits.notice_failure_relaunch_limit,
+                notice_tokens_per_hour: limits.notice_tokens_per_hour,
+            })),
+        };
+        // Offline sessions receive the latest settings when restored. Do not
+        // fail a durable Settings edit merely because one worker disconnected.
+        if st.store.session_routable(&session.id, worker_id, session.ownership_epoch).await? {
+            st.registry.send_settings(worker_id, command).await;
+        }
+    }
+    Ok(())
+}
+
 /// Continues a subagent whose last turn did not finish, with the realm's
 /// resume prompt.
 pub async fn resume(

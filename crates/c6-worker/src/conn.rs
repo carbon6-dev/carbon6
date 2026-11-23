@@ -137,6 +137,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
     let kits = offers_kits && c6_tools::kits::runtime().await.is_some();
     let mut capabilities = crate::capabilities(worker, crate::claude_code::find_claude().is_some(), kits);
     capabilities.push(c6_proto::SESSION_MOVE_CAPABILITY.into());
+    capabilities.push("notice_settings_v1".into());
     let hello = Hello {
         protocol_version: c6_core::PROTOCOL_VERSION,
         version: c6_core::build().into(),

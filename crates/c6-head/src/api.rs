@@ -1990,6 +1990,7 @@ async fn put_subagent_limits(State(st): State<Arc<HeadState>>, Json(l): Json<api
         return Err(ApiErr(StatusCode::BAD_REQUEST, "a session sends 1 to 1000 messages an hour".into()));
     }
     st.store.set_setting(crate::sessions::SUBAGENT_LIMITS, &serde_json::to_string(&l).map_err(anyhow::Error::from)?).await?;
+    crate::sessions::refresh_notice_limits(&st, None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
