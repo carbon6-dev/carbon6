@@ -6,7 +6,7 @@ use c6_api::work::{Followup, SessionTodoAdded, TodoStart, WorkItem};
 use c6_api::{Connection, Decision, Event, EventKind, Session};
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply, eventually};
-use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+use c6_worker::{ConnState, conn, enroll};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -70,7 +70,7 @@ impl Env {
         };
         let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
         enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
-        let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+        let worker = crate::open_worker(state.path()).await;
         let (tx, mut rx) = watch::channel(ConnState::Connecting);
         let stop = CancellationToken::new();
         tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
