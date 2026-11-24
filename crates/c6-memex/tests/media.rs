@@ -240,10 +240,11 @@ async fn photos_and_videos() {
     assert_eq!(thumb.headers()["content-type"], "image/jpeg");
     assert_eq!(&thumb.bytes().await.unwrap()[..2], &[0xFF, 0xD8]);
 
-    // A trip: the Paris days, far from home.
+    // A trip: the Paris days, far from home. Grouping runs asynchronously:
+    // an earlier snapshot may already name the trip before its last member.
     let facets = eventually("a trip", async || {
         let f = rpc("memex.media.facets", json!({})).await;
-        f["events"].as_array()?.iter().any(|e| e["name"].as_str().unwrap_or("").starts_with("Trip: Paris, FR")).then_some(f)
+        f["events"].as_array()?.iter().any(|e| e["name"].as_str().unwrap_or("").starts_with("Trip: Paris, FR") && e["n"] == 11).then_some(f)
     })
     .await;
     let trip = facets["events"].as_array().unwrap().iter().find(|e| e["name"].as_str().unwrap().starts_with("Trip")).unwrap();
