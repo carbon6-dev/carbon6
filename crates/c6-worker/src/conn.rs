@@ -163,6 +163,8 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
     match tokio::time::timeout(READ_TIMEOUT, inbound.message()).await {
         Ok(Ok(Some(HeadMsg { msg: Some(head_msg::Msg::Welcome(w)) }))) => {
             info!(worker = %w.worker_id, name = %w.worker_name, head = %w.head_version, "attached to head");
+            worker.machine_sample_secs.store(w.machine_sample_secs.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+            worker.sessions.launch_pressure.configure_disk(w.machine_disk_hold_percent);
             for ack in &w.acks {
                 if let Err(e) = worker.journal.set_acked_owned(&ack.session_id, ack.seq, ack.ownership_epoch).await {
                     return Ended::Retry(e.context("recording acks"));
@@ -183,6 +185,8 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
     let _stop_uploads = uploads.clone().drop_guard();
     // A separate task so a slow uplink never stops us reading acks and commands.
     tokio::spawn(upload(worker.journal.clone(), tx.clone(), uploads.clone()));
+    tokio::spawn(crate::machines::run(worker.clone(), tx.clone(), uploads.clone()));
+    let requests = dispatch_rpcs(worker.clone(), tx.clone(), uploads.clone());
     // Commands are applied in order by their own task, so the read loop
     // keeps going while one waits on the head (e.g. for a credential, whose
     // reply arrives on this very stream).
@@ -309,16 +313,9 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                         head_msg::Msg::Credential(grant) => worker.link.on_grant(grant),
                         head_msg::Msg::HeadCallReply(reply) => worker.link.on_call_reply(reply),
                         head_msg::Msg::RpcRequest(req) => {
-                            // Off the read loop: requests may take a while (git, big files).
-                            let (w, tx) = (worker.clone(), tx.clone());
-                            tokio::spawn(async move {
-                                let params = serde_json::from_slice(&req.params_json).unwrap_or(serde_json::Value::Null);
-                                let resp = match crate::rpc::handle(&w, &req.method, params).await {
-                                    Ok(v) => RpcResponse { id: req.id, result_json: serde_json::to_vec(&v).unwrap_or_default(), error: String::new() },
-                                    Err(e) => RpcResponse { id: req.id, result_json: Vec::new(), error: format!("{e:#}") },
-                                };
-                                let _ = tx.send(WorkerMsg { msg: Some(worker_msg::Msg::RpcResponse(resp)) }).await;
-                            });
+                            if requests.send(req).is_err() {
+                                return Ended::Retry(anyhow::anyhow!("RPC queue closed"));
+                            }
                         }
                     }
                 }
@@ -328,6 +325,43 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
             },
         }
     }
+}
+
+/// Prepare in wire order, off the ACK read loop (JSON inputs can be large).
+/// Kit registration must precede a following cancellation, even before its
+/// independently running execution future is first polled.
+fn dispatch_rpcs(worker: Arc<Worker>, tx: mpsc::Sender<WorkerMsg>, stop: CancellationToken) -> mpsc::UnboundedSender<c6_proto::RpcRequest> {
+    let (requests, mut queue) = mpsc::unbounded_channel::<c6_proto::RpcRequest>();
+    tokio::spawn(async move {
+        loop {
+            let req = tokio::select! {
+                _ = stop.cancelled() => return,
+                request = queue.recv() => match request { Some(request) => request, None => return },
+            };
+            let mut params = serde_json::from_slice(&req.params_json).unwrap_or(serde_json::Value::Null);
+            let job = (req.method == "kit.job").then(|| crate::rpc::kit_job(worker.clone(), params.take()));
+            let (worker, tx, stop) = (worker.clone(), tx.clone(), stop.clone());
+            tokio::spawn(async move {
+                let result = if let Some(job) = job {
+                    tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => return,
+                        result = job => result,
+                    }
+                } else {
+                    crate::rpc::handle(&worker, &req.method, params).await
+                };
+                let resp = match result {
+                    Ok(value) => {
+                        RpcResponse { id: req.id, result_json: serde_json::to_vec(&value).unwrap_or_default(), error: String::new() }
+                    }
+                    Err(error) => RpcResponse { id: req.id, result_json: Vec::new(), error: format!("{error:#}") },
+                };
+                let _ = tx.send(WorkerMsg { msg: Some(worker_msg::Msg::RpcResponse(resp)) }).await;
+            });
+        }
+    });
+    requests
 }
 
 async fn reject_command(

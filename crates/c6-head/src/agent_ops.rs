@@ -90,7 +90,8 @@ const SENDS: &[&str] =
 const OUTSIDE: &[&str] = &["mail.modify", "mail.cancel", "calendar.update", "calendar.delete", "contacts.create", "contacts.create_many"];
 
 /// Reads in a never-area that show nothing an agent shouldn't see.
-const READ_OK: &[&str] = &["connections.list", "connections.quotas", "connections.models", "workers.list", "commands.list"];
+const READ_OK: &[&str] =
+    &["machines.list", "machines.samples", "connections.list", "connections.quotas", "connections.models", "workers.list", "commands.list"];
 
 /// Yours alone, wherever they are.
 const NEVER: &[&str] = &[

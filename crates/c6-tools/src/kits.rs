@@ -17,6 +17,12 @@ use tokio::process::Command;
 
 use crate::{Concurrency, Tool, ToolCtx, ToolOutput};
 
+/// Worker-local admission; queued calls keep their normal cancellation token.
+#[async_trait]
+pub trait Admission: Send + Sync {
+    async fn wait(&self, ctx: &ToolCtx) -> Result<(), String>;
+}
+
 /// Output kept from a run or a failed build.
 const MAX_OUTPUT: usize = 30_000;
 /// A build that takes longer than this is stopped.
@@ -193,6 +199,12 @@ fn inside(root: &Path, given: &str) -> Result<String, String> {
 /// Runs a command in the kit's image, in the sandbox its permissions
 /// describe, with the session's folder at /work.
 async fn run(ctx: &ToolCtx, rt: &str, spec: &Value, command: Vec<String>) -> ToolOutput {
+    let admission = ctx.session.kit_admission();
+    if let Some(admission) = admission
+        && let Err(error) = admission.wait(ctx).await
+    {
+        return ToolOutput::err(error);
+    }
     if let Err(e) = ensure_images(rt, spec).await {
         return ToolOutput::err(e);
     }

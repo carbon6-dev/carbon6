@@ -15,16 +15,72 @@ use crate::Worker;
 /// base64 in one message).
 pub const MAX_JOB_OUTPUT: u64 = 44 * 1024 * 1024;
 
+pub(crate) struct KitJobState {
+    cancel: tokio_util::sync::CancellationToken,
+    status: &'static str,
+}
+
+struct KitRegistration(Arc<Worker>, String);
+
+impl Drop for KitRegistration {
+    fn drop(&mut self) {
+        self.0.kit_cancels.lock().unwrap().remove(&self.1);
+    }
+}
+
 /// A kit tool run the head asks for, with no session (docs/knowledge.md
 /// §6.2): in a folder of its own under the worker's state, with `inputs`
 /// written there first; what the run leaves in `out/` comes back.
-async fn kit_job(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Value> {
+/// Register synchronously in the ordered RPC dispatcher, before spawning the
+/// future. A following kit.cancel must not race an unpolled job registration.
+pub(crate) fn kit_job(worker: Arc<Worker>, p: Value) -> impl std::future::Future<Output = anyhow::Result<Value>> + Send + 'static {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let id = p["job_id"].as_str().map(str::to_owned).unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    let registration = {
+        let mut jobs = worker.kit_cancels.lock().unwrap();
+        match jobs.entry(id.clone()) {
+            std::collections::hash_map::Entry::Occupied(_) => Err(anyhow!("kit job already running")),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(KitJobState { cancel: cancel.clone(), status: "starting" });
+                Ok(KitRegistration(worker.clone(), id.clone()))
+            }
+        }
+    };
+    async move {
+        let _registration = registration?;
+        kit_job_registered(&worker, &p, &id, &cancel).await
+    }
+}
+
+async fn kit_job_registered(
+    worker: &Arc<Worker>,
+    p: &Value,
+    id: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<Value> {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
     anyhow::ensure!(worker.runs_kit_jobs(), "this worker doesn't run kit jobs (C6_KIT_JOBS=off)");
+    worker
+        .sessions
+        .launch_pressure
+        .wait_disk_with(cancel, || {
+            if let Some(job) = worker.kit_cancels.lock().unwrap().get_mut(id) {
+                job.status = "queued: disk nearly full";
+            }
+        })
+        .await
+        .map_err(|e| anyhow!(e))?;
+    if let Some(job) = worker.kit_cancels.lock().unwrap().get_mut(id) {
+        job.status = "running";
+    }
     let rt = c6_tools::kits::runtime().await.ok_or_else(|| anyhow!("this worker has no container runtime (Docker or Podman)"))?;
     let spec = &p["spec"];
-    c6_tools::kits::build(&rt, spec).await.map_err(|e| anyhow!(e))?;
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("kit job cancelled"),
+        result = c6_tools::kits::build(&rt, spec) => result.map_err(|e| anyhow!(e))?,
+    }
     let dir = worker.state_dir.join("kitjobs").join(uuid::Uuid::now_v7().to_string());
     tokio::fs::create_dir_all(dir.join("out")).await?;
     let result = async {
@@ -51,7 +107,7 @@ async fn kit_job(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Value> {
             tokio::fs::metadata(&from).await.with_context(|| format!("{} not found", from.display()))?;
             mounts.push((from, at.to_owned()));
         }
-        let out = c6_tools::kits::sandboxed(&rt, spec, &dir, &mounts, command, &env, None).await.map_err(|e| anyhow!(e))?;
+        let out = c6_tools::kits::sandboxed(&rt, spec, &dir, &mounts, command, &env, Some(cancel)).await.map_err(|e| anyhow!(e))?;
         let mut files = serde_json::Map::new();
         let mut total = 0u64;
         let mut stack = vec![dir.join("out")];
@@ -99,6 +155,20 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
         return crate::move_sessions::handle(worker, method, params).await;
     }
     match method {
+        "machine.disk_scan" => crate::machines::disk_scan(worker).await,
+        "kit.cancel" => {
+            let id = params["job_id"].as_str().context("job_id required")?;
+            let jobs = worker.kit_cancels.lock().unwrap();
+            if let Some(job) = jobs.get(id) {
+                job.cancel.cancel();
+            }
+            Ok(json!({"cancelled": jobs.contains_key(id)}))
+        }
+        "kit.status" => {
+            let id = params["job_id"].as_str().context("job_id required")?;
+            let jobs = worker.kit_cancels.lock().unwrap();
+            Ok(json!({"status": jobs.get(id).map(|job| job.status)}))
+        }
         "fs.list" => fs_list(serde_json::from_value(params)?).await,
         "fs.read" => fs_read(serde_json::from_value(params)?).await,
         "fs.read_file" => fs_read_file(&params).await,
@@ -138,7 +208,7 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
             let req: c6_api::starts::WorktreeEnd = serde_json::from_value(params)?;
             Ok(serde_json::to_value(crate::worktree::end(&req, &labels).await)?)
         }
-        "kit.job" => kit_job(worker, &params).await,
+        "kit.job" => kit_job(worker.clone(), params).await,
         "session.queue_op" => session_queue_op(worker, &params).await,
         "update.apply" => crate::update::apply(worker, &params).await,
         "update.now" => crate::update::now(worker),
@@ -828,4 +898,66 @@ async fn ssh_check(target: &str) -> anyhow::Result<Value> {
         Ok(Err(e)) => json!({"ok": false, "error": e.trim()}),
         Err(_) => json!({"ok": false, "error": format!("no answer from {target} in 20 seconds")}),
     })
+}
+
+#[cfg(test)]
+mod kit_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_queued_and_unpolled_jobs_never_reach_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = crate::Identity {
+            meta: crate::identity::IdentityMeta {
+                worker_id: c6_core::WorkerId::new(),
+                worker_name: "kit-test".into(),
+                head_url: "https://localhost".into(),
+                tls_domain: None,
+            },
+            key_pem: String::new(),
+            cert_pem: String::new(),
+            ca_pem: String::new(),
+        };
+        let full = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let worker = Worker::open_with_resource_sampler(dir.path(), identity, {
+            let full = full.clone();
+            move || crate::ResourceMeasurement { disk_nearly_full: full.load(std::sync::atomic::Ordering::Relaxed), ..Default::default() }
+        })
+        .await
+        .unwrap();
+        worker.overrides.lock().unwrap().kit_jobs = Some(true);
+        for poll in [false, true] {
+            full.store(true, std::sync::atomic::Ordering::Relaxed);
+            let job = kit_job(worker.clone(), json!({"job_id": "queued-job"}));
+            tokio::pin!(job);
+            let status = handle(&worker, "kit.status", json!({"job_id": "queued-job"})).await.unwrap();
+            assert_eq!(status["status"], "starting", "registered before the job future is polled");
+            if poll {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        assert!(futures::poll!(job.as_mut()).is_pending());
+                        let status = handle(&worker, "kit.status", json!({"job_id": "queued-job"})).await.unwrap();
+                        if status["status"] == "queued: disk nearly full" {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let status = handle(&worker, "kit.status", json!({"job_id": "queued-job"})).await.unwrap();
+                assert_eq!(status["status"], "queued: disk nearly full");
+            }
+            assert_eq!(handle(&worker, "kit.cancel", json!({"job_id": "queued-job"})).await.unwrap()["cancelled"], true);
+            // Space returns after abandonment: it must not resurrect the job.
+            full.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert!(job.await.unwrap_err().to_string().contains("stopped before it started"));
+            assert!(handle(&worker, "kit.status", json!({"job_id": "queued-job"})).await.unwrap()["status"].is_null());
+        }
+        let abandoned = kit_job(worker.clone(), json!({"job_id": "unpolled-job"}));
+        drop(abandoned);
+        assert!(handle(&worker, "kit.status", json!({"job_id": "unpolled-job"})).await.unwrap()["status"].is_null());
+        // No runtime probe, image build or scratch setup is reached.
+        assert!(!dir.path().join("kitjobs").exists());
+    }
 }

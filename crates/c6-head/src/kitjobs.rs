@@ -18,6 +18,58 @@ use crate::{HeadState, bad_request};
 /// own time limit.
 const BUILD_ALLOWANCE: Duration = Duration::from_secs(35 * 60);
 
+struct CancelOnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for CancelOnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            cancel();
+        }
+    }
+}
+
+/// Keep cancellation attached to the caller's future, including while the
+/// worker is waiting for disk. A response timeout alone doesn't stop an RPC.
+async fn remote_job(
+    registry: &crate::registry::Registry,
+    worker: c6_core::WorkerId,
+    params: Value,
+    limit: Duration,
+    cancel: impl FnOnce(),
+    mut queued: impl FnMut(),
+) -> Result<Value, String> {
+    let job_id = params["job_id"].clone();
+    let mut guard = CancelOnDrop(Some(cancel));
+    let work = registry.call(worker, "kit.job", params, limit);
+    tokio::pin!(work);
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(1), Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut announced = false;
+    let result = tokio::time::timeout(limit, async {
+        loop {
+            tokio::select! {
+                result = &mut work => return result,
+                _ = tick.tick(), if !announced => {
+                    let status = tokio::select! {
+                        result = &mut work => return result,
+                        status = registry.call(worker, "kit.status", json!({"job_id": job_id}), Duration::from_secs(3)) => status,
+                    };
+                    if status.is_ok_and(|status| status["status"] == "queued: disk nearly full") {
+                        queued();
+                        announced = true;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| "worker did not respond in time".to_owned())?;
+    if result.is_ok() {
+        guard.0 = None;
+    }
+    result
+}
+
 /// A tool run to do.
 #[derive(Default)]
 pub struct Job {
@@ -153,8 +205,30 @@ pub async fn run(st: &HeadState, job: Job) -> anyhow::Result<Output> {
     let inputs: serde_json::Map<String, Value> = job.inputs.iter().map(|(k, v)| (k.clone(), json!(b64.encode(v)))).collect();
     let limit = Duration::from_secs(job.spec["permissions"]["timeout_s"].as_u64().unwrap_or(120)) + BUILD_ALLOWANCE;
     let mounts: Vec<Value> = job.mounts.iter().map(|(path, at)| json!({"path": path, "at": at})).collect();
-    let params = json!({"spec": job.spec, "command": cmd, "inputs": inputs, "env": env, "mounts": mounts});
-    let v = st.registry.call(worker, "kit.job", params, limit).await.map_err(|e| anyhow::anyhow!("kit job: {e}"))?;
+    let description = format!("{kit}.{}", job.tool);
+    let job_id = uuid::Uuid::now_v7().to_string();
+    let params = json!({"job_id": job_id, "spec": job.spec, "command": cmd, "inputs": inputs, "env": env, "mounts": mounts});
+    let head = st.arc().ok_or_else(|| anyhow::anyhow!("head is shutting down"))?;
+    let cancel_id = job_id.clone();
+    let cancel = move || {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = head.registry.call(worker, "kit.cancel", json!({"job_id": cancel_id}), Duration::from_secs(5)).await;
+            });
+        }
+    };
+    let v = remote_job(&st.registry, worker, params, limit, cancel, || {
+        st.notifier.send(crate::notify::Note {
+            event: "machine",
+            title: format!("Kit {description} queued"),
+            message: format!("queued: disk nearly full. Job {job_id} waits for space on worker {worker}."),
+            priority: "low",
+            path: Some(format!("/r/{}/brief", job.realm)),
+            ..Default::default()
+        });
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("kit job: {e}"))?;
     let mut files = BTreeMap::new();
     for (k, data) in v["files"].as_object().into_iter().flatten() {
         files.insert(k.clone(), b64.decode(data.as_str().unwrap_or_default())?);
@@ -419,4 +493,138 @@ pub async fn for_instance(
         return Err(bad_request(format!("{kit}.{tool} exited {:?}: {}", out.exit, out.stderr.trim())));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    async fn request(rx: &mut mpsc::Receiver<Result<c6_proto::HeadMsg, tonic::Status>>) -> c6_proto::RpcRequest {
+        let message = rx.recv().await.unwrap().unwrap();
+        let Some(c6_proto::head_msg::Msg::RpcRequest(request)) = message.msg else { panic!("expected RPC") };
+        request
+    }
+
+    fn cancel(registry: Arc<crate::registry::Registry>, worker: c6_core::WorkerId) -> impl FnOnce() {
+        move || {
+            tokio::spawn(async move {
+                let _ = registry.call(worker, "kit.cancel", json!({"job_id": "test-job"}), Duration::from_secs(5)).await;
+            });
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_drop_while_outbound_full_does_not_send_the_job_later() {
+        let registry = Arc::new(crate::registry::Registry::new(tokio_util::sync::CancellationToken::new()));
+        let worker = c6_core::WorkerId::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Ok(c6_proto::HeadMsg::default())).await.unwrap();
+        let connection = registry.attach(worker, 1, tx, vec!["kits".into()], "worker").await;
+        let mut work = Box::pin(remote_job(
+            &registry,
+            worker,
+            json!({"job_id": "test-job"}),
+            Duration::from_secs(10),
+            cancel(registry.clone(), worker),
+            || {},
+        ));
+        assert!(futures::poll!(work.as_mut()).is_pending());
+        drop(work);
+        rx.recv().await.unwrap().unwrap();
+        let stopped = request(&mut rx).await;
+        assert_eq!(stopped.method, "kit.cancel", "the abandoned kit.job send must not survive its caller");
+        connection.rpc_response(c6_proto::RpcResponse { id: stopped.id, result_json: b"{}".to_vec(), error: String::new() });
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_drop_and_timeout_cancel_the_same_queued_job() {
+        for abandon in [true, false] {
+            let registry = Arc::new(crate::registry::Registry::new(tokio_util::sync::CancellationToken::new()));
+            let worker = c6_core::WorkerId::new();
+            let (tx, mut rx) = mpsc::channel(8);
+            let connection = registry.attach(worker, 1, tx, vec!["kits".into()], "worker").await;
+            let work = tokio::spawn({
+                let registry = registry.clone();
+                async move {
+                    remote_job(
+                        &registry,
+                        worker,
+                        json!({"job_id": "test-job"}),
+                        Duration::from_secs(10),
+                        cancel(registry.clone(), worker),
+                        || {},
+                    )
+                    .await
+                }
+            });
+            let start = request(&mut rx).await;
+            assert_eq!(start.method, "kit.job");
+            assert_eq!(serde_json::from_slice::<Value>(&start.params_json).unwrap()["job_id"], "test-job");
+            if abandon {
+                work.abort();
+                assert!(work.await.unwrap_err().is_cancelled());
+            } else {
+                // Even an unanswered status RPC cannot extend the job deadline.
+                tokio::time::advance(Duration::from_secs(1)).await;
+                assert_eq!(request(&mut rx).await.method, "kit.status");
+                tokio::time::advance(Duration::from_secs(9)).await;
+                assert!(work.await.unwrap().is_err());
+            }
+            let stopped = loop {
+                let request = request(&mut rx).await;
+                if request.method == "kit.cancel" {
+                    break request;
+                }
+                assert_eq!(request.method, "kit.status");
+            };
+            assert_eq!(stopped.method, "kit.cancel");
+            assert_eq!(serde_json::from_slice::<Value>(&stopped.params_json).unwrap()["job_id"], "test-job");
+            connection.rpc_response(c6_proto::RpcResponse { id: stopped.id, result_json: b"{}".to_vec(), error: String::new() });
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_status_is_visible_once_and_success_disarms_cancellation() {
+        let registry = Arc::new(crate::registry::Registry::new(tokio_util::sync::CancellationToken::new()));
+        let worker = c6_core::WorkerId::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let connection = registry.attach(worker, 1, tx, vec!["kits".into()], "worker").await;
+        let (notice, mut notices) = mpsc::unbounded_channel();
+        let work = tokio::spawn({
+            let registry = registry.clone();
+            async move {
+                remote_job(
+                    &registry,
+                    worker,
+                    json!({"job_id": "test-job"}),
+                    Duration::from_secs(10),
+                    cancel(registry.clone(), worker),
+                    || {
+                        notice.send("queued: disk nearly full").unwrap();
+                    },
+                )
+                .await
+            }
+        });
+        let start = request(&mut rx).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let status = request(&mut rx).await;
+        assert_eq!(status.method, "kit.status");
+        connection.rpc_response(c6_proto::RpcResponse {
+            id: status.id,
+            result_json: br#"{"status":"queued: disk nearly full"}"#.to_vec(),
+            error: String::new(),
+        });
+        assert_eq!(notices.recv().await, Some("queued: disk nearly full"));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        connection.rpc_response(c6_proto::RpcResponse { id: start.id, result_json: b"{}".to_vec(), error: String::new() });
+        assert_eq!(work.await.unwrap().unwrap(), json!({}));
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "no repeat status or cancellation after success");
+        assert!(notices.try_recv().is_err());
+    }
 }

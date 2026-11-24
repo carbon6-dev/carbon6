@@ -260,7 +260,7 @@ impl View {
                 }
                 p
             }
-            View::Workers => "/workers".into(),
+            View::Workers => "/machines".into(),
             View::Worker { id } => format!("/workers/{id}"),
             View::Settings { section, .. } if section.is_empty() => "/settings".into(),
             View::Settings { section, .. } => format!("/settings/{section}"),
@@ -355,7 +355,7 @@ impl View {
             ["sessions", id, "files"] => View::SessionFiles { id: (*id).to_owned(), path: get("path") },
             ["sessions", id, "outputs"] => View::SessionOutputs { id: (*id).to_owned(), output: get("output") },
             ["search"] => View::Search { q: get("q"), kind: get("kind"), worker: get("worker") },
-            ["workers"] => View::Workers,
+            ["machines"] | ["workers"] => View::Workers,
             ["workers", id] => View::Worker { id: (*id).to_owned() },
             ["settings", rest @ ..] => {
                 let note = if query.contains_key("signed_in") {
@@ -434,7 +434,7 @@ impl View {
                 }
             }
             View::Search { q, .. } => format!("Search: {q}"),
-            View::Workers => "Workers".into(),
+            View::Workers => "Machines".into(),
             View::Worker { id } => live
                 .workers
                 .with(|ws| ws.iter().find(|w| &w.id.to_string() == id).map(|w| w.name.clone()))
@@ -4165,6 +4165,16 @@ mod tests {
                 assert_eq!(l.focused_view(), Some(&view));
             }
         }
+    }
+
+    #[test]
+    fn machines_is_canonical_and_workers_remains_a_saved_view_and_url_alias() {
+        assert_eq!(View::from_path("/machines"), View::Workers);
+        assert_eq!(View::from_path("/workers"), View::Workers);
+        assert_eq!(View::from_path("/workers").path(), "/machines");
+        assert_eq!(serde_json::to_string(&View::Workers).unwrap(), r#"{"view":"workers"}"#);
+        assert_eq!(serde_json::from_str::<View>(r#"{"view":"workers"}"#).unwrap(), View::Workers);
+        assert_eq!(View::from_path("/workers/id"), View::Worker { id: "id".into() });
     }
 
     #[test]

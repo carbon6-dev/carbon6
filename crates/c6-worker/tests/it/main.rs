@@ -42,6 +42,7 @@ mod journal;
 mod kitjobs;
 mod labels;
 mod m4;
+mod machines;
 mod memory;
 mod messages;
 mod naming;

@@ -196,6 +196,17 @@ impl Journal {
             .collect()
     }
 
+    /// Both live shell writers and retained Claude runtimes belong to their
+    /// session even between turns. The sampler deduplicates overlapping trees.
+    pub(crate) async fn machine_process_roots(&self) -> anyhow::Result<Vec<(u32, String)>> {
+        let rows = sqlx::query_as::<_, (i64, String)>(
+            "SELECT pgid, session_id FROM shell_writers WHERE pgid > 0 AND absent = 0 UNION SELECT pgid, session_id FROM claude_processes WHERE pgid > 0",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().filter_map(|(pid, session)| u32::try_from(pid).ok().map(|pid| (pid, session))).collect())
+    }
+
     /// Only callers that observed ESRCH may retire a cleanup barrier.
     pub async fn untrack_claude_process(&self, session_id: &str, pgid: i32) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM claude_processes WHERE session_id = ? AND pgid = ?")
@@ -1276,6 +1287,21 @@ impl Journal {
 
 #[cfg(test)]
 mod ownership_tests {
+    #[tokio::test]
+    async fn machine_roots_include_shells_and_retained_claude_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = super::Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        journal.track_claude_process("held-session", 123).await.unwrap();
+        journal.track_claude_process("held-session", 123).await.unwrap();
+        // The ownership table is authoritative even between actor turns.
+        sqlx::query("INSERT INTO shell_writers (writer_id, session_id, root_session_id, task_id, pgid) VALUES ('writer', 'shell-session', 'shell-session', 'task', 456)")
+            .execute(&journal.pool).await.unwrap();
+        sqlx::query("INSERT INTO shell_writers (writer_id, session_id, root_session_id, task_id, pgid, absent) VALUES ('retired', 'old-session', 'old-session', 'old-task', 789, 1)")
+            .execute(&journal.pool).await.unwrap();
+        let mut roots = journal.machine_process_roots().await.unwrap();
+        roots.sort();
+        assert_eq!(roots, vec![(123, "held-session".into()), (456, "shell-session".into())]);
+    }
     use super::*;
 
     fn event(seq: u64) -> SessionEvent {

@@ -215,6 +215,23 @@ pub fn attention() -> LocalBoxFuture<'static, Result<c6_api::Attention, String>>
     get_json("/api/v1/attention")
 }
 
+pub fn machines() -> LocalBoxFuture<'static, Result<Vec<c6_api::machines::Machine>, String>> {
+    get_json(format!("/api/v1/machines{}", in_realm('?')))
+}
+
+pub fn machine_samples(
+    id: String,
+    from_ms: i64,
+    to_ms: i64,
+) -> LocalBoxFuture<'static, Result<Vec<c6_api::machines::MachineSample>, String>> {
+    get_json(format!("/api/v1/machines/{}/samples?from_ms={from_ms}&to_ms={to_ms}&limit=400{}", enc(&id), in_realm('&')))
+}
+
+pub async fn machine_disk_scan(id: String) -> Result<c6_api::machines::MachineDiskScan, String> {
+    let url = format!("/api/v1/machines/{}/disk_scan{}", enc(&id), in_realm('?'));
+    send_json(Request::post(&url), &serde_json::json!({})).await
+}
+
 /// You've seen these worth-a-look items (none: all of them).
 pub async fn attention_seen(keys: Vec<String>) -> Result<(), String> {
     let body = c6_api::AttentionSeen { keys };

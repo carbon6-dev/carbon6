@@ -43,6 +43,7 @@ pub mod knowledge;
 mod listener;
 pub mod lists;
 pub mod liveness;
+pub mod machines;
 pub mod marks;
 pub mod memex;
 pub mod memory;
@@ -151,6 +152,7 @@ pub(crate) fn conflict(msg: impl Into<String>) -> anyhow::Error {
 
 pub struct HeadState {
     pub store: store::Store,
+    pub machines: machines::Machines,
     pub pki: pki::Pki,
     pub registry: registry::Registry,
     pub secrets: secrets::Secrets,
@@ -341,6 +343,7 @@ async fn start_bound(
     let updater = updates::Updater::new(&cfg);
     updates::before_open(&updater, &cfg.data_dir)?;
     let store = store::Store::open(&cfg.data_dir.join("c6h.db")).await?;
+    let machines = machines::Machines::open(&cfg.data_dir.join("machines.sqlite"), cfg.machines.clone()).await?;
     // Backups left by earlier upgrades, beyond the ones to keep.
     store::prune_backups(&cfg.data_dir, store.keep_backups().await?);
     let shutdown = CancellationToken::new();
@@ -351,6 +354,7 @@ async fn start_bound(
     let messages_sent = std::sync::Mutex::new(store.recent_session_messages(c6_core::now_ms() - 3_600_000).await?);
     let state = Arc::new(HeadState {
         store,
+        machines,
         pki,
         registry,
         secrets,
@@ -431,6 +435,7 @@ async fn start_bound(
     // Series thresholds and retention.
     series::spawn_sweeper(state.clone());
     notify::spawn(state.clone());
+    machines::spawn(&state);
     usage::spawn_backfill(state.clone());
     analytics::spawn_backfill(state.clone());
     hosts::spawn_checks(state.clone());

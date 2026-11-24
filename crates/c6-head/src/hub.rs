@@ -188,6 +188,8 @@ impl WorkerHub for HubSvc {
             worker_id: worker_id.to_string(),
             worker_name: row.name.clone(),
             acks,
+            machine_sample_secs: Some(st.machines.config.sample_secs.max(1)),
+            machine_disk_hold_percent: Some(st.machines.config.disk_hold_percent),
         };
         tx.send(Ok(head(head_msg::Msg::Welcome(welcome)))).await.ok();
 
@@ -256,6 +258,15 @@ async fn serve_worker(
             }
             worker_msg::Msg::Hello(_) => warn!(worker = %worker_id, "duplicate Hello ignored"),
             worker_msg::Msg::RpcResponse(resp) => guard.rpc_response(resp),
+            worker_msg::Msg::MachineSample(sample) => {
+                // Observations never enter the durable-event lane or wait for
+                // SQLite/queue capacity. Ignore malformed or oversized frames.
+                if sample.sample_json.len() <= crate::machines::MAX_SAMPLE_BYTES
+                    && let Ok(sample) = serde_json::from_slice::<c6_api::machines::MachineSample>(&sample.sample_json)
+                {
+                    st.machines.record(worker_id.to_string(), sample);
+                }
+            }
             worker_msg::Msg::HeadCall(call) => {
                 // Off the read loop: a relayed call waits on another node.
                 let st = st.clone();

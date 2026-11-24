@@ -2129,7 +2129,10 @@ impl SessionManager {
         // settings and run them itself.
         let labels = session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(&spec), &started.ssh_target);
         let ssh = remote.then(|| Arc::new(c6_tools::remote::SshHost::new(&started.ssh_target, &started.home)));
+        let launch_pressure =
+            Arc::new(if remote { (*self.launch_pressure).clone() } else { self.launch_pressure.scoped(Path::new(&started.cwd)) });
         let session_tools = Arc::new(SessionTools::with_ssh(PathBuf::from(&started.cwd), ssh));
+        session_tools.set_kit_admission(launch_pressure.clone());
         session_tools.background.set_shell_owner(self.journal.shell_owner(session_id, &on_behalf_of));
         // Unlogged starts still own IDs. Reserve before exposing tools, not
         // through the asynchronous reload mailbox after launches can begin.
@@ -2243,6 +2246,7 @@ impl SessionManager {
         self.disk.configure(&spec);
         let actor = Actor {
             spec,
+            launch_pressure,
             session_tools,
             hooks,
             policies,
@@ -3377,6 +3381,7 @@ impl EventSink for TurnSink {
 
 struct Actor {
     spec: CreateSession,
+    launch_pressure: Arc<crate::resource_pressure::Gate>,
     started: SessionStarted,
     session_tools: Arc<SessionTools>,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
@@ -3913,12 +3918,12 @@ impl Actor {
                 let admitted = launch_admission.take().is_some_and(|(id, admission)| {
                     self.inbox.lock().unwrap().queue.iter().any(|(input, _)| input.command_id == id) && admission.redeem()
                 });
-                if admitted { None } else { self.manager.launch_pressure.try_start().err() }
+                if admitted { None } else { self.launch_pressure.try_start().err() }
             } else {
                 None
             };
             if let Some(pressure) = pressure {
-                if !launch_queued {
+                if !launch_queued && pressure != crate::resource_pressure::Pressure::Sampling {
                     launch_queued = true;
                     pressure.announce(&self.writer).await;
                 }

@@ -19,6 +19,28 @@ mod tests {
     use prost::Message;
 
     #[test]
+    fn machine_sample_uses_fresh_worker_tag_nine() {
+        let bytes = b"\x4a\x04\x0a\x02{}";
+        let sample = WorkerMsg { msg: Some(worker_msg::Msg::MachineSample(MachineSample { sample_json: b"{}".to_vec() })) };
+        assert_eq!(sample.encode_to_vec(), bytes);
+        assert_eq!(WorkerMsg::decode(bytes.as_slice()).unwrap(), sample);
+        // Historical Hello remains tag 1, not a new telemetry payload.
+        assert!(matches!(WorkerMsg::decode(b"\x0a\x00".as_slice()).unwrap().msg, Some(worker_msg::Msg::Hello(_))));
+    }
+
+    #[test]
+    fn welcome_machine_settings_are_optional_fresh_tags() {
+        let old = Welcome::decode(&[][..]).unwrap();
+        assert_eq!(old.machine_sample_secs, None);
+        assert_eq!(old.machine_disk_hold_percent, None);
+        let welcome = Welcome { machine_sample_secs: Some(15), machine_disk_hold_percent: Some(5.0), ..Default::default() };
+        let bytes = welcome.encode_to_vec();
+        assert_eq!(bytes[0..2], [0x30, 15]);
+        assert_eq!(bytes[2], 0x39);
+        assert_eq!(Welcome::decode(bytes.as_slice()).unwrap(), welcome);
+    }
+
+    #[test]
     fn narration_uses_a_fresh_tag_without_reclassifying_historical_blocks() {
         for (bytes, block) in [
             (b"\x0a\x06Update".as_slice(), content_block::Block::Text("Update".into())),

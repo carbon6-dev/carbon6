@@ -5,6 +5,7 @@ pub mod citations;
 pub mod docs;
 pub mod docs_archive;
 pub mod labels;
+pub mod machines;
 pub mod marks;
 pub mod projects;
 pub mod prompts;
@@ -4356,7 +4357,7 @@ pub struct Channel {
     #[serde(default)]
     pub secret: String,
     /// Which events (see `NOTIFY_EVENTS`); empty: approvals, decisions,
-    /// failures, notices, automation failures, budgets and hosts.
+    /// failures, notices, automation failures, budgets, hosts and machines.
     #[serde(default)]
     pub events: Vec<String>,
     /// Labels a session must all have; empty: every session.
@@ -4367,7 +4368,8 @@ pub struct Channel {
 }
 
 /// Events a channel can carry: (name, description).
-pub const NOTIFY_EVENTS: [(&str, &str); 14] = [
+pub const NOTIFY_EVENTS: [(&str, &str); 15] = [
+    ("machine", "a machine has low disk space, sustained low memory, or a new OOM kill"),
     ("approval", "a tool call waits for your approval (with Allow / Deny links)"),
     ("decision", "something needs your decision (with a link to answer, when it has options)"),
     ("failed", "a turn ended with an error"),
@@ -4385,8 +4387,8 @@ pub const NOTIFY_EVENTS: [(&str, &str); 14] = [
 ];
 
 /// The events a channel without a list carries.
-pub const DEFAULT_NOTIFY_EVENTS: [&str; 12] =
-    ["approval", "decision", "failed", "notice", "automation", "trigger", "budget", "host", "work", "quota", "backup", "goal"];
+pub const DEFAULT_NOTIFY_EVENTS: [&str; 13] =
+    ["machine", "approval", "decision", "failed", "notice", "automation", "trigger", "budget", "host", "work", "quota", "backup", "goal"];
 
 /// A machine reached over SSH through a worker (`/api/v1/settings/hosts`).
 /// Sessions on it get its labels; templates can target hosts by label.

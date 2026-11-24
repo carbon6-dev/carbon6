@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub mod enrollment;
+pub mod machines;
 #[cfg(feature = "update")]
 pub mod update;
 #[cfg(feature = "upgrade")]

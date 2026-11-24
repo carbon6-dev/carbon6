@@ -634,7 +634,12 @@ impl Runner {
     async fn wait_for_headroom(&self, cancel: &CancellationToken) -> Result<crate::resource_pressure::Admission, String> {
         let p = &self.parent;
         let writer = p.log.as_ref();
-        p.manager.launch_pressure.wait(cancel, move |pressure| pressure.announce(writer)).await
+        let gate = if p.started.ssh_target.is_empty() {
+            p.manager.launch_pressure.scoped(std::path::Path::new(&p.started.cwd))
+        } else {
+            (*p.manager.launch_pressure).clone()
+        };
+        gate.wait(cancel, move |pressure| pressure.announce(writer)).await
     }
 
     /// Counts a delegation against its tree's limit while it runs.

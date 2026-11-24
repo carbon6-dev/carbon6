@@ -16,6 +16,7 @@ pub mod identity;
 pub mod imports;
 pub mod journal;
 pub mod link;
+mod machines;
 mod mcp_bridge;
 pub mod mentions;
 mod move_files;
@@ -57,6 +58,8 @@ pub trait Extension: Send + Sync {
 /// What tests set on a worker instead of the environment (docs/testing.md).
 #[derive(Clone, Debug, Default)]
 pub struct Overrides {
+    /// Machine telemetry cadence; production defaults to 15 seconds.
+    pub machine_every: Option<std::time::Duration>,
     /// Session imports: whose home to read, how often, and how long a file
     /// must be unchanged.
     pub import_home: Option<PathBuf>,
@@ -81,6 +84,10 @@ pub struct Overrides {
 
 /// Everything a running worker shares between its connection and sessions.
 pub struct Worker {
+    machine_sampler: Arc<Mutex<machines::SampleFn>>,
+    machine_sample_secs: std::sync::atomic::AtomicU64,
+    disk_scan: Arc<tokio::sync::Semaphore>,
+    kit_cancels: Mutex<std::collections::HashMap<String, rpc::KitJobState>>,
     pub identity: Identity,
     pub state_dir: PathBuf,
     pub journal: Arc<journal::Journal>,
@@ -102,7 +109,7 @@ pub struct Worker {
 
 impl Worker {
     pub async fn open(state_dir: &Path, identity: Identity) -> anyhow::Result<Arc<Self>> {
-        Self::open_with_gate(state_dir, identity, resource_pressure::Gate::default()).await
+        Self::open_with_gate(state_dir, identity, resource_pressure::Gate::for_state(state_dir)).await
     }
 
     /// Constructor for in-process tests that require deterministic measurements.
@@ -147,6 +154,10 @@ impl Worker {
             tracing::warn!(?error, "could not clean up evicted sessions' attachments");
         }
         Ok(Arc::new(Self {
+            machine_sampler: Arc::new(Mutex::new(machines::sampler())),
+            machine_sample_secs: std::sync::atomic::AtomicU64::new(0),
+            disk_scan: Arc::new(tokio::sync::Semaphore::new(1)),
+            kit_cancels: Mutex::default(),
             identity,
             state_dir: state_dir.to_owned(),
             journal,
@@ -166,6 +177,12 @@ impl Worker {
     /// Hello).
     pub fn set_extension(&self, ext: Arc<dyn Extension>) {
         *self.extension.lock().unwrap() = Some(ext);
+    }
+
+    /// Deterministic telemetry seam; set before starting the connection.
+    #[doc(hidden)]
+    pub fn set_machine_sampler(&self, mut sample: impl FnMut() -> c6_api::machines::MachineSample + Send + 'static) {
+        *self.machine_sampler.lock().unwrap() = Box::new(move |_| sample());
     }
 
     pub fn extension(&self) -> Option<Arc<dyn Extension>> {

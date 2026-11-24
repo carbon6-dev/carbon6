@@ -99,7 +99,14 @@ message WorkerMsg {
     CredentialRequest credential_request = 6;
     RpcResponse rpc_response = 7;
     HeadCall head_call = 8;
+    MachineSample machine_sample = 9;
   }
+}
+
+// Observational, best-effort telemetry; JSON c6_api::machines::MachineSample.
+// Old peers ignore this fresh tag rather than blocking event ingestion.
+message MachineSample {
+  bytes sample_json = 1;
 }
 
 message HeadMsg {
@@ -133,6 +140,8 @@ message Welcome {
   // Head's durable position for each session in Hello; the worker resends
   // everything after it.
   repeated SessionCursor acks = 5;
+  optional uint64 machine_sample_secs = 6;
+  optional double machine_disk_hold_percent = 7;
 }
 
 message Ping {

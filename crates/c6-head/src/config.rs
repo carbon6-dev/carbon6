@@ -12,6 +12,8 @@ use serde::Deserialize;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HeadConfig {
+    /// Machine sampling, warning thresholds and telemetry retention.
+    pub machines: crate::machines::MachineConfig,
     /// The loaded config's path, for admin-command hints; not a TOML setting.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
@@ -79,6 +81,7 @@ pub struct HeadConfig {
 impl Default for HeadConfig {
     fn default() -> Self {
         Self {
+            machines: Default::default(),
             config_path: None,
             data_dir: default_data_dir(),
             bind: Vec::new(),

@@ -419,7 +419,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         name="hosts"
                         title="Hosts"
                         noun="host"
-                        help="Machines your workers reach over SSH (keys and ~/.ssh/config on the worker; carbon6 never handles SSH keys). Start a session on one by its name; it gets the host's labels (so policies, budgets, routing and memory for env:prod apply). Templates can run on every host with given labels. Check every N minutes to be told when one stops answering (a host notification). See them on the Workers page."
+                        help="Machines your workers reach over SSH (keys and ~/.ssh/config on the worker; carbon6 never handles SSH keys). Start a session on one by its name; it gets the host's labels (so policies, budgets, routing and memory for env:prod apply). Templates can run on every host with given labels. Check every N minutes to be told when one stops answering (a host notification). See them on the Machines page."
                         fields=HOST_FIELDS
                         examples=host_examples
                     />
@@ -3513,7 +3513,7 @@ const TEMPLATE_FIELDS: &[Field] = &[
     Field {
         key: "worker_labels",
         label: "Worker labels",
-        placeholder: "with Pick one: workers with any of these labels (set on the Workers page)",
+        placeholder: "with Pick one: workers with any of these labels (set on the Machines page)",
         kind: FieldKind::Labels,
     },
     Field {

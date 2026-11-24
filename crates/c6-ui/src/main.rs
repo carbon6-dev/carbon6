@@ -33,6 +33,7 @@ mod goal;
 mod icons;
 mod itemviews;
 mod labels;
+mod machines;
 mod mail;
 mod mail_html;
 mod markdown;
@@ -236,7 +237,7 @@ fn DesktopHeader(counts: Memo<(usize, usize)>) -> impl IntoView {
                     view! {
                         <HeaderItem name="realms" priority=110><NavLink to=View::Realms label="Realms" /></HeaderItem>
                         <HeaderItem name="decisions" priority=100><decisions::DecisionLink class=NAV /></HeaderItem>
-                        <HeaderItem name="workers" priority=30><NavLink to=View::Workers label="Workers" /></HeaderItem>
+                        <HeaderItem name="workers" priority=30><NavLink to=View::Workers label="Machines" /></HeaderItem>
                         <HeaderItem name="analytics" priority=40><NavLink to=View::Analytics label="Analytics" /></HeaderItem>
                         <HeaderItem name="activity" priority=60><NavLink to=View::Activity label="Activity" /></HeaderItem>
                         <HeaderItem name="usage" priority=35><NavLink to=View::Usage label="Usage" /></HeaderItem>
@@ -260,7 +261,7 @@ fn DesktopHeader(counts: Memo<(usize, usize)>) -> impl IntoView {
                         <HeaderItem name="analytics" priority=40><NavLink to=View::Analytics label="Analytics" /></HeaderItem>
                         <HeaderItem name="mission" priority=20><NavLink to=View::Mission label="Mission" /></HeaderItem>
                         <HeaderItem name="collections" priority=30><NavLink to=View::Collections { name: String::new() } label="Collections" /></HeaderItem>
-                        <HeaderItem name="workers" priority=30><NavLink to=View::Workers label="Workers" /></HeaderItem>
+                        <HeaderItem name="workers" priority=30><NavLink to=View::Workers label="Machines" /></HeaderItem>
                         <HeaderItem name="apps" priority=35><AppsMenu /></HeaderItem>
                         <HeaderItem name="settings" priority=10><NavLink to=View::Settings { note: None, section: String::new() } label="Settings" /></HeaderItem>
                     }.into_any()
@@ -423,7 +424,7 @@ fn MobileMenu(#[prop(optional)] desktop: bool, #[prop(optional, into)] desktop_a
                     <div class="flex flex-col text-sm">
                         <Go to=View::Realms class=MENU>"Realms"</Go>
                         <span data-header-destination="decisions" class="contents"><decisions::DecisionLink class=MENU /></span>
-                        <Go to=View::Workers class=MENU>"Workers"</Go>
+                        <Go to=View::Workers class=MENU>"Machines"</Go>
                         <Go to=View::Analytics class=MENU>"Analytics"</Go>
                         <Go to=View::Activity class=MENU>"Activity"</Go>
                         <Go to=View::Usage class=MENU>"Usage"</Go>
@@ -455,7 +456,7 @@ fn MobileMenu(#[prop(optional)] desktop: bool, #[prop(optional, into)] desktop_a
                     <Go to=View::Memex class=MENU>"Memex"</Go>
                     <div class="my-1 border-t border-zinc-200 dark:border-zinc-800"></div>
                     <Go to=View::Mission class=MENU>"Mission control"</Go>
-                    <Go to=View::Workers class=MENU>"Workers"</Go>
+                    <Go to=View::Workers class=MENU>"Machines"</Go>
                     <Go to=View::Collections { name: String::new() } class=MENU>"Collections"</Go>
                     <views::ViewsMenu class=MENU />
                     <div class="flex items-center"><Go to=View::Activity class=MENU>"Activity"</Go><monitor::ActivityBadge /></div>
@@ -581,7 +582,7 @@ fn PlaceMenu(#[prop(optional)] drawer: bool) -> impl IntoView {
                     <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-900 dark:bg-zinc-100"></span>
                     <span class="flex-1">"Console"</span>
                     {move || console_waiting(&places).map(|n| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you: installs, grants">{n}</span> })}
-                    <span class="text-xs text-muted">"realms, workers, system"</span>
+                    <span class="text-xs text-muted">"realms, machines, system"</span>
                 </a>
             </div>
         </details>

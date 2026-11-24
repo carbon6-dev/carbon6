@@ -17,6 +17,9 @@ use crate::realms::Caller;
 
 pub fn router(state: Arc<HeadState>) -> Router {
     Router::new()
+        .route("/api/v1/machines", get(list_machines))
+        .route("/api/v1/machines/{id}/samples", get(machine_samples))
+        .route("/api/v1/machines/{id}/disk_scan", post(machine_disk_scan))
         .route("/api/v1/workers", get(list_workers))
         .route("/api/v1/workers/enrollments", post(create_enrollment))
         .route("/api/v1/workers/{id}/revoke", post(revoke_worker))
@@ -353,6 +356,56 @@ pub(crate) type ApiResult<T> = Result<T, ApiErr>;
 
 fn parse_worker_id(id: &str) -> ApiResult<WorkerId> {
     id.parse().map_err(|_| ApiErr(StatusCode::BAD_REQUEST, "invalid worker id".into()))
+}
+
+async fn list_machines(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<Vec<api::machines::Machine>>> {
+    Ok(Json(crate::machines::inventory(&st, &caller).await?))
+}
+
+async fn machine_samples(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(query): Query<api::machines::MachineSamplesQuery>,
+) -> ApiResult<Json<Vec<api::machines::MachineSample>>> {
+    crate::machines::authorize(&st, &caller, &id).await?;
+    let mut samples = st.machines.samples(&id, query, now_ms()).await?;
+    crate::machines::filter_samples(&st, &caller, &mut samples).await?;
+    Ok(Json(samples))
+}
+
+async fn machine_disk_scan(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api::machines::MachineDiskScan>> {
+    // An explicit machine operation, not a free agent read. Filesystem paths
+    // span realms: only the console may request investigation.
+    if caller.realm.is_some() || crate::agent_ops::actor().is_some() {
+        return Err(crate::forbidden("disk investigation requires the console").into());
+    }
+    crate::machines::authorize(&st, &caller, &id).await?;
+    if id != "head" {
+        let worker = parse_worker_id(&id)?;
+        let result = st
+            .registry
+            .call(worker, "machine.disk_scan", serde_json::json!({}), Duration::from_secs(15))
+            .await
+            .map_err(|e| ApiErr(StatusCode::CONFLICT, e))?;
+        return Ok(Json(serde_json::from_value(result).map_err(anyhow::Error::from)?));
+    }
+    let data = st.data_dir.clone();
+    let permit = st.machines.disk_scan.clone().try_acquire_owned().map_err(|_| crate::conflict("disk investigation already running"))?;
+    let scan = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::machines::investigate_disk(&data, dirs::home_dir().as_deref(), &std::env::temp_dir())
+    })
+    .await
+    .map_err(anyhow::Error::from)?;
+    Ok(Json(scan))
 }
 
 pub async fn workers_snapshot(st: &HeadState) -> anyhow::Result<Vec<api::Worker>> {

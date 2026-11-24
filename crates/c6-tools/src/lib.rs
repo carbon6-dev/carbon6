@@ -168,6 +168,7 @@ pub trait HeadCaller: Send + Sync {
 
 /// State shared by every tool call in a session.
 pub struct SessionTools {
+    kit_admission: Mutex<Option<Arc<dyn kits::Admission>>>,
     cwd: Mutex<PathBuf>,
     pub background: Background,
     subagents: Mutex<Option<Arc<dyn Subagents>>>,
@@ -204,6 +205,7 @@ impl SessionTools {
     pub fn with_ssh(cwd: PathBuf, ssh: Option<Arc<remote::SshHost>>) -> Self {
         let secrets = Secrets::default();
         Self {
+            kit_admission: Mutex::default(),
             cwd: Mutex::new(cwd),
             seen: Mutex::default(),
             background: Background::with_secrets(secrets.clone(), ssh.clone()),
@@ -222,6 +224,14 @@ impl SessionTools {
 
     pub fn set_memory(&self, m: Option<MemorySink>) {
         *self.memory.lock().unwrap() = m;
+    }
+
+    pub fn set_kit_admission(&self, admission: Arc<dyn kits::Admission>) {
+        *self.kit_admission.lock().unwrap() = Some(admission);
+    }
+
+    pub fn kit_admission(&self) -> Option<Arc<dyn kits::Admission>> {
+        self.kit_admission.lock().unwrap().clone()
     }
 
     pub fn memory(&self) -> Option<MemorySink> {

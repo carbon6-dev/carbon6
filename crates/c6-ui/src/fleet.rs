@@ -17,7 +17,7 @@ fn now_ms() -> i64 {
 #[component]
 pub fn FleetPage() -> impl IntoView {
     let workers = api::live().workers;
-    view! { <main class="mx-auto max-w-6xl space-y-6 px-4 py-6"><Fleet workers /><Hosts /></main> }
+    view! { <main class="mx-auto max-w-6xl space-y-6 px-4 py-6"><crate::machines::Machines /><Fleet workers /><Hosts /></main> }
 }
 
 /// The host inventory and whether each host answers.
@@ -106,6 +106,7 @@ pub fn WorkerPage(id: String) -> impl IntoView {
                     view! { <span class=if online { "text-xs text-emerald-600" } else { "text-xs text-muted" }>{if online { "online" } else { "offline" }}</span> }
                 })}
                 <span class="flex-1"></span>
+                <TabButton tab label="Resources" value="resources" />
                 <TabButton tab label="Files" value="files" />
                 <TabButton tab label="Terminals" value="terminals" />
             </div>
@@ -115,6 +116,7 @@ pub fn WorkerPage(id: String) -> impl IntoView {
             {move || {
                 let id = id.get();
                 match tab.get() {
+                    "resources" => view! { <crate::machines::MachineDetails machine_id=id /> }.into_any(),
                     "terminals" => view! { <crate::term::Terminals worker_id=id /> }.into_any(),
                     _ => view! { <crate::files::FileBrowser worker_id=id /> }.into_any(),
                 }
@@ -154,7 +156,7 @@ pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
         <section class="space-y-4">
             <div class="flex flex-wrap items-end justify-between gap-4">
                 <div>
-                    <h1 class="text-lg font-semibold">"Workers"</h1>
+                    <h2 class="text-lg font-semibold">"Worker controls"</h2>
                     <p class="text-sm text-muted">{move || format!("{} online · {} enrolled", online(), active())}</p>
                 </div>
                 <AddWorker />

@@ -65,11 +65,21 @@ pub fn scope(name: &str) -> Option<Scope> {
         "settings.session_bar.get",
         "settings.session_bar.put",
     ];
-    const SHARED: &[&str] =
-        &["workers.list", "connections.list", "connections.models", "connections.quotas", "commands.list", "realms.list", "hosts.list"];
+    const SHARED: &[&str] = &[
+        "machines.list",
+        "machines.samples",
+        "workers.list",
+        "connections.list",
+        "connections.models",
+        "connections.quotas",
+        "commands.list",
+        "realms.list",
+        "hosts.list",
+    ];
     // Realm data whose handlers don't narrow to the caller's realm yet
     // (or that are carbon6-wide today): the console's, until they do.
     const ADMIN: &[&str] = &[
+        "machines.disk_scan",
         "imports.list",
         "imports.settings.get",
         "imports.settings.put",
@@ -380,6 +390,9 @@ fn build() -> Vec<Op> {
     let mut v = vec![
         // Fleet.
         op!("workers.list", "fleet", "GET" "/api/v1/workers", Read, Input::None, "Workers and the memex node: name, host, whether connected, sessions running, capabilities."),
+        op!("machines.list", "fleet", "GET" "/api/v1/machines", Read, Input::None, "Head and realm-visible workers with their last resource sample and warnings. Head administration metadata is console-only."),
+        op!("machines.samples", "fleet", "GET" "/api/v1/machines/{id}/samples", Read, Input::Query(schema::<api::machines::MachineSamplesQuery>), "Bounded machine resource history; from_ms, to_ms and limit (max 2000). Downsampled points preserve peaks.", choices = &[("id", "machines.list")]),
+        op!("machines.disk_scan", "fleet", "POST" "/api/v1/machines/{id}/disk_scan", Read, Input::None, "Explicit bounded filesystem investigation; console only, never an automatic agent read. Returns MachineDiskScan after the bounded background read. Does not delete anything.", choices = &[("id", "machines.list")]),
         op!("workers.enrollments.create", "fleet", "POST" "/api/v1/workers/enrollments", Secret, Input::Body(schema::<api::CreateEnrollment>), "Creates a one-time enrollment token for a new worker (c6w enroll <token>); valid for an hour.", secret = &["token"]),
         op!("workers.revoke", "fleet", "POST" "/api/v1/workers/{id}/revoke", Destructive, Input::None, "Revokes a worker: it is disconnected and can no longer attach; its sessions stop.", choices = &[("id", "workers.list")]),
         op!("workers.delete", "fleet", "DELETE" "/api/v1/workers/{id}", Destructive, Input::None, "Deletes a revoked worker and its records.", choices = &[("id", "workers.list")]),
