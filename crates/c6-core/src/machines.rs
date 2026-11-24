@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use c6_api::machines::{MachineDisk, MachineDiskScan, MachineFolderUsage, MachineSample, MachineSessionUsage};
-use sysinfo::{Disks, ProcessesToUpdate, System};
+use sysinfo::{Disks, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// Stateful CPU counters. Keep one sampler alive between collection intervals;
 /// never sleep in the collection path to manufacture a CPU measurement.
@@ -13,6 +13,9 @@ use sysinfo::{Disks, ProcessesToUpdate, System};
 pub struct Sampler {
     system: System,
     disks: Disks,
+    // Head/no-root samples never allocate or refresh a process table. Keep
+    // attribution separate so dropping it cannot reset machine CPU deltas.
+    processes: Option<System>,
 }
 
 impl Default for Sampler {
@@ -25,8 +28,7 @@ impl Sampler {
     pub fn new() -> Self {
         let mut system = System::new();
         system.refresh_cpu_all();
-        system.refresh_processes(ProcessesToUpdate::All, true);
-        Self { system, disks: Disks::new() }
+        Self { system, disks: Disks::new(), processes: None }
     }
 
     pub fn sample(&mut self) -> MachineSample {
@@ -38,21 +40,9 @@ impl Sampler {
     pub fn sample_with_roots(&mut self, roots: &[(u32, String)]) -> MachineSample {
         self.system.refresh_cpu_all();
         self.system.refresh_memory();
-        self.system.refresh_processes(ProcessesToUpdate::All, true);
         self.disks.refresh(true);
         let load = System::load_average();
-        let processes: Vec<_> = self
-            .system
-            .processes()
-            .iter()
-            .map(|(pid, p)| ProcessUsage {
-                pid: pid.as_u32(),
-                parent: p.parent().map(|p| p.as_u32()),
-                process_group: process_group(pid.as_u32()),
-                cpu_percent: f64::from(p.cpu_usage()),
-                rss: p.memory(),
-            })
-            .collect();
+        let sessions = self.session_usage(roots);
         let mut disks: Vec<_> = self
             .disks
             .iter()
@@ -88,8 +78,44 @@ impl Sampler {
             oom_kills,
             pressure,
             disks,
-            sessions: attribute_processes(&processes, roots),
+            sessions,
         }
+    }
+
+    fn session_usage(&mut self, roots: &[(u32, String)]) -> Vec<MachineSessionUsage> {
+        if roots.is_empty() {
+            self.processes = None;
+            return Vec::new();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // sysinfo otherwise retains one /proc stat FD per indexed process.
+            // Configure its process-wide cache once, before our first refresh.
+            static DISABLE_PROC_FD_CACHE: std::sync::Once = std::sync::Once::new();
+            DISABLE_PROC_FD_CACHE.call_once(|| {
+                sysinfo::set_open_files_limit(0);
+            });
+        }
+        let system = self.processes.get_or_insert_with(System::new);
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            // Threads share process RSS; enumerating them separately would
+            // double-count memory and needlessly multiply process-table work.
+            ProcessRefreshKind::nothing().with_cpu().with_memory().without_tasks(),
+        );
+        let processes: Vec<_> = system
+            .processes()
+            .iter()
+            .map(|(pid, p)| ProcessUsage {
+                pid: pid.as_u32(),
+                parent: p.parent().map(|p| p.as_u32()),
+                process_group: process_group(pid.as_u32()),
+                cpu_percent: f64::from(p.cpu_usage()),
+                rss: p.memory(),
+            })
+            .collect();
+        attribute_processes(&processes, roots)
     }
 }
 
@@ -353,6 +379,22 @@ fn scan_disk_with_clock(roots: &[PathBuf], limits: DiskScanLimits, at_ms: i64, e
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_root_samples_never_populate_process_state_and_release_old_state() {
+        let mut sampler = Sampler::new();
+        assert!(sampler.processes.is_none());
+        assert!(sampler.system.processes().is_empty());
+        assert!(sampler.sample().sessions.is_empty());
+        assert!(sampler.processes.is_none());
+        assert!(sampler.system.processes().is_empty());
+
+        // Model a previous attributed sample without enumerating host PIDs.
+        sampler.processes = Some(System::new());
+        assert!(sampler.sample().sessions.is_empty());
+        assert!(sampler.processes.is_none());
+        assert!(sampler.system.processes().is_empty());
+    }
 
     #[test]
     fn filters_only_real_filesystems() {

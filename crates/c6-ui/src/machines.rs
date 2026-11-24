@@ -187,7 +187,7 @@ fn MachineCard(machine: Machine, selected: RwSignal<String>) -> impl IntoView {
     let sampled = machine
         .last_sample
         .as_ref()
-        .map(|s| format!("Sample {} ago", crate::when::ago(now_ms() - s.at_ms)))
+        .map(|s| format!("Sample {}", crate::when::ago(now_ms() - s.at_ms)))
         .unwrap_or_else(|| "No telemetry received".into());
     let history_id = machine.id.clone();
     let until = now_ms();
@@ -290,7 +290,7 @@ fn MachineInfo(machine: Machine) -> impl IntoView {
         </div>
         {machine.head.map(|h| view! { <dl class="grid min-w-0 gap-x-6 gap-y-1 text-xs sm:grid-cols-2">
             <div><dt class="text-muted">"Version / update"</dt><dd class="break-all">{machine.version.unwrap_or_else(|| "unknown".into())}" · "{update_summary(&h.update)}</dd></div>
-            <div><dt class="text-muted">"Uptime / connected workers"</dt><dd>{crate::when::ago(h.uptime_secs.saturating_mul(1000).min(i64::MAX as u64) as i64)}" / "{h.connected_workers}</dd></div>
+            <div><dt class="text-muted">"Uptime / connected workers"</dt><dd>{crate::tasks::elapsed(h.uptime_secs.saturating_mul(1000).min(i64::MAX as u64) as i64)}" / "{h.connected_workers}</dd></div>
             <div class="min-w-0"><dt class="text-muted">"Data directory"</dt><dd class="break-all font-mono">{h.data_dir}</dd></div>
             <div class="min-w-0"><dt class="text-muted">"Data directory filesystem"</dt><dd class="break-all">{h.data_disk.map(|d| format!("{} ({}) · {} / {} used · {} available · {}", d.mount, d.filesystem, bytes(d.used), bytes(d.total), bytes(d.available), if d.total > 0 { format!("{:.1}% used", percent(d.used, d.total)) } else { "capacity unknown".into() })).unwrap_or_else(|| "unknown".into())}</dd></div>
             <div><dt class="text-muted">"Databases"</dt><dd>{h.databases.into_iter().map(|d| format!("{}: {}", d.name, bytes(d.bytes))).collect::<Vec<_>>().join(" · ")}</dd></div>
@@ -319,11 +319,11 @@ fn History(mut samples: Vec<MachineSample>, current: Option<MachineSample>, star
                 view! { <Chart label=format!("Disk {mount} (%)") points=disk_points start end oom=oom.clone() /> }
             }).collect_view()}
         </div>
-        <p class="text-xs text-muted">"History: "{crate::when::ago(end - start)}" · red dashed lines mark new OOM kills. Missing samples are unknown; long sampling gaps are disconnected."</p>
+        <p class="text-xs text-muted">"History: "{crate::tasks::elapsed(end - start)}" · red dashed lines mark new OOM kills. Missing samples are unknown; long sampling gaps are disconnected."</p>
         <p class="text-xs text-muted">"Longer ranges show peak envelopes: each time bucket preserves resource peaks and warnings. Different metrics in a bucket may peak at different moments; they are not a simultaneous snapshot."</p>
         {current.map(|s| view! {
             <div class="space-y-3 text-xs">
-                <p class="text-muted">{format!("Current inventory sample: {} ago. This snapshot, partitions and session usage are independent of the history range.", crate::when::ago(now_ms() - s.at_ms))}</p>
+                <p class="text-muted">{format!("Current inventory sample: {}. This snapshot, partitions and session usage are independent of the history range.", crate::when::ago(now_ms() - s.at_ms))}</p>
                 <p class="text-muted">{format!("{} cores · load {:.2} / {:.2} / {:.2} · memory {} used, {} available / {} · swap {} / {} · OOM kills {}", s.cpu_count, s.load[0], s.load[1], s.load[2], bytes(s.memory_used), bytes(s.memory_available), bytes(s.memory_total), bytes(s.swap_used), bytes(s.swap_total), s.oom_kills.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()))}</p>
                 <h3 class="font-medium">"Current partitions"</h3>
                 <div class="overflow-x-auto"><table class="w-full text-left"><thead class="text-muted"><tr><th class="py-1 pr-3">"Mount / filesystem"</th><th class="pr-3">"Used / total"</th><th class="pr-3">"Used %"</th><th class="pr-3">"Available"</th><th>"Inodes used"</th></tr></thead><tbody>{s.disks.into_iter().map(|d| view! {
@@ -391,7 +391,7 @@ fn DiskScan(machine_id: String) -> impl IntoView {
             {move || error.get().map(|e| view! { <crate::util::ErrorBox message=e /> })}
             {move || result.get().map(|r| view! { <div class="space-y-2 text-xs">
                 <p class="text-muted">{format!("{} entries checked · {}", r.entries, if r.partial { "partial results" } else { "complete" })}</p>
-                <div class="max-h-72 space-y-2 overflow-auto">{r.folders.into_iter().map(|f| view! { <div class="flex flex-wrap justify-between gap-x-4"><span class="min-w-0 break-all font-mono">{f.path}</span><span>{bytes(f.bytes)}" · "{f.modified_ms.map(|ms| format!("modified {} ago", crate::when::ago(now_ms() - ms))).unwrap_or_else(|| "modified unknown".into())}</span></div> }).collect_view()}</div>
+                <div class="max-h-72 space-y-2 overflow-auto">{r.folders.into_iter().map(|f| view! { <div class="flex flex-wrap justify-between gap-x-4"><span class="min-w-0 break-all font-mono">{f.path}</span><span>{bytes(f.bytes)}" · "{f.modified_ms.map(|ms| format!("modified {}", crate::when::ago(now_ms() - ms))).unwrap_or_else(|| "modified unknown".into())}</span></div> }).collect_view()}</div>
             </div> })}
         </div>
     }

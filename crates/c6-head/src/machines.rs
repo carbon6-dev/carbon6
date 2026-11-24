@@ -413,16 +413,42 @@ fn merge_peak(old: &mut MachineSample, new: &MachineSample) {
 }
 
 pub fn spawn(st: &Arc<HeadState>) {
-    let Some(mut rx) = st.machines.rx.lock().unwrap().take() else { return };
+    let Some(rx) = st.machines.rx.lock().unwrap().take() else { return };
+    let mut sampler = None;
+    spawn_tasks(st, st.shutdown.clone(), Some(Box::new(move || sampler.get_or_insert_with(c6_core::machines::Sampler::new).sample())), rx);
+}
+
+type SampleFn = Box<dyn FnMut() -> MachineSample + Send>;
+
+// The lease owner is generic so lifecycle tests can isolate telemetry's
+// reference from unrelated head background tasks without mocking the loops.
+trait HeadRef: Send + Sync {
+    fn head(&self) -> &HeadState;
+}
+
+impl HeadRef for HeadState {
+    fn head(&self) -> &HeadState {
+        self
+    }
+}
+
+fn spawn_tasks<S: HeadRef + 'static>(
+    st: &Arc<S>,
+    shutdown: tokio_util::sync::CancellationToken,
+    sampler: Option<SampleFn>,
+    mut rx: mpsc::Receiver<(String, MachineSample)>,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let weak = Arc::downgrade(st);
-    tokio::spawn(async move {
+    let stop = shutdown.clone();
+    let writer = tokio::spawn(async move {
         loop {
-            let Some(st) = weak.upgrade() else { break };
             let item = tokio::select! {
-                _ = st.shutdown.cancelled() => break,
+                _ = stop.cancelled() => break,
                 item = rx.recv() => item,
             };
             let Some(item) = item else { break };
+            let Some(lease) = weak.upgrade() else { break };
+            let st = lease.head();
             let mut batch = vec![item];
             while batch.len() < 128 {
                 match rx.try_recv() {
@@ -463,41 +489,44 @@ pub fn spawn(st: &Arc<HeadState>) {
         }
     });
     let weak = Arc::downgrade(st);
-    tokio::spawn(async move {
+    let stop = shutdown.clone();
+    let maintenance = tokio::spawn(async move {
         let mut timer = tokio::time::interval(Duration::from_secs(60));
         loop {
+            tokio::select! { _ = stop.cancelled() => break, _ = timer.tick() => {} }
             let Some(st) = weak.upgrade() else { break };
-            tokio::select! { _ = st.shutdown.cancelled() => break, _ = timer.tick() => {} }
-            if let Err(e) = st.machines.compact(c6_core::now_ms()).await {
+            if let Err(e) = st.head().machines.compact(c6_core::now_ms()).await {
                 tracing::warn!("compacting machine telemetry: {e:#}");
             }
         }
     });
+    let mut tasks = vec![writer, maintenance];
+    let Some(mut sampler) = sampler else { return tasks };
     let weak = Arc::downgrade(st);
-    let every = Duration::from_secs(st.machines.config.sample_secs.max(1));
-    tokio::spawn(async move {
+    let every = Duration::from_secs(st.head().machines.config.sample_secs.max(1));
+    tasks.push(tokio::spawn(async move {
         let mut timer = tokio::time::interval(every);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut sampler = match tokio::task::spawn_blocking(c6_core::machines::Sampler::new).await {
-            Ok(sampler) => sampler,
-            Err(e) => {
-                tracing::warn!("initializing head sampler: {e}");
-                return;
-            }
-        };
         loop {
-            let Some(st) = weak.upgrade() else { break };
-            tokio::select! { _ = st.shutdown.cancelled() => break, _ = timer.tick() => {} }
-            // System probing is blocking and must not occupy a runtime thread.
+            tokio::select! { _ = shutdown.cancelled() => break, _ = timer.tick() => {} }
+            if weak.strong_count() == 0 {
+                break;
+            }
+            // Initialization and probing run without a HeadState lease. Even
+            // a blocked OS probe must not keep the head and its stores alive.
             match tokio::task::spawn_blocking(move || {
-                let sample = sampler.sample();
+                let sample = sampler();
                 (sampler, sample)
             })
             .await
             {
                 Ok((next, sample)) => {
                     sampler = next;
-                    st.machines.record("head".into(), sample);
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
+                    let Some(st) = weak.upgrade() else { break };
+                    st.head().machines.record("head".into(), sample);
                 }
                 Err(e) => {
                     tracing::warn!("sampling head machine: {e}");
@@ -505,7 +534,8 @@ pub fn spawn(st: &Arc<HeadState>) {
                 }
             }
         }
-    });
+    }));
+    tasks
 }
 
 pub async fn inventory(st: &HeadState, caller: &crate::realms::Caller) -> anyhow::Result<Vec<Machine>> {
@@ -766,6 +796,87 @@ pub async fn authorize(st: &HeadState, caller: &crate::realms::Caller, id: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn idle_tasks_and_blocked_sampling_do_not_retain_head_state() {
+        struct IsolatedHead(Arc<HeadState>);
+        impl HeadRef for IsolatedHead {
+            fn head(&self) -> &HeadState {
+                &self.0
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: temp.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // Other head tasks have independent lifetimes. Give the exact
+        // production loops an isolated owner of one real HeadState reference,
+        // so only telemetry can retain the lease measured below.
+        let state = Arc::new(IsolatedHead(head.state.clone()));
+        head.shutdown().await.unwrap();
+
+        // Exercise the real writer/maintenance loops with sampling disabled
+        // and a separate uncancelled lifetime. The fixture's shutdown token
+        // must not mask a strong lease held by an idle telemetry task.
+        let stop = tokio_util::sync::CancellationToken::new();
+        let (_tx, rx) = mpsc::channel(1);
+        let tasks = spawn_tasks(&state, stop.clone(), None, rx);
+        tokio::task::yield_now().await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            c6_testkit::eventually("idle telemetry tasks to release their state", || async {
+                (Arc::strong_count(&state) == 1).then_some(())
+            }),
+        )
+        .await
+        .expect("idle telemetry retained its head lease");
+        stop.cancel();
+        for task in tasks {
+            c6_testkit::within("idle telemetry task to stop", task).await.unwrap();
+        }
+
+        // A probe can block in the OS: verify that even an in-flight blocking
+        // callback owns no HeadState. Both synchronization points are explicit.
+        let stop = tokio_util::sync::CancellationToken::new();
+        let (_tx, rx) = mpsc::channel(1);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut entered = Some(entered_tx);
+        let tasks = spawn_tasks(
+            &state,
+            stop.clone(),
+            Some(Box::new(move || {
+                if let Some(entered) = entered.take() {
+                    let _ = entered.send(());
+                }
+                let _ = release_rx.recv();
+                MachineSample::default()
+            })),
+            rx,
+        );
+        c6_testkit::within("the controlled sampler to block", entered_rx).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            c6_testkit::eventually("the blocked sampler to release its state", || async { (Arc::strong_count(&state) == 1).then_some(()) }),
+        )
+        .await
+        .expect("the blocked sampler retained its head lease");
+        let weak = Arc::downgrade(&state);
+        drop(state);
+        assert!(weak.upgrade().is_none(), "telemetry must release its owned head lease");
+        release_tx.send(()).unwrap();
+        stop.cancel();
+        for task in tasks {
+            c6_testkit::within("telemetry task to stop after head drop", task).await.unwrap();
+        }
+    }
 
     fn sample(at_ms: i64, cpu: f64, free: u64) -> MachineSample {
         MachineSample {
