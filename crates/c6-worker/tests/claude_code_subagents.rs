@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use c6_api::{Session, SessionDetail, SessionStatus};
+use c6_api::{EventKind, Session, SessionDetail, SessionStatus, TurnEndReason};
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply, eventually};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
@@ -31,7 +31,9 @@ post '{"jsonrpc":"2.0","method":"notifications/initialized"}' > /dev/null
 post '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' > tools.json
 echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_m1","name":"mcp__carbon6__Task","input":{"description":"look","prompt":"Look around.","connection":"api"}}],"stop_reason":"tool_use"},"parent_tool_use_id":null}'
 post '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"Task","arguments":{"description":"look","prompt":"Look around.","connection":"api"}}}' > call.json
-echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_m1","content":"ok"}]},"parent_tool_use_id":null}'
+while [ ! -f result.json ]; do sleep 0.01; done
+cat result.json
+printf '\n'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{"input_tokens":1,"output_tokens":1}}'
 "#;
     let path = dir.join("claude");
@@ -104,11 +106,37 @@ async fn claude_code_delegates_to_carbon6_subagents() {
         .await
         .unwrap();
     let id = s["id"].as_str().unwrap().to_owned();
-    eventually("turn done", async || {
-        let d: SessionDetail = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
-        (d.session.status == SessionStatus::Idle && d.session.end_reason.is_some()).then_some(())
+    let call: Value = eventually("the MCP task result", async || {
+        serde_json::from_str::<Value>(&std::fs::read_to_string(project.path().join("call.json")).ok()?).ok()
     })
     .await;
+    // Forward the real MCP result, including the child-identifying footer.
+    // A fabricated "ok" cannot acknowledge the foreground report durably and
+    // permits a delayed fallback notice to interrupt the later handover turn.
+    let result = json!({
+        "type": "user",
+        "message": {"content": [{
+            "type": "tool_result",
+            "tool_use_id": "toolu_m1",
+            "content": call["result"]["content"],
+            "is_error": call["result"]["isError"],
+        }]},
+        "parent_tool_use_id": null,
+    });
+    std::fs::write(project.path().join("result.json.tmp"), serde_json::to_vec(&result).unwrap()).unwrap();
+    std::fs::rename(project.path().join("result.json.tmp"), project.path().join("result.json")).unwrap();
+    let detail = eventually("turn done", async || {
+        let d: SessionDetail = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
+        (d.session.status == SessionStatus::Idle && d.session.end_reason.is_some()).then_some(d)
+    })
+    .await;
+    assert_eq!(
+        detail.session.end_reason,
+        Some(TurnEndReason::Completed),
+        "events: {}\n{}",
+        http.get(format!("{api}/sessions/{id}/events")).send().await.unwrap().text().await.unwrap(),
+        mock.log()
+    );
 
     let init: Value = serde_json::from_str(&std::fs::read_to_string(project.path().join("init.json")).unwrap()).unwrap();
     assert_eq!(init["result"]["serverInfo"]["name"], "carbon6");
@@ -120,7 +148,6 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     let task = &tools["result"]["tools"][0]["inputSchema"]["properties"];
     assert_eq!(task["connection"]["enum"], json!(["api", "cc"]), "Claude Code is offered to subagents too");
     assert!(task["run_in_background"]["description"].as_str().unwrap().contains("mcp__carbon6__TaskStop"), "{task}");
-    let call: Value = serde_json::from_str(&std::fs::read_to_string(project.path().join("call.json")).unwrap()).unwrap();
     assert_eq!(call["result"]["isError"], false, "{call}");
     assert!(call["result"]["content"][0]["text"].as_str().unwrap().starts_with("api says hi"), "{call}");
 
@@ -143,6 +170,17 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     let child_events: Vec<c6_api::Event> =
         http.get(format!("{api}/sessions/{}/events", child.id)).send().await.unwrap().json().await.unwrap();
     assert_eq!((outputs(&parent_events), outputs(&child_events)), (1, 0), "in the parent's Outputs");
+    let footer = format!("[subagent session {}]", child.id);
+    assert!(
+        parent_events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::ToolResult { call_id, output, is_error, .. }
+                if call_id == "toolu_m1" && !*is_error
+                    && output == call["result"]["content"][0]["text"].as_str().unwrap()
+                    && output.ends_with(&footer)
+        )),
+        "the parent journal must acknowledge the actual foreground report"
+    );
 
     // Handing the parent to carbon6 applies the same saved list.
     mock.push(Reply::Text("handed over".into()));
@@ -153,13 +191,21 @@ async fn claude_code_delegates_to_carbon6_subagents() {
         .await
         .unwrap();
     assert!(r.status().is_success());
-    eventually("the hand-over turn to end", async || {
+    let events = eventually("the hand-over turn to end", async || {
         let events: Vec<c6_api::Event> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
-        (events.iter().filter(|e| matches!(e.kind, c6_api::EventKind::TurnEnded { .. })).count() == 2).then_some(())
+        (events.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { .. })).count() == 2).then_some(events)
     })
     .await;
+    let ends: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e.kind {
+            EventKind::TurnEnded { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends, [TurnEndReason::Completed, TurnEndReason::Completed], "{}", mock.log());
     let requests = mock.requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 3, "{}", mock.log());
     let names: Vec<&str> = requests[2]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["read", "publish_file"]);
     stop.cancel();
