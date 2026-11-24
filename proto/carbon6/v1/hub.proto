@@ -166,6 +166,8 @@ enum SessionActorState {
   SESSION_ACTOR_STATE_STOPPED = 4;
   // Actor has not reached its mailbox loop recently; not proof of exit.
   SESSION_ACTOR_STATE_UNRESPONSIVE = 5;
+  // Resource wait, retried automatically without a recovery deadline.
+  SESSION_ACTOR_STATE_WAITING_FOR_DISK = 6;
 }
 
 enum SessionActivityKind {

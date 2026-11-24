@@ -36,6 +36,7 @@ pub struct SessionManager {
     /// Delegations running per top-level session (for its limit).
     working: Arc<Mutex<HashMap<String, usize>>>,
     pub(crate) launch_pressure: Arc<crate::resource_pressure::Gate>,
+    pub(crate) disk: Arc<crate::disk::Monitor>,
     /// The MCP server that gives Claude Code sessions carbon6's subagents
     /// (started on first use; `None` if it could not start).
     bridge: Arc<tokio::sync::OnceCell<Option<Arc<crate::mcp_bridge::Bridge>>>>,
@@ -332,6 +333,7 @@ struct RecoveryGate {
     active: std::sync::atomic::AtomicBool,
     adopting: std::sync::atomic::AtomicBool,
     activity: Arc<std::sync::atomic::AtomicI32>,
+    disk_wait: Mutex<Option<String>>,
     probe: Mutex<ActorProbe>,
     request: Mutex<Option<RecoveryRequest>>,
 }
@@ -376,7 +378,15 @@ impl RecoveryPause {
         let id = uuid::Uuid::now_v7().to_string();
         *gate.request.lock().unwrap() = Some(RecoveryRequest { incident: id.clone(), ready: None });
         let (updated, state) = tokio::sync::watch::channel(Some(reason.to_owned()));
-        tokio::spawn(report_recovery(writer.link.clone(), writer.session_id.clone(), gate.epoch, id.clone(), reason.to_owned(), state));
+        tokio::spawn(report_recovery(
+            writer.link.clone(),
+            writer.session_id.clone(),
+            gate.epoch,
+            id.clone(),
+            reason.to_owned(),
+            state,
+            false,
+        ));
         Self { id, gate, reason: updated }
     }
 
@@ -411,6 +421,48 @@ impl Drop for RecoveryPause {
     }
 }
 
+/// The disk wait has no action lane and is never a terminal recovery stop.
+struct DiskWait {
+    gate: Arc<RecoveryGate>,
+    reason: tokio::sync::watch::Sender<Option<String>>,
+}
+
+impl DiskWait {
+    fn new(gate: Arc<RecoveryGate>, writer: &Writer, reason: String) -> Self {
+        *gate.disk_wait.lock().unwrap() = Some(reason.clone());
+        let (updated, state) = tokio::sync::watch::channel(Some(reason.clone()));
+        tokio::spawn(report_recovery(
+            writer.link.clone(),
+            writer.session_id.clone(),
+            gate.epoch,
+            uuid::Uuid::now_v7().to_string(),
+            reason,
+            state,
+            true,
+        ));
+        Self { gate, reason: updated }
+    }
+
+    fn update(&self, space: &crate::disk::Space) {
+        let reason = space.waiting_reason();
+        *self.gate.disk_wait.lock().unwrap() = Some(reason.clone());
+        self.reason.send_if_modified(|old| {
+            if old.as_deref() == Some(&reason) {
+                return false;
+            }
+            *old = Some(reason);
+            true
+        });
+    }
+}
+
+impl Drop for DiskWait {
+    fn drop(&mut self) {
+        self.gate.disk_wait.lock().unwrap().take();
+        self.reason.send_replace(None);
+    }
+}
+
 async fn report_recovery(
     link: Arc<HeadLink>,
     session_id: String,
@@ -418,6 +470,7 @@ async fn report_recovery(
     incident: String,
     initial_reason: String,
     mut state: tokio::sync::watch::Receiver<Option<String>>,
+    automatic: bool,
 ) {
     const CLEAR_BUDGET: Duration = Duration::from_secs(60);
     // No journal writes, and never wait for the head in the supervisor.
@@ -438,7 +491,7 @@ async fn report_recovery(
         // Even if the actor recovered, don't displace an unacknowledged
         // warning with a clear: the head may not have queued the parent yet.
         let reason = (current.is_some() || !announced).then_some(&last_reason);
-        let params = serde_json::json!({"session_id": session_id, "ownership_epoch": epoch, "incident": incident, "reason": reason});
+        let params = serde_json::json!({"session_id": session_id, "ownership_epoch": epoch, "incident": incident, "reason": reason, "automatic": automatic});
         let sent_clear = reason.is_none();
         let call = async { link.is_connected() && link.call("session.recovery_status", params).await.is_ok() };
         tokio::pin!(call);
@@ -522,9 +575,14 @@ fn next_recovery_backoff(backoff: Duration) -> Duration {
 /// mailbox stays usable for take-back, callbacks and explicit Rewind.
 struct HeldAdoptionRecovery {
     gate: Arc<RecoveryGate>,
+    budget: Duration,
     deadline: Option<tokio::time::Instant>,
     retry_at: Option<tokio::time::Instant>,
     backoff: Duration,
+    disk_delays: (Duration, Duration),
+    disk_wait: Option<DiskWait>,
+    disk_retry_at: Option<tokio::time::Instant>,
+    disk_was_full: bool,
     reason: String,
     reported_failure: bool,
     pause: Option<RecoveryPause>,
@@ -532,14 +590,19 @@ struct HeldAdoptionRecovery {
 }
 
 impl HeldAdoptionRecovery {
-    fn new(gate: Arc<RecoveryGate>, budget: Duration) -> Self {
+    fn new(gate: Arc<RecoveryGate>, budget: Duration, disk_delays: (Duration, Duration)) -> Self {
         let now = tokio::time::Instant::now();
         gate.adopting.store(true, Ordering::Release);
         Self {
             gate,
+            budget,
             deadline: Some(now + budget),
             retry_at: Some(now),
             backoff: Duration::ZERO,
+            disk_delays,
+            disk_wait: None,
+            disk_retry_at: None,
+            disk_was_full: false,
             reason: "The worker has not finished checking ownership of the held Claude Code runtime; queued messages are held".into(),
             reported_failure: false,
             pause: None,
@@ -549,6 +612,23 @@ impl HeldAdoptionRecovery {
 
     async fn check(&mut self, writer: &Writer, attempt: impl std::future::Future<Output = anyhow::Result<()>>) -> bool {
         let now = tokio::time::Instant::now();
+        if let Some(waiting) = &self.disk_wait {
+            if let Some(space) = writer.disk_probe.as_ref().and_then(|(disk, path)| disk.space(path)) {
+                waiting.update(&space);
+                if self.disk_was_full && space.free >= crate::disk::RESUME_BYTES {
+                    self.disk_retry_at = Some(now);
+                }
+                self.disk_was_full = space.free < crate::disk::RESUME_BYTES;
+            }
+            let retry = self.disk_retry_at.expect("disk waits retain an attempt deadline");
+            if now < retry {
+                // Keep the mailbox usable and sample on its timer without
+                // spending the exponential attempt delay on every tick.
+                self.retry_at = Some(retry.min(now + Duration::from_secs(1)));
+                return false;
+            }
+            self.retry_at = Some(now);
+        }
         if self.deadline.is_some_and(|until| now >= until) {
             self.deadline = None;
             self.retry_at = None;
@@ -565,6 +645,33 @@ impl HeldAdoptionRecovery {
                 attempt.await
             };
             let Err(e) = result else { return true };
+            let space = writer.disk_probe.as_ref().and_then(|(disk, path)| disk.space(path));
+            if crate::disk::resource_error(&e, space.as_ref()) {
+                // A journal read can fail before adoption advances any held
+                // reader. Wait here; do not retire that untouched process.
+                self.pause.take();
+                self.action.take();
+                self.deadline = None;
+                if self.disk_wait.is_none() {
+                    let reason = space.as_ref().map_or_else(
+                        || "Waiting for disk space: free space unavailable. Recovery continues automatically; no action needed.".into(),
+                        crate::disk::Space::waiting_reason,
+                    );
+                    self.disk_wait = Some(DiskWait::new(self.gate.clone(), writer, reason));
+                    self.backoff = self.disk_delays.0;
+                }
+                self.disk_was_full = space.is_some_and(|s| s.free < crate::disk::RESUME_BYTES);
+                let now = tokio::time::Instant::now();
+                self.disk_retry_at = Some(now + self.backoff);
+                self.retry_at = Some(now + self.backoff.min(Duration::from_secs(1)));
+                self.backoff = self.backoff.saturating_mul(2).min(self.disk_delays.1);
+                return false;
+            }
+            if self.disk_wait.take().is_some() {
+                self.deadline = Some(tokio::time::Instant::now() + self.budget);
+                self.disk_retry_at = None;
+                self.backoff = Duration::ZERO;
+            }
             let reason: String =
                 format!("Claude Code could not be safely taken up; queued messages were not sent: {e:#}").chars().take(1000).collect();
             if reason != self.reason {
@@ -589,7 +696,9 @@ impl HeldAdoptionRecovery {
                 };
                 if let Err(e) = recorded {
                     // A failed diagnostic does not authorize retirement of a
-                    // held runtime. Recovery status can report without SQLite.
+                    // held runtime or erase the original ownership/corruption
+                    // failure. Recovery status can report without SQLite.
+                    writer.resource_failure.store(false, Ordering::Release);
                     warn!(session = %writer.session_id, "recording Claude Code adoption failure: {e:#}");
                 }
             }
@@ -631,6 +740,19 @@ impl Drop for HeldAdoptionRecovery {
 }
 
 impl SessionManager {
+    /// Constructor for in-process tests that require deterministic measurements.
+    #[doc(hidden)]
+    pub fn new_with_resource_sampler(
+        journal: Arc<Journal>,
+        link: Arc<HeadLink>,
+        worktrees: PathBuf,
+        sample: impl Fn() -> crate::ResourceMeasurement + Send + Sync + 'static,
+    ) -> Self {
+        let mut manager = Self::new(journal, link, worktrees);
+        manager.launch_pressure = Arc::new(crate::resource_pressure::Gate::new(sample));
+        manager
+    }
+
     pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>, worktrees: PathBuf) -> Self {
         let state_dir = worktrees.parent().map(Path::to_path_buf).unwrap_or_else(|| worktrees.clone());
         prune_browser_profiles(&state_dir.join("browser"), std::time::Duration::from_secs(30 * 24 * 3600));
@@ -642,6 +764,7 @@ impl SessionManager {
             actors: Arc::default(),
             loads: Arc::default(),
             working: Arc::default(),
+            disk: Arc::default(),
             launch_pressure: if cfg!(test) {
                 Arc::new(crate::resource_pressure::Gate::new(crate::ResourceMeasurement::default))
             } else {
@@ -649,6 +772,28 @@ impl SessionManager {
             },
             bridge: Arc::default(),
             remote_waits: Arc::default(),
+        }
+    }
+
+    /// Cheap filesystem measurements, independent of the journal connection.
+    pub(crate) fn report_disk_pressure(&self) {
+        let paths = [self.state_dir.clone(), self.worktrees.clone(), std::env::temp_dir()];
+        for (space, active) in self.disk.warnings(&paths) {
+            // Clears rearm locally; the head only routes active notices. A
+            // failed, delayed clear must not suppress a newer low-space edge.
+            if !active {
+                continue;
+            }
+            let link = self.link.clone();
+            let disk = self.disk.clone();
+            tokio::spawn(async move {
+                let params =
+                    serde_json::json!({"mount": space.mount, "free_bytes": space.free, "total_bytes": space.total, "active": active});
+                if let Err(error) = link.call("disk.pressure", params).await {
+                    disk.retry_warning(&space.mount);
+                    warn!(%error, "could not report disk pressure");
+                }
+            });
         }
     }
 
@@ -789,8 +934,11 @@ impl SessionManager {
         let sessions = actors
             .into_iter()
             .map(|(session_id, a)| {
+                let disk_wait = a.recovery.disk_wait.lock().unwrap().clone();
                 let (state, reason) = if a.tx.is_closed() {
                     (SessionActorState::Stopped, "The worker's session actor exited")
+                } else if let Some(reason) = disk_wait.as_deref() {
+                    (SessionActorState::WaitingForDisk, reason)
                 } else if a.recovery.active.load(Ordering::Acquire) {
                     (SessionActorState::Recovering, "The worker is recovering the session journal")
                 } else if a.recovery.adopting.load(Ordering::Acquire) {
@@ -1948,6 +2096,7 @@ impl SessionManager {
         let on_behalf_of = delegation.as_ref().map_or(session_id, |d| d.root_session_id.as_str()).to_owned();
         let mut writer = Writer::new(session_id.to_owned(), self.journal.clone(), self.link.clone(), next_seq);
         writer.ownership_epoch = epoch;
+        writer.disk_probe = Some((self.disk.clone(), self.state_dir.clone()));
         let writer = Arc::new(writer);
         // On an SSH target, what runs on the worker (hooks, MCP servers)
         // runs in a local folder of the session's.
@@ -2091,6 +2240,7 @@ impl SessionManager {
         tokio::spawn(forward_tasks(task_rx, fence_rx, tx.clone()));
         let spec_default = spec.clone();
         let claude_code = Arc::new(std::sync::atomic::AtomicBool::new(started.tool_profile == crate::claude_code::PROFILE));
+        self.disk.configure(&spec);
         let actor = Actor {
             spec,
             session_tools,
@@ -3378,12 +3528,31 @@ impl Actor {
         let budget = recovery_budget(self.spec.session_recovery_seconds);
         let mut deadline = Some(tokio::time::Instant::now() + budget);
         let mut backoff = Duration::from_millis(100);
+        let (disk_initial, disk_max) = crate::disk::retry_delays(&self.spec);
+        let mut disk_backoff = disk_initial;
+        let mut disk_wait = None::<DiskWait>;
+        let mut disk_was_full = false;
+        let disk = self.manager.disk.clone();
+        let state_dir = self.manager.state_dir.clone();
+        disk.configure(&self.spec);
         let mut cli_retired = false;
         let mut pause = None::<RecoveryPause>;
         let writer = self.writer.clone();
         let mut reason = "A recovery attempt has not completed".to_owned();
+        if writer.resource_failure.swap(false, Ordering::AcqRel) {
+            // Preserve the first write's classification: checking out a new
+            // SQLite connection may take longer than a short recovery bound.
+            // That must not expose a manual stop while disk space is absent.
+            let reason = disk.waiting_reason(&state_dir);
+            disk_wait = Some(DiskWait::new(gate.clone(), &writer, reason));
+            disk_was_full = true;
+        }
         loop {
-            let result = if let Some(until) = deadline {
+            let result = if let Some(waiting) = &disk_wait {
+                crate::disk::wait(&disk, &state_dir, disk_backoff, disk_was_full, |space| waiting.update(space)).await;
+                disk_backoff = disk_backoff.saturating_mul(2).min(disk_max);
+                Some(self.recover_once(&mut cli_retired).await)
+            } else if let Some(until) = deadline {
                 let attempt = async {
                     tokio::time::sleep_until(until.min(tokio::time::Instant::now() + backoff)).await;
                     // A deadline during backoff must not start another retry.
@@ -3412,10 +3581,32 @@ impl Actor {
                 }
             };
             match result {
-                Some(Ok(())) => return,
+                Some(Ok(())) => {
+                    writer.resource_failure.store(false, Ordering::Release);
+                    return;
+                }
                 Some(Err(e)) => {
                     warn!(session = %writer.session_id, "waiting to recover its journal: {e:#}");
                     reason = format!("{e:#}").chars().take(1000).collect();
+                    let space = disk.space(&state_dir);
+                    if crate::disk::resource_error(&e, space.as_ref()) {
+                        disk_was_full = space.as_ref().is_some_and(|s| s.free < crate::disk::RESUME_BYTES);
+                        // Resource exhaustion must not spend the corruption
+                        // budget. Its retry lane survives arbitrarily long
+                        // pressure and wakes on space returning.
+                        pause.take();
+                        if disk_wait.is_none() {
+                            let reason = disk.waiting_reason(&state_dir);
+                            disk_wait = Some(DiskWait::new(gate.clone(), &writer, reason));
+                        }
+                        continue;
+                    }
+                    if disk_wait.take().is_some() {
+                        // A different failure (notably corruption) gets its
+                        // own bounded recovery period, not an infinite wait.
+                        deadline = Some(tokio::time::Instant::now() + budget);
+                        backoff = Duration::from_millis(100);
+                    }
                     if let Some(paused) = &pause {
                         paused.update_reason(&reason);
                     }
@@ -3693,7 +3884,8 @@ impl Actor {
                 rewind_blocked = false;
             }
             if !rewind_blocked && running.is_none() && self.runs_claude_code() && self.claude.is_none() {
-                let recovery = adoption.get_or_insert_with(|| HeldAdoptionRecovery::new(gate.clone(), adoption_budget));
+                let recovery = adoption
+                    .get_or_insert_with(|| HeldAdoptionRecovery::new(gate.clone(), adoption_budget, crate::disk::retry_delays(&self.spec)));
                 if recovery.check(&adoption_writer, self.take_up_held()).await {
                     adoption = None;
                 }
@@ -4603,6 +4795,31 @@ impl Actor {
             // The source command remains pending; do not tell it twice.
             return Ok(());
         }
+        if ended.task_notice.as_ref().is_some_and(|n| n.kind == "recovery" && n.status == "waiting") {
+            // A resource observation is not the child's turn outcome. Do not
+            // resolve its waiter, manufacture a completion envelope, or let
+            // an empty call id match a previous successful child report.
+            let reported = c6_proto::SubagentReported {
+                command_id: command_id.clone(),
+                call_id: String::new(),
+                child_session_id: ended.child_session_id,
+                status: "waiting".into(),
+            };
+            self.notice(
+                PendingInput {
+                    command_id: format!("subagent:{command_id}"),
+                    text: ended.digest,
+                    command: "task-notification".into(),
+                    task_notice: ended.task_notice,
+                    ..Default::default()
+                },
+                busy,
+                ended.wake,
+            )
+            .await?;
+            self.writer.append(session_event::Kind::SubagentReported(reported)).await?;
+            return Ok(());
+        }
         let reason = TurnEndReason::try_from(ended.reason).unwrap_or(TurnEndReason::Unspecified);
         let reported = c6_proto::SubagentReported {
             command_id,
@@ -4815,6 +5032,7 @@ impl Actor {
                     // Attribute a session-only report where it first arrived.
                     // Later scheduling snapshots must not move it to a new run.
                     if !n.command_id.starts_with("task:")
+                        && !n.task_notice.as_ref().is_some_and(|t| t.kind == "recovery")
                         && !previous.contains_key(&n.command_id)
                         && let Some(s) = n.task_notice.as_ref().and_then(|t| children.get(&t.session_id))
                     {
@@ -4829,6 +5047,9 @@ impl Actor {
         // remote reports name the session. Both belong to the same fan-in.
         let mut orphan_outcomes = HashMap::new();
         for n in previous.values() {
+            if n.task_notice.as_ref().is_some_and(|t| t.kind == "recovery") {
+                continue; // observations do not complete fan-in members
+            }
             let failure = n.task_notice.as_ref().is_some_and(|t| matches!(t.status.as_str(), "failed" | "lost" | "error"));
             if let Some((task, state)) = task_completion(&n.command_id) {
                 let failure = failure || matches!(state, "failed" | "lost");
@@ -7169,6 +7390,8 @@ pub(crate) struct Writer {
     logged: std::sync::atomic::AtomicU64,
     activity: Arc<std::sync::atomic::AtomicI32>,
     outstanding_tools: Mutex<HashSet<String>>,
+    disk_probe: Option<(Arc<crate::disk::Monitor>, PathBuf)>,
+    resource_failure: std::sync::atomic::AtomicBool,
 }
 
 impl Writer {
@@ -7183,6 +7406,8 @@ impl Writer {
             logged: std::sync::atomic::AtomicU64::new(next_seq),
             activity: Default::default(),
             outstanding_tools: Default::default(),
+            disk_probe: None,
+            resource_failure: Default::default(),
         }
     }
 
@@ -7190,6 +7415,11 @@ impl Writer {
         let mut tools = self.outstanding_tools.lock().unwrap();
         tools.clear();
         self.activity.store(kind as i32, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn journal_error(&self, error: &anyhow::Error) {
+        let space = self.disk_probe.as_ref().and_then(|(disk, path)| disk.space(path));
+        self.resource_failure.store(crate::disk::resource_error(error, space.as_ref()), Ordering::Release);
     }
 
     fn observe_activity(&self, event: &session_event::Kind) {
@@ -7220,11 +7450,11 @@ impl EventSink for Writer {
         // Streamed text first: it must not arrive after what it streamed.
         self.link.flush_ephemeral();
         let ev = SessionEvent { seq: *next, ts_ms: c6_core::now_ms(), kind: Some(kind) };
-        self.journal.check_ownership(&self.session_id, self.ownership_epoch).await?;
+        self.journal.check_ownership(&self.session_id, self.ownership_epoch).await.inspect_err(|e| self.journal_error(e))?;
         let count = if matches!(&ev.kind, Some(session_event::Kind::Rewound(_))) {
-            self.journal.append_rewind_owned(&self.session_id, &ev, self.ownership_epoch).await?
+            self.journal.append_rewind_owned(&self.session_id, &ev, self.ownership_epoch).await.inspect_err(|e| self.journal_error(e))?
         } else {
-            self.journal.append_owned(&self.session_id, &ev, self.ownership_epoch).await?;
+            self.journal.append_owned(&self.session_id, &ev, self.ownership_epoch).await.inspect_err(|e| self.journal_error(e))?;
             1
         };
         *next += count;
@@ -7234,7 +7464,7 @@ impl EventSink for Writer {
 
     async fn start_turn(&self, turn: u64, inputs: &[PendingInput]) -> anyhow::Result<()> {
         let mut next = self.next_seq.lock().await;
-        self.journal.check_ownership(&self.session_id, self.ownership_epoch).await?;
+        self.journal.check_ownership(&self.session_id, self.ownership_epoch).await.inspect_err(|e| self.journal_error(e))?;
         self.link.flush_ephemeral();
         let kinds = inputs
             .iter()
@@ -7244,7 +7474,7 @@ impl EventSink for Writer {
             .enumerate()
             .map(|(offset, kind)| SessionEvent { seq: *next + offset as u64, ts_ms: c6_core::now_ms(), kind: Some(kind) })
             .collect();
-        self.journal.append_turn_owned(&self.session_id, &events, self.ownership_epoch).await?;
+        self.journal.append_turn_owned(&self.session_id, &events, self.ownership_epoch).await.inspect_err(|e| self.journal_error(e))?;
         *next += events.len() as u64;
         self.logged.store(*next, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -8855,7 +9085,7 @@ mod notice_tests {
         let _clock = pause_clock();
         let gate = manager.actors.lock().unwrap().get("held").unwrap().recovery.clone();
         let writer = Writer::new("held".into(), manager.journal.clone(), manager.link.clone(), 2);
-        let mut adoption = HeldAdoptionRecovery::new(gate.clone(), SECOND);
+        let mut adoption = HeldAdoptionRecovery::new(gate.clone(), SECOND, (5 * SECOND, 300 * SECOND));
         assert!(!adoption.check(&writer, fail()).await);
         assert!(gate.adopting.load(Ordering::Acquire));
         assert!(!adoption.check(&writer, no_attempt()).await, "mailbox activity cannot bypass backoff");
@@ -8891,6 +9121,55 @@ mod notice_tests {
             1,
             "the initial failure is durable, but retries do not write another error"
         );
+    }
+
+    #[tokio::test]
+    async fn held_adoption_waits_for_disk_without_retiring_or_spending_the_ownership_budget() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        for corruption_after_wait in [false, true] {
+            let (_dir, manager, _mock) = idle_session().await;
+            let free = Arc::new(AtomicU64::new(0));
+            let sampled = free.clone();
+            let disk = Arc::new(crate::disk::Monitor::new(move |_| {
+                Some(crate::disk::Space { mount: "/test/state".into(), free: sampled.load(Ordering::SeqCst), total: 1 << 40 })
+            }));
+            let mut writer = Writer::new("held".into(), manager.journal.clone(), manager.link.clone(), 2);
+            writer.disk_probe = Some((disk, manager.state_dir.clone()));
+            let gate = Arc::new(RecoveryGate::default());
+            let fault = Arc::new(AtomicBool::new(true));
+            manager.journal.inject_recovery_error(if corruption_after_wait { 4874 } else { 13 }, fault.clone());
+            let _clock = pause_clock();
+            let mut adoption = HeldAdoptionRecovery::new(gate.clone(), SECOND, (5 * SECOND, 300 * SECOND));
+            assert!(!adoption.check(&writer, manager.journal.recover_connection()).await);
+            tokio::time::advance(240 * SECOND).await;
+            assert!(!adoption.check(&writer, manager.journal.recover_connection()).await);
+            assert!(gate.request.lock().unwrap().is_none());
+            assert!(gate.disk_wait.lock().unwrap().as_ref().unwrap().contains("/test/state: 0 bytes free"));
+            let actual_retry = adoption.disk_retry_at;
+            tokio::time::advance(SECOND).await;
+            assert!(!adoption.check(&writer, async { panic!("sampling must not bypass the attempt backoff") }).await);
+            assert_eq!(adoption.disk_retry_at, actual_retry);
+            if corruption_after_wait {
+                manager.journal.inject_recovery_error(11, fault);
+                tokio::time::advance(actual_retry.unwrap() - tokio::time::Instant::now()).await;
+                assert!(!adoption.check(&writer, manager.journal.recover_connection()).await);
+                assert!(gate.disk_wait.lock().unwrap().is_none());
+                assert!(gate.request.lock().unwrap().is_none(), "corruption gets its own bounded ownership retry budget");
+                tokio::time::advance(SECOND).await;
+                assert!(!adoption.check(&writer, async { panic!("expired corruption budget must not retry") }).await);
+                assert!(gate.request.lock().unwrap().is_some());
+            } else {
+                fault.store(false, Ordering::SeqCst);
+                free.store(crate::disk::RESUME_BYTES, Ordering::SeqCst);
+                tokio::time::advance(SECOND).await;
+                assert!(adoption.check(&writer, manager.journal.recover_connection()).await, "space return bypasses the backoff");
+            }
+            drop(adoption);
+            assert!(gate.disk_wait.lock().unwrap().is_none());
+            assert!(gate.request.lock().unwrap().is_none());
+            assert!(!gate.adopting.load(Ordering::Acquire));
+            tokio::time::resume();
+        }
     }
 
     fn enqueue_test_report(actor: &Handle, number: usize) -> tokio::sync::oneshot::Receiver<()> {
@@ -8973,6 +9252,191 @@ mod notice_tests {
     }
 
     #[tokio::test]
+    async fn disk_full_outlives_recovery_deadline_and_resumes_without_action() {
+        disk_full_recovery(false).await;
+    }
+
+    #[tokio::test]
+    async fn disk_full_resumes_an_interrupted_turn_after_the_old_deadline() {
+        disk_full_recovery(true).await;
+    }
+
+    async fn disk_full_recovery(running: bool) {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        struct WaitingHead(String, mpsc::UnboundedSender<serde_json::Value>);
+        #[async_trait]
+        impl crate::link::LocalHead for WaitingHead {
+            async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+                if method == "session.recovery_status" {
+                    self.1.send(params).unwrap();
+                }
+                Ok(serde_json::Value::Null)
+            }
+            async fn credential(&self, connection: &str) -> c6_proto::CredentialGrant {
+                crate::link::LocalHead::credential(&Head(self.0.clone()), connection).await
+            }
+        }
+        let (dir, mut manager, mock) = idle_session().await;
+        let (sent, mut statuses) = mpsc::unbounded_channel();
+        if running {
+            // Even a budget shorter than the first SQLite checkout must not
+            // install manual recovery after an already classified FULL/I/O.
+            let (mut spec, _) = manager.journal.load_session("held").await.unwrap().unwrap();
+            spec.session_recovery_seconds = 1;
+            let db = sqlx::SqlitePool::connect(&format!("sqlite:{}", dir.path().join("journal.db").display())).await.unwrap();
+            sqlx::query("UPDATE sessions SET spec = ? WHERE id = 'held'").bind(spec.encode_to_vec()).execute(&db).await.unwrap();
+            db.close().await;
+        }
+        manager.link = Arc::new(HeadLink::local(Arc::new(WaitingHead(mock.base_url(), sent))));
+        let free = Arc::new(AtomicU64::new(0));
+        let sampled = free.clone();
+        manager.disk = Arc::new(crate::disk::Monitor::new(move |_| {
+            Some(crate::disk::Space { mount: "/test/state".into(), free: sampled.load(Ordering::SeqCst), total: 1 << 40 })
+        }));
+        let _clock = pause_clock();
+        enqueue_reports(&manager, 1..2, false).await;
+        let _held_turn = if running {
+            let gate = mock.push_gated(c6_testkit::Reply::Text("Original turn still in flight.".into()));
+            mock.push(c6_testkit::Reply::Text("Recovered turn completed automatically.".into()));
+            manager
+                .handle(SessionCommand {
+                    session_id: "held".into(),
+                    command_id: "start-before-full".into(),
+                    kind: Some(session_command::Kind::Input(c6_proto::UserInput {
+                        text: "Continue this work through disk pressure.".into(),
+                        human_origin: true,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            mock.request_headers(0).await;
+            Some(gate)
+        } else {
+            None
+        };
+        let full = Arc::new(AtomicBool::new(true));
+        manager.journal.inject_recovery_error(13, full.clone());
+        manager.journal.inject_append_shmsize("report #2.").await;
+        let actor = manager.actors.lock().unwrap().get("held").unwrap().clone();
+        assert!(enqueue_test_report(&actor, 2).await.is_err());
+        // Drive the initial short recovery backoff while allowing SQLite's
+        // thread to return the injected error. A real clock is watchdog only.
+        let watchdog = std::time::Instant::now() + c6_testkit::wait::deadline();
+        let waiting = loop {
+            if let Ok(status) = statuses.try_recv() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < watchdog, "no disk-wait status");
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(waiting["automatic"], true);
+        assert!(waiting["reason"].as_str().unwrap().contains("/test/state: 0 bytes free"));
+        tokio::time::advance(Duration::from_secs(240)).await;
+        tokio::task::yield_now().await;
+        assert!(actor.recovery.request.lock().unwrap().is_none(), "disk full must not enter the manual lane after 180 seconds");
+        let evidence = manager.liveness_report();
+        assert_eq!(evidence.sessions[0].actor_state, c6_proto::SessionActorState::WaitingForDisk as i32);
+        // A queued callback survives the wait. Free space wakes recovery on
+        // the next sampler tick, without spending the capped backoff delay.
+        let mut later = enqueue_test_report(&actor, 3);
+        full.store(false, Ordering::SeqCst);
+        free.store(crate::disk::RESUME_BYTES, Ordering::SeqCst);
+        tokio::time::advance(SECOND + TICK).await;
+        let restored = barrier(&manager, "disk-space-returned");
+        tokio::pin!(restored);
+        let watchdog = std::time::Instant::now() + c6_testkit::wait::deadline();
+        loop {
+            if futures::poll!(&mut restored).is_ready() {
+                break;
+            }
+            assert!(std::time::Instant::now() < watchdog, "disk recovery did not resume automatically");
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+        later.try_recv().unwrap();
+        assert!(actor.recovery.disk_wait.lock().unwrap().is_none());
+        assert!(actor.recovery.request.lock().unwrap().is_none());
+        if running {
+            // ResumeFailed is queued behind the callbacks retained above;
+            // let it install the normal notice merge timer before advancing.
+            barrier(&manager, "automatic-resume-queued").await;
+            tokio::time::advance(QUIET + TICK).await;
+            // Resource timing is proved above. Real process/HTTP cleanup
+            // may poll OS state, as in release_held_reports below; do not
+            // freeze those unrelated I/O retry timers while awaiting output.
+            tokio::time::resume();
+            let events = logged(&manager, |events| {
+                events.iter().any(|e| {
+                    matches!(&e.kind,
+                Some(session_event::Kind::TurnEnded(t)) if t.reason == TurnEndReason::Completed as i32)
+                })
+            })
+            .await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(&e.kind,
+                Some(session_event::Kind::User(u)) if u.command_id == "start-before-full"))
+                    .count(),
+                1
+            );
+            assert!(mock.requests().len() >= 2, "the interrupted turn must continue without another user input");
+        } else {
+            assert_waiting(&manager, &mock, 3).await;
+            release_held_reports(&manager, &mock, &actor, 3).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn corruption_on_a_full_filesystem_still_offers_retry_and_restart() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for (code, action) in [(11, "retry"), (26, "restart")] {
+            let (_dir, mut manager, _mock) = idle_session().await;
+            let full = crate::disk::Space { mount: "/test".into(), free: 0, total: 1 << 40 };
+            manager.disk = Arc::new(crate::disk::Monitor::new(move |_| Some(full.clone())));
+            let clock = pause_clock();
+            enqueue_reports(&manager, 1..2, false).await;
+            let fault = Arc::new(AtomicBool::new(true));
+            manager.journal.inject_recovery_error(code, fault.clone());
+            let error = manager.journal.recover_connection().await.unwrap_err();
+            assert!(!crate::disk::resource_error(&error, manager.disk.space(Path::new("/test")).as_ref()));
+            manager.journal.inject_append_error("report #2.", code).await;
+            let actor = manager.actors.lock().unwrap().get("held").unwrap().clone();
+            assert!(enqueue_test_report(&actor, 2).await.is_err());
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(u64::from(c6_api::DEFAULT_SESSION_RECOVERY_SECONDS) + 1)).await;
+            let watchdog = std::time::Instant::now() + c6_testkit::wait::deadline();
+            let incident = loop {
+                if let Some(r) = actor.recovery.request.lock().unwrap().as_ref().filter(|r| r.ready.is_some()) {
+                    break r.incident.clone();
+                }
+                assert!(std::time::Instant::now() < watchdog, "corruption did not stop at the recovery bound");
+                tokio::task::yield_now().await;
+            };
+            assert!(actor.recovery.disk_wait.lock().unwrap().is_none());
+            fault.store(false, Ordering::SeqCst);
+            manager.recovery_action("held", 0, &incident, action).unwrap();
+            let recovered = barrier(&manager, "corruption-explicit-action");
+            tokio::pin!(recovered);
+            let watchdog = std::time::Instant::now() + c6_testkit::wait::deadline();
+            loop {
+                if futures::poll!(&mut recovered).is_ready() {
+                    break;
+                }
+                assert!(std::time::Instant::now() < watchdog, "manual recovery did not resume");
+                tokio::time::advance(TICK).await;
+                tokio::task::yield_now().await;
+            }
+            assert!(actor.recovery.request.lock().unwrap().is_none());
+            drop(clock);
+            tokio::time::resume();
+        }
+    }
+
+    #[tokio::test]
     async fn recovery_control_rejects_requests_until_ready_and_while_busy() {
         let (_dir, manager, _mock) = idle_session().await;
         manager.actor("held").await.unwrap().unwrap();
@@ -8987,6 +9451,49 @@ mod notice_tests {
         retry().unwrap();
         assert!(retry().unwrap_err().to_string().contains("still in progress"));
         assert_eq!(action.await, RecoveryAction::Retry);
+    }
+
+    #[tokio::test]
+    async fn parent_disk_wait_notice_is_not_a_subagent_completion() {
+        let (_dir, manager, _mock) = idle_session().await;
+        let _clock = pause_clock();
+        let text = "Subagent child is waiting for disk space on /test: 0 bytes free. It continues automatically.";
+        manager
+            .handle(SessionCommand {
+                command_id: "disk-observation".into(),
+                session_id: "held".into(),
+                kind: Some(session_command::Kind::DelegationEnded(c6_proto::DelegationEnded {
+                    child_session_id: "child".into(),
+                    reason: TurnEndReason::Completed as i32,
+                    report: text.into(),
+                    digest: text.into(),
+                    wake: false,
+                    task_notice: Some(c6_proto::TaskNotice {
+                        kind: "recovery".into(),
+                        title: "Child".into(),
+                        session_id: "child".into(),
+                        status: "waiting".into(),
+                        markdown: text.into(),
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        barrier(&manager, "waiting-not-completed").await;
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        assert!(events.iter().any(|e| matches!(&e.kind,
+            Some(session_event::Kind::SubagentReported(r)) if r.status == "waiting" && r.call_id.is_empty())));
+        let notice = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                Some(session_event::Kind::NoticeQueued(n)) if n.command_id == "subagent:disk-observation" => Some(n),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(notice.text, text);
+        assert!(!notice.text.contains("status=\"completed\""));
     }
 
     #[tokio::test]
@@ -9012,7 +9519,7 @@ mod notice_tests {
         let link = Arc::new(HeadLink::local(Arc::new(ReportHead(sent, true.into()))));
         let reason = "worker journal unavailable".to_owned();
         let (changes, state) = tokio::sync::watch::channel(Some(reason.clone()));
-        let task = tokio::spawn(report_recovery(link, "child".into(), 0, "incident".into(), reason.clone(), state));
+        let task = tokio::spawn(report_recovery(link, "child".into(), 0, "incident".into(), reason.clone(), state, false));
         assert_eq!(calls.recv().await.unwrap(), reason);
         changes.send_replace(None);
         assert_eq!(calls.recv().await.unwrap(), reason);
@@ -9028,7 +9535,7 @@ mod notice_tests {
         link.connected(tx);
         let reason = "worker journal unavailable".to_owned();
         let (changes, state) = tokio::sync::watch::channel(Some(reason.clone()));
-        let mut report = Box::pin(report_recovery(link.clone(), "child".into(), 0, "incident".into(), reason, state));
+        let mut report = Box::pin(report_recovery(link.clone(), "child".into(), 0, "incident".into(), reason, state, false));
         assert!(futures::poll!(report.as_mut()).is_pending());
         tokio::time::advance(Duration::from_secs(120)).await;
         assert!(futures::poll!(report.as_mut()).is_pending(), "no cleanup deadline while active");
@@ -9072,7 +9579,7 @@ mod notice_tests {
         let link = Arc::new(HeadLink::local(Arc::new(ReportHead { calls: sent, ack_warning: Mutex::new(Some(ack_warning)) })));
         let reason = "worker journal unavailable".to_owned();
         let (changes, state) = tokio::sync::watch::channel(Some(reason.clone()));
-        let mut report = Box::pin(report_recovery(link, "child".into(), 0, "incident".into(), reason.clone(), state));
+        let mut report = Box::pin(report_recovery(link, "child".into(), 0, "incident".into(), reason.clone(), state, false));
         assert!(futures::poll!(report.as_mut()).is_pending());
         let (warning, mut warning_dropped) = calls.try_recv().unwrap();
         assert_eq!(warning, reason);

@@ -2248,8 +2248,21 @@ pub struct SubagentLimits {
     #[serde(default = "default_claude_code_idle_minutes")]
     pub claude_code_idle_minutes: u32,
     /// Stop retrying automatically after this many seconds of journal recovery.
+    /// Resource failures such as a full disk are exempt and keep retrying.
     #[serde(default = "default_session_recovery_seconds")]
     pub session_recovery_seconds: u32,
+    /// Initial delay between disk recovery attempts, in seconds.
+    #[serde(default = "default_disk_recovery_initial_seconds")]
+    pub disk_recovery_initial_seconds: u32,
+    /// Maximum delay between disk recovery attempts, in seconds.
+    #[serde(default = "default_disk_recovery_max_seconds")]
+    pub disk_recovery_max_seconds: u32,
+    /// Warn when free disk space falls below this percentage. Zero disables this threshold.
+    #[serde(default = "default_disk_warning_percent")]
+    pub disk_warning_percent: u32,
+    /// Warn when free disk space falls below this many bytes. Zero disables this threshold.
+    #[serde(default = "default_disk_warning_bytes")]
+    pub disk_warning_bytes: u64,
     /// Interval between liveness checks, in seconds.
     #[serde(default = "default_liveness_sweep_seconds")]
     pub liveness_sweep_seconds: u32,
@@ -2368,6 +2381,22 @@ fn default_session_recovery_seconds() -> u32 {
     DEFAULT_SESSION_RECOVERY_SECONDS
 }
 
+fn default_disk_recovery_initial_seconds() -> u32 {
+    5
+}
+
+fn default_disk_recovery_max_seconds() -> u32 {
+    300
+}
+
+fn default_disk_warning_percent() -> u32 {
+    10
+}
+
+fn default_disk_warning_bytes() -> u64 {
+    20 * 1024 * 1024 * 1024
+}
+
 fn default_liveness_sweep_seconds() -> u32 {
     DEFAULT_LIVENESS_SWEEP_SECONDS
 }
@@ -2406,6 +2435,10 @@ impl Default for SubagentLimits {
             notice_tokens_per_hour: DEFAULT_NOTICE_TOKENS_PER_HOUR,
             claude_code_idle_minutes: DEFAULT_CLAUDE_CODE_IDLE_MINUTES,
             session_recovery_seconds: DEFAULT_SESSION_RECOVERY_SECONDS,
+            disk_recovery_initial_seconds: default_disk_recovery_initial_seconds(),
+            disk_recovery_max_seconds: default_disk_recovery_max_seconds(),
+            disk_warning_percent: default_disk_warning_percent(),
+            disk_warning_bytes: default_disk_warning_bytes(),
             liveness_sweep_seconds: DEFAULT_LIVENESS_SWEEP_SECONDS,
             liveness_worker_grace_seconds: DEFAULT_LIVENESS_WORKER_GRACE_SECONDS,
             liveness_model_silence_seconds: DEFAULT_LIVENESS_MODEL_SILENCE_SECONDS,
@@ -2419,6 +2452,31 @@ impl Default for SubagentLimits {
 #[cfg(test)]
 mod notice_settings_tests {
     use super::*;
+
+    #[test]
+    fn disk_settings_default_for_legacy_settings_and_round_trip_large_bytes() {
+        let mut settings: SubagentLimits = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.disk_recovery_initial_seconds, 5);
+        assert_eq!(settings.disk_recovery_max_seconds, 300);
+        assert_eq!(settings.disk_warning_percent, 10);
+        assert_eq!(settings.disk_warning_bytes, 20 * 1024 * 1024 * 1024);
+        settings.disk_warning_bytes = 40 * 1024 * 1024 * 1024;
+        assert_eq!(SubagentLimits::from_stored_json(&settings.to_stored_json().unwrap()).unwrap(), settings);
+        settings.disk_warning_percent = 0;
+        settings.disk_warning_bytes = 0;
+        assert_eq!(SubagentLimits::from_stored_json(&settings.to_stored_json().unwrap()).unwrap(), settings);
+    }
+
+    #[test]
+    fn recovery_automatic_defaults_false_and_is_only_serialized_when_true() {
+        let mut status: SessionRecovery = serde_json::from_value(serde_json::json!({"incident": "i", "reason": "r"})).unwrap();
+        assert!(!status.automatic);
+        assert!(serde_json::to_value(&status).unwrap().get("automatic").is_none());
+        status.automatic = true;
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(wire["automatic"], true);
+        assert_eq!(serde_json::from_value::<SessionRecovery>(wire).unwrap(), status);
+    }
 
     #[test]
     fn legacy_notice_limit_is_ignored_and_new_limits_get_defaults() {
@@ -3461,6 +3519,9 @@ pub struct CatalogCall {
 pub struct SessionRecovery {
     pub incident: String,
     pub reason: String,
+    /// Recovery continues without user action (for example, waiting for disk space).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub automatic: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

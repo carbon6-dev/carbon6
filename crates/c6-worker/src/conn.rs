@@ -274,6 +274,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                 }
             }
             _ = pings.tick() => {
+                worker.sessions.report_disk_pressure();
                 nonce += 1;
                 in_flight.insert(nonce, Instant::now());
                 // Bound the map if pongs go missing.

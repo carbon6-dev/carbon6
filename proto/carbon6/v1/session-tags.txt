@@ -426,6 +426,10 @@ carbon6.v1.SessionCommand 23 NoticeLimits update_notice_limits
 carbon6.v1.Checkpoint 3 string tree_id
 carbon6.v1.CreateSession 43 uint32 notice_loop_backoff_rounds
 carbon6.v1.CreateSession 44 uint32 notice_loop_backoff_max_seconds
+carbon6.v1.CreateSession 45 uint32 disk_recovery_initial_seconds
+carbon6.v1.CreateSession 46 uint32 disk_recovery_max_seconds
+carbon6.v1.CreateSession 47 optional:uint32 disk_warning_percent
+carbon6.v1.CreateSession 48 optional:uint64 disk_warning_bytes
 carbon6.v1.NoticeLimits 6 uint32 notice_loop_backoff_rounds
 carbon6.v1.NoticeLimits 7 uint32 notice_loop_backoff_max_seconds
 carbon6.v1.NoticeLimits 8 optional:uint32 max_subagent_depth

@@ -139,7 +139,9 @@ pub(crate) async fn recovery_attention(
         .unwrap()
         .live
         .iter()
-        .filter(|(id, s)| s.heard.elapsed() < RECOVERY_STATUS_LEASE && ids.is_none_or(|ids| ids.contains(id.as_str())))
+        .filter(|(id, s)| {
+            !s.status.automatic && s.heard.elapsed() < RECOVERY_STATUS_LEASE && ids.is_none_or(|ids| ids.contains(id.as_str()))
+        })
         .map(|(id, s)| (id.clone(), s.worker.to_string(), s.epoch, s.since))
         .collect();
     if candidates.is_empty() {
@@ -521,6 +523,10 @@ async fn create_assistant_with_origin(
         notice_loop_backoff_rounds: limits.notice_loop_backoff_rounds,
         notice_loop_backoff_max_seconds: limits.notice_loop_backoff_max_seconds,
         session_recovery_seconds: limits.session_recovery_seconds,
+        disk_recovery_initial_seconds: limits.disk_recovery_initial_seconds,
+        disk_recovery_max_seconds: limits.disk_recovery_max_seconds,
+        disk_warning_percent: Some(limits.disk_warning_percent),
+        disk_warning_bytes: Some(limits.disk_warning_bytes),
         ..Default::default()
     };
     crate::naming::expect(st, &row.id).await?;
@@ -730,6 +736,10 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         notice_loop_backoff_max_seconds: limits.notice_loop_backoff_max_seconds,
         claude_code_idle_minutes: limits.claude_code_idle_minutes,
         session_recovery_seconds: limits.session_recovery_seconds,
+        disk_recovery_initial_seconds: limits.disk_recovery_initial_seconds,
+        disk_recovery_max_seconds: limits.disk_recovery_max_seconds,
+        disk_warning_percent: Some(limits.disk_warning_percent),
+        disk_warning_bytes: Some(limits.disk_warning_bytes),
         claude_code: Some(claude_code_choice(st, &row.realm).await?),
         claude_code_tools: claude_code_tools(st, Some(&row.realm)).await?.tools,
         claude_code_tools_chosen: true,
@@ -2686,6 +2696,9 @@ pub async fn release_notices(st: &HeadState, session_id: &str) -> anyhow::Result
 }
 
 pub async fn recovery_action(st: &HeadState, session: &SessionRow, request: api::SessionRecoveryRequest) -> anyhow::Result<()> {
+    if recovery_status(st, &session.id).await.is_some_and(|s| s.automatic) {
+        return Err(conflict("recovery continues automatically; no action is needed"));
+    }
     let worker_id = session.worker_id.parse()?;
     if session.archived != 0 || !st.store.session_routable(&session.id, worker_id, session.ownership_epoch).await? {
         return Err(conflict("this session cannot be recovered on its current worker"));
@@ -2724,6 +2737,11 @@ pub(crate) async fn report_recovery(st: &HeadState, worker: WorkerId, session: &
     }
     let id = params["incident"].as_str().and_then(|s| Uuid::parse_str(s).ok()).ok_or_else(|| bad_request("invalid incident"))?.to_string();
     let reason = params["reason"].as_str().map(|r| r.chars().take(1000).collect::<String>());
+    let automatic = params
+        .get("automatic")
+        .map(|v| v.as_bool().ok_or_else(|| bad_request("automatic must be a boolean")))
+        .transpose()?
+        .unwrap_or(false);
     let (status, first, parent_pending) = {
         let mut book = st.hub.recovery.lock().unwrap();
         let owner = (session.id.clone(), worker, epoch);
@@ -2743,7 +2761,7 @@ pub(crate) async fn report_recovery(st: &HeadState, worker: WorkerId, session: &
             }
             let first = current.is_none_or(|s| s.status.incident != id);
             let parent_reported = !first && current.is_some_and(|s| s.parent_reported);
-            let status = api::SessionRecovery { incident: id.clone(), reason };
+            let status = api::SessionRecovery { incident: id.clone(), reason, automatic };
             let since = current.filter(|_| !first).map_or_else(c6_core::now_ms, |s| s.since);
             if current.is_none_or(|s| s.status != status || s.heard.elapsed() >= RECOVERY_STATUS_LEASE) {
                 st.hub.publish(&session.id, api::StreamMsg::Recovery { status: Some(status.clone()) });
@@ -2778,12 +2796,13 @@ pub(crate) async fn report_recovery(st: &HeadState, worker: WorkerId, session: &
         }
     };
     if first {
-        let message = crate::prompts::get(st, "session.recovery_notification", &session.realm).await.replace("{{reason}}", &status.reason);
+        let prompt = if status.automatic { "session.recovery_waiting_notification" } else { "session.recovery_notification" };
+        let message = crate::prompts::get(st, prompt, &session.realm).await.replace("{{reason}}", &status.reason);
         st.notifier.send(crate::notify::Note {
             event: "failed",
-            title: format!("Session recovery stuck: {}", session.title),
+            title: format!("Session recovery {}: {}", if status.automatic { "waiting" } else { "stuck" }, session.title),
             message,
-            priority: "high",
+            priority: if status.automatic { "normal" } else { "high" },
             session_id: Some(session.id.clone()),
             labels: session.all_labels(),
             ..Default::default()
@@ -3587,6 +3606,104 @@ mod input_compatibility_tests {
     }
 
     #[tokio::test]
+    async fn disk_recovery_settings_preserve_legacy_defaults_and_explicit_disabled_warnings() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let session = st.store.session("session").await.unwrap().unwrap();
+        st.store.set_setting(SUBAGENT_LIMITS, "{}").await.unwrap();
+        let spec = session_spec(st, &session, false, Vec::new()).await.unwrap();
+        assert_eq!(spec.disk_recovery_initial_seconds, 5);
+        assert_eq!(spec.disk_recovery_max_seconds, 300);
+        assert_eq!(spec.disk_warning_percent, Some(10));
+        assert_eq!(spec.disk_warning_bytes, Some(20 * 1024 * 1024 * 1024));
+        st.store.set_setting(SUBAGENT_LIMITS, r#"{"disk_warning_percent":0,"disk_warning_bytes":0}"#).await.unwrap();
+        let spec = session_spec(st, &session, false, Vec::new()).await.unwrap();
+        assert_eq!(spec.disk_warning_percent, Some(0));
+        assert_eq!(spec.disk_warning_bytes, Some(0));
+    }
+
+    #[tokio::test]
+    async fn automatic_recovery_is_live_but_never_needs_user_action() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let owner = WorkerId::new();
+        assign_worker(st, owner).await;
+        let incident = Uuid::now_v7().to_string();
+        let mut live = st.hub.subscribe("session");
+        let mut report = json!({
+            "session_id": "session", "ownership_epoch": 0, "incident": incident,
+            "reason": "Waiting for disk space on /data: 0 free. Recovery continues automatically; no action needed.",
+            "automatic": true,
+        });
+        for _ in 0..2 {
+            crate::fabric::handle(st, owner, "session.recovery_status", report.clone()).await.unwrap();
+        }
+        let api::StreamMsg::Recovery { status: Some(status) } = live.try_recv().unwrap() else { panic!("expected automatic status") };
+        assert!(status.automatic);
+        assert_eq!(recovery_status(st, "session").await, Some(status));
+        assert!(live.try_recv().is_err(), "heartbeats do not duplicate the live status");
+        assert!(recovery_attention(st, None).await.unwrap().is_empty());
+        assert_eq!(crate::work::session_live(st, "home", "session").await.unwrap().state, "running");
+        let session = st.store.session("session").await.unwrap().unwrap();
+        let mut display = crate::convert::session(&session, None);
+        crate::api::project_session_health(st, std::slice::from_mut(&mut display)).await.unwrap();
+        assert!(!display.recovery_stuck && !display.needs_you());
+        for action in ["retry", "restart"] {
+            assert!(
+                recovery_action(st, &session, api::SessionRecoveryRequest { incident: incident.clone(), action: action.into() })
+                    .await
+                    .is_err()
+            );
+        }
+        report["automatic"] = json!("yes");
+        assert!(crate::fabric::handle(st, owner, "session.recovery_status", report.clone()).await.is_err());
+        report["automatic"] = json!(true);
+        report["reason"] = Value::Null;
+        crate::fabric::handle(st, owner, "session.recovery_status", report).await.unwrap();
+        assert!(recovery_status(st, "session").await.is_none());
+        assert!(matches!(live.try_recv().unwrap(), api::StreamMsg::Recovery { status: None }));
+    }
+
+    #[tokio::test]
+    async fn automatic_recovery_parent_notice_is_editable_waiting_not_failure_or_completion() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let owner = WorkerId::new();
+        assign_worker(st, owner).await;
+        let mut child = st.store.session("session").await.unwrap().unwrap();
+        child.id = "disk-child".into();
+        child.parent_id = Some("session".into());
+        child.parent_call_id = Some("still-pending-call".into());
+        st.store.create_session(&child, &[], false).await.unwrap();
+        crate::prompts::set(st, "session.subagent_recovery_waiting", "Edited wait for {{child}}: {{reason}}").await.unwrap();
+        let params = json!({
+            "session_id": child.id, "ownership_epoch": 0, "incident": Uuid::now_v7().to_string(),
+            "reason": "Recovery continues automatically; no action needed.", "automatic": true,
+        });
+        for _ in 0..2 {
+            crate::fabric::handle(st, owner, "session.recovery_status", params.clone()).await.unwrap();
+        }
+        let pending = st.store.pending_commands(owner, 0).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let notice = SessionCommand::decode(pending[0].data.as_slice()).unwrap();
+        let Some(session_command::Kind::DelegationEnded(ended)) = notice.kind else { panic!("expected a parent notice") };
+        assert!(ended.call_id.is_empty(), "resource waits never settle the real call");
+        assert_eq!(
+            ended.reason,
+            c6_proto::TurnEndReason::Completed as i32,
+            "a neutral success envelope avoids failed-relaunch classification"
+        );
+        assert!(ended.wake);
+        let task = ended.task_notice.unwrap();
+        assert_eq!(task.kind, "recovery");
+        assert_eq!(task.status, "waiting");
+        assert_eq!(task.markdown, "Edited wait for disk-child: Recovery continues automatically; no action needed.");
+        assert_eq!(ended.report, task.markdown);
+        assert!(ended.said[0].contains("no subagent completion"));
+        assert!(!task.markdown.contains("failed") && !task.markdown.contains("stopped") && !task.markdown.contains("Retry"));
+    }
+
+    #[tokio::test]
     async fn recovery_escalation_is_owner_fenced_and_queues_one_editable_parent_notice() {
         let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
         let st = &head.state;
@@ -3630,7 +3747,7 @@ mod input_compatibility_tests {
             crate::fabric::handle(st, owner, "session.recovery_status", report.clone()).await.unwrap();
         }
         let api::StreamMsg::Recovery { status: Some(status) } = live.try_recv().unwrap() else { panic!("expected escalation") };
-        assert_eq!(status, api::SessionRecovery { incident: incident.clone(), reason: "write unavailable".into() });
+        assert_eq!(status, api::SessionRecovery { incident: incident.clone(), reason: "write unavailable".into(), automatic: false });
         assert_eq!(recovery_status(st, "child").await, Some(status));
         assert!(live.try_recv().is_err(), "a repeat heartbeat must not broadcast another escalation");
         let pending = st.store.pending_commands(owner, 0).await.unwrap();

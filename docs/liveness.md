@@ -11,7 +11,7 @@ Workers report actor state (running, idle, recovering, stopped), its reason,
 activity and held-process health over additive worker-link fields. Reports
 are connection-scoped: an old connection cannot certify a replacement's work.
 Disconnected workers get a short configurable grace; reconnecting within it
-does not lose work. Model silence and recovery have separate bounds. A live
+does not lose work. Model silence and non-resource recovery have separate bounds. A live
 tool is not model silence, however long the tool takes. Missing reports from
 older workers are unknown, never evidence that their actors died.
 
@@ -101,6 +101,25 @@ pending descendants and no activity anywhere in its tree for 30 minutes gets
 a pending-work summary, with ids and since times, even if everything is alive.
 
 ## Visibility and tests
+
+Disk exhaustion is an automatic resource wait, not a stuck or lost session.
+The worker reports `waiting_for_disk` with the state filesystem's mount and
+available bytes, independently of the failing journal. It retries beyond the
+normal 180-second recovery budget, with a 5-second initial delay doubling to
+5 minutes, and samples free space once a second to wake sooner when 16 MiB
+returns. Corruption (`SQLITE_CORRUPT`, `SQLITE_NOTADB`, failed integrity check)
+still escalates through the bounded Retry/Restart lane. User notifications and
+editable parent notices distinguish the automatic wait from a terminal stop.
+
+Early warnings sample the state directory, worker worktrees and temporary
+directory filesystems on the heartbeat tick. Each filesystem warns once below
+the larger of 10% free and 20 GiB; a healthy sample clears and rearms it.
+`disk_warning_percent` and `disk_warning_bytes` configure the threshold;
+`disk_recovery_initial_seconds` and `disk_recovery_max_seconds` configure the
+retry cap. New sessions carry these settings and local children inherit them.
+The warning uses the existing `failed` notification event until the general
+machine notification event is available. Neither sampling nor warnings writes
+to the worker journal.
 
 The read-only liveness operation lists evidence and current losses. Activity
 includes recent incidents; session/subagent views retain the loss cause until

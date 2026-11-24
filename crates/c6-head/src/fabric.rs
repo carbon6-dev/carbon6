@@ -121,6 +121,7 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
     }
     // Sessions this worker imports from Claude Code and Codex (docs/imports.md).
     match method {
+        "disk.pressure" => return disk_pressure(st, from, &params).await,
         "quotas.codex.config" => return crate::quotas::codex_config(st, from).await,
         "quotas.codex.report" => {
             crate::quotas::from_codex(st, from, serde_json::from_value(params)?).await?;
@@ -274,6 +275,31 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
     }
 }
 
+/// The worker owns threshold transitions and hysteresis; the head routes only
+/// active transitions through the existing user notification channels.
+async fn disk_pressure(st: &HeadState, from: WorkerId, params: &Value) -> anyhow::Result<Value> {
+    let worker = st.store.worker(from).await?.filter(|w| w.revoked_at.is_none()).ok_or_else(|| bad_request("unknown or revoked worker"))?;
+    if st.registry.get(from).is_none() {
+        return Err(bad_request("disk pressure must come from a connected worker"));
+    }
+    let active = params["active"].as_bool().ok_or_else(|| bad_request("active must be a boolean"))?;
+    let mount = params["mount"].as_str().filter(|s| !s.is_empty() && s.len() <= 4096).ok_or_else(|| bad_request("mount is required"))?;
+    let free = params["free_bytes"].as_u64().ok_or_else(|| bad_request("free_bytes is required"))?;
+    let total =
+        params["total_bytes"].as_u64().filter(|total| *total > 0 && free <= *total).ok_or_else(|| bad_request("invalid total_bytes"))?;
+    if active {
+        st.notifier.send(crate::notify::Note {
+            event: "failed",
+            title: format!("Low disk space on {}", worker.name),
+            message: format!("Mount {mount} on {}: {free} bytes free of {total} bytes. Sessions wait for disk space and recover automatically if the disk fills.", worker.name),
+            priority: "high",
+            labels: serde_json::from_str(&worker.labels).unwrap_or_default(),
+            ..Default::default()
+        });
+    }
+    Ok(Value::Null)
+}
+
 /// The scope a read grant allows: its kinds, else what the session may see.
 fn granted_scope(params: &Value, kinds: &[String]) -> Value {
     if kinds.is_empty() { params["scope"].clone() } else { json!(kinds) }
@@ -337,4 +363,77 @@ pub async fn get_granted(st: &HeadState, realm: &str, by: &str, params: Value) -
         }
     }
     own
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn disk_pressure_notifies_only_active_transitions_from_known_live_workers() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let worker = WorkerId::new();
+        let mut params = json!({"active": true, "mount": "/data", "free_bytes": 7, "total_bytes": 100});
+        assert!(handle(st, worker, "disk.pressure", params.clone()).await.is_err());
+        st.store
+            .insert_worker(
+                &crate::store::NewWorker {
+                    id: worker,
+                    name: "disk-test",
+                    hostname: "host",
+                    os: "test",
+                    arch: "test",
+                    version: "test",
+                    cert_serial: "disk-test",
+                },
+                "",
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(handle(st, worker, "disk.pressure", params.clone()).await.is_err(), "offline workers cannot report");
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let _live = st.registry.attach(worker, 1, tx, vec![], "worker").await;
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let hook = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(value): axum::Json<Value>| {
+                let sent = sent.clone();
+                async move {
+                    sent.send(value).unwrap();
+                    "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async { axum::serve(listener, hook).await.unwrap() });
+        st.store
+            .set_setting(
+                crate::notify::CHANNELS,
+                &json!([
+                    {"name": "disk-test", "kind": "webhook", "url": url, "events": ["failed"]}
+                ])
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        params["active"] = json!(false);
+        handle(st, worker, "disk.pressure", params.clone()).await.unwrap();
+        params["active"] = json!(true);
+        params["free_bytes"] = json!(101);
+        assert!(handle(st, worker, "disk.pressure", params.clone()).await.is_err());
+        params["free_bytes"] = json!(7);
+        handle(st, worker, "disk.pressure", params.clone()).await.unwrap();
+        st.notifier.send(crate::notify::Note { event: "failed", title: "disk barrier".into(), ..Default::default() });
+        let note = c6_testkit::within("disk pressure notification", received.recv()).await.unwrap();
+        assert_eq!(note["title"], "Low disk space on disk-test");
+        assert!(note["message"].as_str().unwrap().contains("/data on disk-test: 7 bytes free of 100 bytes"));
+        let barrier = c6_testkit::within("disk notification barrier", received.recv()).await.unwrap();
+        assert_eq!(barrier["title"], "disk barrier", "clear and invalid reports must not notify");
+        sqlx::query("UPDATE workers SET revoked_at = 1 WHERE id = ?").bind(worker.to_string()).execute(st.store.pool()).await.unwrap();
+        assert!(handle(st, worker, "disk.pressure", params).await.is_err());
+        server.abort();
+    }
 }

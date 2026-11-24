@@ -12,7 +12,12 @@ const SID: &str = "parent";
 async fn fixture(prompts_json: &str) -> (tempfile::TempDir, Arc<Journal>, SessionManager) {
     let dir = tempfile::tempdir().unwrap();
     let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
-    let manager = SessionManager::new(journal.clone(), Arc::new(HeadLink::default()), dir.path().join("worktrees"));
+    let manager = SessionManager::new_with_resource_sampler(
+        journal.clone(),
+        Arc::new(HeadLink::default()),
+        dir.path().join("worktrees"),
+        c6_worker::ResourceMeasurement::default,
+    );
     let started = SessionStarted { cwd: dir.path().display().to_string(), ..Default::default() };
     journal
         .import(
@@ -97,7 +102,12 @@ async fn worker_startup_reports_the_previous_worker_restarted() {
     let (dir, journal, manager) = fixture("").await;
     start_record(&journal, 2).await;
     drop(manager);
-    let manager = SessionManager::new(journal.clone(), Arc::new(HeadLink::default()), dir.path().join("worktrees"));
+    let manager = SessionManager::new_with_resource_sampler(
+        journal.clone(),
+        Arc::new(HeadLink::default()),
+        dir.path().join("worktrees"),
+        c6_worker::ResourceMeasurement::default,
+    );
     manager.recover().await.unwrap();
     let notice = eventually("agent-visible task loss notice", || lost_notice(&journal)).await;
     assert!(notice.contains("worker restarted"), "{notice}");
@@ -290,8 +300,12 @@ async fn handed_child_report_falls_back_when_the_parent_cannot_record_its_result
     c6_llm::install_crypto_provider();
     let mock = MockLlm::start().await;
     let (dir, journal, _) = fixture("").await;
-    let manager =
-        SessionManager::new(journal.clone(), Arc::new(HeadLink::local(Arc::new(MockHead(mock.base_url())))), dir.path().join("worktrees"));
+    let manager = SessionManager::new_with_resource_sampler(
+        journal.clone(),
+        Arc::new(HeadLink::local(Arc::new(MockHead(mock.base_url())))),
+        dir.path().join("worktrees"),
+        c6_worker::ResourceMeasurement::default,
+    );
     let sid = "live-parent";
     let model = c6_proto::ModelSpec { connection_id: "mock".into(), model: "m".into(), ..Default::default() };
     let spec = CreateSession { model: Some(model.clone()), ..Default::default() };

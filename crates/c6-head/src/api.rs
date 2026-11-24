@@ -1982,6 +1982,17 @@ async fn put_subagent_limits(State(st): State<Arc<HeadState>>, Json(l): Json<api
     if !(1..=3600).contains(&l.session_recovery_seconds) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "automatic journal recovery lasts 1 to 3600 seconds".into()));
     }
+    if !(1..=3600).contains(&l.disk_recovery_initial_seconds)
+        || !(l.disk_recovery_initial_seconds..=86400).contains(&l.disk_recovery_max_seconds)
+    {
+        return Err(ApiErr(
+            StatusCode::BAD_REQUEST,
+            "disk recovery delays must start at 1 to 3600 seconds and have a maximum between the initial delay and 86400 seconds".into(),
+        ));
+    }
+    if l.disk_warning_percent > 100 {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "the disk warning percentage is 0 (off) to 100".into()));
+    }
     for (seconds, label, max) in [
         (l.liveness_sweep_seconds, "the liveness sweep interval", 3600),
         (l.liveness_worker_grace_seconds, "the worker reconnection grace period", 3600),
@@ -5335,6 +5346,30 @@ async fn decision_discussion_session(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn disk_recovery_settings_validate_delays_and_allow_disabled_warning_thresholds() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        sqlx::query("UPDATE sessions SET worker_id = ? WHERE id = 'session'")
+            .bind(WorkerId::new().to_string())
+            .execute(head.state.store.pool())
+            .await
+            .unwrap();
+        for (initial, max, percent) in [(0, 300, 10), (3601, 3601, 10), (5, 4, 10), (5, 86401, 10), (5, 300, 101)] {
+            let limits = api::SubagentLimits {
+                disk_recovery_initial_seconds: initial,
+                disk_recovery_max_seconds: max,
+                disk_warning_percent: percent,
+                ..Default::default()
+            };
+            assert!(matches!(put_subagent_limits(State(head.state.clone()), Json(limits)).await, Err(ApiErr(StatusCode::BAD_REQUEST, _))));
+        }
+        let limits = api::SubagentLimits { disk_warning_percent: 0, disk_warning_bytes: 0, ..Default::default() };
+        assert!(matches!(put_subagent_limits(State(head.state.clone()), Json(limits)).await, Ok(StatusCode::NO_CONTENT)));
+        let saved = crate::sessions::subagent_limits(&head.state, Some("home")).await.unwrap();
+        assert_eq!(saved.disk_warning_percent, 0);
+        assert_eq!(saved.disk_warning_bytes, 0);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn session_notice_stream_replays_recovery_and_pending_holds_before_sync() {

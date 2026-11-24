@@ -92,6 +92,10 @@ distinguishes automatic waiting from waiting for the user:
   as working, not as needing the user, in session lists, Activity and work.
 * **Slowed:** the guard found repetition and is delaying the next automatic
   wake. This is an automatic wait, not an attention alert.
+* **Waiting for disk space:** journal recovery names the mount and free bytes.
+  This also proceeds by itself: recovery continues when space frees, even after
+  the normal recovery deadline. Its notification and parent notice explain
+  automatic continuation; it is not a stuck-recovery Retry/Restart request.
 * **Needs you:** paused by the runaway guard or the optional spending cap, stuck
   recovery, non-waking notices waiting for your next message, or an unknown
   hold that cannot promise automatic progress. This uses amber attention styling

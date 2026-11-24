@@ -951,16 +951,20 @@ async fn live_of(st: &HeadState, realm: &str, a: &Attached, requests: &HashMap<(
             Some(s) => {
                 l.title = if s.title.trim().is_empty() { "Untitled session".into() } else { s.title.clone() };
                 l.at = s.updated_at;
+                let recovery = crate::sessions::recovery_status(st, id).await;
                 l.state = if s.archived != 0 {
                     "archived".into()
                 } else if s.awaiting > 0
                     || s.notice_waiting_at.is_some()
                     || crate::liveness::is_lost(st, id).await?
-                    || crate::sessions::recovery_status(st, id).await.is_some()
+                    || recovery.as_ref().is_some_and(|s| !s.automatic)
                     || asks(st, id).await?
                 {
                     "needs_you".into()
-                } else if s.notices_proceeding || matches!(s.status.as_str(), "running" | "starting") {
+                } else if recovery.as_ref().is_some_and(|s| s.automatic)
+                    || s.notices_proceeding
+                    || matches!(s.status.as_str(), "running" | "starting")
+                {
                     "running".into()
                 } else if s.status == "failed" || s.end_reason == "error" {
                     "failed".into()

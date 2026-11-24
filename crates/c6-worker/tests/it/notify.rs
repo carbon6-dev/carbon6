@@ -92,7 +92,7 @@ async fn channels_and_approval_links() {
     let base = api.trim_end_matches("/api/v1").to_owned();
     assert!(put("public_url", json!({"url": base})).await.is_success());
     assert!(put("channels", json!([
-        {"name": "hook", "kind": "webhook", "url": format!("{hooks}/hook")},
+        {"name": "hook", "kind": "webhook", "url": format!("{hooks}/hook"), "events": ["notice", "approval"]},
         {"name": "slack", "kind": "slack", "url": format!("{hooks}/slack"), "events": ["finished", "notice"], "applies_to": ["ops"]},
         {"name": "phone", "kind": "ntfy", "url": format!("{hooks}/my-topic"), "events": ["approval"]},
         {"name": "off", "kind": "webhook", "url": format!("{hooks}/off"), "enabled": false}
@@ -133,7 +133,8 @@ async fn channels_and_approval_links() {
             .await
         }
     };
-    // The approval comes to the webhook (a default event), not to Slack.
+    // Only the requested events come to the webhook, even if the worker's
+    // filesystem emits a low-space warning on a small CI disk.
     let hook = sent("hook", 2).await;
     assert_eq!(
         (hook[0]["event"].as_str(), hook[0]["title"].as_str(), hook[0]["priority"].as_str()),

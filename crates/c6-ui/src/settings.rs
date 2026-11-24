@@ -4285,11 +4285,34 @@ fn SubagentLimitsSetting() -> impl IntoView {
                         prop:value=move || setting.with(|s| s.claude_code_idle_minutes.to_string()) on:input=move |ev| setting.update(|s| s.claude_code_idle_minutes = number(&ev)) />
                 </label>
                 <label class="space-y-0.5">
-                    <span class="text-xs text-muted">"Automatic journal recovery for new sessions (seconds)"</span>
+                    <span class="text-xs text-muted">"Automatic journal recovery for new sessions (seconds; disk space waits are exempt)"</span>
                     <input type="number" min="1" max="3600" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.session_recovery_seconds.to_string()) on:input=move |ev| setting.update(|s| s.session_recovery_seconds = number(&ev)) />
                 </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Initial disk recovery delay (seconds)"</span>
+                    <input type="number" min="1" max="3600" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.disk_recovery_initial_seconds.to_string()) on:input=move |ev| setting.update(|s| s.disk_recovery_initial_seconds = number(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Maximum disk recovery delay (seconds)"</span>
+                    <input type="number" min="1" max="86400" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.disk_recovery_max_seconds.to_string()) on:input=move |ev| setting.update(|s| s.disk_recovery_max_seconds = number(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Warn below free disk percentage (0 = off)"</span>
+                    <input type="number" min="0" max="100" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.disk_warning_percent.to_string()) on:input=move |ev| setting.update(|s| s.disk_warning_percent = number(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Warn below free disk bytes (0 = off)"</span>
+                    <input type="number" min="0" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.disk_warning_bytes.to_string()) on:input=move |ev| setting.update(|s| s.disk_warning_bytes = event_target_value(&ev).trim().parse::<u64>().unwrap_or(0)) />
+                </label>
             </div>
+            <p class="text-sm text-muted">
+                "Disk settings apply to new sessions. Recovery keeps retrying until disk space returns, even after the journal recovery deadline. Warnings use either enabled threshold; set both thresholds to 0 to disable warnings. The maximum retry delay must be at least the initial delay."
+            </p>
             <p class="text-sm text-muted">
                 "Agents can message other sessions in their realm. The chain ceiling (50 by default) is a last resort. Each send adds one to the last session message received; your next direct message resets the chain. The hourly cap is a legacy option, off by default."
             </p>

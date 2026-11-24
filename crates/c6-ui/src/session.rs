@@ -835,7 +835,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let archived = Signal::derive(move || own_session.get().is_some_and(|s| s.archived));
     let running = move || {
         liveness_loss.with(Option::is_none)
-            && recovery.with(Option::is_none)
+            && recovery.with(|s| s.as_ref().is_none_or(|s| s.automatic))
             && (status.get() == SessionStatus::Running || activity.get() == Some(true))
     };
 
@@ -2664,7 +2664,7 @@ fn BackgroundWork(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>, #[
                 {move || chrome.loss.get().map(|cause| view! { <ErrorBox message=format!("Work lost: {cause}. Send a message to resume this session.") /> })}
                 <Show when=move || !chrome.running.get()><WaitingNotices events=chrome.events now session_id=chrome.id.get_value()
                     snapshot=chrome.notices
-                    blocked=Signal::derive(move || !chrome.notice_current.get() || chrome.recovery.with(Option::is_some) || chrome.loss.with(Option::is_some)) /></Show>
+                    blocked=Signal::derive(move || !chrome.notice_current.get() || chrome.recovery.with(|s| s.as_ref().is_some_and(|s| !s.automatic)) || chrome.loss.with(Option::is_some)) /></Show>
                 <button class="flex min-h-11 w-full items-center gap-2 text-left text-xs" on:click=move |_| chrome.details.set(true)>"Usage & configuration"{crate::icons::chevron_right()}</button>
             </Show>
             <Show when=move || history_visited.get()>
@@ -3022,7 +3022,7 @@ fn Transcript(
     let notice_blocked = Signal::derive(move || {
         !feed.synced.get()
             || feed.stream_failed.get()
-            || recovery.with(Option::is_some)
+            || recovery.with(|s| s.as_ref().is_some_and(|s| !s.automatic))
             || chrome.map_or_else(
                 || live.session(&id.get_value()).map_or(initially_lost, |s| s.liveness_loss.is_some()),
                 |chrome| chrome.loss.with(Option::is_some),
@@ -4044,7 +4044,7 @@ fn RecoveryBanner(recovery: RwSignal<Option<SessionRecovery>>, session_id: Strin
     let id = StoredValue::new(session_id);
     let action = move |action: &'static str| {
         let Some(status) = recovery.get_untracked() else { return };
-        if sending.get_untracked() {
+        if status.automatic || sending.get_untracked() {
             return;
         }
         sending.set(true);
@@ -4060,15 +4060,21 @@ fn RecoveryBanner(recovery: RwSignal<Option<SessionRecovery>>, session_id: Strin
     };
     view! {
         <div role="status" hidden=move || recovery.with(Option::is_none)
-            class="space-y-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
-            <p class="font-medium">"Session recovery is stuck"</p>
+            class=move || if recovery.with(|s| s.as_ref().is_some_and(|s| s.automatic)) {
+                "space-y-2 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+            } else {
+                "space-y-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200"
+            }>
+            <p class="font-medium">{move || if recovery.with(|s| s.as_ref().is_some_and(|s| s.automatic)) { "Waiting for disk space" } else { "Session recovery is stuck" }}</p>
             <p class="break-words">{move || recovery.with(|s| s.as_ref().map(|s| s.reason.clone()).unwrap_or_default())}</p>
+            <Show when=move || recovery.with(|s| s.as_ref().is_some_and(|s| !s.automatic))>
             <p>"Queued messages and notices are held. Restart starts a fresh recovery cycle for this session only."</p>
             <div class="flex flex-wrap gap-2">
                 <button class=UBTN disabled=move || sending.get() on:click=move |_| action("retry")>"Retry"</button>
                 <button class=UBTN disabled=move || sending.get() on:click=move |_| action("restart")>"Restart this session agent"</button>
             </div>
             <p>{move || result.get()}</p>
+            </Show>
         </div>
     }
 }
@@ -8326,7 +8332,9 @@ mod tests {
         let source = include_str!("session.rs");
         let details = source.split("fn BackgroundWork(").nth(1).unwrap().split("/// Session chrome keeps").next().unwrap();
         assert!(details.contains("<WaitingNotices events=chrome.events now session_id=chrome.id.get_value()"));
-        assert!(details.contains("chrome.recovery.with(Option::is_some) || chrome.loss.with(Option::is_some)"));
+        assert!(
+            details.contains("chrome.recovery.with(|s| s.as_ref().is_some_and(|s| !s.automatic)) || chrome.loss.with(Option::is_some)")
+        );
         assert!(details.contains("!chrome.notice_current.get()"), "disconnected and replaying feeds cannot promise an automatic wake");
         assert!(source.contains("blocked=notice_blocked"), "both mounts must withhold automatic claims during a live stop");
         assert!(!PhoneStatusState::default().visible(), "held notices are for the agent, not attention from you");
@@ -9138,7 +9146,13 @@ mod tests {
                 },
             }]);
             let now = RwSignal::new(10_000 + NOTICE_GRACE_MS);
-            let recovery = RwSignal::new(Some(SessionRecovery { incident: "incident".into(), reason: "Recovery could not finish".into() }));
+            // Legacy heads omit `automatic`; that still means manual recovery.
+            let status: SessionRecovery = serde_json::from_value(serde_json::json!({
+                "incident": "incident", "reason": "Recovery could not finish",
+            }))
+            .unwrap();
+            assert!(!status.automatic);
+            let recovery = RwSignal::new(Some(status));
             let stopped = Signal::derive(move || recovery.with(Option::is_some));
             let html = view! {
                 <RecoveryBanner recovery session_id="s".to_owned() />
@@ -9149,12 +9163,32 @@ mod tests {
                 html.contains("Recovery could not finish") && html.contains("Retry") && html.contains("Restart this session agent"),
                 "{html}"
             );
+            assert!(html.contains("border-amber-300") && html.contains("bg-amber-50"), "manual recovery needs attention: {html}");
             assert!(!html.contains("no action needed") && !html.contains("Deliver now anyway"), "{html}");
             let html = view! { <WaitingNotices events now session_id="s".to_owned() blocked=Signal::derive(|| true) /> }.to_html();
             assert!(
                 !html.contains("no action needed") && !html.contains("Deliver now anyway"),
                 "lost work must not promise a wake: {html}"
             );
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn automatic_disk_recovery_has_no_manual_recovery_controls() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let reason = "Waiting for disk space on /data: 0 free. Recovery continues automatically; no action needed.";
+            let status: SessionRecovery = serde_json::from_value(serde_json::json!({
+                "incident": "disk", "reason": reason, "automatic": true,
+            }))
+            .unwrap();
+            let recovery = RwSignal::new(Some(status));
+            let html = view! { <RecoveryBanner recovery session_id="s".to_owned() /> }.to_html();
+            assert!(html.contains("Waiting for disk space") && html.contains("no action needed"), "{html}");
+            assert!(html.contains("border-zinc-200") && html.contains("bg-zinc-50"), "automatic recovery is neutral: {html}");
+            assert!(!html.contains("amber"), "automatic recovery must not look like a manual stop: {html}");
+            assert!(!html.contains("Retry") && !html.contains("Restart") && !html.contains("stuck") && !html.contains("stopped"), "{html}");
         });
     }
 

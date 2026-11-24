@@ -1,5 +1,65 @@
 # Tests that fail only when something is wrong
 
+## Disk-space recovery and early warnings
+
+The disk monitor takes an injected filesystem sampler: its regressions never
+fill a real disk. Paused Tokio time proves that returning free space wakes a
+wait on its next sampling tick rather than waiting for the maximum retry delay.
+Warning tests share a synthetic mount across paths and verify one warning per
+incident, clearing, and rearming after a healthy sample.
+
+Direct `SessionManager` integration fixtures use `new_with_resource_sampler`,
+just as worker fixtures use `open_with_resource_sampler`: unrelated host load
+must not queue the subagent whose journal-failure behavior a test exercises.
+
+The session regressions inject a real `SQLITE_IOERR_SHMSIZE` append failure and
+then persistent `SQLITE_FULL` recovery errors through SQLite's own result-code
+callback. They advance paused time past the old 180-second deadline, queue more
+callbacks while full, clear the fault and restore sampled space, and require
+automatic recovery of both held notices and an interrupted turn without Retry.
+Synthetic `SQLITE_CORRUPT`/`SQLITE_NOTADB` still reach the manual recovery bound
+on a full sampled filesystem, with Retry and Restart tested separately. The
+journal regression requires the very next ack and append to succeed after
+SHMSIZE, without explicitly replacing the connection or replaying the failed
+write. SQLite's implicit rollback must not leave SQLx's transaction depth stale.
+Held-runtime adoption has its own resource-wait regression: sampling ticks do
+not spend the attempt backoff, space return wakes adoption without retiring
+the held process, and a subsequent corruption error gets a fresh bounded
+ownership-check budget rather than inheriting the expired disk wait.
+
+Head regressions use explicit liveness timestamps to verify that a disk wait
+does not become lost after the ordinary recovery deadline, even when a held
+process has exited. Recovery reports exercise automatic status publication,
+heartbeat deduplication, exclusion from needs-you attention, rejection of manual
+Retry/Restart, and clearing. Editable parent notices must keep the real
+delegation pending and report waiting, not failure or completion. A local
+webhook plus a queued notification barrier checks that only valid active disk
+warnings from connected, non-revoked workers notify; no sleep establishes
+delivery or absence.
+
+API tests cover legacy settings defaults, 64-bit byte thresholds, explicit zero
+thresholds (disabled), delay/percentage validation, and the optional `automatic`
+recovery JSON field. Native UI rendering checks that automatic waits show their
+reason in a neutral banner without manual recovery controls; existing
+stuck-recovery tests retain amber
+styling and Retry/Restart behavior.
+
+```sh
+ulimit -n 10240
+cargo test --locked -p c6-worker --lib disk::tests
+cargo test --locked -p c6-worker --lib disk_full
+cargo test --locked -p c6-worker --lib corruption_on_a_full
+cargo test --locked -p c6-worker --lib parent_disk_wait
+cargo test --locked -p c6-worker --lib journal::ownership_tests
+cargo test --locked -p c6-worker --lib held_adoption
+cargo test --locked -p c6-api --lib notice_settings_tests
+cargo test --locked -p c6-head --lib recovery
+cargo test --locked -p c6-head --lib liveness
+cargo test --locked -p c6-head --lib disk_pressure
+cargo test --locked -p c6-ui --bin c6-ui automatic_disk_recovery
+cargo test --locked -p c6-ui --bin c6-ui a_live_stop_suppresses
+```
+
 ## Head indexing and SQLite contention
 
 Search backfill tests use a committed-chunk boundary, not elapsed time, to

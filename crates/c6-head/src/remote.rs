@@ -458,10 +458,8 @@ pub(crate) async fn recovery_notice(
     parent: &str,
     status: &c6_api::SessionRecovery,
 ) -> anyhow::Result<()> {
-    let text = crate::prompts::get(st, "session.subagent_recovery_stuck", &child.realm)
-        .await
-        .replace("{{child}}", &child.id)
-        .replace("{{reason}}", &status.reason);
+    let prompt = if status.automatic { "session.subagent_recovery_waiting" } else { "session.subagent_recovery_stuck" };
+    let text = crate::prompts::get(st, prompt, &child.realm).await.replace("{{child}}", &child.id).replace("{{reason}}", &status.reason);
     send(
         st,
         parent,
@@ -469,8 +467,22 @@ pub(crate) async fn recovery_notice(
         &[],
         DelegationEnded {
             child_session_id: child.id.clone(),
-            reason: TurnEndReason::Error as i32,
-            task_notice: Some(c6_worker::task_report_notice(&child.title, &child.id, TurnEndReason::Error, &text)),
+            // As with liveness observations, a resource wait is not a failed
+            // relaunch or a delegation outcome. Keep the real call pending.
+            reason: if status.automatic { TurnEndReason::Completed } else { TurnEndReason::Error } as i32,
+            task_notice: Some(if status.automatic {
+                c6_proto::TaskNotice {
+                    kind: "recovery".into(),
+                    title: child.title.clone(),
+                    session_id: child.id.clone(),
+                    status: "waiting".into(),
+                    markdown: text.clone(),
+                }
+            } else {
+                c6_worker::task_report_notice(&child.title, &child.id, TurnEndReason::Error, &text)
+            }),
+            report: if status.automatic { text.clone() } else { String::new() },
+            said: if status.automatic { vec!["Recovery notice (no subagent completion):".into()] } else { Vec::new() },
             digest: text,
             wake: true,
             ..Default::default()

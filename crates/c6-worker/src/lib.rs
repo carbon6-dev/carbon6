@@ -8,6 +8,7 @@ pub mod claude_code;
 pub mod codex_limits;
 pub mod commands;
 pub mod conn;
+mod disk;
 pub mod enroll;
 pub mod hooks;
 pub mod hosted;

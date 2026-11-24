@@ -271,7 +271,17 @@ Built 2026-11-03 (design: carbon6 doc "Claude Code sessions: default-deny tool w
   creates a session (default **180 seconds**, allowed **1–3600 seconds**).
   Local subagents inherit their parent's recorded budget, including children
   created after the setting changes; existing sessions are not updated.
-  Older sessions with no recorded value use the default. If the
+  Older sessions with no recorded value use the default. Disk exhaustion is
+  exempt from this bound: `SQLITE_FULL`, `ENOSPC`, and write I/O failures while
+  the state filesystem is full keep retrying automatically. The session shows
+  **Waiting for disk space on <mount>: <free bytes> free**, as proceeding by
+  itself, without Retry/Restart controls. A user notification and a subagent's
+  parent notice explain that no action is needed to resume after space returns.
+  The worker checks free space once per second during its capped exponential
+  backoff (defaults 5 seconds to 5 minutes), waking recovery immediately on
+  the next tick when at least 16 MiB becomes available. The retry delay and
+  disk warning thresholds are settings. Corruption, a failed integrity check,
+  and other non-resource failures still use the bounded recovery lane. If the
   actor is still unable to recover, the session shows **Session recovery is stuck**
   with the reason, **Retry**, and **Restart this session agent**. The head
   sends a user notification and, for a subagent, a failure notice to its

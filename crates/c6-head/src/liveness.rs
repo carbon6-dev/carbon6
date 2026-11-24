@@ -171,6 +171,9 @@ pub async fn sweep_at(st: &HeadState, now: i64) -> anyhow::Result<()> {
                 let actor = SessionActorState::try_from(r.actor_state).unwrap_or(SessionActorState::Unspecified);
                 let current = e.fresh_after(progress.get(&s.id).copied());
                 match actor {
+                    // Resource recovery may wait indefinitely. A previously
+                    // exited held process is not evidence that this actor died.
+                    SessionActorState::WaitingForDisk => None,
                     SessionActorState::Stopped if current => Some(format!("session actor stopped: {}", r.reason)),
                     _ if current && r.held_process == HeldProcessState::Exited as i32 => Some("held process exited".into()),
                     SessionActorState::Unresponsive if current => Some(format!("session actor unresponsive: {}", r.reason)),
@@ -448,6 +451,40 @@ pub async fn snapshot(st: &HeadState) -> anyhow::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn disk_wait_is_not_terminal_even_after_recovery_deadline_or_held_process_exit() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let sweep = st.liveness.sweep.lock().await;
+        let worker = WorkerId::new();
+        sqlx::query("UPDATE sessions SET worker_id = ?, status = 'running', created_at = 0, updated_at = 0 WHERE id = 'session'")
+            .bind(worker.to_string())
+            .execute(st.store.pool())
+            .await
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let live = st.registry.attach(worker, 1, tx, vec![], "worker").await;
+        report(
+            st,
+            worker,
+            live.conn_id,
+            SessionLivenessReport {
+                sessions: vec![SessionLiveness {
+                    session_id: "session".into(),
+                    actor_state: SessionActorState::WaitingForDisk as i32,
+                    held_process: HeldProcessState::Exited as i32,
+                    reason: "waiting for disk space".into(),
+                    ..Default::default()
+                }],
+            },
+        )
+        .await;
+        drop(sweep);
+        sweep_at(st, now_ms() + 7 * 86400 * 1000).await.unwrap();
+        assert!(!is_lost(st, "session").await.unwrap());
+        assert_eq!(st.store.session("session").await.unwrap().unwrap().status, "running");
+    }
     use c6_proto::SessionLiveness;
     use prost::Message;
 

@@ -13,7 +13,7 @@ use anyhow::Context;
 use c6_proto::{CreateSession, SessionEvent, session_event};
 use prost::Message;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Connection, Row, Sqlite, Transaction};
 use tokio::sync::Notify;
 
 /// A known live writer or missing stop/identity confirmation, not a storage
@@ -32,6 +32,8 @@ impl std::error::Error for StopUnconfirmed {}
 
 pub struct Journal {
     pool: SqlitePool,
+    #[cfg(test)]
+    recovery_error: std::sync::Mutex<Option<(i32, Arc<std::sync::atomic::AtomicBool>)>>,
     /// Serialize reset publication/retry authorization with exceptional
     /// metadata-loss cleanup. Acquire before any SQLite transaction; cleanup
     /// holds no database transaction while awaiting process-group absence.
@@ -503,11 +505,28 @@ impl Journal {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(60))
+            .before_acquire(|conn, _| {
+                Box::pin(async move {
+                    // Drain the worker queue, including rollback-on-drop,
+                    // before inspecting SQLx's transaction depth. SQLite can
+                    // implicitly roll back on FULL/IOERR; SQLx then fails its
+                    // own ROLLBACK and retains a stale nonzero depth. Never
+                    // lend that connection to the next reader or writer.
+                    conn.ping().await?;
+                    Ok(!conn.is_in_transaction())
+                })
+            })
             .connect_with(opts)
             .await
             .with_context(|| format!("opening {}", path.display()))?;
         sqlx::migrate!("./migrations").run(&pool).await.context("journal migrations")?;
-        Ok(Self { pool, claude_rewind_ownership: tokio::sync::Mutex::new(()), appended: Notify::new() })
+        Ok(Self {
+            pool,
+            #[cfg(test)]
+            recovery_error: std::sync::Mutex::new(None),
+            claude_rewind_ownership: tokio::sync::Mutex::new(()),
+            appended: Notify::new(),
+        })
     }
 
     /// Discard the journal's single connection before recovery reads or writes.
@@ -515,6 +534,8 @@ impl Journal {
     /// fresh connection with the same options. No interrupted SQL is replayed:
     /// callers must reload durable state if a write's outcome is uncertain.
     pub(crate) async fn recover_connection(&self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.check_injected_recovery_error().await?;
         self.pool
             .acquire()
             .await
@@ -1166,8 +1187,23 @@ async fn write_event_in(tx: &mut sqlx::SqliteConnection, session_id: &str, event
 
 #[cfg(test)]
 impl Journal {
-    /// Matching appends fail with 4874 until this particular SQLite connection closes.
-    pub(crate) async fn inject_append_shmsize(&self, marker: &str) {
+    /// Fail recovery probes until the caller clears the flag.
+    /// Unlike the connection-local SHMSIZE trigger, this survives reconnects.
+    pub(crate) fn inject_recovery_error(&self, code: i32, flag: Arc<std::sync::atomic::AtomicBool>) {
+        *self.recovery_error.lock().unwrap() = Some((code, flag));
+    }
+
+    async fn check_injected_recovery_error(&self) -> sqlx::Result<()> {
+        let fault = self.recovery_error.lock().unwrap().clone();
+        if let Some((code, _)) = fault.filter(|(_, flag)| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+            let mut conn = self.pool.acquire().await?;
+            Self::install_error_function(&mut conn, c"inject_recovery_error", code).await?;
+            sqlx::query("SELECT inject_recovery_error()").execute(&mut *conn).await?;
+        }
+        Ok(())
+    }
+
+    async fn install_error_function(conn: &mut sqlx::SqliteConnection, name: &std::ffi::CStr, code: i32) -> sqlx::Result<()> {
         use std::ffi::{c_char, c_int, c_void};
 
         // Inject a real extended SQLite result through a connection-local
@@ -1185,35 +1221,48 @@ impl Journal {
                 destroy: Option<unsafe extern "C" fn(*mut c_void)>,
             ) -> c_int;
             fn sqlite3_result_error_code(ctx: *mut c_void, code: c_int);
+            fn sqlite3_user_data(ctx: *mut c_void) -> *mut c_void;
         }
         const SQLITE_UTF8: c_int = 1;
-        const SQLITE_IOERR_SHMSIZE: c_int = 4874;
-        unsafe extern "C" fn shmsize(ctx: *mut c_void, _: c_int, _: *mut *mut c_void) {
-            // SAFETY: SQLite invokes this function with its live result context.
-            unsafe { sqlite3_result_error_code(ctx, SQLITE_IOERR_SHMSIZE) };
+        unsafe extern "C" fn error(ctx: *mut c_void, _: c_int, _: *mut *mut c_void) {
+            // SAFETY: SQLite owns the boxed code until it destroys the function.
+            unsafe { sqlite3_result_error_code(ctx, *sqlite3_user_data(ctx).cast::<c_int>()) };
+        }
+        unsafe extern "C" fn destroy(data: *mut c_void) {
+            // SAFETY: SQLite calls this exactly once for the boxed user data,
+            // including when registration fails or the connection closes.
+            unsafe { drop(Box::from_raw(data.cast::<c_int>())) };
         }
 
+        let mut handle = conn.lock_handle().await?;
+        // SAFETY: SQLx pauses its worker while this handle is locked;
+        // SQLite takes ownership of the boxed code through destroy.
+        let status = unsafe {
+            sqlite3_create_function_v2(
+                handle.as_raw_handle().as_ptr().cast(),
+                name.as_ptr(),
+                0,
+                SQLITE_UTF8,
+                Box::into_raw(Box::new(code)).cast(),
+                Some(error),
+                None,
+                None,
+                Some(destroy),
+            )
+        };
+        assert_eq!(status, 0);
+        Ok(())
+    }
+
+    /// Matching appends fail with 4874 until this particular SQLite connection closes.
+    pub(crate) async fn inject_append_shmsize(&self, marker: &str) {
+        self.inject_append_error(marker, 4874).await;
+    }
+
+    pub(crate) async fn inject_append_error(&self, marker: &str, code: i32) {
         assert!(!marker.is_empty());
         let mut conn = self.pool.acquire().await.unwrap();
-        {
-            let mut handle = conn.lock_handle().await.unwrap();
-            // SAFETY: SQLx pauses its worker while this handle is locked;
-            // the callback has static lifetime and owns no user data.
-            let status = unsafe {
-                sqlite3_create_function_v2(
-                    handle.as_raw_handle().as_ptr().cast(),
-                    c"inject_shmsize".as_ptr(),
-                    0,
-                    SQLITE_UTF8,
-                    std::ptr::null_mut(),
-                    Some(shmsize),
-                    None,
-                    None,
-                    None,
-                )
-            };
-            assert_eq!(status, 0);
-        }
+        Self::install_error_function(&mut conn, c"inject_shmsize", code).await.unwrap();
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE TEMP TRIGGER poison_append BEFORE INSERT ON main.events
              WHEN instr(NEW.data, X'{}') > 0 BEGIN SELECT inject_shmsize(); END",
@@ -1234,7 +1283,7 @@ mod ownership_tests {
     }
 
     #[tokio::test]
-    async fn connection_recovery_after_shmsize_does_not_replay_failed_append() {
+    async fn next_ack_and_append_after_shmsize_do_not_replay_failed_append() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
         journal.create_session("s", &CreateSession::default(), &event(1)).await.unwrap();
@@ -1247,17 +1296,10 @@ mod ownership_tests {
         let err = journal.append("s", &failed).await.unwrap_err();
         let sqlx = err.downcast_ref::<sqlx::Error>().expect("SQLite error");
         assert_eq!(sqlx.as_database_error().and_then(|err| err.code()).as_deref(), Some("4874"));
-        // SQLite rolled back automatically, but SQLx 0.9 still thinks it
-        // owns a transaction and refuses the next BEGIN IMMEDIATE.
-        let stale = journal.append("s", &failed).await.unwrap_err();
-        let stale = stale.downcast_ref::<sqlx::Error>().expect("SQLite error");
-        assert!(
-            matches!(stale, sqlx::Error::InvalidSavePointStatement)
-                || stale.as_database_error().and_then(|err| err.code()).as_deref() == Some("4874"),
-            "{stale:?}"
-        );
-
-        journal.recover_connection().await.unwrap();
+        // SQLite rolled back automatically. The next checkout must discard
+        // SQLx's stale depth, without waiting for actor recovery to run.
+        journal.set_acked("s", 1).await.unwrap();
+        assert!(journal.unacked().await.unwrap().is_empty());
         assert_eq!(journal.events_after("s", 0, 10).await.unwrap(), [event(1)]);
         assert!(!journal.is_applied("uncertain").await.unwrap());
         // The replacement still matches the fault trigger but is a new
@@ -1271,7 +1313,39 @@ mod ownership_tests {
             ..event(2)
         };
         journal.append("s", &replacement).await.unwrap();
-        assert_eq!(journal.events_after("s", 0, 10).await.unwrap(), [event(1), replacement]);
+        assert_eq!(journal.unacked().await.unwrap()[0].acked_seq, 1);
+
+        // Also exercise append as the very next operation after a failed
+        // write, rather than allowing an ack/read to repair the connection.
+        journal.inject_append_shmsize("uncertain").await;
+        let failed = SessionEvent { seq: 3, ..failed };
+        let err = journal.append("s", &failed).await.unwrap_err();
+        let err = err.downcast_ref::<sqlx::Error>().unwrap();
+        assert_eq!(err.as_database_error().and_then(|err| err.code()).as_deref(), Some("4874"));
+        let next = SessionEvent { seq: 3, ..replacement.clone() };
+        journal.append("s", &next).await.unwrap();
+        journal.recover_connection().await.unwrap();
+        assert_eq!(journal.events_after("s", 0, 10).await.unwrap(), [event(1), replacement, next]);
+        assert!(!journal.is_applied("uncertain").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn injected_recovery_errors_persist_until_cleared() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        for code in [11, 26, 13, 4874] {
+            let flag = Arc::new(AtomicBool::new(true));
+            journal.inject_recovery_error(code, flag.clone());
+            for _ in 0..2 {
+                let err = journal.recover_connection().await.unwrap_err();
+                let err = err.downcast_ref::<sqlx::Error>().unwrap();
+                assert_eq!(err.as_database_error().and_then(|err| err.code()).as_deref(), Some(code.to_string().as_str()));
+            }
+            flag.store(false, Ordering::SeqCst);
+            journal.recover_connection().await.unwrap();
+        }
     }
 
     #[tokio::test]

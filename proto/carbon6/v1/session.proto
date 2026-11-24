@@ -816,6 +816,11 @@ message CreateSession {
   uint32 session_recovery_seconds = 42;
   uint32 notice_loop_backoff_rounds = 43;
   uint32 notice_loop_backoff_max_seconds = 44;
+  // Resource recovery is unbounded; these control its capped retry delay.
+  uint32 disk_recovery_initial_seconds = 45;
+  uint32 disk_recovery_max_seconds = 46;
+  optional uint32 disk_warning_percent = 47;
+  optional uint64 disk_warning_bytes = 48;
 }
 
 // How a new git worktree is made: the branch ({{id}} is the session's

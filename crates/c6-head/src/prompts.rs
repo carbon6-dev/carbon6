@@ -99,6 +99,16 @@ pub const DEFAULTS: &[Prompt] = &[
         default: "Automatic recovery stopped. Queued messages and notices are held. Open the session to retry or restart its agent. Reason: {{reason}}",
     },
     Prompt {
+        name: "session.recovery_waiting_notification",
+        description: "Notification while recovery waits for resources and continues automatically. Substitution: {{reason}}.",
+        default: "{{reason}}",
+    },
+    Prompt {
+        name: "session.subagent_recovery_waiting",
+        description: "Notice to a parent while its child waits for resources and continues automatically. Substitutions: {{child}}, {{reason}}.",
+        default: "Subagent {{child}} is waiting for resources. {{reason}} Its unfinished work is not a result; keep waiting for its report.",
+    },
+    Prompt {
         name: "session.liveness_lost",
         description: "Failure notice for lost work. Substitutions: {{child}}, {{reason}}, {{progress}}.",
         default: "Subagent {{child}} is lost: {{reason}}. Do not wait for a report that cannot arrive. Its last recorded work follows:\n{{progress}}\nContinue it with SendMessage using its session id, or restart the work after checking whether its old process is still alive. A loss is not permission to run duplicate work.",
