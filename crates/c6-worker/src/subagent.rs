@@ -311,7 +311,7 @@ impl Subagents for Runner {
         // On Claude Code: a Claude Code session of its own, with Claude Code's
         // tools and prompt (carbon6's tools reach it over the bridge).
         let on_claude_code = model_spec.connection_kind == "claude_code";
-        let admission = self.wait_for_headroom(&cancel).await?;
+        let admission = self.wait_for_headroom(&cancel, true).await?;
         let limits = self.check_depth()?;
         let _working = self.permit(&root, limits.running as usize)?;
         let provider = Provider::from_kind(&model_spec.connection_kind).unwrap_or(Provider::OpenAiChat);
@@ -599,7 +599,7 @@ impl Subagents for Runner {
             return Ok(None);
         }
         let root = p.spec.delegation.as_ref().map_or(p.session_id.as_str(), |d| d.root_session_id.as_str()).to_owned();
-        let admission = self.wait_for_headroom(&cancel).await?;
+        let admission = self.wait_for_headroom(&cancel, false).await?;
         let limits = self.check_depth()?;
         let _working = self.permit(&root, limits.running as usize)?;
         // A background invocation has its own waiter even if the child
@@ -631,7 +631,7 @@ impl Runner {
         Ok(limits)
     }
 
-    async fn wait_for_headroom(&self, cancel: &CancellationToken) -> Result<crate::resource_pressure::Admission, String> {
+    async fn wait_for_headroom(&self, cancel: &CancellationToken, new_work: bool) -> Result<crate::resource_pressure::Admission, String> {
         let p = &self.parent;
         let writer = p.log.as_ref();
         let gate = if p.started.ssh_target.is_empty() {
@@ -639,7 +639,11 @@ impl Runner {
         } else {
             (*p.manager.launch_pressure).clone()
         };
-        gate.wait(cancel, move |pressure| pressure.announce(writer)).await
+        if new_work {
+            gate.wait(cancel, move |pressure| pressure.announce(writer)).await
+        } else {
+            gate.wait_continue(cancel, move |pressure| pressure.announce(writer)).await
+        }
     }
 
     /// Counts a delegation against its tree's limit while it runs.

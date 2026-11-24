@@ -42,23 +42,40 @@ pub(crate) async fn run(worker: Arc<Worker>, tx: mpsc::Sender<WorkerMsg>, stop: 
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            biased;
             _ = stop.cancelled() => return,
             _ = tick.tick() => {}
         }
-        let roots = match worker.journal.machine_process_roots().await {
+        // This permit belongs to the worker, not the connection. A probe
+        // abandoned during reconnect still owns it until its OS work exits.
+        let Ok(permit) = worker.machine_sampling.clone().try_acquire_owned() else { continue };
+        let roots = match tokio::select! {
+            biased;
+            _ = stop.cancelled() => return,
+            roots = worker.journal.machine_process_roots() => roots,
+        } {
             Ok(roots) => roots,
             Err(error) => {
                 tracing::warn!(%error, "reading machine attribution roots");
                 Vec::new()
             }
         };
-        let sampler = worker.machine_sampler.clone();
-        // Only one in flight. Do not await outbound capacity or retain history
-        // on workers: event ACKs and commands always get priority.
-        let sample = tokio::task::spawn_blocking(move || (sampler.lock().unwrap())(&roots)).await;
         if stop.is_cancelled() {
             return;
         }
+        let sampler = worker.machine_sampler.clone();
+        // Hold the permit inside the closure, including while queued on the
+        // blocking pool. Cancelling this async wait cannot abort a blocking
+        // syscall, but reconnects cannot enqueue more probes behind it.
+        let sample = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            (sampler.lock().unwrap())(&roots)
+        });
+        let sample = tokio::select! {
+            biased;
+            _ = stop.cancelled() => return,
+            sample = sample => sample,
+        };
         if let Ok(sample) = sample {
             send_sample(&tx, &sample);
         }
@@ -211,6 +228,70 @@ fn scan_each(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reconnects_cancel_without_accumulating_blocked_sampler_probes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let identity = crate::Identity {
+            meta: crate::identity::IdentityMeta {
+                worker_id: c6_core::WorkerId::new(),
+                worker_name: "blocked-telemetry".into(),
+                head_url: "https://localhost:1".into(),
+                tls_domain: None,
+            },
+            key_pem: String::new(),
+            cert_pem: String::new(),
+            ca_pem: String::new(),
+        };
+        let worker = Worker::open_with_resource_sampler(dir.path(), identity, crate::ResourceMeasurement::default).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let mut entered = Some(entered);
+        // Dropping the sender releases the fake OS call, even if an assertion
+        // panics: runtime teardown must never wait forever for this test probe.
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        worker.set_machine_sampler({
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                if let Some(entered) = entered.take() {
+                    let _ = entered.send(());
+                }
+                let _ = blocked.recv();
+                MachineSample::default()
+            }
+        });
+        let (tx, mut rx) = mpsc::channel(1);
+        let stop = CancellationToken::new();
+        let first = tokio::spawn(run(worker.clone(), tx.clone(), stop.clone()));
+        c6_testkit::within("the first telemetry probe to enter the fake OS call", started).await.unwrap();
+        stop.cancel();
+        c6_testkit::within("the blocked telemetry connection to stop without releasing its probe", first).await.unwrap();
+
+        for _ in 0..32 {
+            let stop = CancellationToken::new();
+            let mut reconnect = Box::pin(run(worker.clone(), tx.clone(), stop.clone()));
+            assert!(futures::poll!(reconnect.as_mut()).is_pending());
+            tokio::task::yield_now().await;
+            assert!(futures::poll!(reconnect.as_mut()).is_pending());
+            stop.cancel();
+            c6_testkit::within("a reconnect to stop while the original telemetry probe is blocked", reconnect).await;
+            assert_eq!(worker.machine_sampling.available_permits(), 0);
+            // Counting sampler calls alone would miss extra blocking tasks
+            // queued on the sampler mutex. Each such task also owns an Arc.
+            assert_eq!(Arc::strong_count(&worker.machine_sampler), 2);
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        }
+        assert!(rx.try_recv().is_err(), "cancelled connections never send the abandoned result");
+        drop(release);
+        c6_testkit::within("the abandoned telemetry probe to release its worker permit", async {
+            let permit = worker.machine_sampling.acquire().await.unwrap();
+            drop(permit);
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn telemetry_never_waits_on_capacity_and_keeps_sample_timestamp() {

@@ -85,6 +85,7 @@ pub struct Overrides {
 /// Everything a running worker shares between its connection and sessions.
 pub struct Worker {
     machine_sampler: Arc<Mutex<machines::SampleFn>>,
+    machine_sampling: Arc<tokio::sync::Semaphore>,
     machine_sample_secs: std::sync::atomic::AtomicU64,
     disk_scan: Arc<tokio::sync::Semaphore>,
     kit_cancels: Mutex<std::collections::HashMap<String, rpc::KitJobState>>,
@@ -155,6 +156,7 @@ impl Worker {
         }
         Ok(Arc::new(Self {
             machine_sampler: Arc::new(Mutex::new(machines::sampler())),
+            machine_sampling: Arc::new(tokio::sync::Semaphore::new(1)),
             machine_sample_secs: std::sync::atomic::AtomicU64::new(0),
             disk_scan: Arc::new(tokio::sync::Semaphore::new(1)),
             kit_cancels: Mutex::default(),

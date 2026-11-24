@@ -293,7 +293,7 @@ fn MachineInfo(machine: Machine) -> impl IntoView {
             <div><dt class="text-muted">"Uptime / connected workers"</dt><dd>{crate::tasks::elapsed(h.uptime_secs.saturating_mul(1000).min(i64::MAX as u64) as i64)}" / "{h.connected_workers}</dd></div>
             <div class="min-w-0"><dt class="text-muted">"Data directory"</dt><dd class="break-all font-mono">{h.data_dir}</dd></div>
             <div class="min-w-0"><dt class="text-muted">"Data directory filesystem"</dt><dd class="break-all">{h.data_disk.map(|d| format!("{} ({}) · {} / {} used · {} available · {}", d.mount, d.filesystem, bytes(d.used), bytes(d.total), bytes(d.available), if d.total > 0 { format!("{:.1}% used", percent(d.used, d.total)) } else { "capacity unknown".into() })).unwrap_or_else(|| "unknown".into())}</dd></div>
-            <div><dt class="text-muted">"Databases"</dt><dd>{h.databases.into_iter().map(|d| format!("{}: {}", d.name, bytes(d.bytes))).collect::<Vec<_>>().join(" · ")}</dd></div>
+            <div class="min-w-0"><dt class="text-muted">"Databases"</dt><dd class="break-all">{h.databases.into_iter().map(|d| format!("{}: {}", d.name, bytes(d.bytes))).collect::<Vec<_>>().join(" · ")}</dd></div>
         </dl> })}
         {machine.warnings.into_iter().map(|w| view! { <p class="text-amber-700 dark:text-amber-400">{w}</p> }).collect_view()}
         </div>

@@ -130,11 +130,11 @@ pub(crate) struct Gate {
 
 /// A charged start can be handed from Runner to its child once. Delayed
 /// setup cannot redeem it after the gate's startup accounting has expired.
-pub(crate) struct Admission(Instant);
+pub(crate) struct Admission(Instant, bool);
 
 impl Admission {
-    pub(crate) fn redeem(self) -> bool {
-        self.0.elapsed() < START_WINDOW
+    pub(crate) fn redeem(self, needs_disk: bool) -> bool {
+        self.0.elapsed() < START_WINDOW && (!needs_disk || self.1)
     }
 }
 
@@ -280,13 +280,28 @@ impl Gate {
     /// Budget briefly against starts that may not be visible in the sample
     /// yet. Never retain a reservation for a whole (possibly nested) turn.
     pub(crate) fn try_start(&self) -> Result<(), Pressure> {
+        self.try_turn(true)
+    }
+
+    pub(crate) fn try_continue(&self) -> Result<(), Pressure> {
+        self.try_turn(false)
+    }
+
+    fn try_turn(&self, new_work: bool) -> Result<(), Pressure> {
         let now = Instant::now();
-        let m = self.measurement()?;
+        let m = if new_work {
+            self.measurement()?
+        } else {
+            // Continuations retain memory/load admission, but neither the
+            // new-work disk floor nor an unrelated pending cwd probe may
+            // prevent a recovered existing session from making progress.
+            self.shared.global.snapshot(self.shared.disk_percent.load(std::sync::atomic::Ordering::Relaxed)).ok_or(Pressure::Sampling)?
+        };
         let mut s = self.shared.state.lock().unwrap();
         while s.starts.front().is_some_and(|at| now.saturating_duration_since(*at) >= START_WINDOW) {
             s.starts.pop_front();
         }
-        if m.disk_nearly_full {
+        if new_work && m.disk_nearly_full {
             return Err(Pressure::Disk);
         }
         if m.memory_pressure
@@ -307,7 +322,23 @@ impl Gate {
     }
 
     /// The caller owns the queued work; dropping the future removes it.
-    pub(crate) async fn wait<F, Fut>(&self, cancel: &CancellationToken, mut queued: F) -> Result<Admission, String>
+    pub(crate) async fn wait<F, Fut>(&self, cancel: &CancellationToken, queued: F) -> Result<Admission, String>
+    where
+        F: FnMut(Pressure) -> Fut + Send,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        self.wait_turn(cancel, queued, true).await
+    }
+
+    pub(crate) async fn wait_continue<F, Fut>(&self, cancel: &CancellationToken, queued: F) -> Result<Admission, String>
+    where
+        F: FnMut(Pressure) -> Fut + Send,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        self.wait_turn(cancel, queued, false).await
+    }
+
+    async fn wait_turn<F, Fut>(&self, cancel: &CancellationToken, mut queued: F, new_work: bool) -> Result<Admission, String>
     where
         F: FnMut(Pressure) -> Fut + Send,
         Fut: std::future::Future<Output = ()> + Send,
@@ -317,8 +348,8 @@ impl Gate {
             if cancel.is_cancelled() {
                 return Err("subagent was stopped before it started".into());
             }
-            match self.try_start() {
-                Ok(()) => return Ok(Admission(Instant::now())),
+            match if new_work { self.try_start() } else { self.try_continue() } {
+                Ok(()) => return Ok(Admission(Instant::now(), new_work)),
                 Err(Pressure::Sampling) => {}
                 Err(pressure) if !announced => {
                     queued(pressure).await;
@@ -479,6 +510,42 @@ mod tests {
         assert!(!below_disk_floor(5, 100, 5.0));
         assert!(!below_disk_floor(0, 0, 5.0));
         assert!(!below_disk_floor(0, 100, 0.0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuations_skip_disk_but_preserve_memory_load_and_start_accounting() {
+        let stage = Arc::new(AtomicUsize::new(0));
+        let gate = Gate::immediate({
+            let stage = stage.clone();
+            move || Measurement {
+                disk_nearly_full: true,
+                memory_pressure: stage.load(Ordering::Relaxed) == 0,
+                load: Some(if stage.load(Ordering::Relaxed) == 1 { 2.0 } else { 0.0 }),
+                ..Default::default()
+            }
+        });
+        assert_eq!(gate.try_start(), Err(Pressure::Disk));
+        assert_eq!(gate.try_continue(), Err(Pressure::Memory));
+        stage.store(1, Ordering::Relaxed);
+        tokio::time::advance(RETRY).await;
+        assert_eq!(gate.try_continue(), Err(Pressure::Load));
+        stage.store(2, Ordering::Relaxed);
+        tokio::time::advance(RETRY).await;
+        assert_eq!(gate.try_continue(), Ok(()));
+        let cancel = CancellationToken::new();
+        assert!(gate.wait_continue(&cancel, |_| std::future::ready(())).await.unwrap().redeem(false));
+        assert!(
+            !gate.wait_continue(&cancel, |_| std::future::ready(())).await.unwrap().redeem(true),
+            "a continuation permit cannot bypass first-start disk admission"
+        );
+        assert_eq!(gate.try_start(), Err(Pressure::Disk));
+
+        let reserved =
+            Gate::immediate(|| Measurement { disk_nearly_full: true, memory: Some((600 * MIB, 4096 * MIB)), ..Default::default() });
+        assert_eq!(reserved.try_continue(), Ok(()));
+        assert_eq!(reserved.try_continue(), Err(Pressure::Memory));
+        tokio::time::advance(START_WINDOW).await;
+        assert_eq!(reserved.try_continue(), Ok(()));
     }
 
     #[tokio::test]
@@ -705,7 +772,7 @@ mod tests {
         assert!(reason.try_recv().is_err(), "one announcement per wait");
         stage.store(2, Ordering::Relaxed);
         tokio::time::advance(RETRY).await;
-        assert!(waiting.await.unwrap().unwrap().redeem());
+        assert!(waiting.await.unwrap().unwrap().redeem(true));
     }
 
     #[tokio::test]
@@ -728,7 +795,7 @@ mod tests {
         let admission = gate.wait(&cancel, |_| std::future::ready(())).await.unwrap();
         assert_eq!(gate.try_start(), Err(Pressure::Memory));
         tokio::time::advance(START_WINDOW).await;
-        assert!(!admission.redeem());
+        assert!(!admission.redeem(true));
         assert_eq!(gate.try_start(), Ok(()));
     }
 

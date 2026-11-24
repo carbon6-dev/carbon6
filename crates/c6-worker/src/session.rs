@@ -645,7 +645,7 @@ impl HeldAdoptionRecovery {
                 attempt.await
             };
             let Err(e) = result else { return true };
-            let space = writer.disk_probe.as_ref().and_then(|(disk, path)| disk.space(path));
+            let space = if let Some((disk, path)) = &writer.disk_probe { disk.fresh_space(path).await } else { None };
             if crate::disk::resource_error(&e, space.as_ref()) {
                 // A journal read can fail before adoption advances any held
                 // reader. Wait here; do not retire that untouched process.
@@ -775,7 +775,9 @@ impl SessionManager {
         }
     }
 
-    /// Cheap filesystem measurements, independent of the journal connection.
+    /// Cached filesystem measurements, independent of the journal connection.
+    /// Monitor schedules bounded background probes; this also runs from the
+    /// connection's ACK loop and must never perform filesystem I/O inline.
     pub(crate) fn report_disk_pressure(&self) {
         let paths = [self.state_dir.clone(), self.worktrees.clone(), std::env::temp_dir()];
         for (space, active) in self.disk.warnings(&paths) {
@@ -2247,6 +2249,7 @@ impl SessionManager {
         let actor = Actor {
             spec,
             launch_pressure,
+            disk_admitted: turns > 0,
             session_tools,
             hooks,
             policies,
@@ -3382,6 +3385,8 @@ impl EventSink for TurnSink {
 struct Actor {
     spec: CreateSession,
     launch_pressure: Arc<crate::resource_pressure::Gate>,
+    /// Disk admission is for a new child, not subsequent turns or recovery.
+    disk_admitted: bool,
     started: SessionStarted,
     session_tools: Arc<SessionTools>,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
@@ -3593,7 +3598,7 @@ impl Actor {
                 Some(Err(e)) => {
                     warn!(session = %writer.session_id, "waiting to recover its journal: {e:#}");
                     reason = format!("{e:#}").chars().take(1000).collect();
-                    let space = disk.space(&state_dir);
+                    let space = disk.fresh_space(&state_dir).await;
                     if crate::disk::resource_error(&e, space.as_ref()) {
                         disk_was_full = space.as_ref().is_some_and(|s| s.free < crate::disk::RESUME_BYTES);
                         // Resource exhaustion must not spend the corruption
@@ -3911,14 +3916,22 @@ impl Actor {
             }
             let can_start =
                 !rewind_blocked && !adoption_blocked && running.is_none() && !handoff_waits && !self.inbox.lock().unwrap().queue.is_empty();
-            // Gate every worker-dispatched child turn, including direct
-            // inputs and notice wakes. A fresh Runner admission is good
-            // once, and only while its input is still queued.
+            // New children require disk, memory and load admission. Existing
+            // child turns retain memory/load admission, but disk recovery
+            // resumes at its small headroom threshold, not the new-work 5%.
+            // A fresh Runner admission is good once for its queued input.
             let pressure = if can_start && crate::subagent::depth_of(&self.spec) > 0 {
                 let admitted = launch_admission.take().is_some_and(|(id, admission)| {
-                    self.inbox.lock().unwrap().queue.iter().any(|(input, _)| input.command_id == id) && admission.redeem()
+                    self.inbox.lock().unwrap().queue.iter().any(|(input, _)| input.command_id == id)
+                        && admission.redeem(!self.disk_admitted)
                 });
-                if admitted { None } else { self.launch_pressure.try_start().err() }
+                if admitted {
+                    None
+                } else if self.disk_admitted {
+                    self.launch_pressure.try_continue().err()
+                } else {
+                    self.launch_pressure.try_start().err()
+                }
             } else {
                 None
             };
@@ -6317,6 +6330,7 @@ impl Actor {
     }
 
     fn start_turn(&mut self) -> (TurnTask, CancellationToken) {
+        self.disk_admitted = true;
         self.writer.set_activity(c6_proto::SessionActivityKind::Unspecified);
         self.turns += 1;
         let turn = self.turns;
@@ -7422,9 +7436,12 @@ impl Writer {
         self.activity.store(kind as i32, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn journal_error(&self, error: &anyhow::Error) {
-        let space = self.disk_probe.as_ref().and_then(|(disk, path)| disk.space(path));
-        self.resource_failure.store(crate::disk::resource_error(error, space.as_ref()), Ordering::Release);
+    async fn journal_result<T>(&self, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        if let Err(error) = &result {
+            let space = if let Some((disk, path)) = &self.disk_probe { disk.fresh_space(path).await } else { None };
+            self.resource_failure.store(crate::disk::resource_error(error, space.as_ref()), Ordering::Release);
+        }
+        result
     }
 
     fn observe_activity(&self, event: &session_event::Kind) {
@@ -7455,11 +7472,11 @@ impl EventSink for Writer {
         // Streamed text first: it must not arrive after what it streamed.
         self.link.flush_ephemeral();
         let ev = SessionEvent { seq: *next, ts_ms: c6_core::now_ms(), kind: Some(kind) };
-        self.journal.check_ownership(&self.session_id, self.ownership_epoch).await.inspect_err(|e| self.journal_error(e))?;
+        self.journal_result(self.journal.check_ownership(&self.session_id, self.ownership_epoch).await).await?;
         let count = if matches!(&ev.kind, Some(session_event::Kind::Rewound(_))) {
-            self.journal.append_rewind_owned(&self.session_id, &ev, self.ownership_epoch).await.inspect_err(|e| self.journal_error(e))?
+            self.journal_result(self.journal.append_rewind_owned(&self.session_id, &ev, self.ownership_epoch).await).await?
         } else {
-            self.journal.append_owned(&self.session_id, &ev, self.ownership_epoch).await.inspect_err(|e| self.journal_error(e))?;
+            self.journal_result(self.journal.append_owned(&self.session_id, &ev, self.ownership_epoch).await).await?;
             1
         };
         *next += count;
@@ -7469,7 +7486,7 @@ impl EventSink for Writer {
 
     async fn start_turn(&self, turn: u64, inputs: &[PendingInput]) -> anyhow::Result<()> {
         let mut next = self.next_seq.lock().await;
-        self.journal.check_ownership(&self.session_id, self.ownership_epoch).await.inspect_err(|e| self.journal_error(e))?;
+        self.journal_result(self.journal.check_ownership(&self.session_id, self.ownership_epoch).await).await?;
         self.link.flush_ephemeral();
         let kinds = inputs
             .iter()
@@ -7479,7 +7496,7 @@ impl EventSink for Writer {
             .enumerate()
             .map(|(offset, kind)| SessionEvent { seq: *next + offset as u64, ts_ms: c6_core::now_ms(), kind: Some(kind) })
             .collect();
-        self.journal.append_turn_owned(&self.session_id, &events, self.ownership_epoch).await.inspect_err(|e| self.journal_error(e))?;
+        self.journal_result(self.journal.append_turn_owned(&self.session_id, &events, self.ownership_epoch).await).await?;
         *next += events.len() as u64;
         self.logged.store(*next, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -9135,7 +9152,7 @@ mod notice_tests {
             let (_dir, manager, _mock) = idle_session().await;
             let free = Arc::new(AtomicU64::new(0));
             let sampled = free.clone();
-            let disk = Arc::new(crate::disk::Monitor::new(move |_| {
+            let disk = Arc::new(crate::disk::Monitor::immediate(move |_| {
                 Some(crate::disk::Space { mount: "/test/state".into(), free: sampled.load(Ordering::SeqCst), total: 1 << 40 })
             }));
             let mut writer = Writer::new("held".into(), manager.journal.clone(), manager.link.clone(), 2);
@@ -9258,15 +9275,20 @@ mod notice_tests {
 
     #[tokio::test]
     async fn disk_full_outlives_recovery_deadline_and_resumes_without_action() {
-        disk_full_recovery(false).await;
+        disk_full_recovery(false, false).await;
     }
 
     #[tokio::test]
     async fn disk_full_resumes_an_interrupted_turn_after_the_old_deadline() {
-        disk_full_recovery(true).await;
+        disk_full_recovery(true, false).await;
     }
 
-    async fn disk_full_recovery(running: bool) {
+    #[tokio::test]
+    async fn depth_positive_disk_recovery_resumes_below_new_work_floor_but_preserves_load_admission() {
+        disk_full_recovery(true, true).await;
+    }
+
+    async fn disk_full_recovery(running: bool, child: bool) {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         struct WaitingHead(String, mpsc::UnboundedSender<serde_json::Value>);
         #[async_trait]
@@ -9282,12 +9304,28 @@ mod notice_tests {
             }
         }
         let (dir, mut manager, mock) = idle_session().await;
+        let admission_stage = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        if child {
+            manager.launch_pressure = Arc::new(crate::resource_pressure::Gate::immediate({
+                let stage = admission_stage.clone();
+                move || crate::ResourceMeasurement {
+                    disk_nearly_full: stage.load(Ordering::SeqCst) > 0,
+                    load: Some(if stage.load(Ordering::SeqCst) == 1 { 2.0 } else { 0.0 }),
+                    ..Default::default()
+                }
+            }));
+        }
         let (sent, mut statuses) = mpsc::unbounded_channel();
         if running {
             // Even a budget shorter than the first SQLite checkout must not
             // install manual recovery after an already classified FULL/I/O.
             let (mut spec, _) = manager.journal.load_session("held").await.unwrap().unwrap();
             spec.session_recovery_seconds = 1;
+            if child {
+                // Template/remote children use depth without a local
+                // delegation and therefore resume interrupted turns.
+                spec.depth = 1;
+            }
             let db = sqlx::SqlitePool::connect(&format!("sqlite:{}", dir.path().join("journal.db").display())).await.unwrap();
             sqlx::query("UPDATE sessions SET spec = ? WHERE id = 'held'").bind(spec.encode_to_vec()).execute(&db).await.unwrap();
             db.close().await;
@@ -9295,7 +9333,7 @@ mod notice_tests {
         manager.link = Arc::new(HeadLink::local(Arc::new(WaitingHead(mock.base_url(), sent))));
         let free = Arc::new(AtomicU64::new(0));
         let sampled = free.clone();
-        manager.disk = Arc::new(crate::disk::Monitor::new(move |_| {
+        manager.disk = Arc::new(crate::disk::Monitor::immediate(move |_| {
             Some(crate::disk::Space { mount: "/test/state".into(), free: sampled.load(Ordering::SeqCst), total: 1 << 40 })
         }));
         let _clock = pause_clock();
@@ -9322,6 +9360,7 @@ mod notice_tests {
             None
         };
         let full = Arc::new(AtomicBool::new(true));
+        admission_stage.store(1, Ordering::SeqCst);
         manager.journal.inject_recovery_error(13, full.clone());
         manager.journal.inject_append_shmsize("report #2.").await;
         let actor = manager.actors.lock().unwrap().get("held").unwrap().clone();
@@ -9348,7 +9387,9 @@ mod notice_tests {
         // the next sampler tick, without spending the capped backoff delay.
         let mut later = enqueue_test_report(&actor, 3);
         full.store(false, Ordering::SeqCst);
-        free.store(crate::disk::RESUME_BYTES, Ordering::SeqCst);
+        let recovered_free = crate::disk::RESUME_BYTES + 1024;
+        assert!((recovered_free as f64) < (1u64 << 40) as f64 * 0.05);
+        free.store(recovered_free, Ordering::SeqCst);
         tokio::time::advance(SECOND + TICK).await;
         let restored = barrier(&manager, "disk-space-returned");
         tokio::pin!(restored);
@@ -9369,6 +9410,31 @@ mod notice_tests {
             // let it install the normal notice merge timer before advancing.
             barrier(&manager, "automatic-resume-queued").await;
             tokio::time::advance(QUIET + TICK).await;
+            if child {
+                // Recovery is complete but continuation must still wait for
+                // high load. Disk remains below 5% throughout this proof.
+                let watchdog = std::time::Instant::now() + c6_testkit::wait::deadline();
+                loop {
+                    let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+                    if events.iter().any(|e| {
+                        matches!(&e.kind,
+                        Some(session_event::Kind::Notice(n)) if n.message == crate::resource_pressure::Pressure::Load.message())
+                    }) {
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < watchdog, "recovered child did not reach memory/load-only admission");
+                    tokio::time::advance(TICK).await;
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(mock.requests().len(), 1, "high load must still hold the continuation");
+                admission_stage.store(2, Ordering::SeqCst);
+                tokio::time::advance(SECOND + TICK).await;
+                assert_eq!(
+                    manager.launch_pressure.try_start(),
+                    Err(crate::resource_pressure::Pressure::Disk),
+                    "new work still waits below 5%"
+                );
+            }
             // Resource timing is proved above. Real process/HTTP cleanup
             // may poll OS state, as in release_held_reports below; do not
             // freeze those unrelated I/O retry timers while awaiting output.
@@ -9401,7 +9467,7 @@ mod notice_tests {
         for (code, action) in [(11, "retry"), (26, "restart")] {
             let (_dir, mut manager, _mock) = idle_session().await;
             let full = crate::disk::Space { mount: "/test".into(), free: 0, total: 1 << 40 };
-            manager.disk = Arc::new(crate::disk::Monitor::new(move |_| Some(full.clone())));
+            manager.disk = Arc::new(crate::disk::Monitor::immediate(move |_| Some(full.clone())));
             let clock = pause_clock();
             enqueue_reports(&manager, 1..2, false).await;
             let fault = Arc::new(AtomicBool::new(true));

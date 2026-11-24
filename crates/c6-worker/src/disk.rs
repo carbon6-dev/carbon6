@@ -1,5 +1,9 @@
 //! Disk exhaustion is a resource wait, not evidence that a session was lost.
-use std::collections::HashSet;
+//! Sampling follows the worker's existing Unix platform support. Unavailable
+//! filesystem samples are unknown, not evidence of exhaustion. OS filesystem
+//! calls cannot be interrupted safely: at most two may remain stuck, while
+//! connection handling and asynchronous recovery waits stay cancellable.
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,11 +18,25 @@ pub(crate) struct Space {
 
 pub(crate) const RESUME_BYTES: u64 = 16 * 1024 * 1024;
 type Sampler = dyn Fn(&Path) -> Option<Space> + Send + Sync;
+const SAMPLE_TTL: Duration = Duration::from_secs(1);
+const MAX_PATHS: usize = 64;
+
+#[derive(Default)]
+struct Check {
+    at: Option<tokio::time::Instant>,
+    space: Option<Space>,
+    in_flight: bool,
+}
 
 pub(crate) struct Monitor {
     sample: Arc<Sampler>,
     warned: Mutex<HashSet<PathBuf>>,
     warning: Mutex<(u32, u64)>,
+    cache: Arc<Mutex<HashMap<PathBuf, Check>>>,
+    slots: Arc<tokio::sync::Semaphore>,
+    changed: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    immediate: bool,
 }
 
 impl Default for Monitor {
@@ -29,11 +47,85 @@ impl Default for Monitor {
 
 impl Monitor {
     pub(crate) fn new(sample: impl Fn(&Path) -> Option<Space> + Send + Sync + 'static) -> Self {
-        Self { sample: Arc::new(sample), warned: Mutex::default(), warning: Mutex::new((10, 20 * 1024 * 1024 * 1024)) }
+        Self {
+            sample: Arc::new(sample),
+            warned: Mutex::default(),
+            warning: Mutex::new((10, 20 * 1024 * 1024 * 1024)),
+            cache: Arc::default(),
+            slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            changed: Arc::default(),
+            #[cfg(test)]
+            immediate: false,
+        }
     }
 
+    #[cfg(test)]
+    pub(crate) fn immediate(sample: impl Fn(&Path) -> Option<Space> + Send + Sync + 'static) -> Self {
+        Self { immediate: true, ..Self::new(sample) }
+    }
+
+    /// Nonblocking, best-effort snapshot. A probe owns its slot even after
+    /// callers drop: Unix filesystem syscalls cannot safely be interrupted.
+    /// A stalled mount consumes one of two slots, never an ACK/recovery thread.
+    /// Both live probes and historical path metadata are strictly bounded.
     pub(crate) fn space(&self, path: &Path) -> Option<Space> {
-        (self.sample)(path)
+        #[cfg(test)]
+        if self.immediate {
+            return (self.sample)(path);
+        }
+        let now = tokio::time::Instant::now();
+        let mut cache = self.cache.lock().unwrap();
+        let prior = cache.get(path).and_then(|check| check.space.clone());
+        if cache.get(path).is_some_and(|check| check.in_flight || check.at.is_some_and(|at| now.duration_since(at) < SAMPLE_TTL)) {
+            return prior;
+        }
+        let Ok(permit) = self.slots.clone().try_acquire_owned() else { return prior };
+        if !cache.contains_key(path) && cache.len() >= MAX_PATHS {
+            let oldest = cache.iter().filter(|(_, check)| !check.in_flight).min_by_key(|(_, check)| check.at).map(|(path, _)| path.clone());
+            let Some(oldest) = oldest else { return prior };
+            cache.remove(&oldest);
+        }
+        cache.entry(path.to_owned()).or_default().in_flight = true;
+        drop(cache);
+        let (cache, sample, changed, path) = (self.cache.clone(), self.sample.clone(), self.changed.clone(), path.to_owned());
+        tokio::task::spawn_blocking(move || {
+            // No metadata, canonicalize, statvfs, or injected sampler call may
+            // run under a cache/warning lock or on an async runtime thread.
+            let space = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sample(&path))).ok().flatten();
+            cache.lock().unwrap().insert(path, Check { at: Some(tokio::time::Instant::now()), space, in_flight: false });
+            drop(permit);
+            changed.notify_waiters();
+        });
+        prior
+    }
+
+    /// On an I/O failure, do not classify using a pre-failure healthy sample.
+    /// Wait asynchronously for a shared fresh probe, with a bounded deadline
+    /// if the filesystem is unresponsive. Dropping this wait is always safe.
+    pub(crate) async fn fresh_space(&self, path: &Path) -> Option<Space> {
+        #[cfg(test)]
+        if self.immediate {
+            return self.space(path);
+        }
+        let requested = tokio::time::Instant::now();
+        if let Some(check) = self.cache.lock().unwrap().get_mut(path) {
+            check.at = None;
+        }
+        let until = requested + Duration::from_secs(2);
+        loop {
+            let changed = self.changed.notified();
+            let space = self.space(path);
+            if let Some(check) = self.cache.lock().unwrap().get(path).filter(|check| check.at.is_some_and(|at| at >= requested)) {
+                return check.space.clone();
+            }
+            if tokio::time::Instant::now() >= until {
+                return space;
+            }
+            tokio::select! {
+                _ = changed => {},
+                _ = tokio::time::sleep_until(until.min(tokio::time::Instant::now() + Duration::from_millis(10))) => {},
+            }
+        }
     }
 
     pub(crate) fn waiting_reason(&self, path: &Path) -> String {
@@ -60,12 +152,30 @@ impl Monitor {
     /// Edge-triggered per filesystem; a healthy sample rearms the warning.
     pub(crate) fn warnings(&self, paths: &[PathBuf]) -> Vec<(Space, bool)> {
         let (percent, bytes) = *self.warning.lock().unwrap();
-        let mut warned = self.warned.lock().unwrap();
+        // Cold/oldest paths get the bounded slots first. Otherwise the first
+        // two stale paths in each ping could monopolize both slots forever,
+        // leaving (for example) a separately mounted tmp directory unprobed.
+        let paths = {
+            let cache = self.cache.lock().unwrap();
+            let mut paths: Vec<_> = paths.iter().collect();
+            paths.sort_by_key(|path| cache.get(*path).and_then(|check| check.at));
+            paths
+        };
         let mut out = Vec::new();
         for path in paths {
             if let Some(space) = self.space(path) {
                 let threshold = (space.total / 100 * u64::from(percent)).max(bytes);
+                let mut warned = self.warned.lock().unwrap();
                 if space.free < threshold {
+                    // Retire an old edge if more than the bounded history of
+                    // distinct mounts has been observed. An evicted mount may
+                    // warn again; warning metadata must not grow forever.
+                    if !warned.contains(&space.mount)
+                        && warned.len() >= MAX_PATHS
+                        && let Some(oldest) = warned.iter().next().cloned()
+                    {
+                        warned.remove(&oldest);
+                    }
                     if warned.insert(space.mount.clone()) {
                         out.push((space, true));
                     }
@@ -137,6 +247,7 @@ pub(crate) fn retry_delays(spec: &c6_proto::CreateSession) -> (Duration, Duratio
 pub(crate) async fn wait(monitor: &Monitor, path: &Path, delay: Duration, mut was_full: bool, mut update: impl FnMut(&Space)) {
     let until = tokio::time::Instant::now() + delay;
     loop {
+        let changed = monitor.changed.notified();
         if let Some(space) = monitor.space(path) {
             update(&space);
             if was_full && space.free >= RESUME_BYTES {
@@ -147,7 +258,10 @@ pub(crate) async fn wait(monitor: &Monitor, path: &Path, delay: Duration, mut wa
         if tokio::time::Instant::now() >= until {
             return;
         }
-        tokio::time::sleep_until(until.min(tokio::time::Instant::now() + Duration::from_secs(1))).await;
+        tokio::select! {
+            _ = changed => {},
+            _ = tokio::time::sleep_until(until.min(tokio::time::Instant::now() + Duration::from_secs(1))) => {},
+        }
     }
 }
 
@@ -193,6 +307,102 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[tokio::test]
+    async fn warning_batches_prioritize_cold_and_oldest_paths_before_refreshing_recent_paths() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let blocked = Mutex::new(blocked);
+        let monitor = Monitor::new(move |_| {
+            let _ = blocked.lock().unwrap().recv();
+            None
+        });
+        let paths: Vec<_> = ["/recent", "/oldest", "/cold"].into_iter().map(PathBuf::from).collect();
+        let now = tokio::time::Instant::now();
+        for (path, age) in [(paths[0].clone(), 2), (paths[1].clone(), 3)] {
+            monitor.cache.lock().unwrap().insert(
+                path.clone(),
+                Check {
+                    at: Some(now - Duration::from_secs(age)),
+                    space: Some(Space { mount: path, free: 0, total: 1 << 40 }),
+                    in_flight: false,
+                },
+            );
+        }
+        monitor.warnings(&paths);
+        let cache = monitor.cache.lock().unwrap();
+        assert!(cache[&paths[2]].in_flight, "a cold path must not starve behind stale cached paths");
+        assert!(cache[&paths[1]].in_flight, "the oldest sample gets the remaining slot");
+        assert!(!cache[&paths[0]].in_flight);
+        drop(cache);
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn blocked_probes_are_bounded_without_holding_locks_or_recovery_waiters() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let (entered, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let blocked = Mutex::new(blocked);
+        let monitor = Arc::new(Monitor::new({
+            let calls = calls.clone();
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                entered.send(()).unwrap();
+                let _ = blocked.lock().unwrap().recv();
+                None
+            }
+        }));
+        for n in 0..256 {
+            assert!(monitor.space(Path::new(&format!("/mount/{n}"))).is_none());
+        }
+        starts.recv().await.unwrap();
+        starts.recv().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(monitor.cache.lock().unwrap().len(), 2);
+        assert_eq!(monitor.slots.available_permits(), 0);
+        assert!(monitor.warned.try_lock().is_ok());
+        assert!(monitor.warnings(&[PathBuf::from("/mount/0")]).is_empty());
+        monitor.retry_warning(Path::new("/mount/0"));
+        monitor.configure(&c6_proto::CreateSession::default());
+        let recovery = tokio::spawn({
+            let monitor = monitor.clone();
+            async move { wait(&monitor, Path::new("/mount/0"), Duration::from_secs(300), true, |_| {}).await }
+        });
+        let fresh = tokio::spawn({
+            let monitor = monitor.clone();
+            async move { monitor.fresh_space(Path::new("/mount/0")).await }
+        });
+        tokio::task::yield_now().await;
+        recovery.abort();
+        fresh.abort();
+        assert!(recovery.await.unwrap_err().is_cancelled());
+        assert!(fresh.await.unwrap_err().is_cancelled());
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "waiters never create extra probes");
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn fresh_error_samples_and_historical_path_metadata_are_bounded() {
+        let free = Arc::new(AtomicU64::new(1 << 30));
+        let monitor = Monitor::new({
+            let free = free.clone();
+            move |path| Some(Space { mount: path.to_owned(), free: free.load(Ordering::SeqCst), total: 1 << 40 })
+        });
+        assert_eq!(monitor.fresh_space(Path::new("/state")).await.unwrap().free, 1 << 30);
+        free.store(0, Ordering::SeqCst);
+        assert_eq!(
+            monitor.fresh_space(Path::new("/state")).await.unwrap().free,
+            0,
+            "I/O classification never uses a pre-error healthy value"
+        );
+        for n in 0..(MAX_PATHS * 2) {
+            let path = PathBuf::from(format!("/history/{n}"));
+            assert!(monitor.fresh_space(&path).await.is_some());
+            monitor.warnings(&[path]);
+            assert!(monitor.cache.lock().unwrap().len() <= MAX_PATHS);
+            assert!(monitor.warned.lock().unwrap().len() <= MAX_PATHS);
+        }
+    }
+
+    #[tokio::test]
     async fn sqlite_codes_distinguish_resource_exhaustion_from_corruption() {
         let dir = tempfile::tempdir().unwrap();
         let journal = crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap();
@@ -233,7 +443,7 @@ mod tests {
 
     #[test]
     fn warning_can_be_disabled_without_changing_legacy_defaults() {
-        let monitor = Monitor::new(|_| Some(Space { mount: "/test".into(), free: 0, total: 1 << 40 }));
+        let monitor = Monitor::immediate(|_| Some(Space { mount: "/test".into(), free: 0, total: 1 << 40 }));
         let paths = [PathBuf::from("/test")];
         assert_eq!(monitor.warnings(&paths).len(), 1);
         monitor.configure(&c6_proto::CreateSession { disk_warning_percent: Some(0), disk_warning_bytes: Some(0), ..Default::default() });
@@ -243,7 +453,7 @@ mod tests {
 
     #[test]
     fn failed_active_warning_rearms_without_waiting_for_space() {
-        let monitor = Monitor::new(|_| Some(Space { mount: "/test".into(), free: 0, total: 1 << 40 }));
+        let monitor = Monitor::immediate(|_| Some(Space { mount: "/test".into(), free: 0, total: 1 << 40 }));
         let paths = [PathBuf::from("/state")];
         let (space, active) = monitor.warnings(&paths).pop().unwrap();
         assert!(active);
@@ -256,7 +466,8 @@ mod tests {
     async fn free_space_return_wakes_on_tick_not_backoff() {
         let free = Arc::new(AtomicU64::new(0));
         let value = free.clone();
-        let monitor = Monitor::new(move |_| Some(Space { mount: "/test".into(), free: value.load(Ordering::SeqCst), total: 1 << 40 }));
+        let monitor =
+            Monitor::immediate(move |_| Some(Space { mount: "/test".into(), free: value.load(Ordering::SeqCst), total: 1 << 40 }));
         let task = tokio::spawn(async move { wait(&monitor, Path::new("/test"), Duration::from_secs(300), true, |_| {}).await });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(200)).await;
@@ -271,7 +482,7 @@ mod tests {
         let threshold = 20 * 1024 * 1024 * 1024;
         let free = Arc::new(AtomicU64::new(threshold));
         let value = free.clone();
-        let monitor = Monitor::new(move |_| {
+        let monitor = Monitor::immediate(move |_| {
             Some(Space { mount: "/test".into(), free: value.load(Ordering::SeqCst), total: 100 * 1024 * 1024 * 1024 })
         });
         let paths = [PathBuf::from("/state"), PathBuf::from("/tmp")];

@@ -23,6 +23,10 @@ never fabricated zeroes. Pseudo, overlay and snap-loop filesystems are excluded.
 Process-tree CPU/RSS attribution uses worker-owned session process roots,
 including held Claude Code processes; overlapping roots must not double-count.
 New worker-link fields use new protocol tags and old peers can ignore them.
+Samples without attribution roots do not enumerate processes. Attribution
+disables sysinfo's Linux process-descriptor cache and excludes task/thread
+enumeration. A worker-owned permit bounds sampling across reconnects; cancelling
+the connection abandons the async wait without allowing another blocked probe.
 
 ## Storage and query
 
@@ -104,6 +108,11 @@ cwd is scoped to that launch and cannot block unrelated future work. Queued
 kit RPCs carry cancellation IDs, so abandoning or timing out a caller cancels
 the worker's wait instead of starting the job later. A blocked OS filesystem
 call can occupy a bounded probe slot, but does not prevent waiter cancellation.
+Disk admission applies to new work, not subsequent turns or recovery of an
+existing child. Existing child turns still obey memory/load admission. The
+separate disk-exhaustion recovery path keeps its 16 MiB recovery headroom;
+its filesystem monitor uses two background slots and at most 64 cached paths,
+not synchronous filesystem calls on the ACK/cancellation read loop.
 
 ### Head backend bounds and history caveats
 
@@ -126,6 +135,11 @@ Telemetry is best effort and may drop samples under load. `[machines]` in head
 TOML configures sampling/retention/thresholds and `maintenance_rows` (default 256,
 maximum 4096); each indexed maintenance transaction handles at most that many
 expiration/compaction operations, so a backlog is drained over later sweeps.
+Expiration and both rollup tiers receive fair shares, with rotating priority
+for budgets below three. Sustained fleet traffic can exceed any fixed budget;
+larger fleets should increase `maintenance_rows` to match their ingestion rate.
+Realm attribution checks query only IDs present in the response payload, in
+chunks of at most 500 IDs, rather than loading the realm's entire session list.
 
 Compacted points are peak envelopes, not simultaneous observations. CPU/load,
 used memory/swap, inode use and OOM counters retain maxima; available memory
@@ -137,3 +151,11 @@ peaks, disks at most 128 fullest filesystems. Scanner roots are prioritized
 and scanned with per-root shares of the total time/entry budget; skipped broad
 ancestors, inaccessible paths and limits are reported as partial. A single
 unresponsive filesystem syscall is not portably interruptible.
+
+The pre-existing disk-recovery warning policy is separate: its session settings
+warn below a percentage or byte floor and route through the `failed` event.
+Machines warnings route through `machine`; both may report the same low-space
+episode, with independent channel settings. Telemetry database open failure
+currently fails head startup; fail-open initialization is a possible availability
+hardening follow-up. Investigation reports apparent file lengths, not unique
+allocated blocks (hard links, sparse files and compression can differ).

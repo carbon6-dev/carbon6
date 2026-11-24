@@ -1,5 +1,6 @@
 //! Observational machine telemetry: a bounded mailbox and a separate database.
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,7 @@ const MAILBOX_CAPACITY: usize = 128;
 pub(crate) const MAX_SAMPLE_BYTES: usize = 128 * 1024;
 const MAX_QUERY_ROWS: usize = 16_384;
 const MAX_QUERY_BYTES: usize = 16 * 1024 * 1024;
+const SESSION_QUERY_CHUNK: usize = 500;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -72,6 +74,7 @@ pub struct Machines {
     tx: mpsc::Sender<(String, MachineSample)>,
     rx: Mutex<Option<mpsc::Receiver<(String, MachineSample)>>>,
     latest: Mutex<HashMap<String, Latest>>,
+    maintenance_cursor: AtomicUsize,
     pub(crate) config: MachineConfig,
     started: Instant,
     pub(crate) disk_scan: Arc<tokio::sync::Semaphore>,
@@ -126,6 +129,7 @@ impl Machines {
             tx,
             rx: Mutex::new(Some(rx)),
             latest: Mutex::new(latest),
+            maintenance_cursor: AtomicUsize::new(0),
             config,
             started: Instant::now(),
             disk_scan: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -303,24 +307,42 @@ impl Machines {
         let hourly = now.saturating_sub(millis(self.config.hourly_retention_secs));
         let mut tx = self.pool.begin().await?;
         let mut remaining = self.config.maintenance_rows;
-        let expired = sqlx::query("DELETE FROM machine_samples WHERE rowid IN (SELECT rowid FROM machine_samples WHERE tier IN (0,1,2) AND bucket < ? AND json_extract(data,'$.at_ms') < ? ORDER BY tier,bucket LIMIT ?)")
-            .bind(hourly)
-            .bind(hourly)
-            .bind(remaining as i64)
-            .execute(&mut *tx)
-            .await?.rows_affected() as usize;
-        remaining = remaining.saturating_sub(expired);
-        // Move only old tiers. Existing destination points join the same
-        // deterministic bucket, retaining resource peaks and low-space warnings.
-        for (source, cutoff, target, width) in [(0_i64, raw, 1_i64, 300_000_i64), (1, five, 2, 3_600_000)] {
+        let start = self.maintenance_cursor.fetch_add(1, Ordering::Relaxed) % 3;
+        // Reserve a share for expiration and each rollup before recycling spare
+        // capacity. Rotate the extra rows so budgets of one or two cannot starve
+        // any category, even with a permanently replenished raw backlog.
+        for turn in 0..6 {
             if remaining == 0 {
                 break;
             }
+            let offset = turn % 3;
+            let category = (start + offset) % 3;
+            let limit = if turn < 3 {
+                self.config.maintenance_rows / 3 + usize::from(offset < self.config.maintenance_rows % 3)
+            } else {
+                remaining
+            };
+            if limit == 0 {
+                continue;
+            }
+            if category == 0 {
+                let expired = sqlx::query("DELETE FROM machine_samples WHERE rowid IN (SELECT rowid FROM machine_samples WHERE tier IN (0,1,2) AND bucket < ? AND json_extract(data,'$.at_ms') < ? ORDER BY tier,bucket LIMIT ?)")
+                    .bind(hourly)
+                    .bind(hourly)
+                    .bind(limit as i64)
+                    .execute(&mut *tx)
+                    .await?.rows_affected() as usize;
+                remaining -= expired;
+                continue;
+            }
+            // Existing destination points join the same deterministic bucket,
+            // retaining resource peaks and low-space warnings.
+            let (source, cutoff, target, width) = if category == 1 { (0_i64, raw, 1_i64, 300_000_i64) } else { (1, five, 2, 3_600_000) };
             let rows = sqlx::query("SELECT machine,bucket,data FROM machine_samples WHERE tier=? AND bucket<? AND json_extract(data,'$.at_ms')<? ORDER BY bucket LIMIT ?")
                 .bind(source)
                 .bind(cutoff)
                 .bind(cutoff)
-                .bind(remaining as i64)
+                .bind(limit as i64)
                 .fetch_all(&mut *tx)
                 .await?;
             for row in rows {
@@ -593,8 +615,10 @@ pub async fn inventory(st: &HeadState, caller: &crate::realms::Caller) -> anyhow
             head: None,
         });
     }
-    if caller.realm.is_some() {
-        let allowed = visible_sessions(st, caller).await?;
+    if let Some(realm) = caller.realm.as_deref() {
+        let ids =
+            result.iter().filter_map(|m| m.last_sample.as_ref()).flat_map(|s| s.sessions.iter().map(|s| s.session_id.clone())).collect();
+        let allowed = visible_sessions(st.store.pool(), realm, ids).await?;
         for machine in &mut result {
             if let Some(sample) = &mut machine.last_sample {
                 sample.sessions.retain(|s| allowed.contains(&s.session_id));
@@ -761,20 +785,30 @@ fn scan_each(
     result
 }
 
-async fn visible_sessions(st: &HeadState, caller: &crate::realms::Caller) -> anyhow::Result<HashSet<String>> {
-    Ok(sqlx::query_scalar::<_, String>("SELECT id FROM sessions WHERE realm=?")
-        .bind(caller.realm.as_deref())
-        .fetch_all(st.store.pool())
-        .await?
-        .into_iter()
-        .collect())
+async fn visible_sessions(pool: &SqlitePool, realm: &str, ids: HashSet<String>) -> anyhow::Result<HashSet<String>> {
+    // Work is proportional to this payload, not to the realm's session history.
+    // Keep each statement below SQLite's conservative parameter limit.
+    let ids: Vec<String> = ids.into_iter().collect();
+    let mut allowed = HashSet::new();
+    for chunk in ids.chunks(SESSION_QUERY_CHUNK) {
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT id FROM sessions WHERE realm = ");
+        query.push_bind(realm).push(" AND id IN (");
+        let mut values = query.separated(",");
+        for id in chunk {
+            values.push_bind(id);
+        }
+        query.push(")");
+        allowed.extend(query.build_query_scalar::<String>().fetch_all(pool).await?);
+    }
+    Ok(allowed)
 }
 
 pub async fn filter_samples(st: &HeadState, caller: &crate::realms::Caller, samples: &mut [MachineSample]) -> anyhow::Result<()> {
-    if caller.realm.is_none() {
+    let Some(realm) = caller.realm.as_deref() else {
         return Ok(());
-    }
-    let allowed = visible_sessions(st, caller).await?;
+    };
+    let ids = samples.iter().flat_map(|s| s.sessions.iter().map(|s| s.session_id.clone())).collect();
+    let allowed = visible_sessions(st.store.pool(), realm, ids).await?;
     for sample in samples {
         sample.sessions.retain(|s| allowed.contains(&s.session_id));
     }
@@ -1074,13 +1108,86 @@ mod tests {
         store.write_batch(&batch).await.unwrap();
         assert_eq!(store.compact(now).await.unwrap(), 2);
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM machine_samples").fetch_one(&store.pool).await.unwrap();
-        assert_eq!(count, 10, "expiration must not delete the whole backlog at once");
+        assert!(count >= 10, "maintenance must not consume the whole backlog at once");
         for _ in 0..20 {
             assert!(store.compact(now).await.unwrap() <= 2);
         }
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM machine_samples").fetch_one(&store.pool).await.unwrap();
         assert_eq!(count, 1);
         assert_eq!(store.compact(now).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_progresses_all_categories_with_a_persistent_raw_backlog() {
+        let day = 86_400_000;
+        let now = 100 * day;
+        for budget in [1, 2, 3, 4, 7] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = MachineConfig { maintenance_rows: budget, ..Default::default() };
+            let store = Machines::open(&temp.path().join("fair.sqlite"), config).await.unwrap();
+            let backlog = 6 * budget + 1;
+            let mut tx = store.pool.begin().await.unwrap();
+            for (machine, tier, at_ms) in [("expired", 2, now - 91 * day), ("older", 1, now - 8 * day)] {
+                for n in 0..backlog {
+                    let point = sample(at_ms, 1.0, 500);
+                    sqlx::query("INSERT INTO machine_samples VALUES (?,?,?,?)")
+                        .bind(format!("{machine}-{n}"))
+                        .bind(tier)
+                        .bind(point.at_ms)
+                        .bind(serde_json::to_string(&point).unwrap())
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap();
+                }
+            }
+            tx.commit().await.unwrap();
+            let mut previous = (backlog as i64, backlog as i64, 0_i64);
+            for turn in 0..6 {
+                // Replenish faster than the entire invocation can drain raw.
+                let batch = (0..=budget).map(|n| (format!("raw-{turn}-{n}"), sample(now - 2 * day, 1.0, 500))).collect::<Vec<_>>();
+                store.write_batch(&batch).await.unwrap();
+                let processed = store.compact(now).await.unwrap();
+                assert!(processed > 0 && processed <= budget);
+                let counts: (i64, i64, i64) = sqlx::query_as(
+                    "SELECT
+                     (SELECT count(*) FROM machine_samples WHERE machine LIKE 'expired-%'),
+                     (SELECT count(*) FROM machine_samples WHERE machine LIKE 'older-%' AND tier=1),
+                     (SELECT count(*) FROM machine_samples WHERE machine LIKE 'raw-%' AND tier=1)",
+                )
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+                let raw: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM machine_samples WHERE tier=0").fetch_one(&store.pool).await.unwrap();
+                assert!(raw > 0, "the raw backlog must remain nonempty");
+                if budget >= 3 || turn % 3 == 2 {
+                    assert!(counts.0 < previous.0, "expiration starved with budget {budget}");
+                    assert!(counts.1 < previous.1, "older rollup starved with budget {budget}");
+                    assert!(counts.2 > previous.2, "raw rollup starved with budget {budget}");
+                    previous = counts;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn realm_attribution_queries_only_payload_ids_in_bounded_chunks() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        // Empty payloads do not even query the sessions table.
+        assert!(visible_sessions(&pool, "own", HashSet::new()).await.unwrap().is_empty());
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, realm TEXT NOT NULL)").execute(&pool).await.unwrap();
+        sqlx::query(
+            "WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x+1 FROM n WHERE x<3199)
+             INSERT INTO sessions SELECT 'id-' || x, CASE WHEN x%2=0 THEN 'own' ELSE 'foreign' END FROM n",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut ids = (0..(SESSION_QUERY_CHUNK * 2 + 100)).map(|n| format!("id-{n}")).collect::<Vec<_>>();
+        ids.extend(["id-0".into(), "missing".into(), "id-' OR 1=1 --".into()]);
+        let allowed = visible_sessions(&pool, "own", ids.into_iter().collect()).await.unwrap();
+        let expected = (0..(SESSION_QUERY_CHUNK * 2 + 100)).step_by(2).map(|n| format!("id-{n}")).collect::<HashSet<_>>();
+        assert_eq!(allowed, expected, "exclude foreign, missing and unrelated realm sessions");
     }
 
     #[tokio::test]
