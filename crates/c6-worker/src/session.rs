@@ -9365,17 +9365,13 @@ mod notice_tests {
         manager.journal.inject_append_shmsize("report #2.").await;
         let actor = manager.actors.lock().unwrap().get("held").unwrap().clone();
         assert!(enqueue_test_report(&actor, 2).await.is_err());
-        // Drive the initial short recovery backoff while allowing SQLite's
-        // thread to return the injected error. A real clock is watchdog only.
-        let watchdog = std::time::Instant::now() + c6_testkit::wait::deadline();
-        let waiting = loop {
-            if let Ok(status) = statuses.try_recv() {
-                break status;
-            }
-            assert!(std::time::Instant::now() < watchdog, "no disk-wait status");
-            tokio::time::advance(Duration::from_millis(1)).await;
-            tokio::task::yield_now().await;
-        };
+        // Recovery crosses SQLite's worker thread. Advancing virtual time on
+        // each pending poll can exhaust its pool timeout before real I/O runs
+        // under parallel load. Await the status in real time, then freeze only
+        // for the recovery-deadline proof below.
+        tokio::time::resume();
+        let waiting = c6_testkit::within("the disk-wait status", statuses.recv()).await.unwrap();
+        tokio::time::pause();
         assert_eq!(waiting["automatic"], true);
         assert!(waiting["reason"].as_str().unwrap().contains("/test/state: 0 bytes free"));
         tokio::time::advance(Duration::from_secs(240)).await;
@@ -9391,17 +9387,11 @@ mod notice_tests {
         assert!((recovered_free as f64) < (1u64 << 40) as f64 * 0.05);
         free.store(recovered_free, Ordering::SeqCst);
         tokio::time::advance(SECOND + TICK).await;
-        let restored = barrier(&manager, "disk-space-returned");
-        tokio::pin!(restored);
-        let watchdog = std::time::Instant::now() + c6_testkit::wait::deadline();
-        loop {
-            if futures::poll!(&mut restored).is_ready() {
-                break;
-            }
-            assert!(std::time::Instant::now() < watchdog, "disk recovery did not resume automatically");
-            tokio::time::advance(Duration::from_millis(1)).await;
-            tokio::task::yield_now().await;
-        }
+        // The recovery barrier also queries SQLite: let sampler/recovery
+        // retries use real time instead of racing its I/O with virtual ticks.
+        tokio::time::resume();
+        barrier(&manager, "disk-space-returned").await;
+        tokio::time::pause();
         later.try_recv().unwrap();
         assert!(actor.recovery.disk_wait.lock().unwrap().is_none());
         assert!(actor.recovery.request.lock().unwrap().is_none());
@@ -9410,6 +9400,10 @@ mod notice_tests {
             // let it install the normal notice merge timer before advancing.
             barrier(&manager, "automatic-resume-queued").await;
             tokio::time::advance(QUIET + TICK).await;
+            // Resource timing is proved above. Process scans, SQLite and HTTP
+            // must now complete without manually advancing their retry and
+            // acquire deadlines while they await external I/O.
+            tokio::time::resume();
             if child {
                 // Recovery is complete but continuation must still wait for
                 // high load. Disk remains below 5% throughout this proof.
@@ -9423,22 +9417,16 @@ mod notice_tests {
                         break;
                     }
                     assert!(std::time::Instant::now() < watchdog, "recovered child did not reach memory/load-only admission");
-                    tokio::time::advance(TICK).await;
                     tokio::task::yield_now().await;
                 }
                 assert_eq!(mock.requests().len(), 1, "high load must still hold the continuation");
                 admission_stage.store(2, Ordering::SeqCst);
-                tokio::time::advance(SECOND + TICK).await;
                 assert_eq!(
                     manager.launch_pressure.try_start(),
                     Err(crate::resource_pressure::Pressure::Disk),
                     "new work still waits below 5%"
                 );
             }
-            // Resource timing is proved above. Real process/HTTP cleanup
-            // may poll OS state, as in release_held_reports below; do not
-            // freeze those unrelated I/O retry timers while awaiting output.
-            tokio::time::resume();
             let events = logged(&manager, |events| {
                 events.iter().any(|e| {
                     matches!(&e.kind,

@@ -753,16 +753,39 @@ async fn the_parent_steers_a_running_subagent() {
     let (worker, stop) = run_worker(state.path()).await;
     let project = tempfile::tempdir().unwrap();
 
-    env.mock.push(Reply::ToolCalls(vec![
-        ("task".into(), r#"{"description":"dig","prompt":"Dig.","run_in_background":true}"#.into()),
-        ("bash".into(), r#"{"command":"sleep 1"}"#.into()),
-    ]));
-    env.mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"sleep 3"}"#.into())])); // the subagent
-    env.mock.push(Reply::ToolCalls(vec![("send_message".into(), r#"{"to":"bg1","message":"Also check the shed."}"#.into())]));
-    env.mock.push(Reply::Text("Waiting for it.".into()));
-    env.mock.push(Reply::Text("Dug, and the shed is empty.".into())); // the subagent, steered
-    env.mock.push(Reply::Text("Good.".into())); // the parent, told
+    env.mock.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"dig","prompt":"Dig.","run_in_background":true}"#.into())]));
+    // Parent and child requests can arrive in either order. Hold steering until
+    // the child is streaming, then hold its tool call until steering is queued.
+    let steering = env.mock.push_gated_about(
+        r#""tool_call_id":"call_0_task""#,
+        Reply::ToolCalls(vec![("send_message".into(), r#"{"to":"bg1","message":"Also check the shed."}"#.into())]),
+    );
+    env.mock.push_about(r#""tool_call_id":"call_0_send_message""#, Reply::Text("Waiting for it.".into()));
+    let child_reply =
+        env.mock.push_gated_about(r#"Dig.\n\n---\n"#, Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo digging"}"#.into())]));
+    env.mock.push_about(r#""tool_call_id":"call_0_bash""#, Reply::Text("Dug, and the shed is empty.".into()));
+    env.mock.push_about("shed is empty", Reply::Text("Good.".into()));
     let id = env.create(&worker, project.path(), "go").await;
+    eventually("child model request", async || {
+        env.mock.requests().iter().any(|r| r["messages"].to_string().contains(r#"Dig.\n\n---\n"#)).then_some(())
+    })
+    .await;
+    steering.notify_one();
+    eventually("parent queued steering and is waiting", async || {
+        let ev = env.events(&id).await;
+        (ev.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::ToolResult { tool, output, is_error, .. }
+                    if tool == "send_message" && !*is_error && output.starts_with("Sent:")
+            )
+        }) && turn_end(&ev) == Some(TurnEndReason::Completed))
+        .then_some(())
+    })
+    .await;
+    // Pending steering is journaled at the next model-request boundary, not
+    // while the reply is gated. Completing the tool call lets it join this turn.
+    child_reply.notify_one();
     let ev = eventually("parent told", async || {
         let ev = env.events(&id).await;
         user_messages(&ev).iter().any(|(t, c, _)| c == "task-notification" && t.contains("shed is empty")).then_some(ev)
@@ -938,13 +961,39 @@ async fn subagent_limits_apply() {
         .unwrap();
     assert_eq!(r.status(), 204);
 
-    env.mock.push(Reply::ToolCalls(vec![
-        ("task".into(), r#"{"description":"one","prompt":"One."}"#.into()),
-        ("task".into(), r#"{"description":"two","prompt":"Two."}"#.into()),
-    ]));
-    env.mock.push(Reply::Text("one done".into())); // the one that runs
-    env.mock.push(Reply::Text("Only one ran.".into()));
+    env.mock.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"one","prompt":"One.","run_in_background":true}"#.into())]));
+    let second_launch = env.mock.push_gated_about(
+        r#""tool_call_id":"call_0_task""#,
+        Reply::ToolCalls(vec![("task".into(), r#"{"description":"two","prompt":"Two."}"#.into())]),
+    );
+    let child_reply = env.mock.push_gated_about(r#"One.\n\n---\n"#, Reply::Text("one done".into()));
+    env.mock.push_about(r#""tool_call_id":"call_0_task""#, Reply::Text("Only one ran.".into()));
+    env.mock.push_about("one done", Reply::Text("Only one ran.".into()));
     let id = env.create(&worker, project.path(), "go").await;
+    // Background launch results precede resource admission. Wait until the child
+    // is actually running before attempting another launch, and keep it working
+    // until that launch has hit the concurrent limit. Separate parent calls let
+    // the rejection be journaled without waiting for the gated child to finish.
+    eventually("first child model request", async || {
+        env.mock.requests().iter().any(|r| r["messages"].to_string().contains(r#"One.\n\n---\n"#)).then_some(())
+    })
+    .await;
+    second_launch.notify_one();
+    eventually("overlapping subagent launch refused", async || {
+        env.events(&id)
+            .await
+            .iter()
+            .any(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::ToolResult { tool, output, is_error, .. }
+                        if tool == "task" && *is_error && output.contains("already working")
+                )
+            })
+            .then_some(())
+    })
+    .await;
+    child_reply.notify_one();
     let ev = eventually("parent done", async || {
         let ev = env.events(&id).await;
         (turn_end(&ev) == Some(TurnEndReason::Completed)).then_some(ev)
@@ -959,9 +1008,20 @@ async fn subagent_limits_apply() {
         .collect();
     assert_eq!(results.len(), 2);
     assert!(results.iter().any(|(o, e)| *e && o.contains("already working")), "{results:?}");
-    assert!(results.iter().any(|(o, e)| !*e && o.starts_with("one done")), "{results:?}");
-    let child = &env.children(&id).await[0];
-    match &env.events(&child.id).await[0].kind {
+    assert!(results.iter().any(|(o, e)| !*e && o.starts_with("Started the subagent in the background")), "{results:?}");
+    let children = env.children(&id).await;
+    assert_eq!(children.len(), 1);
+    let child_events = eventually("admitted child completed", async || {
+        let events = env.events(&children[0].id).await;
+        (turn_end(&events) == Some(TurnEndReason::Completed)).then_some(events)
+    })
+    .await;
+    assert!(child_events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::Assistant { blocks, .. }
+            if blocks.iter().any(|b| matches!(b, c6_api::ContentBlock::Text { text, .. } if text == "one done"))
+    )));
+    match &child_events[0].kind {
         EventKind::Started { tools, .. } => assert!(!tools.iter().any(|t| t == "task" || t == "send_message"), "{tools:?}"),
         _ => panic!(),
     }
