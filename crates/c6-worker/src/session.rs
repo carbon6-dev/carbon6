@@ -739,6 +739,32 @@ impl Drop for HeldAdoptionRecovery {
     }
 }
 
+fn background_liveness_counts(tasks: &[c6_tools::TaskInfo]) -> (u32, u32) {
+    let mut total = 0;
+    let mut processes = 0;
+    for task in tasks.iter().filter(|t| t.running && crate::subagent::counted_background(t.notify, t.kind.as_str())) {
+        total += 1;
+        if task.kind != c6_tools::TaskKind::Agent {
+            processes += 1;
+        }
+    }
+    (total, processes)
+}
+
+fn liveness_activity(state: c6_proto::SessionActorState, activity: i32) -> (i32, bool) {
+    use c6_proto::{SessionActivityKind, SessionActorState};
+    if !matches!(state, SessionActorState::Running | SessionActorState::Unresponsive) {
+        return (SessionActivityKind::Unspecified as i32, false);
+    }
+    if activity == SessionActivityKind::Subagent as i32 {
+        // Older heads know Tool and must not classify dependency waits as a
+        // stalled model. New heads use the additive flag for tree silence.
+        (SessionActivityKind::Tool as i32, true)
+    } else {
+        (activity, false)
+    }
+}
+
 impl SessionManager {
     /// Constructor for in-process tests that require deterministic measurements.
     #[doc(hidden)]
@@ -924,7 +950,7 @@ impl SessionManager {
     /// Snapshot the worker's actors without waiting on the journal or actor
     /// mailboxes. A nonblocking mailbox probe detects a stuck run loop.
     pub(crate) fn liveness_report(&self) -> c6_proto::SessionLivenessReport {
-        use c6_proto::{SessionActivityKind, SessionActorState, SessionLiveness};
+        use c6_proto::{SessionActorState, SessionLiveness};
 
         let actors = self.actors.lock().unwrap().clone();
         let held = if actors.values().any(|a| a.claude_code.load(Ordering::Acquire)) {
@@ -953,23 +979,17 @@ impl SessionManager {
                     (SessionActorState::Idle, "")
                 };
                 let held_process = if a.claude_code.load(Ordering::Acquire) { held.get(&session_id).copied() } else { None };
+                let (running_background_tasks, running_background_processes) = background_liveness_counts(&a.tools.background.list());
+                let (activity_kind, waiting_on_subagents) = liveness_activity(state, a.recovery.activity.load(Ordering::Relaxed));
                 SessionLiveness {
                     session_id,
                     ownership_epoch: a.recovery.epoch,
                     actor_state: state as i32,
                     reason: reason.into(),
-                    activity_kind: if matches!(state, SessionActorState::Running | SessionActorState::Unresponsive) {
-                        a.recovery.activity.load(Ordering::Relaxed)
-                    } else {
-                        SessionActivityKind::Unspecified as i32
-                    },
-                    running_background_tasks: a
-                        .tools
-                        .background
-                        .list()
-                        .iter()
-                        .filter(|t| t.running && crate::subagent::counted_background(t.notify, t.kind.as_str()))
-                        .count() as u32,
+                    activity_kind,
+                    waiting_on_subagents,
+                    running_background_tasks,
+                    running_background_processes,
                     held_process: held_process.unwrap_or_default() as i32,
                 }
             })
@@ -2758,6 +2778,44 @@ fn pending_local_reports<'a>(sid: &str, events: &'a [SessionEvent]) -> Vec<(Stri
         .into_iter()
         .map(|(seq, finish, inputs)| (id(seq), finish, inputs))
         .collect()
+}
+
+/// The exact delegated inputs acknowledged by durable local report receipts.
+/// Replay each receipt's preceding journal prefix: a later independent report
+/// must not acknowledge earlier work, and counted work can span several turns.
+/// `pending` contains raw child input command IDs, without the local-wait prefix.
+/// Historical receipts preceding every outstanding input need no prefix replay.
+pub fn delivered_local_report_inputs<'a>(
+    child: &str,
+    events: &'a [SessionEvent],
+    pending: &HashSet<String>,
+) -> Vec<&'a c6_proto::UserMessage> {
+    let prefix = format!("subagent:local:{child}:");
+    let mut delivered = Vec::new();
+    let mut remaining = pending.clone();
+    let Some(first) = events.iter().find_map(|event| match &event.kind {
+        Some(session_event::Kind::User(input)) if remaining.contains(&input.command_id) => Some(event.seq),
+        _ => None,
+    }) else {
+        return delivered;
+    };
+    for (i, event) in events.iter().enumerate() {
+        let Some(session_event::Kind::SubagentReported(receipt)) = &event.kind else { continue };
+        if receipt.child_session_id != child || receipt.status == "waiting" {
+            continue;
+        }
+        let Some(end) = receipt.command_id.strip_prefix(&prefix).and_then(|seq| seq.parse::<u64>().ok()) else { continue };
+        if end < first || end >= event.seq {
+            continue;
+        }
+        if let Some((_, _, inputs)) = pending_local_reports(child, &events[..i]).into_iter().find(|(id, _, _)| id == &receipt.command_id) {
+            delivered.extend(inputs.into_iter().filter(|input| !input.delegated_by.is_empty() && remaining.remove(&input.command_id)));
+            if remaining.is_empty() {
+                break;
+            }
+        }
+    }
+    delivered
 }
 
 /// A successful channel send is not durable delivery. On recovery, look
@@ -7408,7 +7466,8 @@ pub(crate) struct Writer {
     /// streamed text is stamped with.
     logged: std::sync::atomic::AtomicU64,
     activity: Arc<std::sync::atomic::AtomicI32>,
-    outstanding_tools: Mutex<HashSet<String>>,
+    /// Outstanding call IDs; true means a subagent dependency, not other work.
+    outstanding_tools: Mutex<HashMap<String, bool>>,
     disk_probe: Option<(Arc<crate::disk::Monitor>, PathBuf)>,
     resource_failure: std::sync::atomic::AtomicBool,
 }
@@ -7451,16 +7510,26 @@ impl Writer {
             session_event::Kind::Assistant(m) => {
                 if m.stop_reason != "interrupted" {
                     tools.extend(m.blocks.iter().filter_map(|b| match &b.block {
-                        Some(content_block::Block::ToolUse(call)) => Some(call.id.clone()),
+                        Some(content_block::Block::ToolUse(call)) => {
+                            let name =
+                                call.name.rsplit("__").next().unwrap_or(&call.name).rsplit(['.', ':', '/']).next().unwrap_or(&call.name);
+                            Some((call.id.clone(), crate::subagent::delegation_tool(name)))
+                        }
                         _ => None,
                     }));
                 }
             }
-            session_event::Kind::ToolResult(r) if tools.remove(&r.call_id) => {}
+            session_event::Kind::ToolResult(r) if tools.remove(&r.call_id).is_some() => {}
             session_event::Kind::TurnEnded(_) => tools.clear(),
             _ => return,
         }
-        let kind = if tools.is_empty() { SessionActivityKind::Unspecified } else { SessionActivityKind::Tool };
+        let kind = if tools.is_empty() {
+            SessionActivityKind::Unspecified
+        } else if tools.values().all(|delegation| *delegation) {
+            SessionActivityKind::Subagent
+        } else {
+            SessionActivityKind::Tool
+        };
         self.activity.store(kind as i32, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -8433,6 +8502,46 @@ mod notice_tests {
 
     use super::*;
 
+    fn delivered_local_report_inputs<'a>(child: &str, events: &'a [SessionEvent]) -> Vec<&'a c6_proto::UserMessage> {
+        let pending = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                Some(session_event::Kind::User(input)) => Some(input.command_id.clone()),
+                _ => None,
+            })
+            .collect();
+        super::delivered_local_report_inputs(child, events, &pending)
+    }
+
+    #[test]
+    fn background_liveness_distinguishes_agent_waits_from_commands() {
+        use c6_tools::{TaskInfo, TaskKind};
+        let task = |kind, running, notify| TaskInfo { id: String::new(), kind, description: String::new(), running, notify };
+        assert_eq!(background_liveness_counts(&[task(TaskKind::Agent, true, true)]), (1, 0));
+        assert_eq!(background_liveness_counts(&[task(TaskKind::Shell, true, true)]), (1, 1));
+        assert_eq!(
+            background_liveness_counts(&[
+                task(TaskKind::Agent, true, true),
+                task(TaskKind::Shell, true, true),
+                task(TaskKind::Shell, true, false),
+                task(TaskKind::Shell, false, true),
+                task(TaskKind::ClaudeCode, true, false),
+            ]),
+            (3, 2)
+        );
+    }
+
+    #[test]
+    fn subagent_liveness_reports_remain_compatible_with_older_heads() {
+        use c6_proto::{SessionActivityKind as Activity, SessionActorState as State};
+        for state in [State::Running, State::Unresponsive] {
+            assert_eq!(liveness_activity(state, Activity::Subagent as i32), (Activity::Tool as i32, true));
+            assert_eq!(liveness_activity(state, Activity::Tool as i32), (Activity::Tool as i32, false));
+            assert_eq!(liveness_activity(state, Activity::Model as i32), (Activity::Model as i32, false));
+        }
+        assert_eq!(liveness_activity(State::Idle, Activity::Subagent as i32), (Activity::Unspecified as i32, false));
+    }
+
     #[test]
     fn local_report_recovery_keeps_earlier_turns_and_automatic_resumptions() {
         let mut events = vec![
@@ -8469,6 +8578,158 @@ mod notice_tests {
         assert_eq!(pending.len(), 1, "a later receipt must not erase an earlier pending turn");
         assert_eq!(pending[0].0, "subagent:local:child:4");
         assert!(pending_local_reports("legacy-child", &events).is_empty(), "no replay of pre-tracking history");
+    }
+
+    #[test]
+    fn delivered_local_report_inputs_keep_independent_windows_separate() {
+        use session_event::Kind;
+        let input = |id: &str| {
+            Kind::User(c6_proto::UserMessage { command_id: id.into(), delegated_by: "reused-call".into(), ..Default::default() })
+        };
+        let mut events: Vec<_> = [
+            Kind::SubagentReported(local_report_boundary("child")),
+            input("earlier"),
+            Kind::TurnEnded(Default::default()),
+            input("later"),
+            Kind::TurnEnded(Default::default()),
+            Kind::SubagentReported(c6_proto::SubagentReported {
+                command_id: "subagent:local:child:5".into(),
+                child_session_id: "child".into(),
+                status: "completed".into(),
+                ..Default::default()
+            }),
+            input("next"),
+            Kind::TurnEnded(Default::default()),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| ev(i as u64 + 1, 0, kind))
+        .collect();
+        let ids = |events: &[SessionEvent]| {
+            delivered_local_report_inputs("child", events).iter().map(|u| u.command_id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&events), ["later"]);
+        assert!(pending_local_reports("child", &events).iter().any(|(id, _, _)| id == "subagent:local:child:3"));
+        events.push(ev(
+            9,
+            0,
+            Kind::SubagentReported(c6_proto::SubagentReported {
+                command_id: "subagent:local:child:3".into(),
+                child_session_id: "child".into(),
+                status: "completed".into(),
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(ids(&events), ["later", "earlier"]);
+        let pending = HashSet::from(["earlier".into()]);
+        assert_eq!(
+            super::delivered_local_report_inputs("child", &events, &pending).iter().map(|u| u.command_id.as_str()).collect::<Vec<_>>(),
+            ["earlier"]
+        );
+        let pending = HashSet::from(["next".into()]);
+        assert!(super::delivered_local_report_inputs("child", &events, &pending).is_empty());
+        assert!(super::delivered_local_report_inputs("child", &events, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn delivered_local_report_inputs_include_counted_multi_turn_work() {
+        use session_event::Kind;
+        let input =
+            |id: &str| Kind::User(c6_proto::UserMessage { command_id: id.into(), delegated_by: "call".into(), ..Default::default() });
+        let task = |state: &str| {
+            Kind::BackgroundTask(BackgroundTask { task_id: "bg".into(), notify: true, state: state.into(), ..Default::default() })
+        };
+        let events: Vec<_> = [
+            Kind::SubagentReported(local_report_boundary("child")),
+            input("original"),
+            Kind::TurnStarted(Default::default()),
+            Kind::TurnEnded(Default::default()),
+            task("started"), // Durable start can follow the first turn end.
+            input("continuation"),
+            Kind::TurnStarted(Default::default()),
+            Kind::TurnEnded(Default::default()),
+            task("finished"), // The receipt's end sequence is not the interval's last event.
+            Kind::SubagentReported(c6_proto::SubagentReported {
+                command_id: "subagent:local:child:8".into(),
+                child_session_id: "child".into(),
+                status: "completed".into(),
+                ..Default::default()
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| ev(i as u64 + 1, 0, kind))
+        .collect();
+        assert!(delivered_local_report_inputs("child", &events[..9]).is_empty());
+        assert_eq!(
+            delivered_local_report_inputs("child", &events).iter().map(|u| u.command_id.as_str()).collect::<Vec<_>>(),
+            ["original", "continuation"]
+        );
+    }
+
+    #[test]
+    fn delivered_local_report_inputs_exclude_invalid_receipts_and_unconsumed_inputs() {
+        use session_event::Kind;
+        let input = |id: &str, delegated_by: &str, blocked: &str| {
+            Kind::User(c6_proto::UserMessage {
+                command_id: id.into(),
+                delegated_by: delegated_by.into(),
+                blocked: blocked.into(),
+                ..Default::default()
+            })
+        };
+        let base: Vec<_> = [
+            Kind::SubagentReported(local_report_boundary("child")),
+            input("delegated", "call", ""),
+            input("blocked", "call", "blocked"),
+            input("ordinary", "", ""),
+            Kind::TurnEnded(Default::default()),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| ev(i as u64 + 1, 0, kind))
+        .collect();
+        for (command_id, child_session_id, status) in [
+            ("subagent:local:child:tracking", "child", "tracking"),
+            ("subagent:local:other:5", "child", "completed"),
+            ("subagent:local:child:5", "other", "completed"),
+            ("subagent:local:child:5", "child", "waiting"),
+            ("subagent:local:child:6", "child", "completed"),
+            ("subagent:local:child:99", "child", "completed"),
+            ("subagent:local:child:2", "child", "completed"),
+        ] {
+            let mut events = base.clone();
+            events.push(ev(
+                6,
+                0,
+                Kind::SubagentReported(c6_proto::SubagentReported {
+                    command_id: command_id.into(),
+                    child_session_id: child_session_id.into(),
+                    status: status.into(),
+                    ..Default::default()
+                }),
+            ));
+            assert!(
+                delivered_local_report_inputs("child", &events).is_empty(),
+                "invalid receipt {command_id} / {child_session_id} / {status}"
+            );
+        }
+        let mut events = base;
+        events.push(ev(
+            6,
+            0,
+            Kind::SubagentReported(c6_proto::SubagentReported {
+                command_id: "subagent:local:child:5".into(),
+                child_session_id: "child".into(),
+                status: "completed".into(),
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(
+            delivered_local_report_inputs("child", &events).iter().map(|u| u.command_id.as_str()).collect::<Vec<_>>(),
+            ["delegated"]
+        );
+        assert!(delivered_local_report_inputs("legacy-child", &events).is_empty());
     }
 
     #[test]
@@ -12598,6 +12859,28 @@ mod writer_tests {
         writer.set_activity(SessionActivityKind::Model);
         writer.observe_activity(&result("unrelated"));
         assert_eq!(activity(), SessionActivityKind::Model);
+        for name in ["task", "Task", "send_message", "SendMessage", "mcp__carbon6__Task", "tools.send_message", "tools::SendMessage"] {
+            writer.observe_activity(&session_event::Kind::Assistant(AssistantMessage {
+                blocks: vec![ContentBlock {
+                    block: Some(content_block::Block::ToolUse(ToolUse { id: "delegate".into(), name: name.into(), ..Default::default() })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }));
+            assert_eq!(activity(), SessionActivityKind::Subagent, "{name}");
+            writer.observe_activity(&session_event::Kind::Assistant(AssistantMessage {
+                blocks: vec![ContentBlock {
+                    block: Some(content_block::Block::ToolUse(ToolUse { id: "command".into(), name: "bash".into(), ..Default::default() })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }));
+            assert_eq!(activity(), SessionActivityKind::Tool, "mixed outstanding calls");
+            writer.observe_activity(&result("command"));
+            assert_eq!(activity(), SessionActivityKind::Subagent);
+            writer.observe_activity(&result("delegate"));
+            assert_eq!(activity(), SessionActivityKind::Unspecified);
+        }
     }
 
     #[tokio::test]

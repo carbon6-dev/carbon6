@@ -40,6 +40,7 @@ use anyhow::Context;
 
 pub use conn::ConnState;
 pub use identity::Identity;
+pub use session::delivered_local_report_inputs;
 pub use subagent::{digest_text, report_input, spawned_children, status_of, task_report_notice};
 
 /// Idle, synced sessions stay in the journal this long.

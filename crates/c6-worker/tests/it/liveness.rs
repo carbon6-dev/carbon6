@@ -549,7 +549,7 @@ async fn a_long_live_tool_is_not_model_silence() {
 }
 
 #[tokio::test]
-async fn waiting_on_live_background_work_warns_about_tree_silence_not_loss() {
+async fn waiting_on_live_background_work_is_not_tree_silence_or_loss() {
     if !c6_testkit::have("sh") {
         return;
     }
@@ -591,7 +591,12 @@ async fn waiting_on_live_background_work_warns_about_tree_silence_not_loss() {
     .await;
     gate.started(&env, child_dir.path()).await;
     assert_eq!(end_after(&env, &child, 0).await, TurnEndReason::Completed);
-    evidence(&env, &child, |e| e["actor_state"] == SessionActorState::Idle.as_str_name() && e["running_background_tasks"] == 1).await;
+    evidence(&env, &child, |e| {
+        e["actor_state"] == SessionActorState::Idle.as_str_name()
+            && e["running_background_tasks"] == 1
+            && e["running_background_processes"] == 1
+    })
+    .await;
     let now = c6_core::now_ms();
     sweep(&env, now).await;
     assert!(
@@ -603,13 +608,11 @@ async fn waiting_on_live_background_work_warns_about_tree_silence_not_loss() {
     assert_no_incident(&env, &child).await;
 
     sweep(&env, past(now, DEFAULT_LIVENESS_TREE_SILENCE_SECONDS)).await;
-    let rows = incidents(&env, &parent).await;
-    assert_eq!(rows.len(), 1, "one pending-work warning, not a loss: {rows:?}");
-    assert_eq!(rows[0].0, "silence");
-    assert!(rows[0].1.contains(&child) && rows[0].1.contains("pending since"), "{rows:?}");
+    assert_no_incident(&env, &parent).await;
     assert_no_incident(&env, &child).await;
     env.mock.push_about(parent_prompt, Reply::Text("The child has reported back.".into()));
     env.mock.push_about(&user_prompt_scope(child_prompt), Reply::Text("The background work has ended.".into()));
+    let child_floor = env.events(&child).await.last().unwrap().seq;
     gate.release();
     let (output, is_error) = eventually_or(
         "the parent to receive the child's report after the job ends",
@@ -623,6 +626,17 @@ async fn waiting_on_live_background_work_warns_about_tree_silence_not_loss() {
     )
     .await;
     assert!(!is_error && output.contains(&child), "{output}");
+    assert_eq!(end_after(&env, &child, child_floor).await, TurnEndReason::Completed);
+    assert_eq!(end_after(&env, &parent, 0).await, TurnEndReason::Completed);
+    eventually("the completed child's report obligations to be delivered", async || {
+        (head(&env).store.waiting_delegations(&child).await.unwrap().is_empty()
+            && head(&env).store.session(&child).await.unwrap().unwrap().status == "idle")
+            .then_some(())
+    })
+    .await;
+    sweep(&env, past(c6_core::now_ms(), DEFAULT_LIVENESS_TREE_SILENCE_SECONDS)).await;
+    assert_no_incident(&env, &parent).await;
+    assert_no_incident(&env, &child).await;
 }
 
 const LOCAL_PARENT_PROMPT: &str = "LOCAL-PARENT: Wait for the child and its shell job.";

@@ -165,6 +165,11 @@ message SessionLiveness {
   HeldProcessState held_process = 6;
   // Running background tasks tracked by the local runtime (all kinds).
   uint32 running_background_tasks = 7;
+  // Counted running background work, excluding carbon6 subagent waits.
+  // Opaque native Claude Code tasks remain CLI work, including native agents.
+  uint32 running_background_processes = 8;
+  // activity_kind remains TOOL for compatibility with older heads.
+  bool waiting_on_subagents = 9;
 }
 
 enum SessionActorState {
@@ -183,6 +188,8 @@ enum SessionActivityKind {
   SESSION_ACTIVITY_KIND_UNSPECIFIED = 0;
   SESSION_ACTIVITY_KIND_MODEL = 1;
   SESSION_ACTIVITY_KIND_TOOL = 2;
+  // Worker-internal classification; reports send TOOL plus waiting_on_subagents.
+  SESSION_ACTIVITY_KIND_SUBAGENT = 3;
 }
 
 enum HeldProcessState {

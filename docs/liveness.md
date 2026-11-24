@@ -84,6 +84,15 @@ Before enqueueing a local delegated input, the parent journals its exact
 wait obligation. The head can therefore identify the waiting call even if
 the child's actor wedges before journaling that input. Normal foreground
 results and terminal background callbacks retire their respective obligations.
+The child's durable local-report receipt also retires the exact consumed input
+obligations covered by that report. This includes SendMessage continuations
+and reports after the child's own background work wakes it again, even if the
+parent's original detached callback is no longer available. Report-window
+membership comes from the worker's shared replay logic, not idle/completed
+status, reused tool-call ids or the latest report's sequence alone. An unrelated
+earlier report and a queued later input remain pending. Reconciliation is
+transactional in either journal replication order and repairs saved outstanding
+obligations when the head opens its database.
 A marker that syncs after an earlier loss starts a new observation requiring
 fresh evidence, rather than leaving its waiter behind an already-delivered
 incident.
@@ -97,8 +106,19 @@ checks live counted work, and both local and remote reports wait for an idle
 foreground and the final terminal background event. Uncounted servers and
 watchers do not hold a delegation open.
 The sweep covers background work as well as foreground actors. A parent with
-pending descendants and no activity anywhere in its tree for 30 minutes gets
-a pending-work summary, with ids and since times, even if everything is alive.
+pending descendants gets a pending-work summary, with ids and since times,
+only after 30 minutes with no recorded progress and no live tool or counted
+background work anywhere in its tree (including the parent and idle
+intermediates). Worker evidence for this exemption must match the live worker
+connection and ownership epoch and follow the latest progress. A tool call
+or notifying background process can run longer than the silence window without
+producing a false alarm; stale evidence, exited processes and stopped actors
+cannot exempt the tree. Heartbeats alone still do not reset the progress clock.
+The worker separately reports counted background processes and tools waiting
+only on subagents: a parent's Task/SendMessage dependency is not itself live
+process work and cannot mask a silent child. The existing total background-task
+count remains available for actor-loss checks. These distinctions use additive
+worker-link fields; upgrade workers for background-process tree coverage.
 
 ## Visibility and tests
 
@@ -137,3 +157,8 @@ clock; no assertion waits for real grace/model/silence windows. Integration
 tests use the Env harness and inject actor death, disconnected workers and
 gated model responses. Live tools and grace-period reconnects are negative
 controls. Assertions wait for observable conditions rather than sleeping.
+Tree regressions advance the observation past the silence window with a live
+tool or counted background process, then remove that evidence and require a
+single silence notice. Local receipt tests cover background continuations,
+self-woken completion, independent out-of-order reports, reused call ids,
+either journal replication order, same-batch ingestion, and restart repair.

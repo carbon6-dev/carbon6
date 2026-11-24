@@ -6502,8 +6502,13 @@ done
         std::fs::write(records.join("conv-1.pid"), format!("{}\nconv-1\n", orphan.id())).unwrap();
         std::fs::write(records.join("conv-2.pid"), format!("{}\nconv-2\n", stranger.id())).unwrap();
         let mut orphan = orphan;
+        c6_testkit::eventually("the orphan's exact argv to prove ownership", async || {
+            is_claude_for(orphan.id() as i32, "conv-1").then_some(())
+        })
+        .await;
         sweep_orphans(&records).await;
-        assert!(orphan.wait().unwrap().signal().is_some(), "the orphan is stopped");
+        let status = c6_testkit::eventually("the orphan to stop after sweeping", async || orphan.try_wait().unwrap()).await;
+        assert!(status.signal().is_some(), "the orphan is stopped");
         assert!(stranger.try_wait().unwrap().is_none(), "another program with a recorded id is left alone");
         assert_eq!(std::fs::read_dir(&records).unwrap().count(), 0, "the records are gone");
         stranger.kill().unwrap();

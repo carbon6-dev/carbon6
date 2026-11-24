@@ -328,6 +328,7 @@ impl Store {
             .foreign_keys(true);
         let (pool, report) = c6_core::upgrade::open(path, opts, SqlitePoolOptions::new().max_connections(8), &MIGRATOR, &UPGRADES).await?;
         backfill_notice_holds(&pool).await?;
+        reconcile_local_reports(&pool).await?;
         crate::lists::ensure(&pool).await?;
         crate::prompts::seed(&pool).await?;
         crate::claims::seed(&pool).await?;
@@ -1328,6 +1329,7 @@ impl Store {
         let mut rebuild_notices = false;
         let mut done = Vec::new();
         let mut delivered: Vec<String> = Vec::new();
+        let mut local_reports = std::collections::HashSet::new();
         for ev in events {
             if ev.seq <= last {
                 continue;
@@ -1455,12 +1457,22 @@ impl Store {
                         .execute(&mut *tx)
                         .await?;
                     }
+                    // Parent and child journals can replicate in either order.
+                    // A late wait marker must not resurrect a delivered report.
+                    local_reports.insert(r.child_session_id.clone());
                 }
                 Some(Kind::ToolResult(r)) => {
                     settle_foreground_local_waits(&mut tx, session_id, Some(&r.call_id)).await?;
                 }
-                // A remote subagent's report reached its parent.
-                Some(Kind::SubagentReported(r)) => done.push(r.command_id.clone()),
+                Some(Kind::SubagentReported(r)) => {
+                    // Local receipts are written in the child's journal only
+                    // after its parent durably took the report. They cover exact
+                    // consumed inputs, even when a detached callback was lost.
+                    if r.child_session_id == session_id && r.command_id.starts_with(&format!("subagent:local:{session_id}:")) {
+                        local_reports.insert(session_id.to_owned());
+                    }
+                    done.push(r.command_id.clone());
+                }
                 Some(Kind::TurnStarted(_)) => status = "running".into(),
                 Some(Kind::TurnEnded(t)) => {
                     // Recovery/cancellation may close a turn without its
@@ -1519,6 +1531,9 @@ impl Store {
             stored.push(ev);
         }
         if !stored.is_empty() {
+            for child in local_reports {
+                settle_delivered_local_waits(&mut tx, &child).await?;
+            }
             if rebuild_notices {
                 rebuild_notice_holds(&mut tx, session_id).await?;
             } else if notice_holds_changed {
@@ -1832,6 +1847,73 @@ async fn settle_foreground_local_waits(tx: &mut sqlx::SqliteConnection, parent: 
     .bind(call)
     .execute(tx)
     .await?;
+    Ok(())
+}
+
+/// Repair only outstanding local waits, including receipts saved by older
+/// heads. Never infer delivery from idle/completed status or a bare turn end.
+async fn reconcile_local_reports(pool: &SqlitePool) -> anyhow::Result<()> {
+    let children: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT child_id FROM remote_delegations WHERE state = 'waiting' AND command_id LIKE 'subagent:local-wait:delegation:%'",
+    )
+    .fetch_all(pool)
+    .await?;
+    for child in children {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        settle_delivered_local_waits(&mut tx, &child).await?;
+        tx.commit().await?;
+    }
+    Ok(())
+}
+
+async fn settle_delivered_local_waits(tx: &mut sqlx::SqliteConnection, child: &str) -> anyhow::Result<()> {
+    use futures::TryStreamExt;
+    use prost::Message;
+
+    let waiting: Vec<String> = sqlx::query_scalar(
+        "SELECT substr(command_id, length('subagent:local-wait:') + 1) FROM remote_delegations WHERE child_id = ? AND state = 'waiting' AND command_id LIKE 'subagent:local-wait:delegation:%'",
+    ).bind(child).fetch_all(&mut *tx).await?;
+    if waiting.is_empty() {
+        return Ok(());
+    }
+    let waiting = waiting.into_iter().collect();
+    // Read transaction-visible rows, not sessions.last_seq: the receipt can
+    // follow its inputs in this very ingest batch, before that watermark moves.
+    let mut events = Vec::new();
+    {
+        let mut rows =
+            sqlx::query_scalar::<_, Vec<u8>>("SELECT data FROM events WHERE session_id = ? ORDER BY seq").bind(child).fetch(&mut *tx);
+        while let Some(data) = rows.try_next().await? {
+            let event = c6_proto::SessionEvent::decode(data.as_slice())?;
+            // Replay needs work boundaries and receipts, not large assistant
+            // messages or tool output. Stream those past without retaining them.
+            if matches!(
+                event.kind,
+                Some(
+                    c6_proto::session_event::Kind::Started(_)
+                        | c6_proto::session_event::Kind::User(_)
+                        | c6_proto::session_event::Kind::TurnStarted(_)
+                        | c6_proto::session_event::Kind::TurnEnded(_)
+                        | c6_proto::session_event::Kind::BackgroundTask(_)
+                        | c6_proto::session_event::Kind::SubagentReported(_)
+                )
+            ) {
+                events.push(event);
+            }
+        }
+    }
+    for input in c6_worker::delivered_local_report_inputs(child, &events, &waiting) {
+        sqlx::query(
+            "UPDATE remote_delegations SET state = 'reported' WHERE command_id = ? AND child_id = ? AND call_id = ? AND state = 'waiting' \
+             AND parent_id = (SELECT parent_id FROM sessions WHERE id = ?)",
+        )
+        .bind(format!("subagent:local-wait:{}", input.command_id))
+        .bind(child)
+        .bind(&input.delegated_by)
+        .bind(child)
+        .execute(&mut *tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -2606,6 +2688,92 @@ pub(crate) mod tests {
                 text: "synthetic input".into(),
                 ..Default::default()
             })),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_report_receipts_settle_exact_windows_in_either_ingest_order() {
+        use c6_proto::{SessionEvent, SubagentReported, TurnEnded, UserMessage, session_event::Kind};
+
+        for child_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("c6h.db");
+            let store = Store::open(&path).await.unwrap();
+            let worker = WorkerId::new();
+            store.create_session(&session("parent", worker), &[], false).await.unwrap();
+            let mut child = session("child", worker);
+            child.parent_id = Some("parent".into());
+            store.create_session(&child, &[], false).await.unwrap();
+            let event = |seq, kind| SessionEvent { seq, ts_ms: 0, kind: Some(kind) };
+            let marker = |seq, input: &str| {
+                event(
+                    seq,
+                    Kind::SubagentReported(SubagentReported {
+                        command_id: format!("subagent:local-wait:delegation:{input}"),
+                        child_session_id: "child".into(),
+                        call_id: "reused".into(),
+                        status: "waiting".into(),
+                    }),
+                )
+            };
+            let input = |id: &str| {
+                Kind::User(UserMessage { command_id: format!("delegation:{id}"), delegated_by: "reused".into(), ..Default::default() })
+            };
+            let receipt = |end| {
+                Kind::SubagentReported(SubagentReported {
+                    command_id: format!("subagent:local:child:{end}"),
+                    child_session_id: "child".into(),
+                    status: "completed".into(),
+                    ..Default::default()
+                })
+            };
+            let ended = || Kind::TurnEnded(TurnEnded { reason: c6_proto::TurnEndReason::Completed as i32, ..Default::default() });
+            let markers = [marker(1, "old:bg1"), marker(2, "next:bg2"), marker(3, "queued:bg3")];
+            if !child_first {
+                store.ingest(worker, "parent", &markers).await.unwrap();
+            }
+            // The newer interval is delivered first, in the same batch as its
+            // inputs. The old report and an unconsumed call remain outstanding.
+            store
+                .ingest(
+                    worker,
+                    "child",
+                    &[
+                        event(
+                            1,
+                            Kind::SubagentReported(SubagentReported {
+                                command_id: "subagent:local:child:tracking".into(),
+                                ..Default::default()
+                            }),
+                        ),
+                        event(2, input("old:bg1")),
+                        event(3, ended()),
+                        event(4, input("next:bg2")),
+                        event(5, ended()),
+                        event(6, receipt(5)),
+                    ],
+                )
+                .await
+                .unwrap();
+            if child_first {
+                store.ingest(worker, "parent", &markers).await.unwrap();
+            }
+            let waits = store.waiting_delegations("child").await.unwrap();
+            assert_eq!(waits.len(), 2, "only the delivered window settles (child_first={child_first})");
+            assert!(waits.iter().any(|(id, _)| id.ends_with("old:bg1")));
+            assert!(waits.iter().any(|(id, _)| id.ends_with("queued:bg3")));
+            store.ingest(worker, "child", &[event(7, receipt(3))]).await.unwrap();
+            store.ingest(worker, "parent", &markers).await.unwrap();
+            assert_eq!(store.waiting_delegations("child").await.unwrap().len(), 1, "replay cannot resurrect a wait");
+            // Reopening repairs obligations left waiting by an older head,
+            // using receipts, never the child's terminal status.
+            sqlx::query("UPDATE remote_delegations SET state = 'waiting'").execute(store.pool()).await.unwrap();
+            store.pool.close().await;
+            let reopened = Store::open(&path).await.unwrap();
+            let waits = reopened.waiting_delegations("child").await.unwrap();
+            assert_eq!(waits.len(), 1);
+            assert!(waits[0].0.ends_with("queued:bg3"));
+            reopened.pool.close().await;
         }
     }
 

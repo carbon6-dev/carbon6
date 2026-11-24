@@ -189,7 +189,10 @@ pub async fn sweep_at(st: &HeadState, now: i64) -> anyhow::Result<()> {
                     }
                     SessionActorState::Running
                         if current
-                            && r.activity_kind != SessionActivityKind::Tool as i32
+                            && !matches!(
+                                SessionActivityKind::try_from(r.activity_kind),
+                                Ok(SessionActivityKind::Tool | SessionActivityKind::Subagent)
+                            )
                             && silent >= i64::from(l.liveness_model_silence_seconds) * 1000 =>
                     {
                         Some(format!("no model progress for {} seconds; last activity at {}", silent / 1000, last.unwrap_or(e.changed)))
@@ -242,6 +245,27 @@ pub async fn sweep_at(st: &HeadState, now: i64) -> anyhow::Result<()> {
             })
             .collect();
         if descendants.is_empty() {
+            continue;
+        }
+        // A long tool or counted background process is work, not silence.
+        // Check the whole tree (including idle intermediates and the parent),
+        // using the same connection/ownership and progress fences as loss.
+        let live_work = sessions.iter().filter(|s| tree.contains(s.id.as_str())).any(|s| {
+            let Ok(worker) = s.worker_id.parse::<WorkerId>() else { return false };
+            evidence.get(&s.id).is_some_and(|e| {
+                e.worker == worker
+                    && Some(e.connection) == st.registry.connection_stamp(worker).live
+                    && e.report.ownership_epoch as i64 == s.ownership_epoch
+                    && e.fresh_after(progress.get(&s.id).copied())
+                    && matches!(SessionActorState::try_from(e.report.actor_state), Ok(SessionActorState::Running | SessionActorState::Idle))
+                    && e.report.held_process != HeldProcessState::Exited as i32
+                    && (e.report.running_background_processes > 0
+                        || e.report.actor_state == SessionActorState::Running as i32
+                            && e.report.activity_kind == SessionActivityKind::Tool as i32
+                            && !e.report.waiting_on_subagents)
+            })
+        });
+        if live_work {
             continue;
         }
         let last = sessions
@@ -443,6 +467,8 @@ pub async fn snapshot(st: &HeadState) -> anyhow::Result<Value> {
             "reason": e.map(|e| e.report.reason.as_str()).unwrap_or("no current worker evidence"),
             "activity_kind": e.map_or(0, |e| e.report.activity_kind), "held_process": e.map_or(0, |e| e.report.held_process),
             "running_background_tasks": e.map_or(0, |e| e.report.running_background_tasks),
+            "running_background_processes": e.map_or(0, |e| e.report.running_background_processes),
+            "waiting_on_subagents": e.is_some_and(|e| e.report.waiting_on_subagents),
         })
     }).collect();
     Ok(json!({"incidents": incidents, "sessions": evidence}))
@@ -487,6 +513,252 @@ mod tests {
     }
     use c6_proto::SessionLiveness;
     use prost::Message;
+
+    #[tokio::test]
+    async fn delivered_continuation_and_self_woken_reports_clear_tree_pending() {
+        use c6_proto::{SessionEvent, SubagentReported, UserMessage, session_event::Kind};
+
+        for self_woken in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let head = crate::start(crate::HeadConfig {
+                data_dir: dir.path().to_owned(),
+                bind: vec!["127.0.0.1".parse().unwrap()],
+                ui_port: 0,
+                worker_port: 0,
+                auth: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let st = &head.state;
+            let sweep = st.liveness.sweep.lock().await;
+            let worker = WorkerId::new();
+            for (id, parent) in [("parent", None), ("child", Some("parent"))] {
+                sqlx::query("INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, parent_id, parent_call_id) VALUES (?, ?, ?, '', '', '', 'idle', 0, 0, ?, ?)")
+                    .bind(id).bind(worker.to_string()).bind(id).bind(parent).bind(parent.map(|_| "call"))
+                    .execute(st.store.pool()).await.unwrap();
+            }
+            let event = |seq, kind| SessionEvent { seq, ts_ms: 0, kind: Some(kind) };
+            let waiting = |input: &str| {
+                Kind::SubagentReported(SubagentReported {
+                    command_id: format!("subagent:local-wait:{input}"),
+                    child_session_id: "child".into(),
+                    call_id: "reused-call".into(),
+                    status: "waiting".into(),
+                })
+            };
+            let user = |input: &str| {
+                Kind::User(UserMessage { command_id: input.into(), delegated_by: "reused-call".into(), ..Default::default() })
+            };
+            let ended = || Kind::TurnEnded(c6_proto::TurnEnded { turn: 1, reason: c6_proto::TurnEndReason::Completed as i32 });
+            let input = "delegation:continued:bg78";
+            st.store.ingest(worker, "parent", &[event(1, waiting(input))]).await.unwrap();
+            st.store
+                .ingest(
+                    worker,
+                    "child",
+                    &[
+                        event(
+                            1,
+                            Kind::SubagentReported(SubagentReported {
+                                command_id: "subagent:local:child:tracking".into(),
+                                ..Default::default()
+                            }),
+                        ),
+                        event(2, user(input)),
+                    ],
+                )
+                .await
+                .unwrap();
+            if self_woken {
+                st.store
+                    .ingest(
+                        worker,
+                        "child",
+                        &[
+                            event(
+                                3,
+                                Kind::BackgroundTask(c6_proto::BackgroundTask {
+                                    task_id: "own-shell".into(),
+                                    kind: "command".into(),
+                                    state: "started".into(),
+                                    notify: true,
+                                    ..Default::default()
+                                }),
+                            ),
+                            event(4, ended()),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                st.store.ingest(worker, "child", &[event(3, ended())]).await.unwrap();
+            }
+            assert_eq!(st.store.waiting_delegations("child").await.unwrap().len(), 1, "turn end is not report delivery");
+            let (end_seq, receipt_seq) = if self_woken {
+                st.store
+                    .ingest(
+                        worker,
+                        "child",
+                        &[
+                            event(
+                                5,
+                                Kind::BackgroundTask(c6_proto::BackgroundTask {
+                                    task_id: "own-shell".into(),
+                                    kind: "command".into(),
+                                    state: "finished".into(),
+                                    notify: true,
+                                    ..Default::default()
+                                }),
+                            ),
+                            event(6, Kind::User(UserMessage { command: "task-notification".into(), ..Default::default() })),
+                            event(7, ended()),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(st.store.waiting_delegations("child").await.unwrap().len(), 1, "even quiescence waits for delivery");
+                // The task notification starts an independent idle interval.
+                // Its later report must not implicitly acknowledge the earlier
+                // interval that owned the delegation.
+                (4, 8)
+            } else {
+                (3, 4)
+            };
+            let report_id = format!("subagent:local:child:{end_seq}");
+            st.store
+                .ingest(
+                    worker,
+                    "parent",
+                    &[event(2, Kind::NoticeQueued(c6_proto::NoticeQueued { command_id: report_id.clone(), ..Default::default() }))],
+                )
+                .await
+                .unwrap();
+            st.store
+                .ingest(
+                    worker,
+                    "child",
+                    &[event(
+                        receipt_seq,
+                        Kind::SubagentReported(SubagentReported {
+                            command_id: report_id,
+                            child_session_id: "child".into(),
+                            status: "completed".into(),
+                            ..Default::default()
+                        }),
+                    )],
+                )
+                .await
+                .unwrap();
+            assert!(
+                st.store.waiting_delegations("child").await.unwrap().is_empty(),
+                "delivered report retires the consumed input (self_woken={self_woken})"
+            );
+            if self_woken {
+                st.store
+                    .ingest(
+                        worker,
+                        "child",
+                        &[event(
+                            9,
+                            Kind::SubagentReported(SubagentReported {
+                                command_id: "subagent:local:child:7".into(),
+                                child_session_id: "child".into(),
+                                status: "completed".into(),
+                                ..Default::default()
+                            }),
+                        )],
+                    )
+                    .await
+                    .unwrap();
+                assert!(st.store.waiting_delegations("child").await.unwrap().is_empty());
+            }
+            // A later call can reuse the tool id without being settled by the old receipt.
+            let next = "delegation:next:bg79";
+            st.store.ingest(worker, "parent", &[event(3, waiting(next))]).await.unwrap();
+            assert_eq!(st.store.waiting_delegations("child").await.unwrap().len(), 1);
+            st.store.delegation_reported(&format!("subagent:local-wait:{next}")).await.unwrap();
+            sqlx::query("UPDATE sessions SET updated_at = 0").execute(st.store.pool()).await.unwrap();
+            drop(sweep);
+            sweep_at(st, now_ms() + 3_600_000).await.unwrap();
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM liveness_incidents WHERE kind = 'silence'")
+                .fetch_one(st.store.pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "a delivered child is no longer a pending tree");
+            head.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_silence_waits_for_live_tools_and_background_processes() {
+        for background in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let head = crate::start(crate::HeadConfig {
+                data_dir: dir.path().to_owned(),
+                bind: vec!["127.0.0.1".parse().unwrap()],
+                ui_port: 0,
+                worker_port: 0,
+                auth: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let st = &head.state;
+            let sweep = st.liveness.sweep.lock().await;
+            let worker = WorkerId::new();
+            for (id, parent) in [("parent", None), ("child", Some("parent"))] {
+                sqlx::query("INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, parent_id, parent_call_id) VALUES (?, ?, ?, '', '', '', 'idle', 0, 0, ?, ?)")
+                    .bind(id).bind(worker.to_string()).bind(id).bind(parent).bind(parent.map(|_| "call"))
+                    .execute(st.store.pool()).await.unwrap();
+            }
+            st.store.add_remote_delegation("input", "child", "parent", "call").await.unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::channel(16);
+            let live = st.registry.attach(worker, 1, tx, vec![], "worker").await;
+            let health = |alive| SessionLivenessReport {
+                sessions: vec![
+                    SessionLiveness {
+                        session_id: "child".into(),
+                        actor_state: if alive && !background { SessionActorState::Running } else { SessionActorState::Idle } as i32,
+                        activity_kind: if alive && !background { SessionActivityKind::Tool } else { SessionActivityKind::Unspecified }
+                            as i32,
+                        running_background_tasks: u32::from(alive && background),
+                        running_background_processes: u32::from(alive && background),
+                        held_process: HeldProcessState::None as i32,
+                        ..Default::default()
+                    },
+                    SessionLiveness {
+                        // Waiting on the child is not itself a live process. This
+                        // must not hide silence once the child's real work dies.
+                        session_id: "parent".into(),
+                        actor_state: if background { SessionActorState::Idle } else { SessionActorState::Running } as i32,
+                        activity_kind: if background { SessionActivityKind::Unspecified } else { SessionActivityKind::Tool } as i32,
+                        waiting_on_subagents: !background,
+                        running_background_tasks: u32::from(background),
+                        ..Default::default()
+                    },
+                ],
+            };
+            report(st, worker, live.conn_id, health(true)).await;
+            let now = now_ms() + 3_600_000;
+            drop(sweep);
+            sweep_at(st, now).await.unwrap();
+            let notices = || async {
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM liveness_incidents WHERE kind = 'silence' AND session_id = 'parent'")
+                    .fetch_one(st.store.pool())
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(notices().await, 0, "a live process is activity (background={background})");
+            report(st, worker, live.conn_id, health(false)).await;
+            sweep_at(st, now + 1).await.unwrap();
+            assert_eq!(notices().await, 1, "a dead process cannot suppress tree silence");
+            sweep_at(st, now + 2).await.unwrap();
+            assert_eq!(notices().await, 1, "the notice is idempotent");
+            drop(live);
+            head.shutdown().await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn unavailable_parent_with_automatic_group_hold_needs_you_and_receives_child_loss() {
