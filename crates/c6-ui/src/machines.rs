@@ -167,7 +167,7 @@ pub fn Machines() -> impl IntoView {
     view! {
         <section class="space-y-4">
             <div><h1 class="text-lg font-semibold">"Machines"</h1><p class="text-sm text-muted">"The head and workers running carbon6. Refreshes every 15 seconds."</p></div>
-            <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading machines…"</p> }>
+            <Transition fallback=|| view! { <p class="text-sm text-muted">"Loading machines…"</p> }>
                 {move || machines.get().map(|r| match r {
                     Err(e) => view! { <crate::util::ErrorBox message=e /> }.into_any(),
                     Ok(mut ms) => {
@@ -175,7 +175,7 @@ pub fn Machines() -> impl IntoView {
                         view! { <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{ms.into_iter().map(|m| view! { <MachineCard machine=m selected /> }).collect_view()}</div> }.into_any()
                     }
                 })}
-            </Suspense>
+            </Transition>
             {move || view! { <MachineDetails machine_id=selected.get() /> }}
         </section>
     }
@@ -266,17 +266,17 @@ pub fn MachineDetails(machine_id: String) -> impl IntoView {
             <div class="flex flex-wrap items-center justify-between gap-3"><h2 class="font-semibold">"Machine resources"</h2><div class="flex gap-1" role="group" aria-label="History range">{[(3_600_000, "1h"), (86_400_000, "24h"), (604_800_000, "7d")].into_iter().map(|(ms, label)| view! {
                 <button class="rounded border border-zinc-200 px-3 py-1 text-xs aria-pressed:bg-zinc-200 dark:border-zinc-700 dark:aria-pressed:bg-zinc-700" aria-pressed=move || range.get() == ms on:click=move |_| { range.set(ms); end.set(now_ms()); }>{label}</button>
             }).collect_view()}</div></div>
-            <Suspense fallback=|| ()>{move || inventory.get().map(|r| match r {
+            <Transition fallback=|| ()>{move || inventory.get().map(|r| match r {
                 Ok(ms) => ms.into_iter().find(|m| m.id == machine_id.get_value()).map(|m| view! { <MachineInfo machine=m /> }).into_any(),
                 Err(e) => view! { <crate::util::ErrorBox message=e /> }.into_any(),
-            })}</Suspense>
-            <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading history…"</p> }>{move || samples.get().map(|r| match r {
+            })}</Transition>
+            <Transition fallback=|| view! { <p class="text-sm text-muted">"Loading history…"</p> }>{move || samples.get().map(|r| match r {
                 Ok(ss) => {
                     let current = inventory.get().and_then(Result::ok).and_then(|ms| ms.into_iter().find(|m| m.id == machine_id.get_value())).and_then(|m| m.last_sample);
                     view! { <History samples=ss current start=end.get() - range.get() end=end.get() /> }.into_any()
                 },
                 Err(e) => view! { <crate::util::ErrorBox message=e /> }.into_any(),
-            })}</Suspense>
+            })}</Transition>
             <DiskScan machine_id=machine_id.get_value() />
         </section>
     }
