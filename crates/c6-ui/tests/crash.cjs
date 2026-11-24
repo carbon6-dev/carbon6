@@ -279,11 +279,11 @@ browserTest('production mounted markers: pending, focus, single-copy dedupe and 
             window.__crashWorkerMarker = document.querySelector('[data-pane-kind="workers"]');
             window.__crashSessionMarker = document.querySelector('[data-pane-kind="session"]');
           });
-          // Real navigation focuses the already-mounted Workers destination,
+          // Real navigation focuses the already-mounted Machines destination,
           // rather than rebuilding either content wrapper or duplicating it.
           await session.click({ position: { x: 2, y: 2 } });
           const before = await page.evaluate(() => JSON.parse(localStorage.getItem('c6.home.workspace.v2')));
-          await page.locator('header a[href$="/workers"]:visible').first().click();
+          await page.locator('header a[href$="/machines"]:visible').first().click();
           await settle(page);
           const after = await page.evaluate(() => JSON.parse(localStorage.getItem('c6.home.workspace.v2')));
           assert.equal(after.tiles[after.focus].key, 4);
