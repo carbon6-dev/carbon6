@@ -8,6 +8,7 @@ use leptos::task::spawn_local;
 
 use crate::{
     api,
+    icons::{Icon, Size, icon},
     workspace::{Go, View},
 };
 
@@ -145,7 +146,7 @@ fn Chart(
                 }).collect_view()}
                 {valid.is_empty().then(|| view! { <text x="150" y="42" text-anchor="middle" fill="currentColor" font-size="12">"No samples yet"</text> })}
             </svg>
-            <div class="mt-1 flex justify-between text-[10px] text-muted"><span>{format!("0–{domain:.0}")}</span><span>"latest →"</span></div>
+            <div class="mt-1 flex justify-between text-[10px] text-muted"><span>{format!("0–{domain:.0}")}</span><span>"latest "{icon(Icon::ArrowRight, Size::S14)}</span></div>
         </figure>
     }
 }
@@ -220,7 +221,7 @@ fn MachineCard(machine: Machine, selected: RwSignal<String>) -> impl IntoView {
             <div class="flex min-w-0 items-center gap-2"><span class=if machine.online { "h-2 w-2 shrink-0 rounded-full bg-emerald-500" } else { "h-2 w-2 shrink-0 rounded-full bg-zinc-400" }></span><span class="min-w-0 break-words font-medium">{machine.name}</span><span class="ml-auto text-xs text-muted">{machine.role}</span></div>
             <p class="text-xs text-muted">{if machine.online { "online" } else { "offline" }}" · "{machine.version.unwrap_or_else(|| "version unknown".into())}</p>
             <p class="break-all text-xs text-muted">{machine.hostname}</p>
-            {(!machine.warnings.is_empty()).then(|| view! { <span class="inline-flex rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-300" role="status">{format!("⚠ {} warning{}", machine.warnings.len(), if machine.warnings.len() == 1 { "" } else { "s" })}</span> })}
+            {(!machine.warnings.is_empty()).then(|| view! { <span class="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-300" role="status">{icon(Icon::TriangleAlert, Size::S14)}{format!("{} warning{}", machine.warnings.len(), if machine.warnings.len() == 1 { "" } else { "s" })}</span> })}
             <div class="space-y-2">{metrics.into_iter().map(|(label, value, _)| view! {
                 <div><div class="flex justify-between gap-2 text-xs"><span class="shrink-0 text-muted">{label}</span><span class="min-w-0 break-all text-right">{value}</span></div><svg viewBox="0 0 300 80" class="mt-1 h-6 w-full text-sky-600 dark:text-sky-400" role="img" aria-label=format!("{label} over the last hour") preserveAspectRatio="none"><path d=move || {
                     let ss = history.get().and_then(Result::ok).unwrap_or_default();
@@ -286,7 +287,7 @@ fn MachineInfo(machine: Machine) -> impl IntoView {
     let head = machine.role == "head";
     view! {
         <div class="space-y-2 text-sm"><div class="flex flex-wrap items-center gap-2"><strong class="break-all">{machine.name}</strong><span class="text-muted">{machine.role}" · "{if machine.online { "online" } else { "offline" }}</span>
-            {(!head).then(|| view! { <Go to=View::Worker { id: machine.id.clone() } class="text-sky-700 hover:underline dark:text-sky-400">"Files & terminals →"</Go> })}
+            {(!head).then(|| view! { <Go to=View::Worker { id: machine.id.clone() } class="text-sky-700 hover:underline dark:text-sky-400">"Files & terminals "{icon(Icon::ArrowRight, Size::S14)}</Go> })}
         </div>
         {machine.head.map(|h| view! { <dl class="grid min-w-0 gap-x-6 gap-y-1 text-xs sm:grid-cols-2">
             <div><dt class="text-muted">"Version / update"</dt><dd class="break-all">{machine.version.unwrap_or_else(|| "unknown".into())}" · "{update_summary(&h.update)}</dd></div>
