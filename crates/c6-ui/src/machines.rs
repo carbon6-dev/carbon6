@@ -83,6 +83,25 @@ fn disk_series(samples: &[MachineSample], mount: &str) -> Vec<(i64, f64)> {
         .collect()
 }
 
+/// Initial history can arrive after several inventory polls. Fill its missing
+/// timestamps without replacing retained polls, then upsert the latest sample.
+fn merge_card_samples(samples: &mut Vec<MachineSample>, history: &[MachineSample], current: Option<&MachineSample>, end: i64) {
+    for sample in history {
+        if !samples.iter().any(|s| s.at_ms == sample.at_ms) {
+            samples.push(sample.clone());
+        }
+    }
+    if let Some(current) = current {
+        if let Some(sample) = samples.iter_mut().find(|s| s.at_ms == current.at_ms) {
+            sample.clone_from(current);
+        } else {
+            samples.push(current.clone());
+        }
+    }
+    samples.retain(|s| s.at_ms >= end.saturating_sub(3_600_000) && s.at_ms <= end);
+    samples.sort_by_key(|s| s.at_ms);
+}
+
 /// Sort timestamps, discard non-finite points and share one non-degenerate
 /// time/value domain. Missing telemetry is never represented as a zero sample.
 fn chart_path(points: &[(i64, f64)], start: i64, end: i64, ceiling: f64) -> String {
@@ -157,6 +176,13 @@ pub fn Machines() -> impl IntoView {
         api::realm().get();
         api::machines()
     });
+    let inventory = RwSignal::new(Vec::<Machine>::new());
+    Effect::new(move || {
+        if let Some(Ok(mut ms)) = machines.get() {
+            ms.sort_by_key(|m| (m.role != "head", m.name.clone()));
+            inventory.set(ms);
+        }
+    });
     let selected = RwSignal::new("head".to_string());
     let tick = set_interval_with_handle(move || machines.refetch(), Duration::from_secs(15)).ok();
     on_cleanup(move || {
@@ -168,69 +194,66 @@ pub fn Machines() -> impl IntoView {
         <section class="space-y-4">
             <div><h1 class="text-lg font-semibold">"Machines"</h1><p class="text-sm text-muted">"The head and workers running carbon6. Refreshes every 15 seconds."</p></div>
             <Transition fallback=|| view! { <p class="text-sm text-muted">"Loading machines…"</p> }>
-                {move || machines.get().map(|r| match r {
-                    Err(e) => view! { <crate::util::ErrorBox message=e /> }.into_any(),
-                    Ok(mut ms) => {
-                        ms.sort_by_key(|m| (m.role != "head", m.name.clone()));
-                        view! { <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{ms.into_iter().map(|m| view! { <MachineCard machine=m selected /> }).collect_view()}</div> }.into_any()
-                    }
-                })}
+                {move || machines.get().and_then(Result::err).map(|e| view! { <crate::util::ErrorBox message=e /> })}
             </Transition>
+            <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                <For each=move || inventory.get() key=|m| m.id.clone() children=move |initial| {
+                    let machine = Signal::derive(move || inventory.with(|ms| ms.iter().find(|m| m.id == initial.id).cloned()).unwrap_or_else(|| initial.clone()));
+                    view! { <MachineCard machine selected /> }
+                } />
+            </div>
             {move || view! { <MachineDetails machine_id=selected.get() /> }}
         </section>
     }
 }
 
 #[component]
-fn MachineCard(machine: Machine, selected: RwSignal<String>) -> impl IntoView {
-    let id = machine.id.clone();
-    let stale = sample_stale(machine.online, machine.last_sample.as_ref().map(|s| s.at_ms), now_ms(), machine.sample_secs);
-    let sampled = machine
-        .last_sample
-        .as_ref()
-        .map(|s| format!("Sample {}", crate::when::ago(now_ms() - s.at_ms)))
-        .unwrap_or_else(|| "No telemetry received".into());
-    let history_id = machine.id.clone();
+fn MachineCard(machine: Signal<Machine>, selected: RwSignal<String>) -> impl IntoView {
+    let id = StoredValue::new(machine.with_untracked(|m| m.id.clone()));
+    let stale = move || machine.with(|m| sample_stale(m.online, m.last_sample.as_ref().map(|s| s.at_ms), now_ms(), m.sample_secs));
+    let sampled = move || {
+        machine.with(|m| {
+            m.last_sample
+                .as_ref()
+                .map(|s| format!("Sample {}", crate::when::ago(now_ms() - s.at_ms)))
+                .unwrap_or_else(|| "No telemetry received".into())
+        })
+    };
     let until = now_ms();
-    let history = LocalResource::new(move || api::machine_samples(history_id.clone(), until - 3_600_000, until));
-    let metrics = machine
-        .last_sample
-        .as_ref()
-        .map(|s| {
-            vec![
-                ("CPU", format!("{:.0}% · {} cores", s.cpu_percent, s.cpu_count), s.cpu_percent),
-                ("Memory", format!("{} / {}", bytes(s.memory_used), bytes(s.memory_total)), percent(s.memory_used, s.memory_total)),
-                (
-                    "Fullest disk",
-                    s.disks
-                        .iter()
-                        .filter(|d| d.total > 0)
+    let history = LocalResource::new(move || api::machine_samples(id.get_value(), until - 3_600_000, until));
+    let samples = RwSignal::new(Vec::<MachineSample>::new());
+    let end = RwSignal::new(until);
+    Effect::new(move || {
+        let history = history.get().and_then(Result::ok).unwrap_or_default();
+        let current = machine.with(|m| m.last_sample.clone());
+        let until = now_ms().max(current.as_ref().map_or(i64::MIN, |s| s.at_ms));
+        samples.update(|ss| merge_card_samples(ss, &history, current.as_ref(), until));
+        end.set(until);
+    });
+    view! {
+        <button class="min-w-0 space-y-3 rounded-lg border border-zinc-200 bg-white p-4 text-left hover:border-sky-500 aria-pressed:border-sky-500 aria-pressed:bg-sky-50 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:border-sky-500 dark:aria-pressed:bg-sky-950"
+            data-machine-card=id.get_value()
+            aria-pressed=move || selected.get() == id.get_value()
+            on:click=move |_| selected.set(id.get_value())>
+            <div class="flex min-w-0 items-center gap-2"><span class=move || if machine.with(|m| m.online) { "h-2 w-2 shrink-0 rounded-full bg-emerald-500" } else { "h-2 w-2 shrink-0 rounded-full bg-zinc-400" }></span><span class="min-w-0 break-words font-medium">{move || machine.with(|m| m.name.clone())}</span><span class="ml-auto text-xs text-muted">{move || machine.with(|m| m.role.clone())}</span></div>
+            <p class="text-xs text-muted">{move || if machine.with(|m| m.online) { "online" } else { "offline" }}" · "{move || machine.with(|m| m.version.clone().unwrap_or_else(|| "version unknown".into()))}</p>
+            <p class="break-all text-xs text-muted">{move || machine.with(|m| m.hostname.clone())}</p>
+            {move || machine.with(|m| (!m.warnings.is_empty()).then(|| view! { <span class="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-300" role="status">{icon(Icon::TriangleAlert, Size::S14)}{format!("{} warning{}", m.warnings.len(), if m.warnings.len() == 1 { "" } else { "s" })}</span> }))}
+            <div class="space-y-2">{["CPU", "Memory", "Fullest disk"].into_iter().map(|label| view! {
+                <div><div class="flex justify-between gap-2 text-xs"><span class="shrink-0 text-muted">{label}</span><span class="min-w-0 break-all text-right">{move || machine.with(|m| m.last_sample.as_ref().map(|s| match label {
+                    "CPU" => format!("{:.0}% · {} cores", s.cpu_percent, s.cpu_count),
+                    "Memory" => format!("{} / {}", bytes(s.memory_used), bytes(s.memory_total)),
+                    _ => s.disks.iter().filter(|d| d.total > 0)
                         .max_by(|a, b| percent(a.used, a.total).total_cmp(&percent(b.used, b.total)))
                         .map(|d| format!("{:.0}% · {}", percent(d.used, d.total), d.mount))
                         .unwrap_or_else(|| "unknown".into()),
-                    fullest(s),
-                ),
-            ]
-        })
-        .unwrap_or_default();
-    view! {
-        <button class="min-w-0 space-y-3 rounded-lg border border-zinc-200 bg-white p-4 text-left hover:border-sky-500 aria-pressed:border-sky-500 aria-pressed:bg-sky-50 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:border-sky-500 dark:aria-pressed:bg-sky-950"
-            data-machine-card=machine.id.clone()
-            aria-pressed=move || selected.get() == id
-            on:click=move |_| selected.set(machine.id.clone())>
-            <div class="flex min-w-0 items-center gap-2"><span class=if machine.online { "h-2 w-2 shrink-0 rounded-full bg-emerald-500" } else { "h-2 w-2 shrink-0 rounded-full bg-zinc-400" }></span><span class="min-w-0 break-words font-medium">{machine.name}</span><span class="ml-auto text-xs text-muted">{machine.role}</span></div>
-            <p class="text-xs text-muted">{if machine.online { "online" } else { "offline" }}" · "{machine.version.unwrap_or_else(|| "version unknown".into())}</p>
-            <p class="break-all text-xs text-muted">{machine.hostname}</p>
-            {(!machine.warnings.is_empty()).then(|| view! { <span class="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-300" role="status">{icon(Icon::TriangleAlert, Size::S14)}{format!("{} warning{}", machine.warnings.len(), if machine.warnings.len() == 1 { "" } else { "s" })}</span> })}
-            <div class="space-y-2">{metrics.into_iter().map(|(label, value, _)| view! {
-                <div><div class="flex justify-between gap-2 text-xs"><span class="shrink-0 text-muted">{label}</span><span class="min-w-0 break-all text-right">{value}</span></div><svg viewBox="0 0 300 80" class="mt-1 h-6 w-full text-sky-600 dark:text-sky-400" role="img" aria-label=format!("{label} over the last hour") preserveAspectRatio="none"><path d=move || {
-                    let ss = history.get().and_then(Result::ok).unwrap_or_default();
-                    let points: Vec<_> = ss.iter().map(|s| (s.at_ms, match label { "CPU" => s.cpu_percent, "Memory" => percent(s.memory_used, s.memory_total), _ => fullest(s) })).collect();
-                    chart_path(&points, until - 3_600_000, until, 100.0)
+                }).unwrap_or_else(|| "unknown".into()))}</span></div><svg viewBox="0 0 300 80" class="mt-1 h-6 w-full text-sky-600 dark:text-sky-400" role="img" aria-label=format!("{label} over the last hour") preserveAspectRatio="none"><path d=move || {
+                    let points: Vec<_> = samples.with(|ss| ss.iter().map(|s| (s.at_ms, match label { "CPU" => s.cpu_percent, "Memory" => percent(s.memory_used, s.memory_total), _ => fullest(s) })).collect());
+                    chart_path(&points, end.get() - 3_600_000, end.get(), 100.0)
                 } fill="none" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke" /></svg></div>
             }).collect_view()}</div>
-            <p class=if stale { "text-xs text-amber-700 dark:text-amber-400" } else { "text-xs text-muted" }>{sampled}{stale.then_some(" · stale / offline")}</p>
-            {machine.warnings.into_iter().map(|w| view! { <p class="text-xs text-amber-700 dark:text-amber-400">{w}</p> }).collect_view()}
+            <p class=move || if stale() { "text-xs text-amber-700 dark:text-amber-400" } else { "text-xs text-muted" }>{sampled}{move || stale().then_some(" · stale / offline")}</p>
+            {move || machine.with(|m| m.warnings.iter().map(|w| view! { <p class="text-xs text-amber-700 dark:text-amber-400">{w.clone()}</p> }).collect_view())}
         </button>
     }
 }
@@ -401,6 +424,52 @@ fn DiskScan(machine_id: String) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_history_merges_late_initial_history_without_losing_polls() {
+        let sample = |at_ms, cpu_percent| MachineSample { at_ms, cpu_percent, ..Default::default() };
+        let mut samples = Vec::new();
+        merge_card_samples(&mut samples, &[], Some(&sample(20, 20.0)), 20);
+        merge_card_samples(&mut samples, &[], Some(&sample(30, 30.0)), 30);
+        merge_card_samples(&mut samples, &[sample(20, 1.0), sample(10, 10.0)], Some(&sample(40, 40.0)), 40);
+        assert_eq!(samples.iter().map(|s| (s.at_ms, s.cpu_percent)).collect::<Vec<_>>(), [(10, 10.0), (20, 20.0), (30, 30.0), (40, 40.0)]);
+    }
+
+    #[test]
+    fn card_history_upserts_timestamps_and_preserves_samples_without_current_telemetry() {
+        let old = MachineSample { at_ms: 100, cpu_percent: 10.0, ..Default::default() };
+        let current = MachineSample { cpu_percent: 75.0, ..old.clone() };
+        let mut samples = vec![old.clone()];
+        merge_card_samples(&mut samples, std::slice::from_ref(&old), Some(&current), 100);
+        merge_card_samples(&mut samples, &[old], None, 200);
+        assert_eq!(samples, vec![current]);
+    }
+
+    #[test]
+    fn card_history_prunes_the_rolling_hour_including_late_history() {
+        let sample = |at_ms| MachineSample { at_ms, ..Default::default() };
+        let history = [sample(0), sample(1), sample(3_600_002)];
+        let mut samples = vec![sample(-1), sample(2)];
+        merge_card_samples(&mut samples, &history, Some(&sample(3_600_001)), 3_600_001);
+        assert_eq!(samples.iter().map(|s| s.at_ms).collect::<Vec<_>>(), [1, 2, 3_600_001]);
+        merge_card_samples(&mut samples, &history, None, 3_600_003);
+        assert_eq!(samples.iter().map(|s| s.at_ms).collect::<Vec<_>>(), [3_600_001, 3_600_002]);
+        merge_card_samples(&mut samples, &[], None, i64::MAX);
+        assert!(samples.is_empty());
+        merge_card_samples(&mut samples, &[], Some(&sample(i64::MIN)), i64::MIN);
+        assert_eq!(samples[0].at_ms, i64::MIN);
+    }
+
+    #[test]
+    fn card_history_prunes_unchanged_inventory_samples_as_time_advances() {
+        let current = MachineSample { at_ms: 0, ..Default::default() };
+        let mut samples = Vec::new();
+        merge_card_samples(&mut samples, &[], Some(&current), 0);
+        merge_card_samples(&mut samples, &[], Some(&current), 3_600_000);
+        assert_eq!(samples, vec![current.clone()]);
+        merge_card_samples(&mut samples, &[], Some(&current), 3_600_001);
+        assert!(samples.is_empty());
+    }
 
     #[test]
     fn card_freshness_respects_effective_sampling_interval_and_offline_state() {
