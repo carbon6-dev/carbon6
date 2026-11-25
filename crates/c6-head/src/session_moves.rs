@@ -241,6 +241,17 @@ fn refuse(reason: impl Into<String>) -> anyhow::Error {
     Refused(reason.into()).into()
 }
 
+fn preflight_reason(worker: &str, message: &str) -> String {
+    let (field, detail) = if let Some(detail) = message.strip_prefix("Worktree: ") {
+        ("Worktree", detail)
+    } else if let Some(detail) = message.strip_prefix("Worker: ") {
+        ("Worker", detail)
+    } else {
+        ("Folder", message.strip_prefix("Folder: ").unwrap_or(message))
+    };
+    format!("{field} on {worker}: {detail}")
+}
+
 struct Move<'a> {
     st: &'a HeadState,
     row: &'a MoveStatus,
@@ -296,6 +307,13 @@ impl Move<'_> {
     }
 
     async fn rpc(&self, worker: WorkerId, method: &str, extra: Value) -> anyhow::Result<Value> {
+        if worker == self.target
+            && self.request["cwd"].is_string()
+            && matches!(method, "move.preflight" | "move.write" | "move.prepare")
+            && self.st.registry.get(worker).is_some_and(|w| !w.capabilities.iter().any(|c| c == c6_proto::SESSION_MOVE_TARGET_CAPABILITY))
+        {
+            return Err(refuse("Worker: update the destination worker before moving to a selected folder or worktree"));
+        }
         let mut args = json!({
             "move_id": self.row.id, "session_id": self.row.session_id,
             "source_worker_id": self.row.source_worker_id, "target_worker_id": self.row.target_worker_id,
@@ -313,8 +331,15 @@ impl Move<'_> {
             Ok(value) => Ok(value),
             // An unanswered call may have executed. Reissue the exact call,
             // not a later stage, if the connection is still up.
-            Err(msg) if msg == "worker did not respond in time" => Err(anyhow!("{method}: {msg}")),
+            Err(msg) if msg == "worker did not respond in time" => {
+                let field = if method == "move.preflight" { "Folder validation" } else { method };
+                Err(anyhow!("{field}: {msg}"))
+            }
             Err(msg) if self.st.shutdown.is_cancelled() => Err(anyhow!("{method}: {msg}")),
+            Err(msg) if method == "move.preflight" => {
+                let name = self.st.store.worker(worker).await?.map_or_else(|| worker.to_string(), |w| w.name);
+                Err(refuse(preflight_reason(&name, &msg)))
+            }
             Err(msg) => Err(refuse(format!("{method}: {msg}"))),
         }
     }
@@ -628,6 +653,13 @@ mod tests {
     }
 
     #[test]
+    fn preflight_errors_name_the_destination_field_without_rpc_jargon() {
+        assert_eq!(preflight_reason("rust-dev-03", "Folder: choose /srv/falcon"), "Folder on rust-dev-03: choose /srv/falcon");
+        assert_eq!(preflight_reason("rust-dev-03", "Worktree: choose a new branch"), "Worktree on rust-dev-03: choose a new branch");
+        assert_eq!(preflight_reason("rust-dev-03", "Worker: install Claude CLI"), "Worker on rust-dev-03: install Claude CLI");
+    }
+
+    #[test]
     fn restart_grace_is_bounded_and_only_for_unseen_workers_on_existing_moves() {
         let fresh = Boot { wall_ms: 100, since: Instant::now() };
         assert!(fresh.may_wait_for_attach(99, false));
@@ -683,6 +715,19 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+        let session = st.store.session("session").await.unwrap().unwrap();
+        let complete = crate::sessions::PlacementRequest::Target {
+            expected_place_seq: 1,
+            worker: target.to_string(),
+            cwd: "/selected".into(),
+            clone: false,
+            worktree: None,
+            copy_scratch: false,
+        };
+        let error = crate::sessions::change_place(st, &session, &complete).await.unwrap_err();
+        assert!(error.to_string().contains("update the destination worker"), "{error}");
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM session_moves").fetch_one(pool).await.unwrap();
+        assert_eq!(count, 0, "an old worker must never silently ignore a selected folder");
         let command = || {
             sqlx::query("INSERT INTO commands (id, session_id, worker_id, data, created_at) VALUES ('pending', 'session', ?, X'', 1)")
                 .bind(source.to_string())
@@ -709,6 +754,11 @@ mod tests {
         let retry = start(st, "session", source, target, 1, json!({})).await.unwrap();
         let retry = status(st, &retry).await.unwrap().unwrap();
         assert_eq!((retry.source_epoch, retry.target_epoch), (0, 2));
+        let explicit = Move { st, row: &retry, source, target, request: json!({"cwd": "/selected"}), progress: Progress::default() };
+        for method in ["move.preflight", "move.write", "move.prepare"] {
+            let error = explicit.rpc(target, method, json!({})).await.unwrap_err();
+            assert!(error.is::<Refused>(), "a downgraded destination must refuse before any side effects: {error}");
+        }
 
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
         check_worker_realms(&mut tx, &retry).await.unwrap();

@@ -2039,6 +2039,18 @@ pub async fn resume(
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum PlacementRequest {
+    /// The complete destination, submitted and approved as one change.
+    Target {
+        expected_place_seq: u64,
+        worker: String,
+        cwd: String,
+        #[serde(default)]
+        clone: bool,
+        #[serde(default)]
+        worktree: Option<api::starts::WorktreeOptions>,
+        #[serde(default)]
+        copy_scratch: bool,
+    },
     Folder {
         expected_place_seq: u64,
         cwd: String,
@@ -2126,6 +2138,52 @@ pub(crate) async fn placements(st: &HeadState, session_id: &str) -> anyhow::Resu
 
 /// Queues a user-authorized same-worker change. `session` must already have
 /// been resolved in the caller's realm. Only its worker can commit the move.
+/// Picker candidates use exactly the same recorded folders as move preflight.
+/// The worker validates repository identity; head paths are hints, not trust.
+pub(crate) async fn known_placement_folders(st: &HeadState, worker_id: WorkerId) -> anyhow::Result<Vec<String>> {
+    let worker = st.store.worker(worker_id).await?.ok_or_else(|| not_found("no such worker"))?;
+    let mut folders: std::collections::BTreeSet<String> =
+        sqlx::query_scalar::<_, String>("SELECT DISTINCT cwd FROM sessions WHERE worker_id = ? AND ssh_target = '' AND cwd != ''")
+            .bind(worker_id.to_string())
+            .fetch_all(&st.store.pool)
+            .await?
+            .into_iter()
+            .collect();
+    for template in crate::templates::all(st, &crate::realms::Caller::root()).await?.into_iter().map(|t| t.template) {
+        if template.ssh.is_empty()
+            && !template.cwd.is_empty()
+            && (template.workers.is_empty() || template.workers.iter().any(|w| w == "*" || w == &worker.name || w == &worker.id))
+        {
+            folders.insert(template.cwd);
+        }
+    }
+    Ok(folders.into_iter().collect())
+}
+
+pub(crate) async fn placement_candidates(st: &HeadState, session: &SessionRow, target: &str) -> anyhow::Result<serde_json::Value> {
+    let target_id: WorkerId = target.parse().map_err(|_| bad_request("Worker: choose a destination worker"))?;
+    let worker = st.store.worker(target_id).await?.ok_or_else(|| not_found("Worker: destination worker not found"))?;
+    if worker.revoked_at.is_some() || !crate::realms::available(&worker.realms, &session.realm) {
+        return Err(crate::forbidden("Worker: this session's realm may not use that worker"));
+    }
+    let source_id: WorkerId = session.worker_id.parse()?;
+    let source = st
+        .registry
+        .call(source_id, "repos.list", serde_json::json!({"cwd": session.cwd}), Duration::from_secs(30))
+        .await
+        .map_err(|e| conflict(format!("Folder: cannot inspect the current repository: {e}")))?;
+    if source["remote"].as_str().is_none_or(str::is_empty) {
+        // Scratch has no repository identity. Never auto-select an unrelated
+        // checkout merely because the destination happens to know one.
+        return Ok(serde_json::json!({"remote": null, "folders": []}));
+    }
+    let folders = known_placement_folders(st, target_id).await?;
+    st.registry
+        .call(target_id, "repos.list", serde_json::json!({"remote": source["remote"], "known_folders": folders}), Duration::from_secs(30))
+        .await
+        .map_err(|e| conflict(format!("Folder: cannot list repositories on {}: {e}", worker.name)))
+}
+
 pub(crate) async fn change_place(st: &HeadState, session: &SessionRow, req: &PlacementRequest) -> anyhow::Result<String> {
     use crate::{conflict, forbidden};
     let worker_id: WorkerId = session.worker_id.parse()?;
@@ -2134,7 +2192,25 @@ pub(crate) async fn change_place(st: &HeadState, session: &SessionRow, req: &Pla
         return Err(forbidden("the session's realm may not use this worker"));
     }
     let live = st.registry.get(worker_id).ok_or_else(|| conflict("worker is not connected"))?;
+    if let PlacementRequest::Target { worker, cwd, clone, worktree, .. } = req {
+        worker.parse::<WorkerId>().map_err(|_| bad_request("Worker: choose a destination worker"))?;
+        if cwd.trim().is_empty() || cwd.len() > 4096 || cwd.contains('\0') {
+            return Err(bad_request("Folder: choose an absolute destination folder on the selected worker"));
+        }
+        if *clone && worker == &session.worker_id {
+            return Err(bad_request("Folder: cloning is only supported when moving to another worker"));
+        }
+        if let Some(options) = worktree {
+            api::starts::check_options(options).map_err(|e| bad_request(format!("Worktree: {e}")))?;
+            if options.cleanup_mode() != "off" {
+                return Err(bad_request("Worktree: placement worktrees are kept for Move back; choose cleanup off"));
+            }
+        }
+    }
     let destination = match req {
+        PlacementRequest::Target { expected_place_seq, worker, clone, cwd, .. } if worker != &session.worker_id => {
+            Some((*expected_place_seq, worker.clone(), *clone, Some(cwd.clone())))
+        }
         PlacementRequest::Worker { expected_place_seq, worker, clone } => Some((*expected_place_seq, worker.clone(), *clone, None)),
         PlacementRequest::Back { expected_place_seq, place_seq } => {
             let earlier = placements(st, &session.id)
@@ -2160,21 +2236,29 @@ pub(crate) async fn change_place(st: &HeadState, session: &SessionRow, req: &Pla
             return Err(forbidden("the session's realm may not use the destination worker"));
         }
         let target_live = st.registry.get(target_id).ok_or_else(|| conflict("destination worker is not connected"))?;
+        if matches!(req, PlacementRequest::Target { .. })
+            && !target_live.capabilities.iter().any(|c| c == c6_proto::SESSION_MOVE_TARGET_CAPABILITY)
+        {
+            return Err(conflict("Worker: update the destination worker before selecting a folder or worktree there"));
+        }
         if !live.capabilities.iter().any(|c| c == c6_proto::SESSION_MOVE_CAPABILITY)
             || !target_live.capabilities.iter().any(|c| c == c6_proto::SESSION_MOVE_CAPABILITY)
         {
             return Err(conflict("both workers must support fenced session moves"));
         }
-        return crate::session_moves::start(
-            st,
-            &session.id,
-            worker_id,
-            target_id,
-            expected,
-            serde_json::json!({"clone": clone, "previous_cwd": previous,
-                "notice_template": crate::prompts::get(st, "session.place_changed", &session.realm).await}),
-        )
-        .await;
+        let mut request = serde_json::json!({"clone": clone, "previous_cwd": previous,
+            "known_folders": known_placement_folders(st, target_id).await?,
+            "notice_template": crate::prompts::get(st, "session.place_changed", &session.realm).await});
+        if let PlacementRequest::Target { cwd, worktree, copy_scratch, .. } = req {
+            request["cwd"] = serde_json::json!(cwd);
+            let worktree = worktree.as_ref().map(|options| api::starts::WorktreeOptions {
+                branch: api::starts::branch_name(&options.branch, &session.title, Some(&session.id)),
+                ..options.clone()
+            });
+            request["worktree"] = serde_json::json!(worktree);
+            request["copy_scratch"] = serde_json::json!(copy_scratch);
+        }
+        return crate::session_moves::start(st, &session.id, worker_id, target_id, expected, request).await;
     }
     if !live.capabilities.iter().any(|c| c == "same_worker_placement_v1") {
         return Err(conflict("this worker does not support changing place"));
@@ -2196,6 +2280,21 @@ pub(crate) async fn change_place(st: &HeadState, session: &SessionRow, req: &Pla
         ..Default::default()
     };
     match req {
+        PlacementRequest::Target { expected_place_seq, cwd, worktree, copy_scratch, .. } => {
+            change.expected_place_seq = *expected_place_seq;
+            change.cwd.clone_from(cwd);
+            change.copy_scratch = *copy_scratch;
+            change.action = "target".into();
+            if let Some(options) = worktree {
+                change.worktree_spec = Some(c6_proto::WorktreeSpec {
+                    branch: api::starts::branch_name(&options.branch, &session.title, None),
+                    base: options.base.clone(),
+                    fetch: options.fetch,
+                    track: options.track,
+                    setup: options.setup.clone(),
+                });
+            }
+        }
         PlacementRequest::Worker { .. } => unreachable!("worker move handled above"),
         PlacementRequest::Folder { expected_place_seq, cwd, copy_scratch } => {
             if cwd.is_empty() || cwd.len() > 4096 || cwd.contains('\0') {
@@ -3546,6 +3645,18 @@ async fn chatgpt_tokens_now(st: &HeadState, connection_id: &str, refused: bool) 
 mod input_compatibility_tests {
     use super::*;
     use crate::store::tests::legacy_input_command;
+
+    #[test]
+    fn full_placement_target_round_trips_for_exact_consent() {
+        let value = json!({"kind": "target", "expected_place_seq": 27,
+            "worker": "destination", "cwd": "/srv/workspaces/falcon", "clone": false,
+            "worktree": {"branch": "fix/dialog"}, "copy_scratch": false});
+        let request: PlacementRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        let mut unknown = value;
+        unknown["ignored_destination"] = json!("must not be dropped from consent");
+        assert!(serde_json::from_value::<PlacementRequest>(unknown).is_err());
+    }
 
     fn upload(name: &str, mime: &str, bytes: &[u8]) -> api::AttachmentUpload {
         use base64::Engine;

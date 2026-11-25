@@ -17,10 +17,29 @@ qualification. A release must report its verified subset.
 
 Minimal creation uses scratch by default. Same-worker placement supports an
 idle, unarchived, top-level local session running carbon6's own loop. The
-Folder/Worktree dialog and `sessions.place.list` / `sessions.place.change`
+Change session place dialog and `sessions.place.list` / `sessions.place.change`
 catalog operations share the same checked command path. Agent changes always
 require a fresh approval for the exact request, even when the agent already
 owns the session or holds a general write grant.
+
+The location chips open one **Change session place** dialog: choose the worker,
+then a folder on that worker, and optionally create a worktree with a branch.
+The folder browser follows the selected worker, not the session's old worker.
+Matching repositories are offered before submission; choosing a folder resolves
+ambiguity explicitly. One Move submits and validates the complete destination,
+not a worker-only move followed by a second folder command.
+
+`sessions.place.change` accepts `kind: "target"`, `expected_place_seq`, `worker`
+(the worker ID), `cwd`, and optional `worktree` creation options, `clone`, and
+`copy_scratch`. A null/omitted `worktree` uses the selected folder as-is; choose
+an existing linked checkout by its folder. `sessions.place.candidates` takes a
+`worker` query and reports matching folders for that session. Legacy folder,
+worktree, worker, leave-worktree, and Back requests remain accepted. Agent
+consent retains the complete target, including the folder and branch options.
+Explicit cross-worker targets require the destination's
+`session_move_target_v1` capability. A head never sends them to an older mover
+that could silently ignore the folder. This is rechecked during preparation,
+including after a destination reconnect.
 
 The Worker chip offers cross-worker moves for idle, unarchived, top-level
 local sessions, including native Claude Code. Both workers must be online,
@@ -158,17 +177,31 @@ workspaces or a reusable repository cache.
   bounds. A scratch or ordinary folder snapshot goes into a fresh managed
   directory. Traversal, symlinks, special files, and conflicting paths are
   refused rather than followed or overwritten.
-- **Git:** Preflight matches the normalized source remote against known folders
-  from the destination journal and its managed repository cache; it does not
-  scan the filesystem for repositories. Ambiguous matches are refused. If
-  nothing matches, the Worker dialog offers an explicit clone opt-in. An
-  authorized clone with a supported URL populates a reusable bare seed under
-  the destination worker's state directory. The move itself never pushes.
+- **Git:** Preflight matches the normalized source remote against actual
+  Started/PlaceChanged folders and worktree parent repositories in the
+  destination journal, head-known session and template folders, and its managed
+  repository cache. Optional discovery is bounded to worker storage and the
+  parents of recorded folders; it does not recursively search the home tree.
+  SSH/HTTPS forms, default ports, trailing `.git`/slashes and host case match;
+  GitHub repository path case also matches. Nondefault ports and case-sensitive
+  paths on other hosts remain distinct. The dialog lists matches and an
+  explicit folder resolves ambiguity. **Clone here** takes a chosen parent and
+  explicitly authorizes a new repository folder; supported URLs can populate a
+  reusable bare seed under the destination worker's state directory.
+  The move itself never pushes.
   It carries the current branch and its reachable commits (including unpushed
   commits) in a bundle, separate staged and unstaged patches, and non-ignored
   untracked files. The destination verifies the bundle and expected commit and
-  checks patch applicability in a fresh standalone checkout, not a linked
-  worktree. It does not reset an existing checkout. Ignored files and other
+  checks patch applicability in a private staging checkout first. An explicit
+  clean destination at the same commit receives those changes directly, with
+  durable per-file/index backups and checked rollback. A dirty checkout or a
+  different destination commit is refused with guidance to choose a new
+  worktree. A requested new linked worktree starts at the transferred source
+  commit (including unpushed commits), leaving the selected checkout intact.
+  Cross-worker setup commands, fetch/tracking options, and bases other than the
+  transferred commit are refused rather than silently ignored. Legacy
+  worker-only moves still create a fresh standalone checkout. Existing
+  checkouts are never reset. Ignored files and other
   local branches are not copied. Detached HEADs, unsupported or missing
   remotes, custom Git filters, conflicts, tracked binary changes, Git symlinks,
   submodules, and assume-unchanged or skip-worktree index entries are not

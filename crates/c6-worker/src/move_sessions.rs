@@ -112,16 +112,49 @@ pub(crate) async fn handle(worker: &Arc<Worker>, method: &str, p: Value) -> Resu
         "move.preflight" => {
             let descriptor: Descriptor = serde_json::from_value(p["descriptor"].clone())?;
             if descriptor.source.native_resume.is_some() {
-                crate::session::SessionManager::check_native_move_runtime().await?;
+                crate::session::SessionManager::check_native_move_runtime()
+                    .await
+                    .context("Worker: destination cannot resume native Claude sessions")?;
             }
             // Only recorded folders are searched, not the user's home tree.
-            let mut known = worker.journal.known_move_folders().await?;
+            let mut known = worker.journal.known_move_folders(&local).await?;
             if let Some(cwd) = p["request"]["previous_cwd"].as_str() {
                 known.push(PathBuf::from(cwd));
             }
+            if let Some(hints) = p["request"]["known_folders"].as_array() {
+                known.extend(hints.iter().filter_map(Value::as_str).map(crate::expand_home));
+            }
             let clone = p["request"]["clone"].as_bool().unwrap_or(false);
-            let plan =
-                tokio::task::spawn_blocking(move || move_files::preflight_with_clone(&descriptor.source, &known, &state, clone)).await??;
+            let request = p["request"].clone();
+            let plan = tokio::task::spawn_blocking(move || {
+                if request["cwd"].is_string() {
+                    move_files::preflight_selected(&descriptor.source, &state, id, &request).map_err(|error| {
+                        if error.to_string().contains("does not match")
+                            && let Some(repo) = &descriptor.source.repo
+                            && let Some(candidate) = move_files::repository_folders(&state, &known, Some(&repo.remote)).first()
+                        {
+                            return anyhow::anyhow!(
+                                "{error}; choose the matching checkout {} or Clone here in a new folder",
+                                candidate.display()
+                            );
+                        }
+                        error
+                    })
+                } else {
+                    // Back is a fresh snapshot, not an in-place restore. Its
+                    // historical cwd is nevertheless the unambiguous seed to
+                    // prefer when a worker retains several matching checkouts.
+                    if let Some(previous) = request["previous_cwd"].as_str()
+                        && let Ok(plan) =
+                            move_files::preflight_with_clone(&descriptor.source, &[crate::expand_home(previous)], &state, false)
+                    {
+                        return Ok(plan);
+                    }
+                    let known = move_files::repository_folders(&state, &known, descriptor.source.repo.as_ref().map(|r| r.remote.as_str()));
+                    move_files::preflight_with_clone(&descriptor.source, &known, &state, clone)
+                }
+            })
+            .await??;
             Ok(serde_json::to_value(plan)?)
         }
         "move.freeze" => {
@@ -216,9 +249,7 @@ pub(crate) async fn handle(worker: &Arc<Worker>, method: &str, p: Value) -> Resu
                     cwd: prepared.cwd.display().to_string(),
                     repo: descriptor.from.repo.clone(),
                     repo_root: prepared.repo_root.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
-                    // A transferred repository is a standalone checkout; it is
-                    // not subject to linked-worktree leave/cleanup semantics.
-                    worktree_branch: String::new(),
+                    worktree_branch: prepared.worktree_branch.clone(),
                     worker_id: local,
                 };
                 let event = worker

@@ -12,6 +12,9 @@ pub use v1::*;
 
 /// Hello capability required to send a nonzero session ownership epoch.
 pub const SESSION_MOVE_CAPABILITY: &str = "session_move_v1";
+/// The destination honors an explicit folder and worktree plan. Older fenced
+/// movers ignore these fields and must not receive a complete-target request.
+pub const SESSION_MOVE_TARGET_CAPABILITY: &str = "session_move_target_v1";
 
 #[cfg(test)]
 mod tests {

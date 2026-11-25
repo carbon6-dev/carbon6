@@ -155,6 +155,19 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
         return crate::move_sessions::handle(worker, method, params).await;
     }
     match method {
+        "repos.list" => {
+            let mut known = worker.journal.known_move_folders(&worker.identity.meta.worker_id.to_string()).await?;
+            if let Some(hints) = params["known_folders"].as_array() {
+                known.extend(hints.iter().filter_map(Value::as_str).map(crate::expand_home));
+            }
+            known.sort();
+            known.dedup();
+            let cwd = params["cwd"].as_str().map(crate::expand_home);
+            let remote = params["remote"].as_str().map(str::to_owned);
+            let state = worker.state_dir.clone();
+            tokio::task::spawn_blocking(move || crate::move_files::list_repositories(&state, &known, cwd.as_deref(), remote.as_deref()))
+                .await?
+        }
         "machine.disk_scan" => crate::machines::disk_scan(worker).await,
         "kit.cancel" => {
             let id = params["job_id"].as_str().context("job_id required")?;

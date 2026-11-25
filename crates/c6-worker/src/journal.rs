@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use c6_proto::{CreateSession, SessionEvent, session_event};
+use futures::TryStreamExt;
 use prost::Message;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Connection, Row, Sqlite, Transaction};
@@ -763,14 +764,78 @@ impl Journal {
         Ok(loaded.map(|(spec, events)| (spec, events, current.0)))
     }
 
-    pub(crate) async fn known_move_folders(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
-        let specs: Vec<Vec<u8>> = sqlx::query_scalar("SELECT spec FROM sessions LIMIT 4096").fetch_all(&self.pool).await?;
-        Ok(specs
-            .into_iter()
-            .filter_map(|data| CreateSession::decode(data.as_slice()).ok())
-            .filter(|spec| !spec.cwd.is_empty())
-            .map(|spec| std::path::PathBuf::from(spec.cwd))
-            .collect())
+    pub(crate) async fn known_move_folders(&self, local_worker: &str) -> anyhow::Result<Vec<std::path::PathBuf>> {
+        let mut folders = std::collections::BTreeSet::new();
+        {
+            let mut specs = sqlx::query_scalar::<_, Vec<u8>>("SELECT spec FROM sessions").fetch(&self.pool);
+            while let Some(data) = specs.try_next().await? {
+                if let Ok(spec) = CreateSession::decode(data.as_slice())
+                    && spec.ssh_target.is_empty()
+                    && !spec.cwd.is_empty()
+                {
+                    folders.insert(std::path::PathBuf::from(spec.cwd));
+                }
+            }
+        }
+        // CreateSession.cwd can be empty (scratch), unexpanded, or refer to the
+        // checkout before worktree creation. Started and placement receipts are
+        // the actual worker-local paths, including retained previous places.
+        // Imported histories retain places on other workers. Infer the initial
+        // owner from the first tagged placement; preceding Started/legacy
+        // placements belong to that owner, not to whichever worker imported
+        // the history. Histories with no tagged placement are local legacy.
+        let mut session = String::new();
+        let mut initial_owner = None::<String>;
+        let mut pending = std::collections::BTreeSet::new();
+        let mut events = sqlx::query("SELECT session_id, data FROM events ORDER BY session_id, seq").fetch(&self.pool);
+        while let Some(row) = events.try_next().await? {
+            let sid: String = row.get("session_id");
+            if sid != session {
+                if initial_owner.is_none() {
+                    folders.append(&mut pending);
+                }
+                pending.clear();
+                initial_owner = None;
+                session = sid;
+            }
+            let data: Vec<u8> = row.get("data");
+            let Ok(event) = SessionEvent::decode(data.as_slice()) else { continue };
+            match event.kind {
+                Some(session_event::Kind::Started(s)) if s.ssh_target.is_empty() => {
+                    pending.extend([s.cwd, s.repo_root].into_iter().filter(|p| !p.is_empty()).map(std::path::PathBuf::from));
+                }
+                Some(session_event::Kind::PlaceChanged(p)) => {
+                    if initial_owner.is_none() {
+                        initial_owner = p
+                            .from
+                            .as_ref()
+                            .filter(|p| !p.worker_id.is_empty())
+                            .or_else(|| p.to.as_ref().filter(|p| !p.worker_id.is_empty()))
+                            .map(|p| p.worker_id.clone());
+                        if initial_owner.as_deref() == Some(local_worker) {
+                            folders.append(&mut pending);
+                        }
+                        if initial_owner.is_some() {
+                            pending.clear();
+                        }
+                    }
+                    for place in [p.from, p.to].into_iter().flatten() {
+                        let paths = [place.cwd, place.repo_root].into_iter().filter(|p| !p.is_empty()).map(std::path::PathBuf::from);
+                        if place.worker_id == local_worker || (place.worker_id.is_empty() && initial_owner.as_deref() == Some(local_worker))
+                        {
+                            folders.extend(paths);
+                        } else if place.worker_id.is_empty() && initial_owner.is_none() {
+                            pending.extend(paths);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if initial_owner.is_none() {
+            folders.append(&mut pending);
+        }
+        Ok(folders.into_iter().collect())
     }
 
     pub(crate) async fn check_move_history_size(&self, session: &str, limit: u64) -> anyhow::Result<()> {
@@ -1644,6 +1709,82 @@ mod ownership_tests {
             assert_eq!((loaded.notice_quiet_seconds, loaded.max_subagent_depth, loaded.max_running_subagents), (11, 3, 0));
             assert_eq!(events, [history.to_vec(), vec![later]].concat());
         }
+    }
+
+    #[tokio::test]
+    async fn known_move_folders_includes_resolved_scratch_and_later_worktree_placements() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let scratch = dir.path().join("scratch");
+        let checkout = dir.path().join("falcon");
+        let linked = dir.path().join("worktrees/falcon/topic/src");
+        let started = SessionEvent {
+            kind: Some(session_event::Kind::Started(c6_proto::SessionStarted { cwd: scratch.display().to_string(), ..Default::default() })),
+            ..event(1)
+        };
+        // A scratch session's creation spec deliberately has no cwd. Moving
+        // it later updates placement events, not that original saved spec.
+        journal.create_session("s", &CreateSession::default(), &started).await.unwrap();
+        let place = SessionEvent {
+            kind: Some(session_event::Kind::PlaceChanged(c6_proto::PlaceChanged {
+                command_id: "place".into(),
+                from: Some(c6_proto::SessionPlace { cwd: scratch.display().to_string(), ..Default::default() }),
+                to: Some(c6_proto::SessionPlace {
+                    cwd: linked.display().to_string(),
+                    repo_root: checkout.display().to_string(),
+                    worktree_branch: "topic".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..event(2)
+        };
+        journal.append("s", &place).await.unwrap();
+        let folders = journal.known_move_folders("local-worker").await.unwrap();
+        for expected in [&scratch, &checkout, &linked] {
+            assert!(folders.contains(expected), "missing {} in {folders:?}", expected.display());
+        }
+        journal.pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn known_move_folders_excludes_foreign_started_and_legacy_places_in_imported_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let started = SessionEvent {
+            kind: Some(session_event::Kind::Started(c6_proto::SessionStarted { cwd: "/foreign/scratch".into(), ..Default::default() })),
+            ..event(1)
+        };
+        let legacy = SessionEvent {
+            kind: Some(session_event::Kind::PlaceChanged(c6_proto::PlaceChanged {
+                from: Some(c6_proto::SessionPlace { cwd: "/foreign/scratch".into(), ..Default::default() }),
+                to: Some(c6_proto::SessionPlace {
+                    cwd: "/foreign/checkout".into(),
+                    repo_root: "/foreign/primary".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..event(2)
+        };
+        let moved = SessionEvent {
+            kind: Some(session_event::Kind::PlaceChanged(c6_proto::PlaceChanged {
+                from: Some(c6_proto::SessionPlace { cwd: "/foreign/checkout".into(), worker_id: "foreign".into(), ..Default::default() }),
+                to: Some(c6_proto::SessionPlace {
+                    cwd: "/local/linked".into(),
+                    repo_root: "/local/primary".into(),
+                    worker_id: "local".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..event(3)
+        };
+        let spec = CreateSession { cwd: "/local/linked".into(), ..Default::default() };
+        journal.import("s", &spec, &[started, legacy, moved]).await.unwrap();
+        let folders = journal.known_move_folders("local").await.unwrap();
+        assert_eq!(folders, [std::path::PathBuf::from("/local/linked"), std::path::PathBuf::from("/local/primary")]);
+        journal.pool.close().await;
     }
 
     #[tokio::test]

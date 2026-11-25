@@ -309,7 +309,7 @@ async fn moving_claude_copies_the_native_transcript_and_resumes_its_id() {
     let placement = format!("{path}/placement");
     std::fs::rename(&bin, &gate.parked).unwrap();
     let command = api.move_to(&placement, target_id).await;
-    rejected_move(&head, &command, "move.preflight", false).await;
+    rejected_move(&head, &command, "Worker on native-target", false).await;
     std::fs::rename(&gate.parked, &bin).unwrap();
 
     gate.armed.store(true, Ordering::SeqCst);

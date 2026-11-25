@@ -199,7 +199,8 @@ their things asks them first; say so, and carry on when you hear their answer. U
 documents. Realms organise; they don't isolate. Realm-scoped APIs, grants and credential delivery have enforced checks, but \
 commands run as the worker's OS user: shared-worker sessions can reach each other's files. A worker limited to one realm \
 doesn't prevent delegation to agents with wider access. If this conversation needs a different working folder or worktree, use \
-sessions.place.list and ask with sessions.place.change, giving the reason at the top of input. Changing place always asks the user \
+sessions.place.list, find matching folders with sessions.place.candidates, and ask with sessions.place.change using kind target \
+with the full worker, cwd and optional worktree branch in one request, giving the reason at the top of input. Changing place always asks the user \
 for one-time consent, even for your own session. A submitted request is not confirmation: wait for the placement result; do not \
 silently move the conversation or assume files were copied.";
 

@@ -114,6 +114,23 @@ async fn resolve_commit(root: &Path, rev: &str) -> Result<String, String> {
     git(root, &["rev-parse", "--verify", "--end-of-options", &format!("{rev}^{{commit}}")]).await
 }
 
+/// Recognize a linked worktree selected directly in the folder picker.
+pub(crate) async fn existing_place(cwd: &Path) -> Result<(String, String), String> {
+    let Some(top) = cwd.ancestors().find(|p| p.join(".git").exists()) else {
+        return Ok((String::new(), String::new()));
+    };
+    if !top.join(".git").is_file() {
+        return Ok((String::new(), String::new()));
+    }
+    let common = git(top, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await?;
+    let common = Path::new(&common).canonicalize().map_err(|e| format!("Folder: cannot resolve the worktree repository: {e}"))?;
+    let root = common.parent().ok_or_else(|| "Folder: worktree repository has no parent".to_owned())?;
+    let branch =
+        git(top, &["symbolic-ref", "--short", "HEAD"]).await.map_err(|_| "Worktree: choose a checkout with a branch".to_owned())?;
+    validate_recorded_worktree(cwd, root, &branch).await?;
+    Ok((root.display().to_string(), branch))
+}
+
 /// Entry shares the template creation path, but must validate the selected
 /// base and branch *after* fetching and before creating anything.
 async fn create_at(
@@ -893,6 +910,54 @@ mod tests {
         let err = leave(&made.cwd, &clone, &made.branch, false).await.unwrap_err();
         assert!(err.contains("no longer on branch"), "{err}");
         assert!(made.top.exists());
+    }
+
+    #[tokio::test]
+    async fn existing_place_leaves_scratch_and_primary_checkouts_unmarked() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(existing_place(tmp.path()).await.unwrap(), (String::new(), String::new()));
+        sh(tmp.path(), &format!("git init -q -b main && echo base > tracked && git add . && {GIT} commit -qm base"));
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        assert_eq!(existing_place(tmp.path()).await.unwrap(), (String::new(), String::new()));
+        assert_eq!(existing_place(&nested).await.unwrap(), (String::new(), String::new()));
+    }
+
+    #[tokio::test]
+    async fn existing_place_recognizes_nested_linked_checkout_without_changing_dirty_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        sh(tmp.path(), &format!("git init -q -b main && echo base > tracked && git add . && {GIT} commit -qm base"));
+        sh(tmp.path(), "git worktree add -q -b linked linked-checkout");
+        let linked = tmp.path().join("linked-checkout");
+        let nested = linked.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        sh(&linked, "echo staged > tracked && git add tracked && echo unstaged > tracked && echo local > nested/untracked");
+        let status = sh_out(&linked, "git status --porcelain");
+        let index = sh_out(&linked, "git show :tracked");
+        let expected = (tmp.path().canonicalize().unwrap().display().to_string(), "linked".to_owned());
+        assert_eq!(existing_place(&linked).await.unwrap(), expected);
+        assert_eq!(existing_place(&nested).await.unwrap(), expected);
+        assert_eq!(sh_out(&linked, "git status --porcelain"), status);
+        assert_eq!(sh_out(&linked, "git show :tracked"), index);
+        assert_eq!(std::fs::read(linked.join("tracked")).unwrap(), b"unstaged\n");
+        assert_eq!(std::fs::read(nested.join("untracked")).unwrap(), b"local\n");
+    }
+
+    #[tokio::test]
+    async fn existing_place_rejects_unregistered_and_detached_linked_checkouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        sh(tmp.path(), &format!("git init -q -b main && echo base > tracked && git add . && {GIT} commit -qm base"));
+        sh(tmp.path(), "git worktree add -q -b linked linked-checkout");
+        let linked = tmp.path().join("linked-checkout");
+        let fake = tmp.path().join("fake-checkout");
+        std::fs::create_dir(&fake).unwrap();
+        std::fs::copy(linked.join(".git"), fake.join(".git")).unwrap();
+        let err = existing_place(&fake).await.unwrap_err();
+        assert!(err.contains("registration"), "{err}");
+        sh(&linked, "git checkout -q --detach");
+        let err = existing_place(&linked).await.unwrap_err();
+        assert!(err.contains("choose a checkout with a branch"), "{err}");
+        assert!(linked.join("tracked").exists());
     }
 
     #[tokio::test]

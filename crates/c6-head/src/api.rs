@@ -99,6 +99,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
         .route("/api/v1/sessions/{id}/placement", get(session_placement).post(change_session_placement))
+        .route("/api/v1/sessions/{id}/placement/candidates", get(session_placement_candidates))
         .route("/api/v1/sessions/{id}/moves/{move_id}", get(session_move_status))
         .route("/api/v1/sessions/{id}/attachments/{seq}/{index}", get(attachment))
         .route("/api/v1/sessions/{id}/export", get(export_session))
@@ -2503,6 +2504,17 @@ async fn change_session_placement(
     let session = visible_session(&st, &caller, &id).await?;
     let command_id = crate::sessions::change_place(&st, &session, &request).await?;
     Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "command_id": command_id }))))
+}
+
+async fn session_placement_candidates(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(q): Params,
+) -> ApiResult<Json<serde_json::Value>> {
+    let session = visible_session(&st, &caller, &id).await?;
+    let target = q.get("worker").ok_or_else(|| crate::bad_request("Worker: choose a destination worker"))?;
+    Ok(Json(crate::sessions::placement_candidates(&st, &session, target).await?))
 }
 
 async fn session_move_status(

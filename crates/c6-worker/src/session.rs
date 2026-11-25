@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, build_system_prompt, history_from_events, run_turn};
 use c6_llm::{Block, Message, Provider, Role, ToolProfile, model_info};
@@ -5608,6 +5609,29 @@ impl Actor {
         let is_scratch = scratch.canonicalize().is_ok_and(|p| p == Path::new(&from.cwd)) && from.worktree_branch.is_empty();
         let mut entered = None;
         let mut to = match request.action.as_str() {
+            "target" => {
+                anyhow::ensure!(!request.copy_scratch || is_scratch, "Folder: only a scratch workspace can be copied");
+                let cwd = crate::expand_home(&request.cwd);
+                anyhow::ensure!(cwd.is_absolute(), "Folder: choose an absolute folder on this worker");
+                let cwd = cwd.canonicalize().context("Folder: choose an existing folder on this worker")?;
+                anyhow::ensure!(cwd.is_dir(), "Folder: choose a directory");
+                if let Some(spec) = &request.worktree_spec {
+                    let made = crate::worktree::enter(&self.manager.worktrees, &sid, &cwd, spec)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Worktree: {e}"))?;
+                    let to = c6_proto::SessionPlace {
+                        cwd: made.made.cwd.display().to_string(),
+                        repo_root: made.made.root.clone(),
+                        worktree_branch: made.made.branch.clone(),
+                        ..Default::default()
+                    };
+                    entered = Some(made);
+                    to
+                } else {
+                    let (repo_root, worktree_branch) = crate::worktree::existing_place(&cwd).await.map_err(anyhow::Error::msg)?;
+                    c6_proto::SessionPlace { cwd: cwd.display().to_string(), repo_root, worktree_branch, ..Default::default() }
+                }
+            }
             "" | "folder" => {
                 anyhow::ensure!(from.worktree_branch.is_empty(), "Leave the worktree before choosing another folder");
                 anyhow::ensure!(!request.copy_scratch || is_scratch, "Only a scratch workspace can be copied on a folder move");
@@ -5661,26 +5685,39 @@ impl Actor {
             _ => anyhow::bail!("This worker does not support that placement action"),
         };
         to.worker_id = place_worker;
-        let cwd = crate::expand_home(&to.cwd);
-        anyhow::ensure!(cwd.is_absolute(), "Choose an absolute folder on this worker");
-        let cwd = cwd.canonicalize()?;
-        anyhow::ensure!(cwd.is_dir() && cwd != Path::new(&from.cwd), "Choose a different existing folder");
-        to.cwd = cwd.to_str().ok_or_else(|| anyhow::anyhow!("The destination path is not valid UTF-8"))?.to_owned();
-        if request.action == "back" && !to.worktree_branch.is_empty() {
-            crate::worktree::validate_recorded_worktree(&cwd, Path::new(&to.repo_root), &to.worktree_branch)
-                .await
-                .map_err(anyhow::Error::msg)?;
+        let prepared = async {
+            let cwd = crate::expand_home(&to.cwd);
+            anyhow::ensure!(cwd.is_absolute(), "Choose an absolute folder on this worker");
+            let cwd = cwd.canonicalize()?;
+            anyhow::ensure!(cwd.is_dir() && cwd != Path::new(&from.cwd), "Choose a different existing folder");
+            to.cwd = cwd.to_str().ok_or_else(|| anyhow::anyhow!("The destination path is not valid UTF-8"))?.to_owned();
+            if request.action == "back" && !to.worktree_branch.is_empty() {
+                crate::worktree::validate_recorded_worktree(&cwd, Path::new(&to.repo_root), &to.worktree_branch)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+            }
+            let copied = if request.copy_scratch {
+                let source = PathBuf::from(&from.cwd);
+                let destination = cwd.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || crate::place_files::PreparedCopy::prepare(&source, &destination))
+                        .await?
+                        .map_err(anyhow::Error::msg)?,
+                )
+            } else {
+                None
+            };
+            anyhow::Ok((cwd, copied))
         }
-        let copied = if request.copy_scratch {
-            let source = PathBuf::from(&from.cwd);
-            let destination = cwd.clone();
-            Some(
-                tokio::task::spawn_blocking(move || crate::place_files::PreparedCopy::prepare(&source, &destination))
-                    .await?
-                    .map_err(anyhow::Error::msg)?,
-            )
-        } else {
-            None
+        .await;
+        let (cwd, copied) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(entered) = &entered {
+                    crate::worktree::discard(&entered.made).await;
+                }
+                return Err(error);
+            }
         };
         to.repo = repo_slug(&cwd).await;
         let labels = session_labels(&self.spec.labels, &to.repo, &to.cwd, &self.started.home, &spawn_model(&self.spec), "");

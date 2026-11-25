@@ -2018,11 +2018,10 @@ fn placement_chip(
     title: String,
     eligible: Memo<(bool, bool)>,
     placement: ChipDisclosure,
-    cross: bool,
 ) -> impl IntoView {
     move || {
         let (same, other) = eligible.get();
-        let action = (same || (cross && other)).then_some(placement);
+        let action = (same || other).then_some(placement);
         view! { <LocationChip label value=value.clone() title=title.clone() action /> }
     }
 }
@@ -2076,9 +2075,9 @@ pub(crate) fn SessionLocation(chrome: SessionChrome) -> impl IntoView {
             let model_fallback = if s.model.is_empty() { "Default model".to_owned() } else { s.model };
             view! {
                 <div class="flex min-w-0 shrink-0 flex-wrap items-center gap-1 border-b border-zinc-200 px-2 py-1 dark:border-zinc-800" role="group" aria-label="Session location">
-                    {placement_chip(if s.on_head { "Runs on" } else { "Worker" }, worker.clone(), worker, eligible, placement, true)}
-                    {placement_chip("Folder", folder, path, eligible, placement, false)}
-                    {worktree.map(|(branch, path)| placement_chip("Worktree", branch, path, eligible, placement, false))}
+                    {placement_chip(if s.on_head { "Runs on" } else { "Worker" }, worker.clone(), worker, eligible, placement)}
+                    {placement_chip("Folder", folder, path, eligible, placement)}
+                    {worktree.map(|(branch, path)| placement_chip("Worktree", branch, path, eligible, placement))}
                     {move || {
                         let current = chrome.model_label.get();
                         let value = if current.is_empty() { model_fallback.clone() } else { current };
@@ -2098,6 +2097,12 @@ fn move_worker_ready(w: &c6_api::Worker, realm: &str) -> bool {
         && w.role != "head"
         && (w.realms.is_empty() || w.realms.iter().any(|r| r == realm))
         && w.capabilities.iter().any(|c| c == "session_move_v1")
+}
+
+fn move_target_ready(w: &c6_api::Worker, realm: &str) -> bool {
+    // Older session_move_v1 destinations ignore the explicit cwd/worktree.
+    // Keep in sync with c6_proto::SESSION_MOVE_TARGET_CAPABILITY.
+    move_worker_ready(w, realm) && w.capabilities.iter().any(|c| c == "session_move_target_v1")
 }
 
 fn can_change_place(s: &Session) -> bool {
@@ -2137,6 +2142,83 @@ fn placement_outcome(command: &str, events: &[Event], queued: &[QueuedInput]) ->
     queued.iter().find(|q| q.command_id == command).and_then(|q| q.rejected.clone()).map(Err)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PlacementWorktree {
+    #[default]
+    None,
+    Existing,
+    New,
+}
+
+/// The complete destination, independent of browser hooks for state tests.
+#[derive(Clone, Debug, Default)]
+struct PlacementDraft {
+    worker: String,
+    cwd: String,
+    worktree: PlacementWorktree,
+    branch: String,
+    clone: bool,
+    copy_scratch: bool,
+    candidates: api::PlacementCandidates,
+    loading: bool,
+    candidate_error: Option<String>,
+    generation: u64,
+}
+
+impl PlacementDraft {
+    fn clone_destination(&self) -> Option<String> {
+        let parent = self.cwd.trim().trim_end_matches('/');
+        if self.cwd.trim().is_empty() {
+            return None;
+        }
+        let remote = self.candidates.remote.as_deref()?.trim_end_matches('/');
+        let name = remote.rsplit('/').next()?.trim_end_matches(".git");
+        if name.is_empty() || matches!(name, "." | "..") || name.contains(':') {
+            return None;
+        }
+        Some(format!("{parent}/{name}"))
+    }
+
+    fn select_worker(&mut self, worker: String) -> u64 {
+        let generation = self.generation + 1;
+        *self = Self { worker, generation, loading: true, ..Self::default() };
+        generation
+    }
+
+    fn receive_candidates(&mut self, worker: &str, generation: u64, result: Result<api::PlacementCandidates, String>) {
+        // Includes A -> B -> A switches and responses arriving after closing.
+        if self.worker != worker || self.generation != generation {
+            return;
+        }
+        self.loading = false;
+        match result {
+            Ok(candidates) => {
+                // Do not overwrite a folder the user has already chosen.
+                if self.cwd.is_empty() {
+                    self.cwd = candidates.folders.first().cloned().unwrap_or_default();
+                }
+                self.candidates = candidates;
+                self.candidate_error = None;
+            }
+            Err(error) => self.candidate_error = Some(error),
+        }
+    }
+
+    fn request(&self) -> Option<api::PlacementAction> {
+        if self.worker.is_empty() || self.cwd.trim().is_empty() {
+            return None;
+        }
+        Some(api::PlacementAction::Target {
+            worker: self.worker.clone(),
+            cwd: self.cwd.trim().to_owned(),
+            clone: self.clone,
+            worktree: (self.worktree == PlacementWorktree::New)
+                .then(|| c6_api::starts::WorktreeOptions { branch: self.branch.trim().to_owned(), ..Default::default() }),
+            copy_scratch: self.copy_scratch,
+        })
+    }
+}
+
 #[component]
 fn PlacementDialog(
     chrome: SessionChrome,
@@ -2163,11 +2245,39 @@ fn PlacementDialog(
         let id = id.get_value();
         async move { if open { api::placements(id).await } else { Ok(Vec::new()) } }
     });
-    let target = RwSignal::new(String::new());
-    let worker = RwSignal::new(String::new());
-    let action = RwSignal::new(String::new());
-    let option = RwSignal::new(false);
-    let branch = RwSignal::new(String::new());
+    let draft = RwSignal::new(PlacementDraft::default());
+    let initialized = RwSignal::new(None::<u64>);
+    let select_worker = Callback::new(move |worker: String| {
+        let mut generation = 0;
+        draft.update(|d| generation = d.select_worker(worker.clone()));
+        let id = id.get_value();
+        spawn_local(async move {
+            let result = api::placement_candidates(id, worker.clone()).await;
+            draft.try_update(|d| d.receive_candidates(&worker, generation, result));
+        });
+    });
+    Effect::new(move || {
+        if !open.get() {
+            initialized.set(None);
+            draft.update(|d| d.generation += 1);
+            return;
+        }
+        let Some(Ok(rows)) = places.get() else { return };
+        let Some(current) = rows.first() else { return };
+        if initialized.get_untracked() == Some(current.seq) {
+            return;
+        }
+        initialized.set(Some(current.seq));
+        select_worker.run(current.worker_id.clone());
+        draft.update(|d| {
+            if !scratch_place(&id.get_value(), &current.cwd) {
+                d.cwd.clone_from(&current.cwd);
+            }
+            if !current.worktree_branch.is_empty() {
+                d.worktree = PlacementWorktree::Existing;
+            }
+        });
+    });
     let pending = RwSignal::new(None::<PendingPlacement>);
     let error = RwSignal::new(None::<String>);
     Effect::new(move || {
@@ -2181,10 +2291,6 @@ fn PlacementDialog(
             pending.set(None);
             match result {
                 Ok(()) => {
-                    action.set(String::new());
-                    target.set(String::new());
-                    option.set(false);
-                    branch.set(String::new());
                     pending.set(Some(PendingPlacement::Moved));
                 }
                 Err(reason) => {
@@ -2255,17 +2361,17 @@ fn PlacementDialog(
             }
         });
     });
-    let live = api::live();
     view! {
         <Show when=move || open.get()>
             {move || if picking.get() {
-                let Some(d) = chrome.detail.get_untracked().and_then(Result::ok) else { return ().into_any() };
-                let start = places.get_untracked().and_then(Result::ok).and_then(|rows| rows.first().map(|p| {
-                    if scratch_place(&d.session.id, &p.cwd) { String::new() } else { p.cwd.clone() }
-                })).unwrap_or_default();
+                let worker = draft.with_untracked(|d| d.worker.clone());
+                let start = draft.with_untracked(|d| d.cwd.clone());
                 view! {
-                    <crate::files::FolderPicker worker_id=d.session.worker_id.to_string() start
-                        on_select=Callback::new(move |folder| { target.set(folder); picking.set(false); })
+                    <crate::files::FolderPicker worker_id=worker.clone() start
+                        on_select=Callback::new(move |folder| {
+                            draft.update(|d| { if d.worker == worker { d.cwd = folder; } });
+                            picking.set(false);
+                        })
                         on_cancel=Callback::new(move |()| picking.set(false)) />
                 }.into_any()
             } else {
@@ -2284,122 +2390,7 @@ fn PlacementDialog(
                             {move || places.get().map(|result| match result {
                                 Ok(rows) if rows.is_empty() => view! { <p class="text-sm text-muted">"The session's starting place is not available yet."</p> }.into_any(),
                                 Ok(rows) => {
-                                    let mut rows = rows.into_iter();
-                                    let current = rows.next().expect("non-empty placement history");
-                                    let seq = current.seq;
-                                    let in_worktree = !current.worktree_branch.is_empty();
-                                    let scratch = !in_worktree && scratch_place(&id.get_value(), &current.cwd);
-                                    let cwd = StoredValue::new(current.cwd.clone());
-                                    let source = StoredValue::new(current.worker_id.clone());
-                                    let targets = Memo::new(move |_| {
-                                        let Some(detail) = chrome.detail.get().and_then(Result::ok) else { return Vec::new() };
-                                        live.workers.with(|ws| ws.iter().filter_map(|w| {
-                                            let id = w.id.to_string();
-                                            (move_worker_ready(w, &detail.session.realm) && source.with_value(|s| *s != id))
-                                                .then(|| (id, w.name.clone()))
-                                        }).collect::<Vec<_>>())
-                                    });
-                                    let ready = move |id: &str| targets.with(|ws| ws.iter().any(|(w, _)| w == id));
-                                    let previous = StoredValue::new(rows.collect::<Vec<_>>());
-                                    let destination = move |choice: &str| {
-                                        let seq = choice.parse::<u64>().ok()?;
-                                        previous.with_value(|rows| rows.iter().find(|p| p.seq == seq).cloned())
-                                    };
-                                    let actions: &[(&str, &str)] = if in_worktree {
-                                        &[("leave", "Leave the worktree")]
-                                    } else {
-                                        &[("folder", "Move to a folder"), ("worktree", "Create a Git worktree")]
-                                    };
-                                    let request = move || {
-                                        use api::PlacementAction as A;
-                                        let (same, cross) = eligible.get();
-                                        action.with(|choice| Some(match choice.as_str() {
-                                            "folder" if same && !in_worktree && target.with(|path| !path.is_empty() && cwd.with_value(|cwd| path != cwd)) =>
-                                                (A::Folder { cwd: target.get(), copy_scratch: scratch && option.get() }, false),
-                                            "worktree" if same && !in_worktree => (A::Worktree { options: c6_api::starts::WorktreeOptions {
-                                                branch: branch.with(|b| b.trim().to_owned()), ..Default::default()
-                                            } }, false),
-                                            "leave" if same && in_worktree => (A::LeaveWorktree { merge: option.get() }, false),
-                                            "worker" if cross && worker.with(|w| ready(w)) => (A::Worker { worker: worker.get(), clone: option.get() }, true),
-                                            _ => {
-                                                let place = destination(choice)?;
-                                                let other = source.with_value(|s| *s != place.worker_id);
-                                                if !(if other { cross && ready(&place.worker_id) } else { same }) { return None; }
-                                                (A::Back { place_seq: place.seq }, other)
-                                            }
-                                        }))
-                                    };
-                                    view! {
-                                        <div class="space-y-3">
-                                            <p class="break-all text-xs text-muted">"Current place: " <span class="font-mono">{placed_at(&current)}</span></p>
-                                            <fieldset disabled=move || pending.with(PendingPlacement::busy) || eligible.get() == (false, false) class="space-y-3 disabled:opacity-60">
-                                                <label class="block text-xs text-muted">"Action"
-                                                    <select class=INPUT prop:value=move || action.get() on:change=move |ev| {
-                                                        action.set(event_target_value(&ev));
-                                                        option.set(false);
-                                                        worker.set(String::new());
-                                                    }>
-                                                        <option value="">"Choose a change…"</option>
-                                                        {actions.iter().map(|&(key, label)| view! { <option value=key disabled=move || !eligible.get().0>{label}</option> }).collect_view()}
-                                                        <option value="worker" disabled=move || !eligible.get().1>"Move to another worker"</option>
-                                                        <optgroup label="Move back" hidden=previous.with_value(Vec::is_empty)>
-                                                            {previous.with_value(|places| places.iter().map(|p| {
-                                                                view! { <option value=p.seq.to_string()>{placed_at(p)}</option> }
-                                                            }).collect_view())}
-                                                        </optgroup>
-                                                    </select>
-                                                </label>
-                                                <label class="block text-xs text-muted" hidden=move || !action.with(|s| s == "worker")>"Worker"
-                                                    <select class=INPUT prop:value=move || worker.get() on:change=move |ev| {
-                                                        worker.set(event_target_value(&ev));
-                                                        option.set(false);
-                                                    }>
-                                                        <option value="">{move || if targets.with(Vec::is_empty) { "No eligible workers online" } else { "Choose a worker…" }}</option>
-                                                        {move || targets.get().into_iter().map(|(id, name)| {
-                                                            let selected = worker.with_untracked(|w| *w == id);
-                                                            view! { <option value=id prop:selected=selected>{name}</option> }
-                                                        }).collect_view()}
-                                                    </select>
-                                                </label>
-                                                <div class="space-y-2" hidden=move || !action.with(|s| s == "folder")>
-                                                    <button type="button" class=BUTTON_QUIET on:click=move |_| picking.set(true)>"Choose folder…"</button>
-                                                    <p class="break-all font-mono text-xs">{move || target.get()}</p>
-                                                </div>
-                                                <div class="space-y-2" hidden=move || !action.with(|s| s == "worktree")>
-                                                    <p class="text-xs text-muted">"Start from this checkout’s HEAD and carry tracked and non-ignored untracked changes. Ignored files stay behind; binary and submodule changes are refused. The original checkout stays intact."</p>
-                                                    <label class="block max-w-xs text-xs text-muted">"Branch (optional)"
-                                                        <input class=INPUT placeholder="Generated c6/… branch" prop:value=move || branch.get() on:input=move |ev| branch.set(event_target_value(&ev)) />
-                                                    </label>
-                                                </div>
-                                                <p class="text-xs text-muted" hidden=move || !action.with(|s| s == "leave")>
-                                                    "Return to the main checkout. The worktree and branch remain available for Move back."
-                                                </p>
-                                                <label class="block space-x-2 text-sm" hidden=move || !action.with(|s| s == "leave" || s == "worker" || (scratch && s == "folder"))>
-                                                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || option.get()
-                                                        on:change=move |ev| option.set(event_target_checked(&ev)) />
-                                                    <span>{move || action.with(|s| match s.as_str() {
-                                                        "leave" => "Merge the branch first (fast-forward only)",
-                                                        "worker" => "Clone repository if no matching repository exists",
-                                                        _ => "Copy scratch files without overwriting (otherwise leave them in scratch)",
-                                                    })}</span>
-                                                </label>
-                                                {move || action.with(|s| destination(s)).map(|place| view! {
-                                                    <p class="text-xs text-muted">{if source.with_value(|s| *s != place.worker_id) {
-                                                        "Moving back to another worker creates a fresh workspace. The old folder stays untouched."
-                                                    } else { "Previous places are not backups. The destination is checked again before moving." }}</p>
-                                                    <p class="break-all font-mono text-xs text-muted">{placed_at(&place)}</p>
-                                                })}
-                                                <button type="button" class=BUTTON
-                                                    disabled=move || request().is_none()
-                                                    on:click=move |_| { if let Some((action, cross)) = untrack(request) { submit.run((seq, action, cross)); } }>
-                                                    {move || action.with(|s| match s.as_str() {
-                                                        "folder" => "Move to folder", "worktree" => "Create and enter worktree", "leave" => "Leave worktree",
-                                                        "" => "Change place", "worker" => "Move to worker", _ => "Move back",
-                                                    })}
-                                                </button>
-                                            </fieldset>
-                                        </div>
-                                    }.into_any()
+                                    view! { <PlacementDestination chrome rows draft pending eligible picking select_worker submit /> }.into_any()
                                 }
                                 Err(reason) => view! {
                                     <ErrorBox message=reason />
@@ -2411,6 +2402,183 @@ fn PlacementDialog(
                 }.into_any()
             }}
         </Show>
+    }
+}
+
+#[component]
+fn PlacementDestination(
+    chrome: SessionChrome,
+    rows: Vec<api::Placement>,
+    draft: RwSignal<PlacementDraft>,
+    pending: RwSignal<Option<PendingPlacement>>,
+    eligible: Memo<(bool, bool)>,
+    picking: RwSignal<bool>,
+    select_worker: Callback<String>,
+    submit: Callback<(u64, api::PlacementAction, bool)>,
+) -> impl IntoView {
+    let current = StoredValue::new(rows[0].clone());
+    let scratch = current.with_value(|p| scratch_place(&chrome.id.get_value(), &p.cwd));
+    let rows = StoredValue::new(rows);
+    let live = api::live();
+    let targets = Memo::new(move |_| {
+        let Some(detail) = chrome.detail.get().and_then(Result::ok) else { return Vec::new() };
+        let (same, cross) = eligible.get();
+        live.workers.with(|ws| {
+            ws.iter()
+                .filter_map(|w| {
+                    let id = w.id.to_string();
+                    let source = current.with_value(|p| p.worker_id == id);
+                    let allowed = if source {
+                        same && w.status == c6_api::WorkerStatus::Online
+                    } else {
+                        cross && move_target_ready(w, &detail.session.realm)
+                    };
+                    allowed.then(|| (id, w.name.clone()))
+                })
+                .collect::<Vec<_>>()
+        })
+    });
+    let cross = move || draft.with(|d| current.with_value(|p| d.worker != p.worker_id));
+    let request = move || {
+        if pending.with(PendingPlacement::busy) {
+            return None;
+        }
+        draft.with(|d| {
+            if d.loading || !targets.with(|ws| ws.iter().any(|(id, _)| *id == d.worker)) {
+                return None;
+            }
+            let same_place = current.with_value(|p| p.worker_id == d.worker && p.cwd == d.cwd.trim());
+            if same_place && d.worktree != PlacementWorktree::New {
+                return None;
+            }
+            d.request().map(|action| (action, cross()))
+        })
+    };
+    view! {
+        <div class="space-y-3">
+            <p class="break-all text-xs text-muted">"Current place: " <span class="font-mono">{current.with_value(placed_at)}</span></p>
+            <fieldset disabled=move || pending.with(PendingPlacement::busy) || eligible.get() == (false, false) class="space-y-3 disabled:opacity-60">
+                <label class="block text-xs text-muted">"Worker"
+                    <select class=INPUT prop:value=move || draft.with(|d| d.worker.clone())
+                        on:change=move |ev| select_worker.run(event_target_value(&ev))>
+                        <option value="">{move || if targets.with(Vec::is_empty) { "No eligible workers online" } else { "Choose a worker…" }}</option>
+                        {move || targets.get().into_iter().map(|(id, name)| {
+                            let selected = draft.with_untracked(|d| d.worker == id);
+                            view! { <option value=id prop:selected=selected>{name}</option> }
+                        }).collect_view()}
+                    </select>
+                </label>
+                {move || draft.with(|d| d.loading).then(|| view! {
+                    <p role="status" class="text-xs text-muted">"Looking for matching repositories on this worker…"</p>
+                })}
+                {move || draft.with(|d| d.candidate_error.clone()).map(|reason| view! {
+                    <ErrorBox message=reason />
+                    <button type="button" class=BUTTON_QUIET on:click=move |_| select_worker.run(draft.with_untracked(|d| d.worker.clone()))>"Retry folder search"</button>
+                })}
+                {move || (!draft.with(|d| d.candidates.folders.is_empty())).then(|| view! {
+                    <label class="block text-xs text-muted">"Matching folders"
+                        <select class=INPUT prop:value=move || draft.with(|d| d.cwd.clone())
+                            on:change=move |ev| draft.update(|d| d.cwd = event_target_value(&ev))>
+                            <option value="" disabled>"Choose a matching folder…"</option>
+                            {move || draft.with(|d| d.candidates.folders.clone()).into_iter().map(|path| {
+                                let selected = draft.with_untracked(|d| d.cwd == path);
+                                view! { <option value=path.clone() prop:selected=selected>{path.clone()}</option> }
+                            }).collect_view()}
+                        </select>
+                    </label>
+                })}
+                {move || (!draft.with(|d| d.loading) && draft.with(|d| d.candidate_error.is_none() && d.candidates.folders.is_empty())).then(|| view! {
+                    <p class="text-xs text-muted">"No matching repository found on this worker. Choose a folder, or explicitly allow cloning into a new folder."</p>
+                })}
+                <div class="space-y-1">
+                    <label class="block text-xs text-muted">"Folder on selected worker"
+                        <input class=INPUT placeholder="/path/to/repository or worktree" prop:value=move || draft.with(|d| d.cwd.clone())
+                            on:input=move |ev| draft.update(|d| d.cwd = event_target_value(&ev)) />
+                    </label>
+                    <button type="button" class=BUTTON_QUIET disabled=move || draft.with(|d| d.worker.is_empty())
+                        on:click=move |_| picking.set(true)>"Choose folder…"</button>
+                    {move || (cross() && draft.with(|d| d.clone_destination().is_some())).then(|| view! {
+                        <button type="button" class=BUTTON_QUIET on:click=move |_| draft.update(|d| {
+                            if let Some(destination) = d.clone_destination() {
+                                d.cwd = destination;
+                                d.clone = true;
+                            }
+                        })>"Clone here"</button>
+                        <p class="break-all text-xs text-muted">{move || draft.with(|d| d.clone_destination().map(|path| format!("Use the chosen folder as parent; clone into {path}.")))}</p>
+                    })}
+                </div>
+                {move || {
+                    let previous = rows.with_value(|rows| rows.iter().filter(|p| draft.with(|d| d.worker == p.worker_id)).cloned().collect::<Vec<_>>());
+                    (!previous.is_empty()).then(|| view! {
+                        <label class="block text-xs text-muted">"Previously used folders and worktrees"
+                            <select class=INPUT prop:value="" on:change=move |ev| {
+                                let selected = event_target_value(&ev).parse::<u64>().ok();
+                                if let Some(place) = rows.with_value(|rows| rows.iter().find(|p| Some(p.seq) == selected).cloned()) {
+                                    draft.update(|d| {
+                                        if d.worker == place.worker_id {
+                                            d.cwd = place.cwd;
+                                            d.worktree = if place.worktree_branch.is_empty() { PlacementWorktree::None } else { PlacementWorktree::Existing };
+                                            d.branch.clear();
+                                        }
+                                    });
+                                }
+                            }>
+                                <option value="">"Choose a previous folder…"</option>
+                                {previous.into_iter().map(|p| view! { <option value=p.seq.to_string()>{placed_at(&p)}</option> }).collect_view()}
+                            </select>
+                        </label>
+                    })
+                }}
+                <label class="block text-xs text-muted">"Worktree"
+                    <select class=INPUT prop:value=move || draft.with(|d| match d.worktree {
+                        PlacementWorktree::None => "none", PlacementWorktree::Existing => "existing", PlacementWorktree::New => "new",
+                    }) on:change=move |ev| draft.update(|d| {
+                        d.worktree = match event_target_value(&ev).as_str() {
+                            "existing" => PlacementWorktree::Existing, "new" => PlacementWorktree::New, _ => PlacementWorktree::None,
+                        };
+                    })>
+                        <option value="none">"None — use selected folder"</option>
+                        <option value="existing">"Existing worktree — use its folder"</option>
+                        <option value="new">"New worktree and branch"</option>
+                    </select>
+                </label>
+                {move || (draft.with(|d| d.worktree == PlacementWorktree::Existing)).then(|| view! {
+                    <p class="text-xs text-muted">"Select the existing worktree’s folder above. No worktree or branch will be created."</p>
+                })}
+                {move || (draft.with(|d| d.worktree == PlacementWorktree::New)).then(|| view! {
+                    <label class="block text-xs text-muted">"New branch (optional)"
+                        <input class=INPUT placeholder="Generated c6/… branch" prop:value=move || draft.with(|d| d.branch.clone())
+                            on:input=move |ev| draft.update(|d| d.branch = event_target_value(&ev)) />
+                        <span class="block pt-1">{move || if cross() {
+                            "Create a separate checkout at the transferred source commit to preserve this session’s work. The original checkout stays intact."
+                        } else {
+                            "Create a separate checkout from the selected repository’s HEAD. The original checkout stays intact."
+                        }}</span>
+                    </label>
+                })}
+                {move || cross().then(|| view! {
+                    <label class="block space-x-2 text-sm">
+                        <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || draft.with(|d| d.clone)
+                            on:change=move |ev| draft.update(|d| d.clone = event_target_checked(&ev)) />
+                        <span>"Allow cloning the repository into the selected folder if needed"</span>
+                        <span class="block text-xs text-muted">"The Folder field is the exact clone destination, not its parent. Clone here fills it from a chosen parent."</span>
+                        {move || draft.with(|d| d.candidates.remote.clone()).filter(|remote| !remote.is_empty()).map(|remote| view! {
+                            <span class="block break-all text-xs text-muted">{remote}</span>
+                        })}
+                    </label>
+                })}
+                {move || (scratch && !cross()).then(|| view! {
+                    <label class="block space-x-2 text-sm">
+                        <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || draft.with(|d| d.copy_scratch)
+                            on:change=move |ev| draft.update(|d| d.copy_scratch = event_target_checked(&ev)) />
+                        <span>"Copy scratch files without overwriting (otherwise leave them in scratch)"</span>
+                    </label>
+                })}
+                <p class="text-xs text-muted">"The destination is checked before moving. Existing folders are not backups."</p>
+                <button type="button" class=BUTTON disabled=move || request().is_none()
+                    on:click=move |_| { if let Some((action, cross)) = untrack(request) { submit.run((current.with_value(|p| p.seq), action, cross)); } }>"Move"</button>
+            </fieldset>
+        </div>
     }
 }
 
@@ -9367,6 +9535,22 @@ mod tests {
     }
 
     #[test]
+    fn placement_target_requires_explicit_destination_support_but_source_does_not() {
+        let mut w = worker(W, "online");
+        w.capabilities.push("session_move_v1".into());
+        assert!(move_worker_ready(&w, "team"), "old workers can still be sources");
+        assert!(!move_target_ready(&w, "team"), "old destinations ignore cwd and must not be offered");
+        w.capabilities.push("session_move_target_v1".into());
+        assert!(move_target_ready(&w, "team"));
+        w.realms.push("other".into());
+        assert!(!move_target_ready(&w, "team"));
+        w.realms.push("team".into());
+        assert!(move_target_ready(&w, "team"));
+        w.status = c6_api::WorkerStatus::Offline;
+        assert!(!move_target_ready(&w, "team"));
+    }
+
+    #[test]
     fn location_labels_distinguish_scratch_remote_home_folder_and_worktree() {
         let mut s = session(W, false);
         let scratch = Started { cwd: "/state/scratch/s".into(), branch: String::new(), repo: String::new() };
@@ -9413,10 +9597,138 @@ mod tests {
             assert!(folder.contains("aria-haspopup=\"dialog\"") && folder.contains("aria-expanded=\"true\""), "{folder}");
 
             let cross_only = Memo::new(|_| (false, true));
-            let chip = |label, cross| placement_chip(label, "value".into(), String::new(), cross_only, dialog, cross).to_html();
-            assert!(chip("Worker", true).contains("<button"));
-            assert!(!chip("Folder", false).contains("<button"));
+            let chip = |label| placement_chip(label, "value".into(), String::new(), cross_only, dialog).to_html();
+            assert!(chip("Worker").contains("<button"));
+            assert!(chip("Folder").contains("<button"));
+            assert!(chip("Worktree").contains("<button"));
         });
+    }
+
+    #[test]
+    fn placement_clone_here_builds_exact_destination_from_chosen_parent() {
+        let mut draft = PlacementDraft {
+            cwd: " /home/dev/projects/ ".into(),
+            candidates: api::PlacementCandidates { remote: Some("example.invalid/team/carbon6.git".into()), folders: Vec::new() },
+            ..Default::default()
+        };
+        assert_eq!(draft.clone_destination().as_deref(), Some("/home/dev/projects/carbon6"));
+        draft.cwd = "/".into();
+        assert_eq!(draft.clone_destination().as_deref(), Some("/carbon6"));
+        draft.cwd.clear();
+        assert!(draft.clone_destination().is_none());
+        draft.cwd = "/parent".into();
+        draft.candidates.remote = None;
+        assert!(draft.clone_destination().is_none());
+    }
+
+    #[test]
+    fn placement_scratch_copy_is_explicit_and_resets_on_worker_change() {
+        let mut draft = PlacementDraft { worker: "source".into(), cwd: "/destination".into(), ..Default::default() };
+        assert_eq!(serde_json::to_value(draft.request().unwrap()).unwrap()["copy_scratch"], false);
+        draft.copy_scratch = true;
+        assert_eq!(serde_json::to_value(draft.request().unwrap()).unwrap()["copy_scratch"], true);
+        draft.select_worker("other".into());
+        assert!(!draft.copy_scratch);
+    }
+
+    #[test]
+    fn placement_worker_selection_clears_the_entire_old_destination() {
+        let mut draft = PlacementDraft {
+            worker: "first".into(),
+            cwd: "/old/repo".into(),
+            branch: "old-branch".into(),
+            clone: true,
+            worktree: PlacementWorktree::New,
+            ..Default::default()
+        };
+        draft.select_worker("second".into());
+        assert_eq!(draft.worker, "second");
+        assert!(draft.cwd.is_empty() && draft.branch.is_empty());
+        assert!(!draft.clone);
+        assert_eq!(draft.worktree, PlacementWorktree::None);
+        assert!(draft.loading);
+        assert!(draft.request().is_none());
+    }
+
+    #[test]
+    fn placement_candidates_preselect_best_folder_without_overwriting_user_choice() {
+        let mut draft = PlacementDraft::default();
+        let generation = draft.select_worker("worker".into());
+        let candidates = api::PlacementCandidates { remote: Some("origin".into()), folders: vec!["/best".into(), "/other".into()] };
+        draft.receive_candidates("worker", generation, Ok(candidates.clone()));
+        assert_eq!(draft.cwd, "/best");
+        assert_eq!(draft.candidates.folders, ["/best", "/other"]);
+        assert!(!draft.loading);
+
+        let generation = draft.select_worker("worker".into());
+        draft.cwd = "/manually/chosen".into();
+        draft.receive_candidates("worker", generation, Ok(candidates));
+        assert_eq!(draft.cwd, "/manually/chosen");
+    }
+
+    #[test]
+    fn placement_candidates_ignore_stale_workers_generations_and_errors() {
+        let mut draft = PlacementDraft::default();
+        let first = draft.select_worker("a".into());
+        let second = draft.select_worker("b".into());
+        let third = draft.select_worker("a".into());
+        let candidate = || api::PlacementCandidates { folders: vec!["/stale".into()], ..Default::default() };
+        draft.receive_candidates("b", second, Ok(candidate()));
+        draft.receive_candidates("a", first, Ok(candidate()));
+        draft.receive_candidates("a", first, Err("old failure".into()));
+        assert!(draft.cwd.is_empty() && draft.candidates.folders.is_empty());
+        assert!(draft.loading && draft.candidate_error.is_none());
+        draft.receive_candidates("a", third, Err("worker unavailable".into()));
+        assert!(!draft.loading);
+        assert_eq!(draft.candidate_error.as_deref(), Some("worker unavailable"));
+        draft.cwd = "/manual".into();
+        assert!(draft.request().is_some(), "failed discovery must still allow an explicit folder");
+    }
+
+    #[test]
+    fn placement_empty_candidates_never_authorize_clone_or_reuse_an_old_path() {
+        let mut draft = PlacementDraft { cwd: "/other-worker/repo".into(), clone: true, ..Default::default() };
+        let generation = draft.select_worker("new-worker".into());
+        draft.receive_candidates("new-worker", generation, Ok(api::PlacementCandidates::default()));
+        assert!(!draft.loading);
+        assert!(!draft.clone);
+        assert!(draft.cwd.is_empty());
+        assert!(draft.request().is_none());
+        draft.cwd = "/new-worker/repo".into();
+        draft.clone = true;
+        assert!(draft.request().is_some());
+        // Closing the dialog also invalidates an in-flight response.
+        draft.generation += 1;
+        draft.receive_candidates("new-worker", generation, Err("late failure".into()));
+        assert!(draft.candidate_error.is_none());
+    }
+
+    #[test]
+    fn placement_none_existing_and_new_send_one_complete_target() {
+        let mut draft = PlacementDraft {
+            worker: "selected-worker".into(),
+            cwd: " /chosen/folder ".into(),
+            branch: " feature/move ".into(),
+            ..Default::default()
+        };
+        for mode in [PlacementWorktree::None, PlacementWorktree::Existing, PlacementWorktree::New] {
+            draft.worktree = mode;
+            let value = serde_json::to_value(draft.request().unwrap()).unwrap();
+            assert_eq!(value["kind"], "target");
+            assert_eq!(value["worker"], "selected-worker");
+            assert_eq!(value["cwd"], "/chosen/folder");
+            assert_eq!(value["clone"], false);
+            assert_eq!(value["copy_scratch"], false);
+            if mode == PlacementWorktree::New {
+                assert_eq!(value["worktree"]["branch"], "feature/move");
+            } else {
+                assert!(value["worktree"].is_null());
+            }
+        }
+        draft.clone = true;
+        assert_eq!(serde_json::to_value(draft.request().unwrap()).unwrap()["clone"], true);
+        draft.cwd = "   ".into();
+        assert!(draft.request().is_none());
     }
 
     #[test]

@@ -544,8 +544,15 @@ fn get_json<T: DeserializeOwned + 'static>(url: impl Into<String>) -> LocalBoxFu
     parse_json(get_text(url.into()))
 }
 
-async fn send_json<T: DeserializeOwned + 'static>(req: RequestBuilder, body: &impl Serialize) -> Result<T, String> {
-    json(req.json(body).map_err(|e| e.to_string())?.send().await).await
+fn send_json<T: DeserializeOwned + 'static>(req: RequestBuilder, body: &impl Serialize) -> LocalBoxFuture<'static, Result<T, String>> {
+    parse_json(send_text(req.json(body).map_err(|e| e.to_string())))
+}
+
+// As with GET, the send/body-read future is independent of both JSON types.
+// Do not specialize its network polling and error paths for every request body.
+#[inline(never)]
+fn send_text(req: Result<gloo_net::http::Request, String>) -> LocalBoxFuture<'static, Result<String, String>> {
+    Box::pin(async move { response_text(req?.send().await).await })
 }
 
 pub(crate) async fn voice_tidy(text: String, session_id: Option<String>, realm: Option<String>) -> Result<String, String> {
@@ -655,11 +662,18 @@ pub(crate) struct Placement {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PlacementAction {
-    Folder { cwd: String, copy_scratch: bool },
-    Worktree { options: c6_api::starts::WorktreeOptions },
-    LeaveWorktree { merge: bool },
-    Back { place_seq: u64 },
-    Worker { worker: String, clone: bool },
+    Target { worker: String, cwd: String, clone: bool, worktree: Option<c6_api::starts::WorktreeOptions>, copy_scratch: bool },
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct PlacementCandidates {
+    #[serde(default)]
+    pub remote: Option<String>,
+    pub folders: Vec<String>,
+}
+
+pub(crate) fn placement_candidates(id: String, worker: String) -> LocalBoxFuture<'static, Result<PlacementCandidates, String>> {
+    get_json(format!("/api/v1/sessions/{id}/placement/candidates?worker={}", enc(&worker)))
 }
 
 #[derive(Serialize)]
@@ -2166,12 +2180,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn worker_placement_sends_exact_selection_and_clone_consent() {
-        let request =
-            PlacementRequest { expected_place_seq: 23, action: PlacementAction::Worker { worker: "worker-id".into(), clone: false } };
+    fn placement_candidates_allow_scratch_without_a_remote() {
+        let candidates: PlacementCandidates = serde_json::from_value(serde_json::json!({"remote": null, "folders": []})).unwrap();
+        assert!(candidates.remote.is_none());
+        assert!(candidates.folders.is_empty());
+    }
+
+    #[test]
+    fn target_placement_sends_complete_destination_and_explicit_consent() {
+        let request = PlacementRequest {
+            expected_place_seq: 23,
+            action: PlacementAction::Target {
+                worker: "worker-id".into(),
+                cwd: "/repo/existing-worktree".into(),
+                clone: false,
+                worktree: None,
+                copy_scratch: false,
+            },
+        };
         assert_eq!(
             serde_json::to_value(request).unwrap(),
-            serde_json::json!({"expected_place_seq": 23, "kind": "worker", "worker": "worker-id", "clone": false}),
+            serde_json::json!({"expected_place_seq": 23, "kind": "target", "worker": "worker-id", "cwd": "/repo/existing-worktree", "clone": false, "worktree": null, "copy_scratch": false}),
         );
     }
 

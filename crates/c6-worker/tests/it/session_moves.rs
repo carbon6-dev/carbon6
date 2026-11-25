@@ -1233,6 +1233,241 @@ async fn register_checkout(env: &Env, checkout: &Path) {
 }
 
 #[tokio::test]
+async fn combined_target_discovers_unused_repo_and_transfers_into_a_new_linked_worktree() {
+    let env = Env::new().await;
+    let (_origin, source, target) = repositories(&env);
+    std::fs::write(source.join("committed.txt"), "unpushed\n").unwrap();
+    git(&source, &["add", "committed.txt"]);
+    git(&source, &["commit", "-qm", "Local commit for combined move"]);
+    let commit = git(&source, &["rev-parse", "HEAD"]);
+    let prompt = "Prepare a combined worker folder and worktree move";
+    env.script(prompt,
+        "printf 'staged\n' > tracked.txt && git add tracked.txt && printf 'unstaged\n' > tracked.txt && printf 'draft\n' > draft.txt && cat tracked.txt",
+        "Ready to move the complete place.");
+    let started = env.start(&env.source, Some(&source), prompt).await;
+    let id = &started.id;
+    env.ended(id, 1).await;
+
+    // No session has ever used the destination checkout. The worker reports
+    // it from its bounded roots, matching SSH against the source HTTPS URL.
+    let candidates: Value = env.get(&format!("sessions/{id}/placement/candidates?worker={}", env.target.id)).await;
+    assert!(candidates["folders"].as_array().unwrap().contains(&json!(target)), "{candidates}");
+    let before = env.placements(id).await;
+    let (after, moved) = env
+        .moved(
+            id,
+            json!({
+                "kind": "target", "expected_place_seq": before[0]["seq"],
+                "worker": env.target.id, "cwd": target, "worktree": {"branch": "combined-topic"}
+            }),
+            &env.target,
+        )
+        .await;
+    let destination = Path::new(&after.cwd);
+    assert_ne!(destination, target);
+    assert_eq!(git(destination, &["branch", "--show-current"]).trim(), "combined-topic");
+    assert_eq!(git(destination, &["rev-parse", "HEAD"]), commit);
+    let common = git(destination, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    assert_eq!(Path::new(common.trim()).canonicalize().unwrap(), target.join(".git").canonicalize().unwrap());
+    assert_eq!(git(destination, &["status", "--porcelain=v1", "--untracked-files=all"]), "MM tracked.txt\n?? draft.txt\n");
+    assert_eq!(git(destination, &["show", ":tracked.txt"]), "staged\n");
+    assert_eq!(std::fs::read_to_string(destination.join("tracked.txt")).unwrap(), "unstaged\n");
+    assert_eq!(std::fs::read_to_string(destination.join("draft.txt")).unwrap(), "draft\n");
+    assert_eq!(git(&target, &["branch", "--show-current"]).trim(), "main");
+    assert!(git(&target, &["status", "--porcelain=v1"]).is_empty());
+    let EventKind::PlaceChanged { to, .. } = &moved.kind else { unreachable!() };
+    assert_eq!(to.worktree_branch, "combined-topic");
+    assert_eq!(Path::new(&to.repo_root), target);
+
+    let places = env.placements(id).await;
+    let (back, _) = env
+        .moved(
+            id,
+            json!({"kind": "back", "expected_place_seq": places[0]["seq"],
+        "place_seq": before[0]["seq"]}),
+            &env.source,
+        )
+        .await;
+    assert_eq!(std::fs::read_to_string(Path::new(&back.cwd).join("draft.txt")).unwrap(), "draft\n");
+    assert!(destination.exists(), "Move back must retain the linked worktree");
+    let history = env.placements(id).await;
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[1]["seq"], moved.seq);
+    assert_eq!(history[1]["worktree_branch"], "combined-topic");
+    // This worker now knows both the primary checkout and the retained linked
+    // checkout. The historical folder disambiguates the seed for another Back
+    // without overwriting either earlier place.
+    let (again, _) = env
+        .moved(
+            id,
+            json!({"kind": "back", "expected_place_seq": history[0]["seq"],
+        "place_seq": moved.seq}),
+            &env.target,
+        )
+        .await;
+    assert_ne!(Path::new(&again.cwd), destination);
+    assert_eq!(std::fs::read_to_string(Path::new(&again.cwd).join("draft.txt")).unwrap(), "draft\n");
+    assert!(destination.exists());
+    assert_eq!(env.placements(id).await.len(), 4);
+}
+
+#[tokio::test]
+async fn scratch_candidates_do_not_preselect_an_unrelated_destination_repository() {
+    let env = Env::new().await;
+    let _repositories = repositories(&env);
+    let prompt = "Choose a scratch destination without assuming a repository";
+    env.mock.push_about(prompt, Reply::Text("Please choose the destination folder.".into()));
+    let started = env.start(&env.source, None, prompt).await;
+    env.ended(&started.id, 1).await;
+    let candidates: Value = env.get(&format!("sessions/{}/placement/candidates?worker={}", started.id, env.target.id)).await;
+    assert!(candidates["remote"].is_null());
+    assert_eq!(candidates["folders"], json!([]));
+}
+
+#[tokio::test]
+async fn explicit_nonmatching_folder_refuses_without_moving_or_creating_a_worktree() {
+    let env = Env::new().await;
+    let (origin, source, target) = repositories(&env);
+    let wrong = env.target.state.join("unrelated");
+    git(env.root.path(), &["clone", "-q", origin.to_str().unwrap(), wrong.to_str().unwrap()]);
+    git(&wrong, &["remote", "set-url", "origin", "https://example.invalid/unrelated/checkout.git"]);
+    let prompt = "Keep this session in its matching source repository";
+    env.mock.push_about(prompt, Reply::Text("I will stay until a valid move is prepared.".into()));
+    let started = env.start(&env.source, Some(&source), prompt).await;
+    env.ended(&started.id, 1).await;
+    let before = env.placements(&started.id).await;
+    let command = env
+        .request_move(
+            &started.id,
+            json!({"kind": "target", "expected_place_seq": before[0]["seq"],
+        "worker": env.target.id, "cwd": wrong, "worktree": {"branch": "must-not-exist"}}),
+        )
+        .await;
+    env.assert_move_failed(&command, "Folder").await;
+    let (_, error) = env.move_state(&command).await;
+    let error = error.unwrap();
+    assert!(!error.contains("move.preflight:"), "{error}");
+    assert!(error.to_ascii_lowercase().contains("match"), "{error}");
+    env.assert_source_unchanged(&started.id, &before, 0).await;
+    for checkout in [&target, &wrong] {
+        assert!(git(checkout, &["status", "--porcelain=v1"]).is_empty());
+        assert!(git(checkout, &["for-each-ref", "refs/heads/must-not-exist"]).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn combined_target_uses_the_chosen_clean_checkout_not_a_private_clone() {
+    let env = Env::new().await;
+    let (_origin, source, target) = repositories(&env);
+    let prompt = "Move directly into the selected destination checkout";
+    env.script(prompt, "printf carried > draft.txt && cat draft.txt", "The draft will follow me.");
+    let started = env.start(&env.source, Some(&source), prompt).await;
+    env.ended(&started.id, 1).await;
+    let before = env.placements(&started.id).await;
+    let (after, _) = env
+        .moved(
+            &started.id,
+            json!({"kind": "target", "expected_place_seq": before[0]["seq"],
+        "worker": env.target.id, "cwd": target}),
+            &env.target,
+        )
+        .await;
+    assert_eq!(Path::new(&after.cwd), target);
+    assert_eq!(std::fs::read_to_string(target.join("draft.txt")).unwrap(), "carried");
+    assert_eq!(std::fs::read_to_string(source.join("draft.txt")).unwrap(), "carried");
+}
+
+#[tokio::test]
+async fn same_worker_target_changes_folder_and_creates_worktree_in_one_command() {
+    let env = Env::new().await;
+    let (origin, source, _) = repositories(&env);
+    let selected = env.source.state.join("another-checkout");
+    git(env.root.path(), &["clone", "-q", origin.to_str().unwrap(), selected.to_str().unwrap()]);
+    let prompt = "Choose a different repository folder and new worktree on this worker";
+    env.mock.push_about(prompt, Reply::Text("The complete target can be prepared together.".into()));
+    let started = env.start(&env.source, Some(&source), prompt).await;
+    env.ended(&started.id, 1).await;
+    let before = env.placements(&started.id).await;
+    let command = env
+        .request_move(
+            &started.id,
+            json!({"kind": "target", "expected_place_seq": before[0]["seq"],
+        "worker": env.source.id, "cwd": selected, "worktree": {"branch": "same-worker-target"}}),
+        )
+        .await;
+    let to = eventually("the same-worker complete placement to commit once", async || {
+        let detail = env.detail(&started.id).await;
+        assert!(detail.queued.iter().all(|q| q.rejected.is_none()), "{:?}", detail.queued);
+        env.events(&started.id).await.into_iter().find_map(|e| match e.kind {
+            EventKind::PlaceChanged { command_id, to, .. } if command_id == command => Some(to),
+            _ => None,
+        })
+    })
+    .await;
+    assert_eq!(to.worktree_branch, "same-worker-target");
+    assert_eq!(Path::new(&to.repo_root), selected);
+    assert_eq!(git(Path::new(&to.cwd), &["branch", "--show-current"]).trim(), "same-worker-target");
+    let history = env.placements(&started.id).await;
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["cwd"], to.cwd);
+}
+
+#[tokio::test]
+async fn same_worker_target_discards_new_worktree_when_scratch_copy_conflicts() {
+    let env = Env::new().await;
+    let (_origin, selected, _) = repositories(&env);
+    let prompt = "Keep scratch files when the complete destination cannot be prepared";
+    env.mock.push_about(prompt, Reply::Text("The source must remain authoritative.".into()));
+    let started = env.start(&env.source, None, prompt).await;
+    env.ended(&started.id, 1).await;
+    let before = env.placements(&started.id).await;
+    let source = PathBuf::from(before[0]["cwd"].as_str().unwrap());
+    std::fs::write(source.join("tracked.txt"), "scratch content\n").unwrap();
+    let command = env
+        .request_move(
+            &started.id,
+            json!({"kind": "target", "expected_place_seq": before[0]["seq"],
+        "worker": env.source.id, "cwd": selected, "worktree": {"branch": "scratch-conflict"}, "copy_scratch": true}),
+        )
+        .await;
+    eventually("the conflicting scratch copy to be rejected", async || {
+        env.detail(&started.id).await.queued.into_iter().find(|q| q.command_id == command && q.rejected.is_some())
+    })
+    .await;
+    env.assert_source_unchanged(&started.id, &before, 0).await;
+    assert_eq!(std::fs::read_to_string(source.join("tracked.txt")).unwrap(), "scratch content\n");
+    assert!(!git(&selected, &["branch", "--list", "scratch-conflict"]).contains("scratch-conflict"));
+    assert_eq!(git(&selected, &["worktree", "list", "--porcelain"]).matches("worktree ").count(), 1);
+}
+
+#[tokio::test]
+async fn combined_target_refuses_a_dirty_checkout_without_overwriting_its_files() {
+    let env = Env::new().await;
+    let (_origin, source, target) = repositories(&env);
+    std::fs::write(target.join("tracked.txt"), "destination edits\n").unwrap();
+    git(&target, &["add", "tracked.txt"]);
+    std::fs::write(target.join("draft.txt"), "destination draft\n").unwrap();
+    let original_status = git(&target, &["status", "--porcelain=v1"]);
+    let prompt = "Do not overwrite the destination's unfinished work";
+    env.mock.push_about(prompt, Reply::Text("Please choose a safe destination.".into()));
+    let started = env.start(&env.source, Some(&source), prompt).await;
+    env.ended(&started.id, 1).await;
+    let before = env.placements(&started.id).await;
+    let command = env
+        .request_move(
+            &started.id,
+            json!({"kind": "target", "expected_place_seq": before[0]["seq"],
+        "worker": env.target.id, "cwd": target}),
+        )
+        .await;
+    env.assert_move_failed(&command, "Folder").await;
+    env.assert_source_unchanged(&started.id, &before, 0).await;
+    assert_eq!(git(&target, &["status", "--porcelain=v1"]), original_status);
+    assert_eq!(git(&target, &["show", ":tracked.txt"]), "destination edits\n");
+    assert_eq!(std::fs::read_to_string(target.join("draft.txt")).unwrap(), "destination draft\n");
+}
+
+#[tokio::test]
 async fn repo_move_transfers_unpushed_commit_and_preserves_index_and_worktree() {
     let env = Env::new().await;
     let (origin, source, target) = repositories(&env);

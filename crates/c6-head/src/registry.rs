@@ -181,6 +181,12 @@ impl Registry {
         {
             return Err("worker does not support session ownership fencing".into());
         }
+        if matches!(method, "move.preflight" | "move.write" | "move.prepare")
+            && params["request"]["cwd"].is_string()
+            && !live.capabilities.iter().any(|c| c == c6_proto::SESSION_MOVE_TARGET_CAPABILITY)
+        {
+            return Err("Worker: update the destination worker before moving to a selected folder or worktree".into());
+        }
         let (tx, waiters) = (live.tx, live.rpc_waiters);
         let id = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let (done, wait) = oneshot::channel();
@@ -381,6 +387,84 @@ mod tests {
             let (result, ()) = tokio::join!(call, reply);
             assert_eq!(result.unwrap()["connection"], "selected");
             assert_eq!(input.prompt, "expanded mention", "wire gating must leave the saved input intact");
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_target_gate_uses_the_captured_connection_after_replacement() {
+        for method in ["move.preflight", "move.write", "move.prepare"] {
+            for capable in [false, true] {
+                let reg = Registry::new(CancellationToken::new());
+                let id = WorkerId::new();
+                let (selected_tx, mut selected_rx) = mpsc::channel(1);
+                let (replacement_tx, mut replacement_rx) = mpsc::channel(1);
+                let capabilities = |target| {
+                    let mut capabilities = vec![c6_proto::SESSION_MOVE_CAPABILITY.into()];
+                    if target {
+                        capabilities.push(c6_proto::SESSION_MOVE_TARGET_CAPABILITY.into());
+                    }
+                    capabilities
+                };
+                let selected = reg.attach(id, 1, selected_tx, capabilities(capable), "worker").await;
+                let replacement = Mutex::new(None);
+                let call = reg.call_with_params(
+                    id,
+                    method,
+                    |live| {
+                        assert_eq!(live.conn_id, selected.conn_id);
+                        // Upgrade or downgrade after capture, before the gate.
+                        // Neither capability checks nor sending may follow it.
+                        *replacement.lock().unwrap() = Some(reg.attach_inner(id, 2, replacement_tx, capabilities(!capable), "worker"));
+                        serde_json::json!({"request": {"cwd": "/selected/checkout"}})
+                    },
+                    std::time::Duration::from_secs(5),
+                );
+                if capable {
+                    let reply = async {
+                        let message = selected_rx.recv().await.unwrap().unwrap();
+                        let Some(head_msg::Msg::RpcRequest(request)) = message.msg else { panic!("move RPC") };
+                        assert_eq!(request.method, method);
+                        assert!(selected.cancel.is_cancelled());
+                        assert!(replacement_rx.try_recv().is_err(), "must not send to the downgraded replacement");
+                        selected.rpc_response(c6_proto::RpcResponse {
+                            id: request.id,
+                            result_json: br#"{"connection":"selected"}"#.to_vec(),
+                            error: String::new(),
+                        });
+                    };
+                    let (result, ()) = tokio::join!(call, reply);
+                    assert_eq!(result.unwrap()["connection"], "selected");
+                } else {
+                    let error = call.await.unwrap_err();
+                    assert!(error.contains("update the destination worker"), "{method}: {error}");
+                    assert!(selected_rx.try_recv().is_err(), "old captured worker must receive no request");
+                    assert!(replacement_rx.try_recv().is_err(), "must not redirect to the upgraded replacement");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_move_and_cleanup_rpcs_do_not_require_complete_target_capability() {
+        for method in ["move.preflight", "move.write", "move.prepare", "move.activate", "move.abort", "move.retire"] {
+            let reg = Registry::new(CancellationToken::new());
+            let id = WorkerId::new();
+            let (tx, mut rx) = mpsc::channel(1);
+            let connection = reg.attach(id, 1, tx, vec![c6_proto::SESSION_MOVE_CAPABILITY.into()], "worker").await;
+            let params = if matches!(method, "move.activate" | "move.abort" | "move.retire") {
+                serde_json::json!({"request": {"cwd": "/selected/checkout"}})
+            } else {
+                serde_json::json!({"request": {"clone": false}})
+            };
+            let call = reg.call(id, method, params, std::time::Duration::from_secs(5));
+            let reply = async {
+                let message = rx.recv().await.unwrap().unwrap();
+                let Some(head_msg::Msg::RpcRequest(request)) = message.msg else { panic!("move RPC") };
+                assert_eq!(request.method, method);
+                connection.rpc_response(c6_proto::RpcResponse { id: request.id, result_json: b"{}".to_vec(), error: String::new() });
+            };
+            let (result, ()) = tokio::join!(call, reply);
+            assert!(result.is_ok(), "{method}: {result:?}");
         }
     }
 }
