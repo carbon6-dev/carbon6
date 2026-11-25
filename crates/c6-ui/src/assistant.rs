@@ -98,8 +98,9 @@ fn AskBox(on_close: Callback<()>) -> impl IntoView {
                         if ev.key() == "Escape" { on_close.run(()); }
                     }></textarea>
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-                <div class="flex items-center justify-end gap-2">
-                    <span class="flex-1 text-xs text-muted">"Enter to ask · Shift+Enter for a new line · it asks before anything destructive"</span>
+                <div class="flex min-w-0 flex-wrap items-center justify-end gap-2">
+                    <crate::voice::Voice text=text area=area disabled=busy />
+                    <span class="min-w-0 flex-1 text-xs text-muted">"Enter to ask · Shift+Enter for a new line · it asks before anything destructive"</span>
                     <button class=BUTTON_QUIET on:click=move |_| on_close.run(())>"Cancel"</button>
                     <button class=BUTTON disabled=move || busy.get() on:click=move |_| send()>{move || if busy.get() { "Asking…" } else { "Ask" }}</button>
                 </div>

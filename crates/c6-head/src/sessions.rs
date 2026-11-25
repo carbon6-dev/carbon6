@@ -2557,6 +2557,8 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                     crate::naming::ROUTE_LABEL,
                     crate::work::ROUTE_LABEL,
                     crate::projects::ROUTE_LABEL,
+                    "task:transcribe",
+                    "task:tidy",
                 ]
                 .contains(&l.as_str())
             });
@@ -2565,7 +2567,7 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                     c,
                     &format!(
                         "routing rule {:?} (unless it applies to assistant, task:suggest, task:catchup, task:timeline, task:name, \
-                         task:work or task:projects)",
+                         task:work, task:projects, task:transcribe or task:tidy)",
                         r.name
                     ),
                 )?;

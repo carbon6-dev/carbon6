@@ -1426,6 +1426,9 @@ pub async fn execute_for_caller(
     made_by: &str,
     caller: crate::realms::Caller,
 ) -> anyhow::Result<Value> {
+    if op.name.starts_with("voice.") {
+        return Err(bad_request("Voice operations are UI-only: record or tidy dictation in the composer."));
+    }
     if !args.is_object() {
         args = json!({});
     }

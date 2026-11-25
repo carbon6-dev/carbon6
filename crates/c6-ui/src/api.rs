@@ -548,6 +548,16 @@ async fn send_json<T: DeserializeOwned + 'static>(req: RequestBuilder, body: &im
     json(req.json(body).map_err(|e| e.to_string())?.send().await).await
 }
 
+pub(crate) async fn voice_tidy(text: String, session_id: Option<String>, realm: Option<String>) -> Result<String, String> {
+    let request = Request::post("/api/v1/voice/tidy");
+    let request = match realm {
+        Some(realm) => request.header("X-C6-Realm", &realm),
+        None => request,
+    };
+    let value: serde_json::Value = send_json(request, &serde_json::json!({"text": text, "session_id": session_id})).await?;
+    value["text"].as_str().map(str::to_owned).ok_or_else(|| "Tidy returned no text".into())
+}
+
 #[inline(never)]
 fn empty(req: Result<Response, gloo_net::Error>) -> LocalBoxFuture<'static, Result<(), String>> {
     Box::pin(async move { check(req).await.map(drop) })

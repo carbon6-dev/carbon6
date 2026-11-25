@@ -645,6 +645,7 @@ pub fn MemexSettings() -> impl IntoView {
                     }
                 }).collect_view()}
                 <p class="text-xs text-muted sm:col-span-3">"Photos and videos in memex folders are read in place, by the c6-extract kit on their worker. Files above are paths on the head's machine; nothing is downloaded for you. Places: a GeoNames cities file names where photos were taken. Faces: an UltraFace-style detector and an ArcFace- or MobileFaceNet-style embedder (sent to the kit); faces are grouped and you name them in Review. Videos get keyframes, and transcripts with a transcription model."</p>
+                <p class="text-xs text-muted sm:col-span-3">"The message-box microphone uses a task:transcribe routing rule, or this transcription model if no rule matches. Audio is forwarded for transcription, not stored by carbon6."</p>
                 <label class="space-y-0.5">
                     <span class="text-xs text-muted">"Model calls a day"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="500" prop:value=move || per_day.get() on:input=move |ev| per_day.set(event_target_value(&ev)) />

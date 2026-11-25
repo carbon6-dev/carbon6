@@ -2082,6 +2082,14 @@ fn SessionForm(
             ></textarea>
             <crate::completion::CompletionList completion=completion below=true />
             <div class="flex min-w-0 flex-wrap items-center gap-1.5 px-2 pb-2">
+                <crate::voice::Voice text=prompt area=prompt_box disabled=Signal::derive(move || pending.get() || fixed().is_some()) realm=Signal::derive(move || {
+                    template.with(|t| t.as_ref().map(|t| t.realm.clone())).unwrap_or_else(|| {
+                        if seeded {
+                            let realm = seed_realm.get_value();
+                            if realm.is_empty() { "home".into() } else { realm }
+                        } else { api::realm().get() }
+                    })
+                }) />
                 {move || match template.get() {
                     Some(t) => view! {
                         <span class="min-w-0 truncate text-xs text-muted" title=t.template.description.clone()>

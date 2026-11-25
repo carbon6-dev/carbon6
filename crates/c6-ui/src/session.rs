@@ -7255,6 +7255,7 @@ fn Composer(
                             {icon(Icon::Plus, Size::S14)}
                         </button>
                         <input node_ref=picker type="file" multiple class="hidden" on:change=add_files />
+                        <crate::voice::Voice text=text area=area session_id=id.get_value() disabled=disabled />
                 {(model.is_some() || subagents.is_some()).then(|| view! {
                     <div node_ref=model_anchor class="relative flex min-w-0 flex-1 flex-wrap items-center gap-1 text-xs">
                         {model.map(|m| view! {

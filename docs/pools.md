@@ -8,9 +8,10 @@ Pools are for what runs in the head, which calls models itself:
 - the memex: understanding (sorting, cards, reading, pages), drafting, vision, embeddings and transcription (**Settings → Memex**);
 - the assistant (**Settings → Assistant**, or a routing rule for `assistant`);
 - session suggestions, names, catch-up cards and timelines (a routing rule for `task:suggest`, `task:name`, `task:catchup` or `task:timeline`);
+- composer dictation and its optional Tidy action (`task:transcribe` and `task:tidy`; see docs/voice.md);
 - work and projects' model calls (a routing rule for `task:work` or `task:projects`).
 
-Sessions and subagents don't use pools. Their worker dials the connection itself, so they can't start on a pool, and a routing rule names a pool only if it applies to `assistant`, `task:suggest`, `task:name`, `task:catchup`, `task:timeline`, `task:work` or `task:projects`.
+Sessions and subagents don't use pools. Their worker dials the connection itself, so they can't start on a pool, and a routing rule names a pool only if it applies to `assistant`, `task:suggest`, `task:name`, `task:catchup`, `task:timeline`, `task:transcribe`, `task:tidy`, `task:work` or `task:projects`.
 
 ## How a pool picks a member
 

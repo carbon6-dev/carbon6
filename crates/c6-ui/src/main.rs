@@ -66,6 +66,7 @@ mod understanding;
 mod usage;
 mod util;
 mod views;
+mod voice;
 mod watchers;
 mod when;
 mod word_diff;

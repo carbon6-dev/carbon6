@@ -17,6 +17,8 @@ use crate::realms::Caller;
 
 pub fn router(state: Arc<HeadState>) -> Router {
     Router::new()
+        .route("/api/v1/transcribe", post(crate::voice::transcribe).layer(axum::extract::DefaultBodyLimit::max(crate::voice::MAX_AUDIO)))
+        .route("/api/v1/voice/tidy", post(crate::voice::tidy))
         .route("/api/v1/machines", get(list_machines))
         .route("/api/v1/machines/{id}/samples", get(machine_samples))
         .route("/api/v1/machines/{id}/disk_scan", post(machine_disk_scan))

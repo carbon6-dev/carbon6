@@ -564,7 +564,7 @@ pub async fn video_from(m: &Memex, job: &crate::extract::Done<'_>, v: &Value) ->
 /// (on a pool's member, when the connection is a pool).
 pub async fn transcribe(m: &Memex, task: &Task, audio: &[u8]) -> anyhow::Result<String> {
     let text = match m.link.pool(&task.connection_id).await {
-        Some(pool) => pool.run(&task.model, &m.realm, |e| transcription(e, &task.model, audio)).await?,
+        Some(pool) => pool.run(&task.model, &m.realm, |e| transcription(e, &task.model, audio, "audio/mp4", None, true)).await?,
         None => {
             let g = m.link.realm_credential(&m.realm, &task.connection_id).await?;
             let e = c6_llm::pool::Endpoint {
@@ -574,7 +574,7 @@ pub async fn transcribe(m: &Memex, task: &Task, audio: &[u8]) -> anyhow::Result<
                 headers: g.headers,
                 context_window: g.context_window,
             };
-            transcription(e, &task.model, audio).await?
+            transcription(e, &task.model, audio, "audio/mp4", None, true).await?
         }
     };
     let v: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"text": text}));
@@ -592,14 +592,41 @@ pub async fn transcribe(m: &Memex, task: &Task, audio: &[u8]) -> anyhow::Result<
         .join("\n"))
 }
 
-async fn transcription(e: c6_llm::pool::Endpoint, model: &str, audio: &[u8]) -> Result<String, c6_llm::LlmError> {
+/// Shared OpenAI-style transcription transport. Dictation supplies the browser's
+/// MIME type and vocabulary; media indexing asks for timestamped segments.
+pub async fn transcription(
+    e: c6_llm::pool::Endpoint,
+    model: &str,
+    audio: &[u8],
+    mime: &str,
+    vocabulary: Option<&str>,
+    timestamps: bool,
+) -> Result<String, c6_llm::LlmError> {
     use c6_llm::LlmError;
+    if !matches!(e.kind.as_str(), "openai" | "openai_compat") {
+        return Err(LlmError::Config("transcription needs an OpenAI or OpenAI-compatible connection with /audio/transcriptions".into()));
+    }
     let url = format!("{}/audio/transcriptions", e.base_url.trim_end_matches('/'));
+    let extension = match mime.split(';').next().unwrap_or(mime).trim() {
+        "audio/webm" | "video/webm" => "webm",
+        "audio/ogg" => "ogg",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mpeg" => "mp3",
+        "audio/flac" => "flac",
+        "audio/aac" => "aac",
+        _ => "m4a",
+    };
     let file = reqwest::multipart::Part::bytes(audio.to_vec())
-        .file_name("audio.m4a")
-        .mime_str("audio/mp4")
+        .file_name(format!("audio.{extension}"))
+        .mime_str(mime)
         .map_err(|e| LlmError::Config(e.to_string()))?;
-    let form = reqwest::multipart::Form::new().text("model", model.to_owned()).text("response_format", "verbose_json").part("file", file);
+    let mut form = reqwest::multipart::Form::new()
+        .text("model", model.to_owned())
+        .text("response_format", if timestamps { "verbose_json" } else { "json" })
+        .part("file", file);
+    if let Some(prompt) = vocabulary.filter(|v| !v.is_empty()) {
+        form = form.text("prompt", prompt.to_owned());
+    }
     let mut req = reqwest::Client::new().post(&url).timeout(crate::llm::CALL_LIMITS.total).bearer_auth(&e.bearer).multipart(form);
     for (k, v) in &e.headers {
         req = req.header(k, v);

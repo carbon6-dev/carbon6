@@ -29,6 +29,11 @@ look at files and run read-only commands as needed, but do not change files unle
 
 pub const DEFAULTS: &[Prompt] = &[
     Prompt {
+        name: "voice.tidy",
+        description: "Tidies composer dictation. The raw transcript is the user message; return only the edited text.",
+        default: "Rewrite this dictation without adding content. Preserve its meaning and technical words, identifiers and paths. Remove fillers and false starts, and fix punctuation. Return only the edited text, without commentary.",
+    },
+    Prompt {
         name: "session.base",
         description: "What every agent session is told first (the environment and project instructions follow).",
         default: c6_agent::BASE_PROMPT,

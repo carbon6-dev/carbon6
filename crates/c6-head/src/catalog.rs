@@ -165,7 +165,7 @@ pub fn scope(name: &str) -> Option<Scope> {
     const REALM_FIRST: &[&str] = &["workers.fs.", "workers.git.", "workers.terminals."];
     if DEVICE.contains(&name) {
         Some(Device)
-    } else if name == "system.liveness" || REALM_FIRST.iter().any(|a| name.starts_with(a)) {
+    } else if name.starts_with("voice.") || name == "system.liveness" || REALM_FIRST.iter().any(|a| name.starts_with(a)) {
         Some(Realm)
     } else if SHARED.contains(&name) {
         Some(Shared)
@@ -388,6 +388,8 @@ pub fn find(name: &str) -> Option<&'static Op> {
 #[rustfmt::skip]
 fn build() -> Vec<Op> {
     let mut v = vec![
+        op!("voice.transcribe", "sessions", "POST" "/api/v1/transcribe", Read, Input::Query(schema::<crate::voice::Context>), "UI-only dictation: raw audio body (at most 25 MB), Content-Type audio/mp4 or audio/webm, optional session_id query for realm-checked vocabulary. Returns {text}; never stores audio or sends a message. task:transcribe routing wins over Settings → Memex transcription model."),
+        op!("voice.tidy", "sessions", "POST" "/api/v1/voice/tidy", Read, Input::Body(schema::<crate::voice::Tidy>), "UI-only optional dictation editing: {text, session_id?} returns {text}, without sending a message. task:tidy wins over the suggestion model. Instructions are editable as voice.tidy."),
         // Fleet.
         op!("workers.list", "fleet", "GET" "/api/v1/workers", Read, Input::None, "Workers and the memex node: name, host, whether connected, sessions running, capabilities."),
         op!("machines.list", "fleet", "GET" "/api/v1/machines", Read, Input::None, "Head and realm-visible workers with their last resource sample and warnings. Head administration metadata is console-only."),

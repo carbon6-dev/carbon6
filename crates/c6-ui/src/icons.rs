@@ -91,6 +91,7 @@ pub enum Icon {
     Bookmark,
     Link,
     Paperclip,
+    Mic,
     Lock,
     Menu,
     Trash2,
@@ -203,6 +204,7 @@ impl Icon {
         Self::Bookmark,
         Self::Link,
         Self::Paperclip,
+        Self::Mic,
         Self::Lock,
         Self::Menu,
         Self::Trash2,
@@ -315,6 +317,7 @@ impl Icon {
             Self::Bookmark => "bookmark",
             Self::Link => "link",
             Self::Paperclip => "paperclip",
+            Self::Mic => "mic",
             Self::Lock => "lock",
             Self::Menu => "menu",
             Self::Trash2 => "trash-2",
@@ -490,6 +493,7 @@ impl Icon {
             Self::Paperclip => {
                 r#"<path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551" />"#
             }
+            Self::Mic => r#"<path d="M12 19v3" /><path d="M19 10v2a7 7 0 0 1-14 0v-2" /><rect x="9" y="2" width="6" height="12" rx="3" />"#,
             Self::Lock => r#"<rect width="18" height="11" x="3" y="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />"#,
             Self::Menu => r#"<path d="M4 5h16" /><path d="M4 12h16" /><path d="M4 19h16" />"#,
             Self::Trash2 => {
@@ -705,6 +709,7 @@ legacy_icons! {
     bookmark => Bookmark, S16;
     link => Link, S16;
     paperclip => Paperclip, S16;
+    microphone => Mic, S16;
     lock => Lock, S16;
     menu => Menu, S16;
     trash => Trash2, S16;

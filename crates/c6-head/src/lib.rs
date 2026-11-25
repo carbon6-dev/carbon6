@@ -84,6 +84,7 @@ pub mod ui_ca;
 pub mod updates;
 pub mod usage;
 pub mod views;
+mod voice;
 pub mod watchers;
 mod webauthn;
 pub mod work;

@@ -95,6 +95,8 @@ const READ_OK: &[&str] =
 
 /// Yours alone, wherever they are.
 const NEVER: &[&str] = &[
+    "voice.transcribe",
+    "voice.tidy",
     // Watchers are yours to set and run (docs/watchers.md).
     "watchers.put",
     "watchers.reset",

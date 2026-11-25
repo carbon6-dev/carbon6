@@ -341,7 +341,8 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
                             caret.set(el.selection_start().ok().flatten().unwrap_or(0) as usize);
                         }
                     }></textarea>
-                <div class="flex items-center gap-2 px-2 pb-1 text-[11px] text-muted">
+                <div class="flex min-w-0 flex-wrap items-center gap-2 px-2 pb-1 text-[11px] text-muted">
+                    <crate::voice::Voice text=text area=area />
                     {in_thread.then(|| view! {
                         <label class="flex min-h-8 items-center gap-1 pointer-coarse:min-h-11">
                             <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || broadcast.get() on:change=move |ev| broadcast.set(event_target_checked(&ev)) />
@@ -350,7 +351,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
                     })}
                     <crate::compose::WorkInSession key=target.get_value() about=place_name.get_value() current=text set=Callback::new(move |t: String| text.set(t)) />
                     <span class="flex-1"></span>
-                    {(!in_thread).then(|| view! { <span>"Enter to send · Shift+Enter for a new line · ↑ to edit your last"</span> })}
+                    {(!in_thread).then(|| view! { <span class="min-w-0">"Enter to send · Shift+Enter for a new line · ↑ to edit your last"</span> })}
                     <button class="rounded bg-sky-700 px-2 py-0.5 text-white disabled:opacity-40" disabled=move || text.get().trim().is_empty() on:click=move |_| s2()>"Send"</button>
                 </div>
             </div>
