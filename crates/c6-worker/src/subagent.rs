@@ -133,8 +133,9 @@ const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// The connection, model and effort a subagent runs on. In order, each
 /// overriding the one before: its parent's model, the session's default
 /// for subagents, a named agent's model, and what the `Task` call asks for.
-/// Only `connections` (those the session's realm may use) or the parent's
-/// own may be used. One on Claude Code runs as a Claude Code session of its
+/// Only `connections` (those the session's realm may use), the head-authorized
+/// default target or the parent's own may be used. Credentials still require
+/// the head's current realm authorization. One on Claude Code runs as a Claude Code session of its
 /// own; any other in carbon6's own loop.
 pub fn resolve_model(
     parent: &ModelSpec,
@@ -1836,8 +1837,11 @@ mod tests {
         assert!(err.contains("no connection \"nope\"") && err.contains("work, blacktitan ChatGPT, router"), "{err}");
         assert!(resolve_model(&parent, &none, "", &choice("router", "", ""), &conns).unwrap_err().contains("no default model"));
         assert!(resolve_model(&parent, &none, "", &choice("", "", "huge"), &conns).unwrap_err().contains("effort"));
-        let gone = SubagentDefault { target: Some(spec("c9", "openai", "gpt-5", "")), model: String::new() };
-        assert!(resolve_model(&parent, &gone, "", &no, &conns).unwrap_err().contains("not available"));
+        // A head-authorized default can be newer than this catalog, but it
+        // does not authorize an arbitrary connection supplied by the call.
+        let unlisted = SubagentDefault { target: Some(spec("c9", "openai", "gpt-5", "")), model: String::new() };
+        assert_eq!(resolve_model(&parent, &unlisted, "", &no, &conns).unwrap(), spec("c9", "openai", "gpt-5", ""));
+        assert!(resolve_model(&parent, &unlisted, "", &choice("c10", "m", ""), &conns).unwrap_err().contains("no connection"));
         // A Claude Code parent: its subagents run on Claude Code too, unless
         // another connection is named.
         let cc = spec("cc", "claude_code", "opus", "");

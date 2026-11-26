@@ -154,6 +154,34 @@ async fn credentials_go_only_to_what_a_workers_session_uses() {
     head.shutdown().await.unwrap();
 }
 
+/// A default is head-authorized, not an escape from realm availability.
+/// Retained worker defaults also cannot obtain credentials after revocation.
+#[tokio::test]
+async fn subagent_defaults_do_not_bypass_realm_authorization() {
+    let (head, _dir) = head().await;
+    let (st, api) = (&head.state, Api::of(&head));
+    use reqwest::Method as M;
+    api.ok(M::POST, "realms", json!({"id": "mach5-agents"})).await;
+    let w = worker(st, "worker", &[]).await;
+    let own = connection(&api, "own", &[]).await;
+    let allowed = connection(&api, "allowed", &[]).await;
+    let forbidden = connection(&api, "forbidden", &["home"]).await;
+    let s = session(&api, w, &own, "mach5-agents").await;
+    let path = format!("sessions/{s}/subagent-model");
+    api.ok(M::PUT, &path, json!({"connection_id": allowed, "model": "m"})).await;
+    assert_eq!(ask(st, w, &s, &allowed).await.error, "");
+
+    let error = api.send(M::PUT, &path, json!({"connection_id": forbidden, "model": "m"})).await.unwrap_err();
+    assert!(error.contains("not available to realm mach5-agents"), "{error}");
+    assert_eq!(st.store.session(&s).await.unwrap().unwrap().subagent_connection_id, allowed);
+    assert!(ask(st, w, &s, &forbidden).await.error.contains("not available to realm mach5-agents"));
+
+    api.ok(M::PUT, &format!("connections/{allowed}/realms"), json!({"realms": ["home"]})).await;
+    assert_eq!(st.store.session(&s).await.unwrap().unwrap().subagent_connection_id, allowed);
+    assert!(ask(st, w, &s, &allowed).await.error.contains("not available to realm mach5-agents"));
+    head.shutdown().await.unwrap();
+}
+
 /// A worker older than the head (the head is updated first) says no session
 /// when it asks: serving every realm, it still gets what its live sessions
 /// use (a session's connection, a model switch's, their secrets as

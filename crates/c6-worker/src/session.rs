@@ -6939,18 +6939,17 @@ impl Actor {
                 }
             }
             let result = if claude_code {
-                if let Some(message) = claude_code_delegation_unavailable(&sub.spec, &bridge_tools) {
-                    if let Err(e) = sink
+                if let Some(message) = claude_code_delegation_unavailable(&sub.spec, &bridge_tools)
+                    && let Err(e) = sink
                         .append(session_event::Kind::Notice(c6_proto::Notice {
                             title: "Subagents unavailable".into(),
                             message,
                             ..Default::default()
                         }))
                         .await
-                    {
-                        error!(session = %writer.session_id, "recording unavailable subagents: {e:#}");
-                        return None;
-                    }
+                {
+                    error!(session = %writer.session_id, "recording unavailable subagents: {e:#}");
+                    return None;
                 }
                 let bridge = if bridge_tools.is_empty() { None } else { manager.bridge().await };
                 if !bridge_tools.is_empty() && bridge.is_none() {
@@ -12126,9 +12125,14 @@ for line in sys.stdin:
     /// it can be proven ours (a worker waits for `ready` before anything
     /// could stop it; under load a stop right after the spawn could not).
     async fn leave_rewind_held(manager: &SessionManager, spec: &CreateSession, bin: &Path, cwd: &Path, conversation: &str) {
+        // Match the production launch identity, including the explanation
+        // when both delegation paths are disabled. Otherwise the next turn
+        // correctly replaces this fixture instead of testing adoption.
+        let tools = claude_code_subagent_tools(spec, &[]);
         let launch = crate::claude_code::Launch {
             conversation: conversation.into(),
             settings: Some(claude_code_settings(spec, None)),
+            system_prompt: Some(claude_code_system_prompt(spec, &[], &tools)),
             worker: c6_core::build().to_owned(),
             native: claude_code_native(spec),
             ..Default::default()
@@ -12346,7 +12350,7 @@ for line in sys.stdin:
         );
         let trace = held_trace(dir.path());
         let inputs = trace.iter().filter(|v| v["kind"] == "input").collect::<Vec<_>>();
-        assert_eq!(inputs.len(), 1, "no implicit Resume, initialize, or duplicate input");
+        assert_eq!(inputs.len(), 1, "no implicit Resume, initialize, or duplicate input; events: {raw:#?}");
         assert_eq!(inputs[0]["conversation"].as_str(), Some(fork.as_str()));
         assert!(inputs[0]["value"]["message"]["content"].to_string().contains("model-only"), "PendingInput.prompt reaches the CLI");
         assert!(!inputs[0]["value"]["message"]["content"].to_string().contains("display-only"));
