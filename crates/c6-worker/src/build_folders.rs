@@ -21,7 +21,7 @@ pub(crate) fn incremental_scan_root(fs: &impl FileSystem, path: &Path) -> PathBu
     let profile_root = path.parent().and_then(Path::parent).unwrap_or(path);
     for ancestor in profile_root.ancestors().take(64).take_while(|p| p.parent().is_some()) {
         if ancestor.file_name().is_some_and(|name| name == "target")
-            || fs.entry(&ancestor.join(".rustc_info.json")).is_ok_and(|entry| !entry.directory && !entry.symlink)
+            || fs.entry(&ancestor.join(".rustc_info.json")).is_ok_and(|entry| entry.file && !entry.symlink)
         {
             return ancestor.to_owned();
         }
@@ -107,6 +107,7 @@ pub(crate) struct Inventory {
 pub(crate) struct Entry {
     pub path: PathBuf,
     pub directory: bool,
+    pub file: bool,
     pub symlink: bool,
     pub bytes: u64,
     pub modified_ms: Option<i64>,
@@ -129,6 +130,7 @@ impl FileSystem for LocalFs {
         Ok(Entry {
             path: path.to_owned(),
             directory: meta.is_dir(),
+            file: meta.is_file(),
             symlink: meta.file_type().is_symlink(),
             bytes: if meta.is_file() { meta.len() } else { 0 },
             modified_ms: meta
@@ -239,9 +241,16 @@ pub(crate) fn discover_with(
                 result.partial |= entry.directory;
                 Vec::new()
             };
-            let has_name = |name: &str| children.iter().any(|p| p.file_name().is_some_and(|n| n == name));
-            let custom = has_name(".rustc_info.json");
-            let profile = has_name(".fingerprint") && has_name("deps") && has_name("build");
+            // Marker names alone are not proof: a source directory may have
+            // similarly named files or symlinks. Never follow a marker link.
+            let has_marker = |name: &str, directory| {
+                children.iter().any(|p| {
+                    p.file_name().is_some_and(|n| n == name)
+                        && fs.entry(p).is_ok_and(|entry| !entry.symlink && if directory { entry.directory } else { entry.file })
+                })
+            };
+            let custom = has_marker(".rustc_info.json", false);
+            let profile = has_marker(".fingerprint", true) && has_marker("deps", true) && has_marker("build", true);
             let mut candidates = Vec::new();
             if entry.directory && (registered || target || incremental || custom) {
                 let recognized = custom || (incremental && folders.iter().any(|(parent, f)| path.starts_with(parent) && !f.partial));
@@ -542,7 +551,7 @@ mod tests {
         fn add(&mut self, path: &str, directory: bool, bytes: u64, modified_ms: i64) {
             self.0.insert(
                 path.into(),
-                Entry { path: path.into(), directory, symlink: false, bytes, modified_ms: Some(modified_ms), device: 1 },
+                Entry { path: path.into(), directory, file: !directory, symlink: false, bytes, modified_ms: Some(modified_ms), device: 1 },
             );
         }
     }
@@ -652,6 +661,31 @@ mod tests {
         let incremental = scan.folders.iter().find(|f| f.incremental).unwrap();
         assert_eq!(incremental.bytes, 40);
         assert!(incremental.active);
+    }
+
+    #[test]
+    fn marker_names_only_prove_output_when_the_entry_types_match_without_symlinks() {
+        let mut scope = reference("session");
+        scope.path = "/owned".into();
+        scope.scope = true;
+        for (directory, symlink) in [(true, false), (false, true), (false, false)] {
+            let mut fs = FakeFs::default();
+            fs.add("/owned", true, 0, 1);
+            fs.add("/owned/custom-output", true, 0, 1);
+            fs.add("/owned/custom-output/.rustc_info.json", directory, 2, 1);
+            fs.0.get_mut(Path::new("/owned/custom-output/.rustc_info.json")).unwrap().symlink = symlink;
+            let scan = discover_with(&fs, &[], std::slice::from_ref(&scope), &[], Limits::default(), || Duration::ZERO);
+            let planned = plan(&scan.folders, &CleanupRequest::Archived, i64::MAX, DEFAULT_ARCHIVED_GRACE);
+            assert_eq!(planned.len(), usize::from(!directory && !symlink));
+        }
+        let mut fs = FakeFs::default();
+        fs.add("/owned", true, 0, 1);
+        fs.add("/owned/debug", true, 0, 1);
+        for name in [".fingerprint", "deps", "build"] {
+            fs.add(&format!("/owned/debug/{name}"), false, 2, 1);
+        }
+        let scan = discover_with(&fs, &[], &[scope], &[], Limits::default(), || Duration::ZERO);
+        assert!(scan.folders.is_empty(), "ordinary files with profile-marker names must not prove a build root");
     }
 
     #[test]
