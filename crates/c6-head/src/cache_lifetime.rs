@@ -304,6 +304,7 @@ async fn enumerate_page(pool: &sqlx::SqlitePool) -> anyhow::Result<bool> {
     let current: Option<String> =
         sqlx::query_scalar("SELECT value FROM settings WHERE key = ?").bind(ENUM_CURSOR).fetch_optional(&mut *tx).await?;
     if current != saved {
+        tx.rollback().await?;
         return Ok(true);
     }
     for session in &sessions {
@@ -339,6 +340,9 @@ async fn backfill_page(pool: &sqlx::SqlitePool) -> anyhow::Result<bool> {
             .fetch_optional(&mut *tx)
             .await?;
     let Some(session) = session else {
+        // Drop queues an asynchronous rollback. Await it so a completed page
+        // has actually released its writer before foreground work resumes.
+        tx.rollback().await?;
         return Ok(false);
     };
     replay_page(&mut tx, &session, None).await?;
@@ -716,11 +720,24 @@ mod tests {
 
         let store = crate::store::Store::open(&path).await.unwrap();
         while backfill_page(&store.pool).await.unwrap() {}
+        // An idle page must release its writer before returning, not merely
+        // queue a rollback on a pool connection's SQLite worker thread.
+        {
+            use sqlx::Connection as _;
+            let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path).busy_timeout(std::time::Duration::ZERO);
+            let mut foreground = sqlx::SqliteConnection::connect_with(&options).await.unwrap();
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut foreground).await.unwrap();
+            sqlx::query("ROLLBACK").execute(&mut foreground).await.unwrap();
+            foreground.close().await.unwrap();
+        }
         let e = replay_evidence(&store.pool).await;
         assert_eq!(e.read_pairs, 90); // includes the mid-call checkpoint and arrival
         assert_eq!(e.longest_read, 3600);
         assert!(e.estimate("claude_code").learned);
-        let mut tx = store.pool.begin().await.unwrap();
+        // Production calls record after inserting an event and already owns
+        // the writer. A duplicate-only probe must obtain the same authority,
+        // rather than attempt a deferred read-to-write lock upgrade.
+        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
         record(&mut tx, "s", 273).await.unwrap(); // duplicate is inert
         append_calls(&mut tx, "s", 91, 92).await;
         record(&mut tx, "s", 276).await.unwrap(); // bounded live increment
