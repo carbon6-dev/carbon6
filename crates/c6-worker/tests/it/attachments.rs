@@ -288,16 +288,20 @@ async fn queued_attachment_edit_replaces_bytes_and_notes() {
     .unwrap();
     capture(&mock, first).await;
 
+    // This tests queue replacement, not the external PDF converter's launch
+    // time inside the RPC's two-second preparation budget. HTML still needs
+    // extraction and generated notes, but is parsed in-process. Separate PDF
+    // tests above exercise the platform converter and original-byte storage.
     let old_text = "Stale attachment contains a turquoise wombat";
-    let old_pdf = pdf(old_text);
+    let old_document = format!("<html><body><p>{old_text}</p></body></html>").into_bytes();
     let old_binary = [0xff, 0, 1];
-    let (pdf_name, bin_name) = ("queued.pdf", "queued.bin");
+    let (document_name, bin_name) = ("queued.html", "queued.bin");
     let url = format!("{api}/sessions/{}", s.id);
     let queued: QueuedInput = serde_json::from_str(
         &post(
             &http,
             &format!("{url}/messages"),
-            json!({"text": "Original queued prompt", "attachments": [upload(pdf_name, "application/pdf", &old_pdf),
+            json!({"text": "Original queued prompt", "attachments": [upload(document_name, "text/html", &old_document),
                                                                       upload(bin_name, "application/octet-stream", &old_binary)]}),
         )
         .await,
@@ -316,17 +320,17 @@ async fn queued_attachment_edit_replaces_bytes_and_notes() {
     let r = http.put(format!("{url}/queue/{}", queued.command_id)).json(&json!({"text": intermediate})).send().await.unwrap();
     assert!(r.status().is_success(), "queue edit failed: {}", r.text().await.unwrap());
     let dir = state.path().join("attachments").join(&s.id);
-    let old_pdf_path = stored_attachment(&dir, pdf_name, &old_pdf);
+    let old_document_path = stored_attachment(&dir, document_name, &old_document);
     let old_bin_path = stored_attachment(&dir, bin_name, &old_binary);
 
     let updated = "Use the replacement queued files";
     let new_text = "Replacement attachment contains a golden axolotl";
-    let new_pdf = pdf(new_text);
+    let new_document = format!("<html><body><p>{new_text}</p></body></html>").into_bytes();
     let new_binary = [0xfe, 0, 2, 3];
     let input = c6_proto::UserInput {
         text: updated.into(),
         attachments: vec![
-            c6_proto::Attachment { name: pdf_name.into(), mime: "application/pdf".into(), data: new_pdf.clone() },
+            c6_proto::Attachment { name: document_name.into(), mime: "text/html".into(), data: new_document.clone() },
             c6_proto::Attachment { name: bin_name.into(), mime: "application/octet-stream".into(), data: new_binary.to_vec() },
         ],
         ..Default::default()
@@ -347,14 +351,14 @@ async fn queued_attachment_edit_replaces_bytes_and_notes() {
     mock.push_about(updated, Reply::Text("Replacement seen.".into()));
     gate.notify_one();
     let content = capture(&mock, updated).await;
-    assert_stored_and_mentioned(&dir, pdf_name, &new_pdf, &content);
+    assert_stored_and_mentioned(&dir, document_name, &new_document, &content);
     assert_stored_and_mentioned(&dir, bin_name, &new_binary, &content);
-    assert!(content.contains(new_text), "missing replacement PDF text: {content}");
+    assert!(content.contains(new_text), "missing replacement document text: {content}");
     assert_eq!(content.matches("Worker-local path:").count(), 2, "expected one note per replacement file: {content}");
-    for stale in [old_text, intermediate, "Original queued prompt", old_pdf_path.to_str().unwrap(), old_bin_path.to_str().unwrap()] {
+    for stale in [old_text, intermediate, "Original queued prompt", old_document_path.to_str().unwrap(), old_bin_path.to_str().unwrap()] {
         assert!(!content.contains(stale), "stale queued data {stale:?}: {content}");
     }
-    assert_eq!(std::fs::read(old_pdf_path).unwrap(), old_pdf, "editing may not overwrite a path already handed out");
+    assert_eq!(std::fs::read(old_document_path).unwrap(), old_document, "editing may not overwrite a path already handed out");
     assert_eq!(std::fs::read(old_bin_path).unwrap(), old_binary, "editing may not overwrite a path already handed out");
 
     stop.cancel();

@@ -38,9 +38,11 @@ JSON
 async fn fresh_worktree_starts_beside_unpublished_held_session_and_shows_subagents() {
     let bins = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
+    let claude = fake_claude(bins.path());
+    c6_testkit::runnable(&claude, &["--version"]).await;
     // SAFETY: this binary has one test; nothing else reads the variable.
     unsafe {
-        std::env::set_var("C6_CLAUDE_BIN", fake_claude(bins.path()));
+        std::env::set_var("C6_CLAUDE_BIN", &claude);
         std::env::set_var("CLAUDE_CONFIG_DIR", config.path());
     }
     let head_dir = tempfile::tempdir().unwrap();
@@ -121,7 +123,8 @@ async fn fresh_worktree_starts_beside_unpublished_held_session_and_shows_subagen
     let delivered: Value = serde_json::from_slice(&std::fs::read(project.join("delivered.json")).unwrap()).unwrap();
     assert!(delivered.to_string().contains("what is here?"), "the first prompt must reach the CLI");
     let detail: SessionDetail = http.get(format!("{api}/sessions/{id}")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(detail.session.end_reason, Some(TurnEndReason::Completed));
+    let events: Vec<Event> = http.get(format!("{api}/sessions/{id}/events")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(detail.session.end_reason, Some(TurnEndReason::Completed), "fresh-session events: {events:?}");
     assert!(publishing.is_dir(), "a young launch reservation must not be removed");
     assert_eq!(std::fs::read_dir(config.path()).unwrap().count(), 0, "no pre-existing Claude transcript is needed");
     let children = eventually("the mirrored subagent", async || {
