@@ -4273,7 +4273,7 @@ fn SubagentLimitsSetting() -> impl IntoView {
                 </p>
             </div>
             <label class="flex items-center gap-2 text-sm">
-                <input type="checkbox" prop:checked=move || setting.with(|s| s.keep_warm.enabled)
+                <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || setting.with(|s| s.keep_warm.enabled)
                     on:change=move |ev| setting.update(|s| s.keep_warm.enabled = event_target_checked(&ev)) />
                 "Keep large contexts warm during background work"
             </label>
