@@ -188,20 +188,20 @@ pub(crate) async fn session_environment(state: PathBuf) -> Vec<(String, String)>
 #[derive(Debug, Default, Serialize)]
 struct Stats {
     cache_size_bytes: Option<u64>,
-    cache_hits: u64,
-    cache_misses: u64,
+    cache_hits: Option<u64>,
+    cache_misses: Option<u64>,
     hit_rate: Option<f64>,
     compile_time_saved_seconds: Option<f64>,
     compile_time_saved_estimated: bool,
 }
 
-fn count(value: &Value) -> u64 {
+fn count(value: &Value) -> Option<u64> {
     // sccache reports both per-language and per-compiler breakdowns of the
     // same requests. Counting both would double the displayed hit count.
     if let Some(counts) = value.get("counts") {
         return count(counts);
     }
-    value.as_u64().unwrap_or_else(|| value.as_object().map_or(0, |v| v.values().map(count).fold(0_u64, u64::saturating_add)))
+    value.as_u64().or_else(|| value.as_object()?.values().try_fold(0_u64, |sum, value| Some(sum.saturating_add(count(value)?))))
 }
 
 fn seconds(value: &Value) -> Option<f64> {
@@ -214,12 +214,12 @@ fn parse_stats(value: &Value) -> Stats {
     let stats = &value["stats"];
     let cache_hits = count(&stats["cache_hits"]);
     let cache_misses = count(&stats["cache_misses"]);
-    let requests = cache_hits.saturating_add(cache_misses);
+    let requests = cache_hits.zip(cache_misses).map(|(hits, misses)| hits.saturating_add(misses));
     let saved = seconds(&stats["compile_time_saved"]).or_else(|| seconds(&stats["compilation_time_saved"]));
     let estimated = || {
         let compilations = stats["compilations"].as_u64().filter(|n| *n > 0)?;
         Some(
-            (seconds(&stats["compiler_write_duration"])? / compilations as f64 * cache_hits as f64
+            (seconds(&stats["compiler_write_duration"])? / compilations as f64 * cache_hits? as f64
                 - seconds(&stats["cache_read_hit_duration"])?)
             .max(0.0),
         )
@@ -228,7 +228,7 @@ fn parse_stats(value: &Value) -> Stats {
         cache_size_bytes: value["cache_size"].as_u64(),
         cache_hits,
         cache_misses,
-        hit_rate: (requests > 0).then(|| cache_hits as f64 / requests as f64),
+        hit_rate: requests.filter(|n| *n > 0).and_then(|n| Some(cache_hits? as f64 / n as f64)),
         // Current sccache reports aggregate compile and read durations, not
         // the original duration of each hit. Label this estimate explicitly.
         compile_time_saved_seconds: saved.or_else(estimated),
@@ -351,8 +351,8 @@ mod tests {
     fn stats_support_language_counters_and_unknown_saved_time() {
         let stats = parse_stats(&json!({"cache_size":42,"stats":{"cache_hits":{"Rust":8,"C/C++":2},"cache_misses":{"Rust":5}}}));
         assert_eq!(stats.cache_size_bytes, Some(42));
-        assert_eq!(stats.cache_hits, 10);
-        assert_eq!(stats.cache_misses, 5);
+        assert_eq!(stats.cache_hits, Some(10));
+        assert_eq!(stats.cache_misses, Some(5));
         assert_eq!(stats.hit_rate, Some(2.0 / 3.0));
         assert_eq!(stats.compile_time_saved_seconds, None);
         let stats = parse_stats(&json!({"stats":{"compile_time_saved":{"secs":12,"nanos":500000000}}}));
@@ -364,10 +364,31 @@ mod tests {
             "compilations":2,"compiler_write_duration":{"secs":20,"nanos":0},
             "cache_read_hit_duration":{"secs":1,"nanos":0}
         }}));
-        assert_eq!(stats.cache_hits, 4);
-        assert_eq!(stats.cache_misses, 2);
+        assert_eq!(stats.cache_hits, Some(4));
+        assert_eq!(stats.cache_misses, Some(2));
         assert_eq!(stats.compile_time_saved_seconds, Some(39.0));
         assert!(stats.compile_time_saved_estimated);
+    }
+
+    #[test]
+    fn missing_or_unsupported_counters_stay_unknown_instead_of_zero() {
+        for value in [json!({}), json!({"stats":{"cache_hits":"unsupported","cache_misses":null}})] {
+            let stats = parse_stats(&value);
+            assert_eq!(stats.cache_hits, None);
+            assert_eq!(stats.cache_misses, None);
+            assert_eq!(stats.hit_rate, None);
+            assert_eq!(stats.compile_time_saved_seconds, None);
+            let wire = serde_json::to_value(stats).unwrap();
+            assert!(wire["cache_hits"].is_null() && wire["cache_misses"].is_null());
+        }
+        let stats = parse_stats(&json!({"stats":{"cache_hits":{"counts":{}},"cache_misses":0}}));
+        assert_eq!(stats.cache_hits, Some(0));
+        assert_eq!(stats.cache_misses, Some(0));
+        assert_eq!(stats.hit_rate, None);
+        let stats = parse_stats(&json!({"stats":{"cache_hits":5}}));
+        assert_eq!(stats.cache_hits, Some(5));
+        assert_eq!(stats.cache_misses, None);
+        assert_eq!(stats.hit_rate, None);
     }
 
     #[test]
