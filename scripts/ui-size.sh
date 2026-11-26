@@ -20,6 +20,11 @@ cd "$(dirname "$0")/.."
 # bytes after sharing the existing Settings field renderers. Retain these
 # controls rather than remove functionality to fit the previous allowance.
 accepted_raw=11528007
+# 2026-11-26: worker compile-cache settings/statistics and attributed build
+# folders add guarded, explicitly confirmed cleanup controls. After sharing JSON
+# decoding and repeated form/metric renderers, the measured Linux production
+# build is 11,547,277 raw / 2,879,521 Brotli bytes. Retain typed editable views
+# rather than trading input stability for view-erasure size savings.
 # 2026-11-21: aliases add creation/switch controls and per-account transcript
 # metadata. After sharing Settings renderers, the measured Linux release is
 # 2,790,904 bytes Brotli (82,824 above the previous accepted build); raw WASM
