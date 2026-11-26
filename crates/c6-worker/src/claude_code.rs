@@ -3067,6 +3067,18 @@ impl Process {
         (self.unconfirmed.is_empty() && self.pending.is_none() && !self.tasks_running()).then_some(self.idle_since + idle)
     }
 
+    /// Context maintenance must not lose native work or a notification waiting
+    /// to start a turn. carbon6-held work survives this CLI's restart.
+    pub(crate) fn trim_quiet(&self) -> bool {
+        self.idle_until(Duration::ZERO).is_some()
+            && self.lines.is_empty()
+            && self.held.as_ref().is_none_or(|h| {
+                std::fs::metadata(h.dir.join("out")).is_ok_and(|meta| meta.len() == h.offset.load(std::sync::atomic::Ordering::SeqCst))
+            })
+            && self.unwoken.is_empty()
+            && self.wake_due.is_none()
+    }
+
     /// The next line it wrote (`None`: it exited). For a session's actor
     /// while no turn runs; pass the line to [`Process::idle_line`].
     pub async fn next_line(&mut self) -> Option<Value> {
@@ -3971,6 +3983,13 @@ fn transcripts_root() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
         .map(|d| d.join("projects"))
+}
+
+/// The native conversation's file, shared by quiet context trimming and
+/// the resume/rewind readers. Never derive it from carbon6's session id:
+/// a handoff or rewind may have selected another native conversation.
+pub(crate) fn transcript_path(cwd: &Path, conversation: &str) -> Option<PathBuf> {
+    transcript_of(&transcripts_root()?, cwd, conversation)
 }
 
 /// A conversation's transcript: `<root>/<cwd, each character but a letter or
@@ -5296,6 +5315,152 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}
     fn spawn(bin: &Path, cwd: &Path, conversation: &str, resume: bool, observer: Option<Arc<Observer>>) -> Process {
         let launch = Launch { conversation: conversation.into(), ..Default::default() };
         Process::spawn(bin, launch, resume, cwd, "opus", Arc::default(), None, observer).unwrap()
+    }
+
+    #[tokio::test]
+    async fn trim_quiet_rejects_unread_task_start_and_assistant_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = live_claude(dir.path());
+        let mut p = spawn(&bin, dir.path(), "s", false, None);
+        assert!(p.trim_quiet(), "fixture writes nothing until given input");
+        for value in [
+            serde_json::json!({"type":"system", "subtype":"task_started", "task_id":"bg1", "task_type":"local_bash"}),
+            serde_json::json!({"type":"assistant", "message":{"role":"assistant", "content":[{"type":"text", "text":"Notification reply"}]}}),
+        ] {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            p.lines = rx;
+            tx.send((0, value.clone())).unwrap();
+            assert!(p.idle_until(Duration::ZERO).is_some(), "unread output is not yet reflected in mapped work");
+            assert!(!p.trim_quiet(), "maintenance must not discard queued native output: {value}");
+            assert_eq!(p.lines.try_recv().unwrap().1, value);
+            assert!(p.trim_quiet(), "the unread-output gate clears only once that output is taken");
+        }
+        p.close().await;
+    }
+
+    #[tokio::test]
+    async fn trim_quiet_rejects_unconsumed_held_output_even_before_a_complete_line_is_queued() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = live_claude(dir.path());
+        let mut p = spawn(&bin, dir.path(), "s", false, None);
+        let held_dir = dir.path().join("held-output");
+        std::fs::create_dir(&held_dir).unwrap();
+        let out = held_dir.join("out");
+        std::fs::write(&out, []).unwrap();
+        let offset = Arc::new(AtomicU64::new(0));
+        // Inject only the output bookkeeping; the fixture itself remains a
+        // non-held child and is closed normally after removing this metadata.
+        p.held = Some(Held { dir: held_dir, keeper: p.pgid.unwrap(), offset: offset.clone(), done: true, stop_on_drop: false });
+        assert!(p.trim_quiet());
+        let partial = br#"{"type":"assistant""#;
+        std::fs::write(&out, partial).unwrap();
+        assert!(p.lines.is_empty(), "the partial held line has not reached the receiver");
+        assert!(!p.trim_quiet(), "held bytes beyond the consumed offset are native work too");
+        let line = b"{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"bg1\"}\n";
+        std::fs::write(&out, line).unwrap();
+        assert!(!p.trim_quiet(), "a complete but untaken line also prevents maintenance");
+        p.consumed(line.len() as u64, &serde_json::json!({"type":"system", "subtype":"task_started"}));
+        assert_eq!(offset.load(Ordering::SeqCst), line.len() as u64);
+        assert!(p.trim_quiet(), "all file bytes have now been taken");
+        std::fs::remove_file(&out).unwrap();
+        assert!(!p.trim_quiet(), "an unreadable held output file fails closed");
+        p.held = None;
+        p.close().await;
+    }
+
+    #[tokio::test]
+    async fn trim_quiet_allows_carbon6_held_shell_and_delegation_that_survive_cli_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = live_claude(dir.path());
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let held = dir.path().join("held-shells");
+        tools.background.set_held_dir(held.clone());
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        tools.background.set_sink(Some(tx));
+        let (agent, agent_cancel) = tools.background.start_agent("carbon6-held delegation", false);
+        let listener = tokio::net::UnixListener::bind(dir.path().join("trim-gate.sock")).unwrap();
+        let job = script(
+            dir.path(),
+            "held-trim-job",
+            r#"#!/usr/bin/env python3
+import socket
+with socket.socket(socket.AF_UNIX) as gate:
+    gate.connect('trim-gate.sock')
+    gate.sendall(b'ready')
+    assert gate.recv(1) == b'x'
+print('held shell finished', flush=True)
+"#,
+        );
+        let shell =
+            tools.background.spawn(&shell_quote(&job.to_string_lossy()), dir.path(), false, &CancellationToken::new()).await.unwrap();
+        let (mut gate, _) = c6_testkit::within("held shell to connect to its gate", listener.accept()).await.unwrap();
+        let mut ready = [0; 5];
+        c6_testkit::within("held shell readiness handshake", gate.read_exact(&mut ready)).await.unwrap();
+        assert_eq!(&ready, b"ready");
+        assert!(held.join(&shell).join("meta.json").is_file(), "this is a real held shell, not just a task-registry entry");
+        let p = spawn(&bin, dir.path(), "s", false, Some(observer(dir.path(), tools.clone()).await));
+        assert!(tools.background.snapshot(&agent).unwrap().running);
+        assert!(tools.background.snapshot(&shell).unwrap().running);
+        assert!(!p.tasks_running(), "carbon6 owns these tasks, not the CLI");
+        assert!(p.trim_quiet(), "carbon6-held work must not defer native context maintenance");
+        p.close().await;
+        assert!(tools.background.snapshot(&agent).unwrap().running, "closing Claude must not end the delegation");
+        assert!(!agent_cancel.is_cancelled());
+        assert!(tools.background.snapshot(&shell).unwrap().running, "the held shell still waits at its independent gate");
+        gate.write_all(b"x").await.unwrap();
+        let finished = c6_testkit::within("held shell to finish after its gate opens", async {
+            loop {
+                let event = events.recv().await.expect("task sink is still connected");
+                if event.id == shell && event.state != c6_tools::TaskState::Started {
+                    break event;
+                }
+            }
+        })
+        .await;
+        assert_eq!(finished.state, c6_tools::TaskState::Finished);
+        let snapshot = tools.background.snapshot(&shell).unwrap();
+        assert!(!snapshot.running);
+        assert_eq!(snapshot.exit_code, Some(0));
+        assert!(snapshot.stdout.text.contains("held shell finished"));
+        tools.background.finish_agent(&agent, Ok("delegation finished after CLI close".into()));
+        assert!(!tools.background.snapshot(&agent).unwrap().running);
+    }
+
+    #[tokio::test]
+    async fn trim_quiet_native_task_lifecycle_requires_completion_and_notification_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = live_claude(dir.path());
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let mut p = spawn(&bin, dir.path(), "s", false, Some(observer(dir.path(), tools).await));
+        let sink: Arc<dyn EventSink> = Arc::new(VecSink::default());
+        assert!(p.trim_quiet());
+        let started = serde_json::json!({
+            "type":"system", "subtype":"task_started", "task_id":"native-build",
+            "description":"Native build", "task_type":"local_bash", "is_backgrounded":true
+        });
+        assert!(!p.idle_line(started, &sink).await.unwrap());
+        assert!(p.tasks_running());
+        assert!(!p.trim_quiet(), "native work would be lost if the CLI were replaced now");
+        let completed = serde_json::json!({
+            "type":"system", "subtype":"task_notification", "task_id":"native-build",
+            "status":"completed", "summary":"Native build finished"
+        });
+        assert!(!p.idle_line(completed, &sink).await.unwrap());
+        assert!(!p.tasks_running());
+        assert!(p.wake_due().is_some());
+        assert!(!p.trim_quiet(), "an undelivered native completion still owns work");
+        let (_, notice) = p.take_unwoken().expect("completion must be delivered before trimming");
+        assert_eq!(notice.status, "completed");
+        assert!(p.wake_due().is_none());
+        assert!(p.trim_quiet(), "completed and delivered native work no longer blocks maintenance");
+        p.close().await;
     }
 
     fn input(id: &str, text: &str) -> PendingInput {

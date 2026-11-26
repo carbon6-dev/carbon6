@@ -4284,6 +4284,18 @@ fn SubagentLimitsSetting() -> impl IntoView {
                     <input type="number" min="1" max="1440" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.claude_code_idle_minutes.to_string()) on:input=move |ev| setting.update(|s| s.claude_code_idle_minutes = number(&ev)) />
                 </label>
+                <label class="flex items-center gap-2 text-sm">
+                    <input type="checkbox" class=crate::components::CHECKBOX
+                        prop:checked=move || setting.with(|s| s.claude_code_trim_enabled)
+                        on:change=move |ev| setting.update(|s| s.claude_code_trim_enabled = event_target_checked(&ev)) />
+                    "Automatically trim Claude Code context"
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Claude Code trim threshold (tokens; 0 = min(200,000, half the context window))"</span>
+                    <input type="number" min="0" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.claude_code_trim_at.to_string())
+                        on:input=move |ev| setting.update(|s| s.claude_code_trim_at = event_target_value(&ev).trim().parse::<u64>().unwrap_or(0)) />
+                </label>
                 <label class="space-y-0.5">
                     <span class="text-xs text-muted">"Automatic journal recovery for new sessions (seconds; disk space waits are exempt)"</span>
                     <input type="number" min="1" max="3600" class=format!("{INPUT} py-1")

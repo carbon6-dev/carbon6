@@ -434,3 +434,7 @@ carbon6.v1.NoticeLimits 6 uint32 notice_loop_backoff_rounds
 carbon6.v1.NoticeLimits 7 uint32 notice_loop_backoff_max_seconds
 carbon6.v1.NoticeLimits 8 optional:uint32 max_subagent_depth
 carbon6.v1.NoticeLimits 9 optional:uint32 max_running_subagents
+carbon6.v1.CreateSession 51 optional:bool claude_code_trim_enabled
+carbon6.v1.CreateSession 52 uint64 claude_code_trim_at
+carbon6.v1.NoticeLimits 11 optional:bool claude_code_trim_enabled
+carbon6.v1.NoticeLimits 12 optional:uint64 claude_code_trim_at

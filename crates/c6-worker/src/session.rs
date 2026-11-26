@@ -3887,6 +3887,7 @@ impl Actor {
         let adoption_writer = self.writer.clone();
         let mut launch_queued = false;
         let mut launch_admission = None::<(String, crate::resource_pressure::Admission)>;
+        let mut maintenance_running = false;
         self.rewinds = recover_rewind_queue(self.runs_claude_code(), std::mem::take(&mut self.rewinds), reset);
         loop {
             while running.is_none()
@@ -4024,6 +4025,9 @@ impl Actor {
             // A merge window or a ready fan-in group, never an hourly wake count.
             let waiting_to_wake = !rewind_blocked && !adoption_blocked && running.is_none() && self.deferred.iter().any(|(_, wake)| *wake);
             let retry_at = (waiting_to_wake && self.link.is_connected()).then_some(self.notice_deadline).flatten();
+            // Maintenance blocks runtime replacement, not idle notice guards:
+            // there is no model turn for a callback to join while it runs.
+            let turn_running = running.is_some() && !maintenance_running;
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => return,
@@ -4040,7 +4044,7 @@ impl Actor {
                             input.from_title.replace('"', "'"),
                             input.text
                         );
-                        if let Err(e) = self.notice(input, running.is_some(), true).await {
+                        if let Err(e) = self.notice(input, turn_running, true).await {
                             error!(session = %self.writer.session_id, "queueing a session message: {e:#}");
                             return;
                         }
@@ -4161,7 +4165,7 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::SendNow(command_id)) => {
-                        if running.is_some() && self.runs_claude_code() {
+                        if turn_running && self.runs_claude_code() {
                             // The running turn asks its process to deliver it now.
                             self.inbox.lock().unwrap().send_now(command_id);
                         } else if let Some((_, cancel)) = running.as_ref() {
@@ -4171,7 +4175,7 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::Delegate(input, done, admission)) => {
-                        if running.is_none() && let Some(admission) = admission {
+                        if (running.is_none() || maintenance_running) && let Some(admission) = admission {
                             launch_admission = Some((input.command_id.clone(), admission));
                         }
                         if let Some(done) = done {
@@ -4186,7 +4190,7 @@ impl Actor {
                         inbox.push(*input, None);
                     }
                     Some(ActorMsg::RemoteReport(command_id, ended, recorded)) => {
-                        match self.remote_report(command_id, *ended, running.is_some()).await {
+                        match self.remote_report(command_id, *ended, turn_running).await {
                             Ok(()) => { let _ = recorded.send(Ok(())); }
                             Err(e) => {
                                 error!(session = %self.writer.session_id, "taking a remote subagent's report: {e:#}");
@@ -4227,7 +4231,7 @@ impl Actor {
                             task_notice,
                             ..Default::default()
                         };
-                        if let Err(e) = self.notice(input, running.is_some(), wake).await {
+                        if let Err(e) = self.notice(input, turn_running, wake).await {
                             error!(session = %self.writer.session_id, "queueing a subagent's report: {e:#}");
                             return;
                         }
@@ -4259,6 +4263,8 @@ impl Actor {
                                     "notice_loop_backoff_max_seconds": limits.notice_loop_backoff_max_seconds,
                                     "max_subagent_depth": limits.max_subagent_depth,
                                     "max_running_subagents": limits.max_running_subagents,
+                                    "claude_code_trim_enabled": self.spec.claude_code_trim_enabled.unwrap_or(true),
+                                    "claude_code_trim_at": self.spec.claude_code_trim_at,
                                 }).to_string(),
                                 priority: "low".into(),
                                 quiet: true,
@@ -4287,7 +4293,7 @@ impl Actor {
                         self.noticed.extend(noticed);
                         for (input, wake) in pending {
                             info!(session = %self.writer.session_id, notice = %input.command_id, "delivering a notice again after a reload");
-                            if let Err(e) = self.deliver_notice(input, running.is_some(), wake, false).await {
+                            if let Err(e) = self.deliver_notice(input, turn_running, wake, false).await {
                                 error!(session = %self.writer.session_id, "delivering a notice again: {e:#}");
                                 return;
                             }
@@ -4330,8 +4336,8 @@ impl Actor {
                         // Lost because you stopped the turn (Claude Code didn't
                         // stop, so its process was): the agent hears it with
                         // your next message, and isn't woken for it.
-                        let held = lost_native && self.after_stop(running.is_some());
-                        if let Err(e) = self.task_event(record, notice, &ev.output, running.is_some() && !held, !held).await {
+                        let held = lost_native && self.after_stop(turn_running);
+                        if let Err(e) = self.task_event(record, notice, &ev.output, turn_running && !held, !held).await {
                             error!(session = %self.writer.session_id, "recording a background task: {e:#}");
                             return;
                         }
@@ -4368,7 +4374,7 @@ impl Actor {
                             command: "task-notification".into(),
                             ..Default::default()
                         };
-                        if let Err(e) = self.notice(input, running.is_some(), true).await {
+                        if let Err(e) = self.notice(input, turn_running, true).await {
                             error!(session = %self.writer.session_id, "resuming an interrupted turn: {e:#}");
                             return;
                         }
@@ -4401,7 +4407,7 @@ impl Actor {
                             let note = cause.prompt(&self.spec);
                             task_notice(&record, &report, (!remote).then_some(note.as_str()))
                         });
-                        if let Err(e) = self.task_event(record, notice, "", running.is_some(), true).await {
+                        if let Err(e) = self.task_event(record, notice, "", turn_running, true).await {
                             error!(session = %self.writer.session_id, "recording a lost background task: {e:#}");
                             return;
                         }
@@ -4614,7 +4620,16 @@ impl Actor {
                                     *running = Some(self.start_turn());
                                     self.running_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                                 }
-                                Ok(false) => {}
+                                Ok(false) => {
+                                    if self.claude.as_ref().is_some_and(|p| p.trim_quiet()) {
+                                        // Draining the last trailing result or native-task
+                                        // update can make a deferred trim eligible. This
+                                        // owns the supervised slot, not a model turn.
+                                        *running = Some(self.start_claude_maintenance());
+                                        maintenance_running = true;
+                                        self.running_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                }
                                 Err(e) => {
                                     error!(session = %self.writer.session_id, "recording Claude Code's output: {e:#}");
                                     return;
@@ -4657,8 +4672,11 @@ impl Actor {
                 }
                 done = async { (&mut running.as_mut().unwrap().0).await }, if running.is_some() => {
                     *running = None;
+                    let maintenance = std::mem::take(&mut maintenance_running);
                     self.running_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                    self.writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: false, ..Default::default() }));
+                    if !maintenance {
+                        self.writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: false, ..Default::default() }));
+                    }
                     match done {
                         Ok(Some((conv, claude))) => {
                             self.conv = Some(conv);
@@ -4672,7 +4690,7 @@ impl Actor {
                             }
                             // A turn Claude Code started right after your stop,
                             // stopped before it showed anything: not a turn.
-                            if self.claude.as_mut().is_some_and(|p| p.take_unshown()) {
+                            if !maintenance && self.claude.as_mut().is_some_and(|p| p.take_unshown()) {
                                 self.turns -= 1;
                             }
                             if let Err(e) = self.settle_delegations().await {
@@ -4999,6 +5017,8 @@ impl Actor {
                         "notice_loop_backoff_max_seconds": self.spec.notice_loop_backoff_max_seconds,
                         "max_subagent_depth": self.spec.max_subagent_depth,
                         "max_running_subagents": self.spec.max_running_subagents,
+                        "claude_code_trim_enabled": self.spec.claude_code_trim_enabled.unwrap_or(true),
+                        "claude_code_trim_at": self.spec.claude_code_trim_at,
                     })
                     .to_string(),
                     priority: "low".into(),
@@ -6424,6 +6444,73 @@ impl Actor {
         Ok(())
     }
 
+    /// Quiet maintenance owns the same supervised slot as a turn, so cleanup
+    /// can wait without blocking the mailbox or allowing adoption/rewind over
+    /// its process group. It never takes input or changes the turn counter.
+    fn start_claude_maintenance(&mut self) -> (TurnTask, CancellationToken) {
+        let conv = self.conv.take().expect("no turn is running");
+        let process = self.claude.take().expect("an idle Claude Code process");
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        let writer = self.writer.clone();
+        let manager = self.manager.clone();
+        let session_tools = self.session_tools.clone();
+        let bridge_tools = self.claude_code_subagent_tools();
+        let bridge_core = claude_code_core(&self.spec);
+        let policies = self.policies.clone();
+        let observer = Arc::new(crate::claude_code::Observer {
+            tools: self.session_tools.clone(),
+            journal: self.journal.clone(),
+            link: self.link.clone(),
+            session_id: writer.session_id.clone(),
+            ownership_epoch: writer.ownership_epoch,
+            spec: self.spec.clone(),
+            started: self.started.clone(),
+        });
+        let stdin = self.claude_stdin.clone();
+        let model = self.spec.model.clone().unwrap_or_default().model;
+        let task = tokio::spawn(async move {
+            let bridge = if bridge_tools.is_empty() { None } else { manager.bridge().await };
+            let register = || {
+                bridge.as_ref().map(|b| {
+                    b.register(crate::mcp_bridge::Entry {
+                        session_id: writer.session_id.clone(),
+                        session: session_tools.clone(),
+                        tools: bridge_tools.clone(),
+                        cancel: Mutex::default(),
+                        journal: observer.journal.clone(),
+                        matched: Mutex::default(),
+                        policies: policies.clone(),
+                        instructions: CLAUDE_CODE_INTRO.into(),
+                        core: bridge_core.clone(),
+                    })
+                })
+            };
+            let sink: Arc<dyn EventSink> = writer.clone();
+            match maintain_claude_context(
+                &writer.session_id,
+                process,
+                &session_tools.cwd(),
+                &model,
+                &stdin,
+                &register,
+                observer.clone(),
+                &manager.claude_dir(),
+                &sink,
+                &c,
+            )
+            .await
+            {
+                Ok(process) => Some((conv, process)),
+                Err(e) => {
+                    error!(session = %writer.session_id, "Claude Code maintenance failed: {e:#}");
+                    None
+                }
+            }
+        });
+        (task, cancel)
+    }
+
     fn start_turn(&mut self) -> (TurnTask, CancellationToken) {
         self.disk_admitted = true;
         self.writer.set_activity(c6_proto::SessionActivityKind::Unspecified);
@@ -6573,10 +6660,11 @@ impl Actor {
                 };
                 // Which of Claude Code's conversations this turn continues
                 // (and what a new one is told first), as the log has it.
-                let conversation = match async {
+                let (conversation, trim) = match async {
                     let events = log.events_after(&writer.session_id, 0, u32::MAX).await?;
-                    journal_claude_conversation(&log, &writer.session_id, spec_for_claude.as_ref().expect("a Claude Code turn"), &events)
-                        .await
+                    let spec = spec_for_claude.as_ref().expect("a Claude Code turn");
+                    let conversation = journal_claude_conversation(&log, &writer.session_id, spec, &events).await?;
+                    Ok::<_, anyhow::Error>((conversation, ClaudeTrim::from_events(spec, &events)))
                 }
                 .await
                 {
@@ -6602,6 +6690,7 @@ impl Actor {
                     turn,
                     process,
                     &conversation,
+                    trim,
                     launch,
                     &session_tools.cwd(),
                     &cfg.model,
@@ -6647,6 +6736,166 @@ impl Actor {
     }
 }
 
+/// The latest reported call usage and resolved model window. Older CLIs that
+/// omit per-call usage provide a conservative turn-total fallback instead.
+/// Maintenance never changes the event log used by the UI.
+struct ClaudeTrim {
+    tokens: u64,
+    stub: String,
+}
+
+impl ClaudeTrim {
+    fn from_events(spec: &CreateSession, events: &[SessionEvent]) -> Option<Self> {
+        if spec.claude_code_trim_enabled == Some(false) {
+            return None;
+        }
+        let effective = c6_agent::effective_events(events);
+        let usage = effective
+            .iter()
+            .rev()
+            .take_while(|e| {
+                !matches!(&e.kind, Some(session_event::Kind::Compaction(_)))
+                    && !matches!(&e.kind, Some(session_event::Kind::ModelSwitched(m)) if m.handoff.is_some())
+            })
+            .find_map(|e| match &e.kind {
+                Some(session_event::Kind::Usage(u)) => Some(u),
+                _ => None,
+            })?;
+        let tokens = usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens + usage.output_tokens;
+        let threshold = match spec.claude_code_trim_at {
+            0 if usage.context_window > 0 => SUBAGENT_TRIM_AT.min(usage.context_window / 2),
+            0 => SUBAGENT_TRIM_AT,
+            n => n,
+        };
+        (tokens >= threshold).then(|| Self { tokens, stub: spec_prompt(spec, "session.trimmed_output", c6_agent::TRIMMED_OUTPUT) })
+    }
+
+    /// Preparation is read-only. Check quiet again afterwards: the reader may
+    /// have queued native output while we examined a large transcript.
+    fn candidate(&self, process: &crate::claude_code::Process, cwd: &Path) -> Option<PathBuf> {
+        if !process.trim_quiet() {
+            return None;
+        }
+        let path = crate::claude_code::transcript_path(cwd, &process.launch().conversation)?;
+        match crate::claude_trim::prepare(&path, &self.stub) {
+            Ok(Some(_)) if process.trim_quiet() => Some(path),
+            Ok(_) => None,
+            Err(e) => {
+                warn!("deferring Claude Code context trim: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Only after confirmed whole-group absence. Shutdown may flush native
+    /// metadata, so re-read rather than publishing the pre-shutdown snapshot.
+    async fn apply(&self, path: &Path, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
+        match crate::claude_trim::prepare(path, &self.stub).and_then(|candidate| {
+            let Some(candidate) = candidate else { return Ok(None) };
+            let after = self.tokens.saturating_mul(candidate.after as u64) / candidate.before.max(1) as u64;
+            let count = candidate.count;
+            candidate.apply()?;
+            Ok(Some((count, after)))
+        }) {
+            Ok(Some((count, after))) => {
+                sink.append(session_event::Kind::Notice(c6_proto::Notice {
+                    title: format!("Trimmed {count} old tool outputs from Claude Code's context"),
+                    message: format!(
+                        "{}k → {}k tokens (estimated; full outputs remain in carbon6's log).",
+                        self.tokens / 1000,
+                        after / 1000
+                    ),
+                    priority: "low".into(),
+                    quiet: true,
+                }))
+                .await?;
+            }
+            Ok(None) => {}
+            Err(e) => warn!("deferring Claude Code context trim after shutdown: {e:#}"),
+        }
+        Ok(())
+    }
+}
+
+/// Context maintenance at a quiet boundary, including one reached while the
+/// actor drains idle output. This does not run a model turn or take any input.
+#[allow(clippy::too_many_arguments)]
+async fn maintain_claude_context(
+    session: &str,
+    process: crate::claude_code::Process,
+    cwd: &Path,
+    model: &str,
+    stdin: &crate::claude_code::Stdin,
+    register: &(dyn Fn() -> Option<crate::mcp_bridge::Registration> + Send + Sync),
+    observer: Arc<crate::claude_code::Observer>,
+    claude_dir: &Path,
+    sink: &Arc<dyn EventSink>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<crate::claude_code::Process>> {
+    let journal = observer.journal.clone();
+    // Settings can change while a turn or native background task runs. Resolve
+    // the policy from the durable current spec, not the preceding turn's copy.
+    let trim = journal.load_session(session).await?.and_then(|(spec, events)| ClaudeTrim::from_events(&spec, &events));
+    let Some(trim) = trim else { return Ok(Some(process)) };
+    let Some(path) = trim.candidate(&process, cwd) else { return Ok(Some(process)) };
+    if cancel.is_cancelled() {
+        return Ok(Some(process));
+    }
+    let launch = process.launch().clone();
+    if let Err(error) = process.close_for_replacement().await {
+        if !error.is::<crate::claude_code::ReplacementBlocked>() {
+            return Err(error);
+        }
+        sink.append(session_event::Kind::Error(ErrorEvent {
+            message: format!("{error}; queued inputs remain available to take back while cleanup waits."),
+        }))
+        .await?;
+        // The actor can cancel this slot to admit Rewind/Stop. Leave the
+        // durable retirement/group records intact: cancellation is never
+        // permission to edit under a live group or start another process.
+        tokio::select! {
+            result = crate::claude_code::wait_for_replacement(&journal, session) => result?,
+            _ = cancel.cancelled() => return Ok(None),
+        }
+    }
+    // A Rewind/Stop admitted during retirement must win before publication or
+    // respawn. Keep the same ownership fence through the replacement launch.
+    let Some(_admission) = crate::claude_code::replacement_admission(&journal, session, cancel).await? else {
+        return Ok(None);
+    };
+    // Retirement can wait while realm settings change. Honor a disable, a
+    // raised threshold, or a new stub before touching the stopped transcript.
+    let trim = journal.load_session(session).await?.and_then(|(spec, events)| ClaudeTrim::from_events(&spec, &events));
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
+    if let Some(trim) = trim {
+        trim.apply(&path, sink).await?;
+    }
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
+    let Some(bin) = crate::claude_code::find_claude() else { return Ok(None) };
+    match crate::claude_code::Process::spawn_held(
+        &claude_dir.join("held"),
+        session,
+        &bin,
+        launch,
+        true,
+        cwd,
+        model,
+        stdin.clone(),
+        register(),
+        Some(observer),
+    ) {
+        Ok(process) => Ok(Some(process)),
+        Err(e) => {
+            warn!(session, "Claude Code context maintenance deferred resume: {e:#}");
+            Ok(None)
+        }
+    }
+}
+
 /// Runs a Claude Code turn on the session's process (docs/background.md
 /// §4), starting one if there is none, or if it was started with other
 /// settings and has no background tasks to lose. Gives the process back
@@ -6658,6 +6907,7 @@ async fn claude_turn(
     turn: u64,
     mut process: Option<crate::claude_code::Process>,
     conversation: &crate::claude_code::ClaudeConversation,
+    trim: Option<ClaudeTrim>,
     launch: crate::claude_code::Launch,
     cwd: &Path,
     model: &str,
@@ -6694,7 +6944,14 @@ async fn claude_turn(
     let mut restarted = false;
     let mut promoted = false;
     let mut admission = None;
-    if let Some(p) = process.take_if(|p| (p.launch() != &launch || !p.is_held()) && p.idle_until(std::time::Duration::ZERO).is_some()) {
+    // Read only while the runtime is held; writing is forbidden until its
+    // entire process group is confirmed absent. Missing/unknown transcripts
+    // simply defer maintenance, never the user's next turn.
+    let trim_path = process.as_ref().zip(trim.as_ref()).and_then(|(p, trim)| trim.candidate(p, cwd));
+    let worth_trimming = trim_path.is_some();
+    if let Some(p) =
+        process.take_if(|p| (p.launch() != &launch || !p.is_held() || worth_trimming) && p.idle_until(std::time::Duration::ZERO).is_some())
+    {
         // A reset initializes non-held until its branch is confirmed. Promote
         // that quiet process to restart-surviving transport on its next turn;
         // this alone is not a settings/worker change to announce.
@@ -6706,6 +6963,9 @@ async fn claude_turn(
             if admission.is_none() {
                 return Ok(None);
             }
+        }
+        if worth_trimming && let Some((path, trim)) = trim_path.as_ref().zip(trim.as_ref()) {
+            trim.apply(path, sink).await?;
         }
     }
     let inputs = inbox.lock().unwrap().drain();
@@ -6798,7 +7058,7 @@ async fn claude_turn(
             model,
             stdin.clone(),
             register(),
-            Some(observer),
+            Some(observer.clone()),
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -6818,7 +7078,10 @@ async fn claude_turn(
         }
     }
     if end.alive {
-        return Ok(Some(p));
+        // A wait on carbon6-held shells or subagents starts now, not with
+        // the next input. They survive this CLI's restart; its native tasks
+        // do not, and candidate() refuses those. No model call is made here.
+        return maintain_claude_context(session, p, cwd, model, stdin, register, observer, claude_dir, sink, cancel).await;
     }
     inbox.lock().unwrap().requeue(p.take_unsent());
     Ok(None)
@@ -7883,6 +8146,52 @@ fn trim_at(spec: &CreateSession, window: u64) -> u64 {
 }
 
 const SUBAGENT_TRIM_AT: u64 = 200_000;
+
+#[cfg(test)]
+mod claude_trim_tests {
+    use super::*;
+
+    fn call(tokens: u64, window: u64) -> SessionEvent {
+        SessionEvent {
+            kind: Some(session_event::Kind::Usage(c6_proto::Usage {
+                input_tokens: 1,
+                cache_read_tokens: tokens - 1,
+                context_window: window,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn native_trim_defaults_cover_top_level_and_subagents_and_use_the_actual_window() {
+        let mut spec = CreateSession::default();
+        assert!(ClaudeTrim::from_events(&spec, &[]).is_none());
+        assert!(ClaudeTrim::from_events(&spec, &[call(199_999, 1_000_000)]).is_none());
+        assert_eq!(ClaudeTrim::from_events(&spec, &[call(200_000, 1_000_000)]).unwrap().tokens, 200_000);
+        assert!(ClaudeTrim::from_events(&spec, &[call(99_999, 200_000)]).is_none());
+        assert!(ClaudeTrim::from_events(&spec, &[call(100_000, 200_000)]).is_some());
+        assert!(ClaudeTrim::from_events(&spec, &[call(200_000, 0)]).is_some());
+        spec.delegation = Some(Default::default());
+        assert!(ClaudeTrim::from_events(&spec, &[call(200_000, 1_000_000)]).is_some());
+        spec.claude_code_trim_enabled = Some(false);
+        assert!(ClaudeTrim::from_events(&spec, &[call(900_000, 1_000_000)]).is_none());
+    }
+
+    #[test]
+    fn native_trim_uses_latest_call_and_the_editable_prompt_and_explicit_threshold() {
+        let spec = CreateSession {
+            claude_code_trim_at: 300_000,
+            prompts_json: r#"{"session.trimmed_output":"Custom {{call}} stub"}"#.into(),
+            ..Default::default()
+        };
+        assert!(ClaudeTrim::from_events(&spec, &[call(900_000, 1_000_000), call(250_000, 1_000_000)]).is_none());
+        let trim = ClaudeTrim::from_events(&spec, &[call(350_000, 1_000_000)]).unwrap();
+        assert_eq!(trim.stub, "Custom {{call}} stub");
+        let compact = SessionEvent { kind: Some(session_event::Kind::Compaction(Default::default())), ..Default::default() };
+        assert!(ClaudeTrim::from_events(&spec, &[call(900_000, 1_000_000), compact]).is_none());
+    }
+}
 
 #[cfg(test)]
 mod route_tool_tests {
@@ -10543,6 +10852,7 @@ mod notice_tests {
             notice_loop_backoff_max_seconds: 200,
             max_subagent_depth: Some(4),
             max_running_subagents: Some(0),
+            ..Default::default()
         };
         tx.send(ActorMsg::NoticeLimits(limits)).unwrap();
         barrier(&manager, "limits-refreshed").await;

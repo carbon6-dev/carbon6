@@ -1,5 +1,32 @@
 # Tests that fail only when something is wrong
 
+## Claude Code context maintenance
+
+`claude_trim::tests` exercise native JSONL policy and atomic publication with
+temporary transcripts: compaction boundaries, instruction starts, latest and
+short results, media, sidecars, pairing, idempotence, malformed/truncated input,
+concurrent changes and unchanged line bytes. `session::claude_trim_tests` check
+last-call accounting, the actual context window, per-session inherited realm
+settings and the editable prompt. Journal snapshot regressions ensure older
+settings notices cannot silently re-enable an explicit opt-out.
+
+The standalone `claude_code_trim` integration binary owns a temporary
+`CLAUDE_CONFIG_DIR` and stand-in CLI. Native transcript snapshots taken by the
+resumed process prove that trimming happened before input, while carbon6's
+event log still contains full outputs. It uses stream/turn boundaries rather
+than sleeps. Native background work blocks restart, completing it permits the
+next quiet trim, and carbon6-held shells/delegations continue across a trim at
+the start of their wait. Actor-level regressions also drain a trailing result
+after the authoritative idle edge and finish native work without waking the
+main agent: both must retry maintenance without another input or model turn.
+No test edits the user's `~/.claude`.
+
+```sh
+cargo test --locked -p c6-worker --lib claude_trim
+cargo test --locked -p c6-worker --lib native_trim_settings
+cargo test --locked -p c6-worker --test claude_code_trim
+```
+
 ## Disk-space recovery and early warnings
 
 The disk monitor takes an injected filesystem sampler: its regressions never

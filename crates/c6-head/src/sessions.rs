@@ -735,6 +735,8 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         notice_loop_backoff_rounds: limits.notice_loop_backoff_rounds,
         notice_loop_backoff_max_seconds: limits.notice_loop_backoff_max_seconds,
         claude_code_idle_minutes: limits.claude_code_idle_minutes,
+        claude_code_trim_enabled: Some(limits.claude_code_trim_enabled),
+        claude_code_trim_at: limits.claude_code_trim_at,
         session_recovery_seconds: limits.session_recovery_seconds,
         disk_recovery_initial_seconds: limits.disk_recovery_initial_seconds,
         disk_recovery_max_seconds: limits.disk_recovery_max_seconds,
@@ -1986,6 +1988,8 @@ pub async fn refresh_notice_limits(st: &HeadState, worker: Option<WorkerId>) -> 
                 notice_loop_backoff_max_seconds: limits.notice_loop_backoff_max_seconds,
                 max_subagent_depth: Some(limits.max_depth),
                 max_running_subagents: Some(limits.max_running),
+                claude_code_trim_enabled: Some(limits.claude_code_trim_enabled),
+                claude_code_trim_at: Some(limits.claude_code_trim_at),
             })),
         };
         // Offline sessions receive the latest settings when restored. Do not
@@ -2790,6 +2794,8 @@ pub async fn release_notices(st: &HeadState, session_id: &str) -> anyhow::Result
                 notice_loop_backoff_max_seconds: limits.notice_loop_backoff_max_seconds,
                 max_subagent_depth: Some(limits.max_depth),
                 max_running_subagents: Some(limits.max_running),
+                claude_code_trim_enabled: Some(limits.claude_code_trim_enabled),
+                claude_code_trim_at: Some(limits.claude_code_trim_at),
             }),
         })),
     };

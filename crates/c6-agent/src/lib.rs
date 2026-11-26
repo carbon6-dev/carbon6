@@ -11,9 +11,9 @@ use c6_proto::{ephemeral_event, session_event};
 
 pub use base_prompt::{BASE_PROMPT, base_prompt_for_tools};
 pub use history::{
-    HANDOFF_BUDGET, NATIVE_PDF_REJECTED_NOTE, TRIMMED_OUTPUT, compacted_context, context_tokens_from_events, effective_events,
-    handoff_context, history_from_events, model_text, portable_events, portable_messages, rewind_context, transcript_text, user_blocks,
-    user_text,
+    HANDOFF_BUDGET, NATIVE_PDF_REJECTED_NOTE, TRIM_KEEP_AFTER_INSTRUCTION, TRIM_KEEP_LATEST, TRIM_MIN_CHARS, TRIMMED_OUTPUT,
+    compacted_context, context_tokens_from_events, effective_events, handoff_context, history_from_events, model_text, portable_events,
+    portable_messages, rewind_context, transcript_text, user_blocks, user_text,
 };
 pub use prompt::build_system_prompt;
 pub use turn::{

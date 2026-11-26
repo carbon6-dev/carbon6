@@ -2248,6 +2248,12 @@ pub struct SubagentLimits {
     /// up, in minutes.
     #[serde(default = "default_claude_code_idle_minutes")]
     pub claude_code_idle_minutes: u32,
+    /// Trim Claude Code context automatically before its context window fills.
+    #[serde(default = "default_claude_code_trim_enabled")]
+    pub claude_code_trim_enabled: bool,
+    /// Context token threshold for trimming. Zero uses min(200,000, half the context window).
+    #[serde(default)]
+    pub claude_code_trim_at: u64,
     /// Stop retrying automatically after this many seconds of journal recovery.
     /// Resource failures such as a full disk are exempt and keep retrying.
     #[serde(default = "default_session_recovery_seconds")]
@@ -2378,6 +2384,10 @@ fn default_claude_code_idle_minutes() -> u32 {
     DEFAULT_CLAUDE_CODE_IDLE_MINUTES
 }
 
+fn default_claude_code_trim_enabled() -> bool {
+    true
+}
+
 fn default_session_recovery_seconds() -> u32 {
     DEFAULT_SESSION_RECOVERY_SECONDS
 }
@@ -2435,6 +2445,8 @@ impl Default for SubagentLimits {
             notice_loop_backoff_max_seconds: DEFAULT_NOTICE_LOOP_BACKOFF_MAX_SECONDS,
             notice_tokens_per_hour: DEFAULT_NOTICE_TOKENS_PER_HOUR,
             claude_code_idle_minutes: DEFAULT_CLAUDE_CODE_IDLE_MINUTES,
+            claude_code_trim_enabled: true,
+            claude_code_trim_at: 0,
             session_recovery_seconds: DEFAULT_SESSION_RECOVERY_SECONDS,
             disk_recovery_initial_seconds: default_disk_recovery_initial_seconds(),
             disk_recovery_max_seconds: default_disk_recovery_max_seconds(),
@@ -2453,6 +2465,23 @@ impl Default for SubagentLimits {
 #[cfg(test)]
 mod notice_settings_tests {
     use super::*;
+
+    #[test]
+    fn claude_code_trim_defaults_for_legacy_settings_and_round_trips() {
+        let mut settings: SubagentLimits = serde_json::from_str("{}").unwrap();
+        assert!(settings.claude_code_trim_enabled);
+        assert_eq!(settings.claude_code_trim_at, 0);
+        assert_eq!(settings, SubagentLimits::default());
+        for (enabled, at) in [(false, 10_000_000_000u64), (true, 0)] {
+            settings.claude_code_trim_enabled = enabled;
+            settings.claude_code_trim_at = at;
+            let json = serde_json::to_value(&settings).unwrap();
+            assert_eq!(json["claude_code_trim_enabled"], enabled);
+            assert_eq!(json["claude_code_trim_at"], at);
+            assert_eq!(serde_json::from_value::<SubagentLimits>(json).unwrap(), settings);
+            assert_eq!(SubagentLimits::from_stored_json(&settings.to_stored_json().unwrap()).unwrap(), settings);
+        }
+    }
 
     #[test]
     fn disk_settings_default_for_legacy_settings_and_round_trip_large_bytes() {

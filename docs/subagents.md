@@ -346,14 +346,55 @@ The head sends each session the connections its realm may use (`CreateSession.su
 
 Until 2026-11-09 Claude Code was left out. A Claude Code session's agent then named the API connection for its subagents to run at all, which billed every one per call instead of on the Claude Code plan. Claude Code sessions are now told their subagents run on Claude Code unless the user asks for another model (`CLAUDE_CODE_NOTE`).
 
-### Long subagents shed old tool output
+### Long conversations shed old tool output
 
 In carbon6's own loop, a subagent whose request would read more than 200k tokens (or half its model's window, if that is smaller) has its old tool output trimmed first (`history::trim_old_tool_output`, `TurnConfig.trim_at`).
 - **What stays:** the latest 8 outputs, the first 5 after every message to the agent (what it read to learn each instruction), and outputs under 400 characters.
 - **What goes:** each other output becomes the editable prompt `session.trimmed_output` ("[Earlier output of ‹call› removed to save context. Run the tool again if you need it.]").
 - **Cache-friendly:** a trim happens only when it saves at least a fifth, and trimmed outputs stay trimmed, so the cached prefix changes about as often as with compaction, which still comes after if needed.
 - **Evidence:** in step replays of 30 points from long Falcon subagents, this policy read 52% less context with no loss beyond the judge's own noise (docs/replay-eval.md).
-- **Scope:** your own sessions aren't trimmed. Neither are Claude Code sessions: Claude Code keeps its context itself.
+- **Scope in carbon6's own loop:** only subagents are trimmed; your top-level sessions aren't.
+
+**Claude Code sessions, including top-level sessions and carbon6-managed
+subagents, use the same policy between turns.** Claude Code owns its in-memory
+context, so carbon6 cannot change it during a call. As a turn ends at a quiet
+boundary (and before sending input on a later turn), carbon6 checks the last call's
+reported context against `min(200000, window / 2)`. It does not restart a
+process with an unacknowledged input, a pending native turn or notification,
+or Claude Code's own running background tasks/agents. Large conversations wait
+until those finish; no active turn is cut short to save tokens. Work carbon6
+holds (its background subagents and held shells) survives the CLI's restart,
+so it does not block trimming: a wait on that work starts with the smaller
+transcript. Trimming itself makes no model call and does not keep caches warm.
+Consuming the last idle-only message or native task completion retries the
+quiet check, so deferred maintenance does not require another user message.
+
+The worker first checks that trimming would save at least 20% of the live
+message content, then uses the existing quiet-restart path to stop the whole
+Claude Code process group. Only then does it re-read and atomically replace
+the native JSONL transcript **in place**, retaining its conversation ID, UUIDs,
+parent links, tool calls and result pairing. Only text-only old tool results
+after the latest native `compact_boundary` change; media, assistant text,
+user instructions and compacted history stay. Unknown or malformed transcript
+shapes defer maintenance rather than risk the conversation. Resume and moves
+preserve the native ID and file layout; Rewind forks the already-trimmed
+history through its selected cutoff into a new native conversation.
+
+Claude Code resumes that transcript with `--resume`. Previously trimmed stubs
+stay byte-for-byte unchanged, including when the editable prompt changes.
+carbon6's event log and the full outputs shown in the UI are not rewritten.
+A quiet line reports the number of outputs trimmed and the estimated smaller
+context (the byte reduction scaled to the last reported token count, not an
+exact tokenizer measurement). The first call after trimming writes a new,
+smaller cache prefix; at these sizes the savings pay for that write within a
+couple of calls.
+
+**Settings → Agents → Limits**, per realm (or
+`GET/PUT /api/v1/settings/subagent-limits`):
+- `claude_code_trim_enabled`: `true` by default; `false` disables native trimming.
+- `claude_code_trim_at`: token threshold; `0` (default) uses the window-aware
+  threshold above. This also applies to existing sessions and is inherited by
+  new subagents. It does not change carbon6's own-loop trimming threshold.
 
 ### Tools and prompt
 

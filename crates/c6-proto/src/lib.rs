@@ -116,6 +116,8 @@ mod tests {
                 notice_loop_backoff_max_seconds: 900,
                 max_subagent_depth: Some(5),
                 max_running_subagents: Some(0),
+                claude_code_trim_enabled: Some(false),
+                claude_code_trim_at: Some(10_000_000_000),
             }),
         };
         assert_eq!(ReleaseNotices::decode(release.encode_to_vec().as_slice()).unwrap(), release);

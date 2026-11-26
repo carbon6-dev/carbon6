@@ -5,6 +5,7 @@ mod attachments;
 pub mod checkpoint;
 mod checkpoint_process;
 pub mod claude_code;
+mod claude_trim;
 pub mod codex_limits;
 pub mod commands;
 pub mod conn;

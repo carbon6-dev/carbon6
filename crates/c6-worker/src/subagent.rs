@@ -45,6 +45,8 @@ impl LaunchLimits {
                 notice_loop_backoff_max_seconds: spec.notice_loop_backoff_max_seconds,
                 max_subagent_depth: Some(spec.max_subagent_depth),
                 max_running_subagents: Some(spec.max_running_subagents),
+                claude_code_trim_enabled: spec.claude_code_trim_enabled,
+                claude_code_trim_at: Some(spec.claude_code_trim_at),
             },
         }
     }
@@ -70,6 +72,12 @@ impl LaunchLimits {
         }
         if let Some(running) = limits.max_running_subagents {
             spec.max_running_subagents = running;
+        }
+        if let Some(enabled) = limits.claude_code_trim_enabled {
+            spec.claude_code_trim_enabled = Some(enabled);
+        }
+        if let Some(at) = limits.claude_code_trim_at {
+            spec.claude_code_trim_at = at;
         }
     }
 }
@@ -1618,6 +1626,8 @@ mod tests {
             notice_loop_backoff_max_seconds: 120,
             max_subagent_depth: Some(2),
             max_running_subagents: Some(0),
+            claude_code_trim_enabled: Some(false),
+            claude_code_trim_at: Some(123_456),
         };
         LaunchLimits::apply_notice_limits(&mut edited, &update);
         *limits.lock().unwrap() = LaunchLimits::of(&edited);
@@ -1626,10 +1636,26 @@ mod tests {
         let mut inherited = runner.parent.spec.clone();
         limits.lock().unwrap().inherit(&mut inherited);
         assert_eq!(LaunchLimits::of(&inherited).notices, update);
+        assert_eq!(inherited.claude_code_trim_enabled, Some(false));
+        assert_eq!(inherited.claude_code_trim_at, 123_456);
         *limits.lock().unwrap() = LaunchLimits::of(&spec);
         assert!(runner.check_depth().is_err());
         spec.delegation.as_mut().unwrap().agent_json = r#"{"name":"finder","tools":["Read","Task"]}"#.into();
         assert_eq!(saved_tools(&spec, &started), ["Read"], "old journals do not gain tools whose launch authorization is unknown");
+    }
+
+    #[test]
+    fn older_notice_limits_preserve_trim_settings_and_explicit_zero_resets_threshold() {
+        let mut spec = CreateSession { claude_code_trim_enabled: Some(false), claude_code_trim_at: 123_456, ..Default::default() };
+        LaunchLimits::apply_notice_limits(&mut spec, &c6_proto::NoticeLimits::default());
+        assert_eq!(spec.claude_code_trim_enabled, Some(false));
+        assert_eq!(spec.claude_code_trim_at, 123_456);
+        LaunchLimits::apply_notice_limits(
+            &mut spec,
+            &c6_proto::NoticeLimits { claude_code_trim_enabled: Some(true), claude_code_trim_at: Some(0), ..Default::default() },
+        );
+        assert_eq!(spec.claude_code_trim_enabled, Some(true));
+        assert_eq!(spec.claude_code_trim_at, 0);
     }
 
     #[test]

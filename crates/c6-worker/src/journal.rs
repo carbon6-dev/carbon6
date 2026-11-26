@@ -1136,6 +1136,8 @@ pub(crate) fn apply_notice_settings_snapshot(spec: &mut CreateSession, event: &S
         notice: c6_api::SubagentLimits,
         max_subagent_depth: Option<u32>,
         max_running_subagents: Option<u32>,
+        claude_code_trim_enabled: Option<bool>,
+        claude_code_trim_at: Option<u64>,
     }
     let Some(session_event::Kind::Notice(notice)) = &event.kind else { return };
     if !notice.quiet || (notice.title != crate::notice_guard::CONTINUED_TITLE && notice.title != "Notice settings refreshed") {
@@ -1148,6 +1150,14 @@ pub(crate) fn apply_notice_settings_snapshot(spec: &mut CreateSession, event: &S
     }
     if let Some(running) = snapshot.max_running_subagents {
         spec.max_running_subagents = running;
+    }
+    // Old notice snapshots predate native trimming: absence must not undo a
+    // current realm override when a session is restored from older history.
+    if let Some(enabled) = snapshot.claude_code_trim_enabled {
+        spec.claude_code_trim_enabled = Some(enabled);
+    }
+    if let Some(threshold) = snapshot.claude_code_trim_at {
+        spec.claude_code_trim_at = threshold;
     }
     spec.notice_quiet_seconds = limits.notice_quiet_seconds;
     spec.notice_max_wait_seconds = limits.notice_max_wait_seconds;
@@ -1654,6 +1664,29 @@ mod ownership_tests {
         assert_eq!(journal.ownership("s").await.unwrap(), (4, false, "move".into()));
         assert_eq!(journal.events_after_owned("s", 0, 10, 4).await.unwrap(), [event(1), event(2)]);
         assert_eq!(journal.load_session_owned("s").await.unwrap().unwrap(), (spec, vec![event(1), event(2)], 4));
+    }
+
+    #[test]
+    fn native_trim_settings_survive_snapshots_without_resetting_legacy_overrides() {
+        let mut spec = CreateSession { claude_code_trim_enabled: Some(false), claude_code_trim_at: 450_000, ..Default::default() };
+        let snapshot = |message: serde_json::Value| SessionEvent {
+            kind: Some(session_event::Kind::Notice(c6_proto::Notice {
+                title: "Notice settings refreshed".into(),
+                message: message.to_string(),
+                quiet: true,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        apply_notice_settings_snapshot(&mut spec, &snapshot(serde_json::json!({"notice_quiet_seconds": 9})));
+        assert_eq!((spec.claude_code_trim_enabled, spec.claude_code_trim_at), (Some(false), 450_000));
+        apply_notice_settings_snapshot(
+            &mut spec,
+            &snapshot(serde_json::json!({
+                "claude_code_trim_enabled": true, "claude_code_trim_at": 0,
+            })),
+        );
+        assert_eq!((spec.claude_code_trim_enabled, spec.claude_code_trim_at), (Some(true), 0));
     }
 
     #[tokio::test]
