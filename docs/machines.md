@@ -81,6 +81,15 @@ folders require explicit confirmation and are never automatic cleanup targets.
 After removal the old scan is cleared: investigate again for fresh sizes and
 attribution. The head has no worker build-folder cleanup controls.
 
+Both automatic and confirmed build-folder cleanup require worker-wide
+quiescence: no active turns/tasks, live or unconfirmed shell/CLI writers,
+pending launches, or open terminals. A background process can change directory
+into another session's output, so the worker does not treat its original cwd
+as sufficient proof that an unrelated target is unused. Missing cwd children
+retain their proven worktree/repository scope; unresolved attribution refuses
+cleanup rather than silently dropping an idle or active reference. A provably
+absent managed worktree top may be ignored only when its reference is idle.
+
 ## Shared compile cache
 
 Each worker's Machines detail has a **Shared compile cache** panel in the

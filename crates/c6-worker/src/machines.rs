@@ -115,12 +115,17 @@ pub(crate) async fn disk_scan(worker: &Worker) -> anyhow::Result<serde_json::Val
         let home = dirs::home_dir();
         let temp = std::env::temp_dir();
         let mut scan = investigate(&roots, home.as_deref(), &temp);
-        let references = build_folders::prepare_references(&state, references);
+        let (references, preparation_partial) = build_folders::prepare_references(&state, references);
         let (roots, root_partial) = investigation_roots(&roots, home.as_deref(), &temp);
         let builds = build_folders::discover(&roots, &references, &[], build_folders::Limits::default());
         scan.entries += builds.entries;
-        scan.partial |= builds.partial || root_partial || attribution_partial;
+        scan.partial |= builds.partial || root_partial || attribution_partial || preparation_partial;
         scan.build_folders = builds.folders;
+        if attribution_partial || preparation_partial {
+            for folder in &mut scan.build_folders {
+                folder.partial = true;
+            }
+        }
         scan
     })
     .await?;
@@ -152,14 +157,16 @@ async fn build_context(worker: &Worker) -> anyhow::Result<(Vec<build_folders::Re
                 .map(|s| s.session_id),
         )
         .collect();
-    // A terminal may cd after opening. Conservatively protect every build
-    // folder while any terminal is alive, rather than trusting its initial cwd.
+    // Shells, held CLI processes and terminals may cd after launch, including
+    // into another session's archived workspace. Their initial session scope
+    // cannot prove which build outputs they currently use. Durable pending
+    // launch receipts count too; cleanup requires worker-wide quiescence.
     let terminal = worker.terminals.list().iter().any(|t| t.exited.is_none());
-    let unknown_active = active.iter().any(|id| !references.iter().any(|r| &r.session_id == id));
+    let writer_active = terminal || !active.is_empty();
     for reference in &mut references {
-        reference.active = terminal || active.contains(&reference.session_id);
+        reference.active = writer_active;
     }
-    Ok((references, partial || terminal || unknown_active))
+    Ok((references, partial || writer_active))
 }
 
 pub(crate) async fn build_folder_archives(worker: &Worker, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
@@ -212,7 +219,8 @@ pub(crate) async fn remove_build_folders(worker: &Worker, params: serde_json::Va
             request.path.canonicalize().is_ok_and(|path| path == request.path),
             "use the exact canonical path returned by disk investigation"
         );
-        let references = build_folders::prepare_references(&state, references);
+        let (references, preparation_partial) = build_folders::prepare_references(&state, references);
+        anyhow::ensure!(!preparation_partial, "cannot resolve complete build-folder attribution");
         // Only a recognized target/custom Rust directory or its incremental
         // child is removable. Never treat an arbitrary requested path as owned.
         anyhow::ensure!(
@@ -275,7 +283,8 @@ async fn maintain_build_folders(worker: &Worker, _sample: &MachineSample) -> any
     let result = tokio::task::spawn_blocking(move || {
         let (_permit, _lifecycle) = (permit, lifecycle);
         let grace = crate::compile_cache::load(&state).map(|c| Duration::from_secs(u64::from(c.archived_grace_days) * 86_400))?;
-        let references = build_folders::prepare_references(&state, references);
+        let (references, preparation_partial) = build_folders::prepare_references(&state, references);
+        anyhow::ensure!(!preparation_partial, "cannot resolve complete build-folder attribution");
         let scan = build_folders::discover(&[], &references, &[], build_folders::Limits::default());
         let (planned, pressure) = maintenance_plan(scan.folders, warning_percent, c6_core::now_ms(), grace, crate::disk::sample);
         let notice_sessions: Vec<_> = planned.iter().flat_map(|f| f.session_ids.clone()).collect();
@@ -539,6 +548,39 @@ mod tests {
         );
         assert!(target.join("debug/app").exists());
         owner.not_launched(&reservation).await.unwrap();
+        let other_cwd = state.join("worktrees/repo/other-session");
+        std::fs::create_dir_all(&other_cwd).unwrap();
+        worker
+            .journal
+            .create_session(
+                "other-session",
+                &c6_proto::CreateSession::default(),
+                &c6_proto::SessionEvent {
+                    seq: 1,
+                    kind: Some(c6_proto::session_event::Kind::Started(c6_proto::SessionStarted {
+                        cwd: other_cwd.to_string_lossy().into_owned(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let other_owner = worker.journal.shell_owner("other-session", "other-session");
+        let pending = other_owner.reserve("may-cd-into-shared-target").await.unwrap();
+        let (references, partial) = build_context(&worker).await.unwrap();
+        assert!(partial, "a pending shell from another scope must block global cleanup");
+        assert!(references.iter().all(|reference| reference.active));
+        assert!(remove_build_folders(&worker, serde_json::json!({"path": target, "confirmed": true})).await.is_err());
+        assert!(target.join("debug/app").exists());
+        other_owner.not_launched(&pending).await.unwrap();
+        worker.journal.track_claude_process("other-session", 123).await.unwrap();
+        assert!(
+            remove_build_folders(&worker, serde_json::json!({"path": target, "confirmed": true})).await.is_err(),
+            "an idle held CLI in another scope may still write this target"
+        );
+        worker.journal.untrack_claude_process("other-session", 123).await.unwrap();
+        assert!(!build_context(&worker).await.unwrap().1, "cleanup becomes available once durable writer barriers are gone");
         assert!(
             remove_build_folders(&worker, serde_json::json!({"path": state, "incremental_only": true, "confirmed": true}))
                 .await

@@ -50,16 +50,53 @@ pub(crate) struct Reference {
 /// Resolve journal cwd records on the blocking pool. Only the worker's own
 /// worktree layout establishes ownership; repository roots outside it remain
 /// external even when a carbon6 session happened to build there.
-pub(crate) fn prepare_references(state: &Path, places: Vec<Reference>) -> Vec<Reference> {
-    let worktrees = state.join("worktrees").canonicalize().ok();
-    let scratch = state.join("scratch").canonicalize().ok();
+pub(crate) fn prepare_references(state: &Path, places: Vec<Reference>) -> (Vec<Reference>, bool) {
+    let state = state.canonicalize().ok();
+    let managed_root = |name: &str| {
+        let path = state.as_ref()?.join(name);
+        match path.canonicalize() {
+            Ok(path) => Some(path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Some(path),
+            Err(_) => None,
+        }
+    };
+    let worktrees = managed_root("worktrees");
+    let scratch = managed_root("scratch");
     let mut references = Vec::new();
+    let mut partial = false;
     for place in places {
-        let Ok(cwd) = place.path.canonicalize() else {
-            if place.active {
-                references.push(place);
-            }
+        if !normalized(&place.path) {
+            partial = true;
             continue;
+        }
+        let (cwd, existing_ancestor) = match place.path.canonicalize() {
+            Ok(cwd) => (cwd, None),
+            Err(_) => {
+                // Find the first existing lexical ancestor. Do not skip over
+                // permission errors or dangling links: they do not prove that
+                // the requested path is absent or belongs to this directory.
+                let mut resolved = None;
+                for ancestor in place.path.ancestors().take(64) {
+                    match std::fs::symlink_metadata(ancestor) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(_) => break,
+                        Ok(_) => {
+                            if let Ok(existing) = ancestor.canonicalize()
+                                && existing.is_dir()
+                                && let Ok(suffix) = place.path.strip_prefix(ancestor)
+                            {
+                                resolved = Some((existing.join(suffix), Some(existing)));
+                            }
+                            break;
+                        }
+                    }
+                }
+                let Some(resolved) = resolved else {
+                    partial = true;
+                    continue;
+                };
+                resolved
+            }
         };
         let owned_top = worktrees
             .as_ref()
@@ -75,10 +112,36 @@ pub(crate) fn prepare_references(state: &Path, places: Vec<Reference>) -> Vec<Re
                     (session.as_os_str() == std::ffi::OsStr::new(&place.session_id)).then(|| root.join(session))
                 })
             });
-        let top = owned_top.clone().unwrap_or_else(|| cwd.ancestors().find(|p| p.join(".git").exists()).unwrap_or(&cwd).to_owned());
+        let top = if let Some(top) = &owned_top {
+            if let Some(existing) = &existing_ancestor
+                && !existing.starts_with(top)
+            {
+                // The nearest existing ancestor is above the managed top,
+                // so the entire top (not merely a cwd child) is provably gone.
+                // Automatic/manual cleanup holds the lifecycle writer while
+                // resolving these inputs, excluding managed-top recreation.
+                if !place.active {
+                    continue;
+                }
+                partial = true;
+            }
+            top.clone()
+        } else {
+            let existing = existing_ancestor.as_deref().unwrap_or(&cwd);
+            match existing.ancestors().take(64).find(|p| p.join(".git").exists()) {
+                Some(repository) => repository.to_owned(),
+                None if existing_ancestor.is_none() => cwd,
+                None => {
+                    // No managed top or repository scope proves attribution.
+                    // Never silently lose even an idle unarchived reference.
+                    partial = true;
+                    continue;
+                }
+            }
+        };
         references.push(Reference { path: top, scope: true, carbon6_owned: owned_top.is_some(), ..place });
     }
-    references
+    (references, partial)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -597,7 +660,8 @@ mod tests {
         a.path = worktree.join("nested");
         let mut b = reference("scratch-session");
         b.path = scratch.join("nested");
-        let references = prepare_references(&state, vec![a, b]);
+        let (references, partial) = prepare_references(&state, vec![a, b]);
+        assert!(!partial);
         assert!(references.iter().all(|r| r.scope && r.carbon6_owned));
         let scan = discover(&[], &references, &[], Limits::default());
         assert!(!scan.partial);
@@ -606,6 +670,83 @@ mod tests {
         assert!(planned.iter().all(|f| Path::new(&f.path) != worktree && Path::new(&f.path) != scratch));
         assert!(planned.iter().any(|f| f.path.ends_with("nested/custom-output")));
         assert!(planned.iter().any(|f| f.path.ends_with("nested/target")));
+    }
+
+    #[test]
+    fn missing_cwd_children_preserve_idle_unarchived_and_active_shared_worktree_protection() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().canonicalize().unwrap();
+        let worktree = state.join("worktrees/repo/archived");
+        let target = worktree.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+        let mut archived = reference("archived");
+        archived.path = worktree.clone();
+        let mut shared = reference("unarchived");
+        shared.path = worktree.join("deleted-subdir/nested");
+        shared.archived_at_ms = None;
+        for active in [false, true] {
+            shared.active = active;
+            let (references, partial) = prepare_references(&state, vec![archived.clone(), shared.clone()]);
+            assert!(!partial, "the existing managed top proves the scope of its missing child");
+            assert_eq!(references.len(), 2);
+            assert!(references.iter().all(|r| r.path == worktree && r.carbon6_owned));
+            let scan = discover(&[], &references, &[], Limits::default());
+            assert!(!scan.partial);
+            let folder = scan.folders.iter().find(|f| Path::new(&f.path) == target).unwrap();
+            assert_eq!(folder.archived_at_ms, None);
+            assert_eq!(folder.active, active);
+            assert!(folder.session_ids.iter().any(|id| id == "unarchived"));
+            for request in [CleanupRequest::Archived, CleanupRequest::DiskPressure { bytes_to_free: u64::MAX }] {
+                assert!(plan(&scan.folders, &request, i64::MAX, Duration::ZERO).is_empty());
+            }
+            if active {
+                let request = CleanupRequest::Confirmed { path: target.clone(), confirmed: true };
+                assert!(plan(&scan.folders, &request, i64::MAX, Duration::ZERO).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn only_proven_absent_idle_managed_tops_are_skipped_and_unknown_paths_are_partial() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(state.join("worktrees/repo")).unwrap();
+        let mut removed = reference("removed");
+        removed.path = state.join("worktrees/repo/removed/deleted-child");
+        let (references, partial) = prepare_references(&state, vec![removed.clone()]);
+        assert!(!partial && references.is_empty(), "a removed managed top must not permanently prevent unrelated cleanup");
+        removed.active = true;
+        let (references, partial) = prepare_references(&state, vec![removed]);
+        assert!(partial, "an active writer with an absent top is not safe to ignore");
+        assert_eq!(references.len(), 1);
+        let mut unknown = reference("unknown");
+        unknown.path = state.join("external/deleted-child");
+        let (_, partial) = prepare_references(&state, vec![unknown]);
+        assert!(partial, "missing external placement without a proven repository scope is uncertain");
+        symlink(state.join("nowhere"), state.join("worktrees/repo/dangling")).unwrap();
+        let mut dangling = reference("dangling");
+        dangling.path = state.join("worktrees/repo/dangling/child");
+        let (_, partial) = prepare_references(&state, vec![dangling]);
+        assert!(partial, "a dangling managed-top symlink is not proof that the top is absent");
+    }
+
+    #[test]
+    fn missing_external_cwd_child_preserves_a_proven_repository_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().canonicalize().unwrap();
+        let repository = state.join("external");
+        std::fs::create_dir_all(repository.join(".git")).unwrap();
+        let mut place = reference("external");
+        place.path = repository.join("deleted-child");
+        place.archived_at_ms = None;
+        let (references, partial) = prepare_references(&state, vec![place]);
+        assert!(!partial);
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].path, repository);
+        assert!(!references[0].carbon6_owned);
+        assert_eq!(references[0].archived_at_ms, None);
     }
 
     #[test]
