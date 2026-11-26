@@ -143,12 +143,22 @@ pub fn resolve_model(
     choice: &ModelChoice,
     connections: &[SubagentConnection],
 ) -> Result<ModelSpec, String> {
+    let target = default.target.as_ref().map(|m| SubagentConnection {
+        id: m.connection_id.clone(),
+        name: m.connection_id.clone(),
+        kind: m.connection_kind.clone(),
+        default_model: m.model.clone(),
+    });
     let names = || {
         if connections.is_empty() { "none".to_owned() } else { connections.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ") }
     };
     let find = |want: &str| -> Option<&SubagentConnection> {
         let want = want.trim();
-        connections.iter().find(|c| c.id == want).or_else(|| connections.iter().find(|c| c.name.eq_ignore_ascii_case(want)))
+        connections
+            .iter()
+            .find(|c| c.id == want)
+            .or_else(|| connections.iter().find(|c| c.name.eq_ignore_ascii_case(want)))
+            .or_else(|| target.as_ref().filter(|c| c.id == want))
     };
     // `connection/model`, where the part before a slash names a connection
     // (model ids may have slashes of their own).
@@ -204,6 +214,9 @@ pub fn resolve_model(
     }
     match connections.iter().find(|c| c.id == m.connection_id) {
         Some(c) => m.connection_kind = c.kind.clone(),
+        // The head can change the default during a turn. Its authorized
+        // target need not be in the parent's start-time connection catalog.
+        None if default.target.as_ref().is_some_and(|t| t.connection_id == m.connection_id) => {}
         // The parent's own (a Claude Code parent's subagents run on Claude Code too).
         None if m.connection_id == parent.connection_id => {}
         None => return Err(format!("that connection is not available to this session's subagents; available: {}", names())),
@@ -326,7 +339,26 @@ impl Subagents for Runner {
         let admission = self.wait_for_headroom(&cancel, true).await?;
         let limits = self.check_depth()?;
         let _working = self.permit(&root, limits.running as usize)?;
-        let provider = Provider::from_kind(&model_spec.connection_kind).unwrap_or(Provider::OpenAiChat);
+        // An alias retains its stable ID in the child spec. Its provider
+        // family is fixed, but "alias" itself is not a provider kind: ask
+        // the head rather than silently building OpenAI tools for Claude.
+        // LinkedClient still resolves the account afresh on every model call.
+        let kind = if model_spec.connection_kind == "alias" {
+            p.manager
+                .link
+                .session_credential(&root, &model_spec.connection_id)
+                .await
+                .map_err(|e| format!("subagent connection: {e:#}"))?
+                .kind
+        } else {
+            model_spec.connection_kind.clone()
+        };
+        let provider = if on_claude_code {
+            // No provider loop; the native runtime supplies its own tools.
+            Provider::OpenAiChat
+        } else {
+            Provider::from_kind(&kind).ok_or_else(|| format!("unsupported subagent connection kind: {kind}"))?
+        };
         let info = model_info(provider, &model_spec.model);
         let profile = info.tool_profile;
         let context_window = p.manager.link.context_window(&root, &model_spec).await;
@@ -1736,6 +1768,20 @@ mod tests {
         assert!(!crate::session::has_tool(&filtered, "web_search"));
         let filtered = filter_tools(child_tools.clone(), Some((&child_tools, false)), None);
         assert!(crate::session::has_tool(&filtered, "web_search"), "a parent's function search also passes the cap");
+    }
+
+    #[test]
+    fn a_live_default_missing_from_the_old_catalog_is_authorized() {
+        let parent = spec("cc", "claude_code", "opus", "");
+        let target = spec("subscription", "alias", "gpt-6.2-sol", "medium");
+        let default = SubagentDefault { target: Some(target.clone()), ..Default::default() };
+        assert_eq!(resolve_model(&parent, &default, "", &ModelChoice::default(), &[]).unwrap(), target);
+        assert_eq!(resolve_model(&parent, &default, "", &choice("subscription", "", ""), &[]).unwrap(), target);
+        assert_eq!(
+            resolve_model(&parent, &default, "", &choice("", "gpt-6.1-sol", "high"), &[]).unwrap(),
+            spec("subscription", "alias", "gpt-6.1-sol", "high")
+        );
+        assert!(resolve_model(&parent, &default, "", &choice("unavailable", "m", ""), &[]).is_err());
     }
 
     #[test]

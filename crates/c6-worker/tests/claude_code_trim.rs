@@ -56,6 +56,13 @@ def mcp(method, params, request_id):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(request) as response:
         return json.load(response)
+# Every process, including a quiet --resume replacement, checks the real
+# bridge registration instead of trusting the advertised --allowedTools.
+mcp('initialize', dict(protocolVersion='2025-06-18', capabilities={},
+    clientInfo=dict(name='trim-bridge-probe', version='0')), 90)
+bridge_tools = mcp('tools/list', {}, 91)['result']['tools']
+assert {'Task', 'SendMessage'}.issubset({tool['name'] for tool in bridge_tools}), bridge_tools
+trace(kind='bridge', tools=bridge_tools)
 def message(kind, content, uid=None, **extra):
     return dict(type=kind, uuid=uid or str(uuid.uuid4()), sessionId=sid,
                 parentUuid=None, isSidechain=False,
@@ -588,6 +595,9 @@ async fn native_context_is_trimmed_only_between_quiet_turns_and_resumed_without_
         let after = std::fs::read(&native).unwrap();
         if trimmed_after_second {
             assert_native_trim(project.path());
+            let bridges: Vec<_> = records(&project.path().join("trace.jsonl")).into_iter().filter(|v| v["kind"] == "bridge").collect();
+            assert_eq!(bridges.len(), 2, "{name}: each process registered the bridge");
+            assert_eq!(bridges[0]["tools"], bridges[1]["tools"], "{name}: quiet resume preserves the full tool list, including Task");
             assert_eq!(starts[1]["resume"], starts[0]["sid"], "{name}: preserve the native conversation ID");
             assert_eq!(starts[1]["sid"], starts[0]["sid"]);
             let args = starts[1]["args"].as_array().unwrap();

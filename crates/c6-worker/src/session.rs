@@ -6371,7 +6371,7 @@ impl Actor {
             conversation: reset.session_id.clone(),
             effort: (!model.effort.is_empty()).then_some(model.effort),
             settings: Some(claude_code_settings(&self.spec, self.hooks.as_ref().map(|h| h.claude_settings()).as_deref())),
-            system_prompt: (!tools.is_empty()).then(|| self.claude_code_system_prompt(&tools)),
+            system_prompt: Some(self.claude_code_system_prompt(&tools)),
             tools: names,
             worker: c6_core::build().into(),
             compile_cache_env_fingerprint: crate::claude_code::compile_cache_env_fingerprint(&self.session_tools.command_defaults()),
@@ -6379,6 +6379,10 @@ impl Actor {
             extra_args: Vec::new(),
         };
         let bridge = if tools.is_empty() { None } else { self.manager.bridge().await };
+        anyhow::ensure!(
+            tools.is_empty() || bridge.is_some(),
+            "Claude Code's carbon6 MCP bridge could not start; refusing to launch without its tools"
+        );
         let register = || {
             bridge.as_ref().map(|b| {
                 b.register(crate::mcp_bridge::Entry {
@@ -6513,6 +6517,7 @@ impl Actor {
             return Ok(());
         };
         let bridge_tools = self.claude_code_subagent_tools();
+        let needs_bridge = !bridge_tools.is_empty();
         let registration = match token {
             Some(token) if !bridge_tools.is_empty() => self.manager.bridge().await.map(|b| {
                 b.register_as(
@@ -6532,6 +6537,10 @@ impl Actor {
             }),
             _ => None,
         };
+        anyhow::ensure!(
+            !needs_bridge || registration.is_some(),
+            "Claude Code's carbon6 MCP bridge could not be re-registered; refusing to adopt a process without its tools"
+        );
         let observer = Arc::new(crate::claude_code::Observer {
             tools: self.session_tools.clone(),
             journal: self.journal.clone(),
@@ -6669,47 +6678,7 @@ impl Actor {
         let model = self.spec.model.as_ref().map(|m| m.model.as_str()).unwrap_or_default();
         let labels =
             session_labels(&self.spec.labels, &self.started.repo, &self.started.cwd, &self.started.home, model, &self.started.ssh_target);
-        // The ones chosen for Claude Code sessions (Settings → Agents; by
-        // default the subagent tools, documents and session messages), of
-        // those this session has. A routing rule's tool list narrows them,
-        // except the subagent tools and documents, which it never did.
-        let choice = claude_code_choice(&self.spec);
-        let chosen = |name: &str| choice.as_ref().is_none_or(|c| is_chosen(c, name));
-        // A subagent's named agent narrows all of them.
-        let agent = crate::subagent::agent_tools(&self.spec).unwrap_or_default();
-        let chosen = |name: &str| chosen(name) && c6_tools::tool_allowed(&agent, name);
-        let narrowed = |name: &str| matches!(name, "doc") || c6_tools::tool_allowed(&self.spec.tools, name);
-        let mut tools: Vec<Arc<dyn Tool>> = vec![
-            // carbon6's documents, as mcp__carbon6__doc (docs/docs.md §9).
-            Arc::new(c6_tools::records::Doc::new(false)),
-        ];
-        tools.extend(claude_code_extras(&self.spec, &labels, c6_tools::browser::find_chrome()));
-        tools.retain(|t| {
-            let name = t.spec().name;
-            chosen(&name) && narrowed(&name)
-        });
-        let depth = crate::subagent::depth_of(&self.spec);
-        let connections = task_connections(&self.spec);
-        let templates = task_templates(&self.spec);
-        if (connections.is_empty() && templates.is_empty()) || !crate::subagent::may_delegate(&self.spec, depth) {
-            return tools;
-        }
-        let agents = session_agents(&self.spec, &labels);
-        let mut all: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(
-                c6_tools::Task::with_agents(true, agents)
-                    .with_group_guidance(spec_prompt(&self.spec, "session.subagent_group", ""))
-                    .with_connections(connections)
-                    .with_templates(&templates_intro(&self.spec), templates)
-                    .stopped_with("mcp__carbon6__TaskStop"),
-            ),
-            Arc::new(c6_tools::SendMessage::claude()),
-            Arc::new(c6_tools::BashOutput::carbon6()),
-            Arc::new(c6_tools::KillShell::carbon6()),
-        ];
-        all.retain(|t| chosen(&t.spec().name));
-        all.extend(tools);
-        all
+        claude_code_subagent_tools(&self.spec, &labels)
     }
 
     /// What a Claude Code session is told about carbon6's tools it gets,
@@ -6791,6 +6760,14 @@ impl Actor {
         let model = self.spec.model.clone().unwrap_or_default().model;
         let task = tokio::spawn(async move {
             let bridge = if bridge_tools.is_empty() { None } else { manager.bridge().await };
+            if !bridge_tools.is_empty() && bridge.is_none() {
+                let _ = writer
+                    .append(session_event::Kind::Error(ErrorEvent {
+                        message: "Claude Code's carbon6 MCP bridge could not start; quiet restart cannot preserve its tools".into(),
+                    }))
+                    .await;
+                return None;
+            }
             let register = || {
                 bridge.as_ref().map(|b| {
                     b.register(crate::mcp_bridge::Entry {
@@ -6896,7 +6873,7 @@ impl Actor {
         // carbon6's subagents, offered to Claude Code over MCP.
         let bridge_tools = if claude_code { self.claude_code_subagent_tools() } else { Vec::new() };
         let bridge_core = claude_code_core(&self.spec);
-        let bridge_prompt = (claude_code && !bridge_tools.is_empty()).then(|| self.claude_code_system_prompt(&bridge_tools));
+        let bridge_prompt = claude_code.then(|| self.claude_code_system_prompt(&bridge_tools));
         // What the process was started with: other tools, or others up
         // front, need a new one.
         let bridge_names: Vec<String> = bridge_tools
@@ -6962,7 +6939,34 @@ impl Actor {
                 }
             }
             let result = if claude_code {
+                if let Some(message) = claude_code_delegation_unavailable(&sub.spec, &bridge_tools) {
+                    if let Err(e) = sink
+                        .append(session_event::Kind::Notice(c6_proto::Notice {
+                            title: "Subagents unavailable".into(),
+                            message,
+                            ..Default::default()
+                        }))
+                        .await
+                    {
+                        error!(session = %writer.session_id, "recording unavailable subagents: {e:#}");
+                        return None;
+                    }
+                }
                 let bridge = if bridge_tools.is_empty() { None } else { manager.bridge().await };
+                if !bridge_tools.is_empty() && bridge.is_none() {
+                    let inputs = inbox.lock().unwrap().drain();
+                    let failed = async {
+                        sink.start_turn(turn, &inputs).await?;
+                        sink.append(session_event::Kind::Error(ErrorEvent {
+                            message: "Claude Code's carbon6 MCP bridge could not start; refusing to run without its tools".into(),
+                        }))
+                        .await?;
+                        sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
+                        Ok::<_, anyhow::Error>(())
+                    }
+                    .await;
+                    return failed.ok().map(|()| (conv, claude));
+                }
                 if bridge.is_some() {
                     session_tools.set_subagents(Some(Arc::new(crate::subagent::Runner::new(sub, &[]))));
                 }
@@ -7696,7 +7700,22 @@ pub(crate) fn session_agents(spec: &CreateSession, labels: &[String]) -> Vec<c6_
 
 /// The connections a session's subagents may run on (from the head).
 pub(crate) fn subagent_connections(spec: &CreateSession) -> Vec<c6_api::SubagentConnection> {
-    serde_json::from_str(&spec.subagent_connections_json).unwrap_or_default()
+    let mut connections: Vec<c6_api::SubagentConnection> = serde_json::from_str(&spec.subagent_connections_json).unwrap_or_default();
+    // Old journals predate the connection catalog. Model switches and
+    // SetSubagentModel replay the head-authorized models, not that catalog.
+    // Both the session's own connection and its chosen default are usable
+    // even then (including an alias: keep its ID for call-time resolution).
+    for model in [spec.model.as_ref(), spec.subagent_target.as_ref()].into_iter().flatten() {
+        if !model.connection_id.is_empty() && !connections.iter().any(|c| c.id == model.connection_id) {
+            connections.push(c6_api::SubagentConnection {
+                id: model.connection_id.clone(),
+                name: model.connection_id.clone(),
+                kind: model.connection_kind.clone(),
+                default_model: model.model.clone(),
+            });
+        }
+    }
+    connections
 }
 
 /// Those connections, as `Task` lists them.
@@ -7985,13 +8004,73 @@ pub fn claude_code_tool_names() -> Vec<(String, String)> {
 pub const CLAUDE_CODE_INTRO: &str = "carbon6 runs these tools: subagents in its own loop, on any connection and model the session may use; \
      documents, messages to other sessions and the rest in carbon6, for this session.";
 
+/// The bridge's tool set, shared by new launches, held-process adoption and
+/// quiet restarts. A route narrows extras, but not delegation or documents.
+fn claude_code_subagent_tools(spec: &CreateSession, labels: &[String]) -> Vec<Arc<dyn Tool>> {
+    let choice = claude_code_choice(spec);
+    let agent = crate::subagent::agent_tools(spec).unwrap_or_default();
+    let chosen = |name: &str| choice.as_ref().is_none_or(|c| is_chosen(c, name)) && c6_tools::tool_allowed(&agent, name);
+    let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(c6_tools::records::Doc::new(false))];
+    tools.extend(claude_code_extras(spec, labels, c6_tools::browser::find_chrome()));
+    tools.retain(|t| {
+        let name = t.spec().name;
+        chosen(&name) && (name == "doc" || c6_tools::tool_allowed(&spec.tools, &name))
+    });
+    let connections = task_connections(spec);
+    let templates = task_templates(spec);
+    if (connections.is_empty() && templates.is_empty()) || !crate::subagent::may_delegate(spec, crate::subagent::depth_of(spec)) {
+        return tools;
+    }
+    let mut all: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(
+            c6_tools::Task::with_agents(true, session_agents(spec, labels))
+                .with_group_guidance(spec_prompt(spec, "session.subagent_group", ""))
+                .with_connections(connections)
+                .with_templates(&templates_intro(spec), templates)
+                .stopped_with("mcp__carbon6__TaskStop"),
+        ),
+        Arc::new(c6_tools::SendMessage::claude()),
+        Arc::new(c6_tools::BashOutput::carbon6()),
+        Arc::new(c6_tools::KillShell::carbon6()),
+    ];
+    all.retain(|t| chosen(&t.spec().name));
+    all.extend(tools);
+    all
+}
+
+/// Never silently disable both delegation paths. Keep depth and named-agent
+/// restrictions (rather than bypassing them with native Agent), and explain
+/// the refusal both in the agent's prompt and in a user-visible notice.
+fn claude_code_delegation_unavailable(spec: &CreateSession, tools: &[Arc<dyn Tool>]) -> Option<String> {
+    if tools.iter().any(|t| t.spec().name == "Task") || claude_code_native(spec).is_none_or(|t| t.iter().any(|n| n == "Agent")) {
+        return None;
+    }
+    let reason = if !crate::subagent::may_delegate(spec, crate::subagent::depth_of(spec)) {
+        "the subagent depth limit has been reached"
+    } else if claude_code_choice(spec).is_some_and(|c| !is_chosen(&c, "Task")) {
+        "Task is disabled in Settings → Agents"
+    } else if !c6_tools::tool_allowed(&crate::subagent::agent_tools(spec).unwrap_or_default(), "Task") {
+        "this named agent's tool list does not allow Task"
+    } else {
+        "this session has no available subagent connection or template"
+    };
+    Some(format!(
+        "Subagents are unavailable: {reason}. Claude Code's native Agent is disabled; do not try Agent or sessions.create as a workaround."
+    ))
+}
+
 /// What a Claude Code session is told about carbon6 and its tools, added
 /// to its system prompt: the `session.claude_code` prompt, then the
 /// guidance carbon6's loop gives with them.
 fn claude_code_system_prompt(spec: &CreateSession, labels: &[String], tools: &[Arc<dyn Tool>]) -> String {
     let note = spec_prompt(spec, "session.claude_code", c6_agent::CLAUDE_CODE_NOTE);
     let guidance = claude_code_guidance(spec, labels, tools);
-    format!("{}\n\n{}", note.trim(), guidance.trim())
+    let mut prompt = format!("{}\n\n{}", note.trim(), guidance.trim());
+    if let Some(reason) = claude_code_delegation_unavailable(spec, tools) {
+        prompt.push_str("\n\n# Subagents unavailable\n\n");
+        prompt.push_str(&reason);
+    }
+    prompt
 }
 
 /// carbon6's guidance for the tools a Claude Code session gets, which its
@@ -9103,6 +9182,93 @@ mod label_tests {
 #[cfg(test)]
 mod claude_code_tools_tests {
     use super::*;
+
+    #[test]
+    fn legacy_journal_with_an_alias_default_keeps_delegation_after_replay() {
+        // The live failure: an old API session switched to Claude Code, then
+        // selected an alias for subagents. Neither event supplies a catalog.
+        let own =
+            ModelSpec { connection_id: "cc".into(), connection_kind: "claude_code".into(), model: "opus".into(), ..Default::default() };
+        let target = ModelSpec {
+            connection_id: "subscription".into(),
+            connection_kind: "alias".into(),
+            model: "gpt-6.2-sol".into(),
+            effort: "medium".into(),
+            ..Default::default()
+        };
+        let mut spec = CreateSession::default();
+        conversation_from_log(
+            &mut spec,
+            &[
+                SessionEvent {
+                    kind: Some(session_event::Kind::ModelSwitched(ModelSwitched { model: Some(own.clone()), ..Default::default() })),
+                    ..Default::default()
+                },
+                SessionEvent {
+                    kind: Some(session_event::Kind::SubagentModelSet(c6_proto::SubagentModelSet {
+                        model: Some(target.clone()),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            ],
+        );
+        assert!(spec.subagent_connections_json.is_empty());
+        let tools = claude_code_subagent_tools(&spec, &[]);
+        let names: Vec<_> = tools.iter().map(|t| t.spec().name).collect();
+        assert_eq!(&names[..4], ["Task", "SendMessage", "TaskOutput", "TaskStop"]);
+        assert!(claude_code_delegation_unavailable(&spec, &tools).is_none());
+        let connections = subagent_connections(&spec);
+        assert_eq!(connections.len(), 2);
+        assert_eq!(
+            crate::subagent::resolve_model(&own, &crate::subagent::SubagentDefault::of(&spec), "", &Default::default(), &connections)
+                .unwrap(),
+            target
+        );
+        // A catalog entry keeps its human name; no duplicates on restore.
+        spec.subagent_connections_json = serde_json::to_string(&connections).unwrap();
+        assert_eq!(subagent_connections(&spec).len(), 2);
+    }
+
+    #[test]
+    fn disabled_native_agent_always_has_task_or_an_explicit_reason() {
+        let mut spec = CreateSession {
+            model: Some(ModelSpec {
+                connection_id: "cc".into(),
+                connection_kind: "claude_code".into(),
+                model: "opus".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for expected in [None, Some("Settings → Agents"), Some("depth limit"), Some("named agent")] {
+            match expected {
+                Some("Settings → Agents") => spec.claude_code = Some(c6_proto::ClaudeCodeToolChoice::default()),
+                Some("depth limit") => {
+                    spec.claude_code = None;
+                    spec.max_subagent_depth = 1;
+                    spec.depth = 1;
+                }
+                Some("named agent") => {
+                    spec.depth = 0;
+                    spec.delegation =
+                        Some(c6_proto::Delegation { agent_json: r#"{"name":"reader","tools":["Read"]}"#.into(), ..Default::default() });
+                }
+                _ => {}
+            }
+            let tools = claude_code_subagent_tools(&spec, &[]);
+            let reason = claude_code_delegation_unavailable(&spec, &tools);
+            match expected {
+                None => assert!(tools.iter().any(|t| t.spec().name == "Task") && reason.is_none()),
+                Some(expected) => {
+                    assert!(!tools.iter().any(|t| t.spec().name == "Task"));
+                    let reason = reason.unwrap();
+                    assert!(reason.contains(expected), "{reason}");
+                    assert!(claude_code_system_prompt(&spec, &[], &tools).contains(&reason));
+                }
+            }
+        }
+    }
 
     /// Automatic gives every tool the session has; a list chosen by hand
     /// (or by an older head) gives those; the core set defaults to the

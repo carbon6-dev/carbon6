@@ -14,7 +14,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// A `claude` that speaks MCP to the server its `--mcp-config` names (with
-/// curl): it lists the tools, then calls `Task` for a subagent on "api",
+/// curl): it lists the tools, then calls `Task` on the session's alias default,
 /// streaming the call first as Claude Code does.
 fn fake_claude(dir: &Path) -> std::path::PathBuf {
     let script = r#"#!/bin/sh
@@ -29,8 +29,9 @@ post() { curl -s -X POST -H 'Content-Type: application/json' -H 'Accept: applica
 post '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fake","version":"0"}}}' > init.json
 post '{"jsonrpc":"2.0","method":"notifications/initialized"}' > /dev/null
 post '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' > tools.json
-echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_m1","name":"mcp__carbon6__Task","input":{"description":"look","prompt":"Look around.","connection":"api"}}],"stop_reason":"tool_use"},"parent_tool_use_id":null}'
-post '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"Task","arguments":{"description":"look","prompt":"Look around.","connection":"api"}}}' > call.json
+while [ ! -f delegate-now ]; do sleep 0.01; done
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_m1","name":"mcp__carbon6__Task","input":{"description":"look","prompt":"Look around."}}],"stop_reason":"tool_use"},"parent_tool_use_id":null}'
+post '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"Task","arguments":{"description":"look","prompt":"Look around."}}}' > call.json
 while [ ! -f result.json ]; do sleep 0.01; done
 cat result.json
 printf '\n'
@@ -54,6 +55,7 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     unsafe { std::env::set_var("C6_CLAUDE_BIN", &claude) };
     c6_testkit::runnable(&claude, &["--version"]).await;
     let mock = MockLlm::start().await;
+    let old_account = MockLlm::start().await;
     let head_dir = tempfile::tempdir().unwrap();
     let cfg = HeadConfig {
         data_dir: head_dir.path().to_owned(),
@@ -81,10 +83,13 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     let add =
         async |body: Value| -> Value { http.post(format!("{api}/connections")).json(&body).send().await.unwrap().json().await.unwrap() };
     let cc = add(json!({"kind": "claude_code", "name": "cc", "base_url": ""})).await;
-    let api_conn = add(json!({"name": "api", "base_url": mock.base_url(), "default_model": "m2"})).await;
+    let account = add(json!({"name": "account", "base_url": mock.base_url(), "default_model": "m2"})).await;
+    let previous = add(json!({"name": "previous", "base_url": old_account.base_url(), "default_model": "m2"})).await;
+    let api_conn = add(json!({"name": "api", "kind": "alias", "alias_target_id": previous["id"]})).await;
     let r = http
         .put(format!("{api}/settings/routes"))
-        .json(&json!([{"name": "cc with limited carbon6 tools", "connection": "cc", "model": "opus", "tools": ["Read", "publish_file"]}]))
+        .json(&json!([{"name": "cc with limited carbon6 tools", "connection": "cc", "model": "opus",
+            "subagent_connection": "api", "subagent_model": "m2", "tools": ["Read", "publish_file"]}]))
         .send()
         .await
         .unwrap();
@@ -106,6 +111,20 @@ async fn claude_code_delegates_to_carbon6_subagents() {
         .await
         .unwrap();
     let id = s["id"].as_str().unwrap().to_owned();
+    eventually("the original bridge registration", async || {
+        serde_json::from_str::<Value>(&std::fs::read_to_string(project.path().join("tools.json")).ok()?).ok()
+    })
+    .await;
+    // Switching after the process registered its tools must not pin the
+    // child to the alias's old account. The Task call omits a connection.
+    http.post(format!("{api}/connections/{}/alias/switch", api_conn["id"].as_str().unwrap()))
+        .json(&json!({"target_id": account["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    std::fs::write(project.path().join("delegate-now"), "go").unwrap();
     let call: Value = eventually("the MCP task result", async || {
         serde_json::from_str::<Value>(&std::fs::read_to_string(project.path().join("call.json")).ok()?).ok()
     })
@@ -146,7 +165,11 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     // others the session has.
     assert_eq!(names[..5], ["Task", "SendMessage", "TaskOutput", "TaskStop", "doc"]);
     let task = &tools["result"]["tools"][0]["inputSchema"]["properties"];
-    assert_eq!(task["connection"]["enum"], json!(["api", "cc"]), "Claude Code is offered to subagents too");
+    assert_eq!(
+        task["connection"]["enum"],
+        json!(["account", "api", "cc", "previous"]),
+        "aliases and Claude Code are offered to subagents too"
+    );
     assert!(task["run_in_background"]["description"].as_str().unwrap().contains("mcp__carbon6__TaskStop"), "{task}");
     assert_eq!(call["result"]["isError"], false, "{call}");
     assert!(call["result"]["content"][0]["text"].as_str().unwrap().starts_with("api says hi"), "{call}");
@@ -154,6 +177,7 @@ async fn claude_code_delegates_to_carbon6_subagents() {
     // carbon6 ran it, on the API connection's default model, under the call.
     let reqs = mock.requests();
     assert_eq!(reqs.len(), 2);
+    assert!(old_account.requests().is_empty(), "alias targets are resolved at call time");
     assert_eq!(reqs[0]["model"], "m2");
     let names: Vec<&str> = reqs[0]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["read", "publish_file"], "carbon6 subagents inherit a Claude Code parent's list");
