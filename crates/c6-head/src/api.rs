@@ -4185,21 +4185,67 @@ async fn get_catalog() -> Json<serde_json::Value> {
 
 /// `?realm=` on a Settings request: its lists are that realm's own.
 async fn settings_realm(State(st): State<Arc<HeadState>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let refresh = refreshes_session_specs(req.method(), req.uri().path());
     let realm = (req.uri().path().starts_with("/api/v1/settings/"))
         .then(|| req.uri().query().and_then(|q| q.split('&').find_map(|p| p.strip_prefix("realm=")).map(str::to_owned)))
         .flatten()
         .filter(|r| !r.is_empty());
-    let Some(realm) = realm else { return next.run(req).await };
-    // A realm's caller stays in its realm.
-    if let Some(mine) = req.extensions().get::<Caller>().and_then(|c| c.realm.clone())
-        && mine != realm
+    let response = match realm {
+        None => next.run(req).await,
+        Some(realm) => {
+            // A realm's caller stays in its realm.
+            if let Some(mine) = req.extensions().get::<Caller>().and_then(|c| c.realm.clone())
+                && mine != realm
+            {
+                return ApiErr(StatusCode::FORBIDDEN, format!("this is limited to realm {mine}")).into_response();
+            }
+            match crate::realms::exists(&st, &realm).await {
+                Ok(true) => crate::store::SETTINGS_REALM.scope(realm, next.run(req)).await,
+                _ => ApiErr(StatusCode::BAD_REQUEST, format!("no realm {realm:?}")).into_response(),
+            }
+        }
+    };
+    if refresh
+        && response.status().is_success()
+        && let Err(error) = crate::sessions::refresh_specs(&st, None).await
     {
-        return ApiErr(StatusCode::FORBIDDEN, format!("this is limited to realm {mine}")).into_response();
+        // The mutation already committed. Do not turn it into a failed edit
+        // merely because a worker disconnected or a refresh read failed.
+        tracing::warn!("refreshing session configurations after an API edit: {error:#}");
     }
-    match crate::realms::exists(&st, &realm).await {
-        Ok(true) => crate::store::SETTINGS_REALM.scope(realm, next.run(req)).await,
-        _ => ApiErr(StatusCode::BAD_REQUEST, format!("no realm {realm:?}")).into_response(),
+    response
+}
+
+/// Configuration may be edited through Settings or directly through the
+/// collections behind its lists. Reads and unrelated record writes must not
+/// broadcast snapshots (in particular, normal agent activity is not an edit).
+fn refreshes_session_specs(method: &axum::http::Method, path: &str) -> bool {
+    if !matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+        return false;
     }
+    if matches!(path, "/api/v1/connections/test" | "/api/v1/installs/plan" | "/api/v1/settings/channels/test") {
+        return false;
+    }
+    if path.starts_with("/api/v1/settings/") {
+        return true;
+    }
+    for prefix in ["/api/v1/connections", "/api/v1/memories", "/api/v1/installs", "/api/v1/realms", "/api/v1/grants"] {
+        if path == prefix || path.strip_prefix(prefix).is_some_and(|tail| tail.starts_with('/')) {
+            return true;
+        }
+    }
+    if let Some(tail) = path.strip_prefix("/api/v1/collections/") {
+        let name = tail.split('/').next().unwrap_or_default();
+        return !tail.ends_with("/query") && (name == crate::lists::MEMORY || crate::lists::list(name).is_some());
+    }
+    if let Some(tail) = path.strip_prefix("/api/v1/sessions/") {
+        return tail.ends_with("/labels");
+    }
+    // The older app lifecycle endpoints also replace instance settings.
+    (path == "/api/v1/apps" && method == axum::http::Method::POST)
+        || path.strip_prefix("/api/v1/apps/").is_some_and(|tail| {
+            !tail.contains('/') && method == axum::http::Method::DELETE || tail.ends_with("/upgrade") && method == axum::http::Method::POST
+        })
 }
 
 // --- Collections (docs/os.md §4.1) ---------------------------------------------

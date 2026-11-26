@@ -678,17 +678,9 @@ async fn with_builtin_policies(st: &HeadState, yours: String) -> String {
 }
 
 async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Vec<SessionEvent>) -> anyhow::Result<CreateSession> {
-    let memex = crate::memex::ready(st);
-    let scope = crate::memex::scope_for(st, &row.realm, &row.all_labels()).await;
     let connection = st.store.effective_connection(&row.connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
-    let connections = st.store.effective_connections().await?;
-    let subagent_connections = subagent_connections(&connections, &row.realm, !row.ssh_target.is_empty());
-    let limits = subagent_limits(st, Some(&row.realm)).await?;
-    // carbon6's prompts as the session's realm has them (docs/os.md §4.6).
-    let base = crate::prompts::get(st, "session.base", &row.realm).await;
-    let base_prompt =
-        if row.fork_seq.is_some() { format!("{base}\n\n{}", crate::prompts::get(st, "session.side_chat", &row.realm).await) } else { base };
-    Ok(CreateSession {
+    let config = session_config(st, row).await?;
+    let mut spec = CreateSession {
         model: Some(ModelSpec {
             connection_id: row.connection_id.clone(),
             model: row.model.clone(),
@@ -698,34 +690,54 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
             compact_at_percent: compact_at(&connection),
         }),
         cwd: row.cwd.clone(),
-        base_prompt,
         worktree,
+        labels: row.head_labels(),
+        ssh_target: row.ssh_target.clone(),
+        subagent_model: row.subagent_model.clone(),
+        subagent_target: config.subagent_target.clone(),
+        subagent_target_explicit: !row.subagent_model.is_empty() || !row.subagent_connection_id.is_empty(),
+        seed,
+        ..Default::default()
+    };
+    spec.apply_derived(&config);
+    Ok(spec)
+}
+
+/// Realm/instance-derived settings, shared by creation and refresh. Session
+/// identity, model choices, transcript and runtime state are not settings.
+async fn session_config(st: &HeadState, row: &SessionRow) -> anyhow::Result<CreateSession> {
+    let memex = crate::memex::ready(st);
+    let scope = crate::memex::scope_for(st, &row.realm, &row.all_labels()).await;
+    let connections = st.store.effective_connections().await?;
+    let subagent_connections = subagent_connections(&connections, &row.realm, !row.ssh_target.is_empty());
+    let limits = subagent_limits(st, Some(&row.realm)).await?;
+    // carbon6's prompts as the session's realm has them (docs/os.md §4.6).
+    let base = crate::prompts::get(st, "session.base", &row.realm).await;
+    let base_prompt =
+        if row.fork_seq.is_some() { format!("{base}\n\n{}", crate::prompts::get(st, "session.side_chat", &row.realm).await) } else { base };
+    Ok(CreateSession {
+        base_prompt,
         mcp_servers_json: st.store.setting_in(MCP_SERVERS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),
         skills_json: st.store.setting_in(SKILLS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),
         hooks_json: st.store.setting_in(HOOKS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),
         agents_json: st.store.setting_in(AGENTS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),
         // Its realm's secrets, and root's it has none of.
         secrets_json: serde_json::to_string(&st.store.secrets_for(&row.realm).await?)?,
-        labels: row.head_labels(),
-        ssh_target: row.ssh_target.clone(),
         web_search_json: st.store.setting_for(WEB_SEARCH, &row.realm).await?.unwrap_or_default(),
         memories_json: crate::memory::for_sessions_of(st, &row.realm, &row.instance).await?,
         policies_json: with_builtin_policies(st, st.store.setting_in(POLICIES, &row.realm, &row.instance).await?.unwrap_or_default()).await,
-        subagent_model: row.subagent_model.clone(),
+        // This is the session's saved routing cap, not a newly selected
+        // route. Refresh must not widen a delegated session's authority.
         tools: serde_json::from_str(&row.tools)?,
         subagent_target: subagent_target(row, &connections),
         subagent_connections_json: serde_json::to_string(&subagent_connections)?,
-        memex_brief: String::new(),
         memex_tools: memex,
         memex_mail: memex && scope.iter().any(|k| k == "email"),
         memex_calendar: memex && scope.iter().any(|k| k == "event"),
         memex_chat: memex && scope.iter().any(|k| k == "chat"),
         prompts_json: crate::prompts::for_worker(st, &row.realm).await,
-        seed,
-        delegation: None,
         max_subagent_depth: limits.max_depth,
         max_running_subagents: limits.max_running,
-        depth: 0,
         subagent_templates_json: serde_json::to_string(&crate::templates::for_subagents(st, &row.realm, &row.instance).await)?,
         auto_turns_per_hour: 0,
         notice_quiet_seconds: limits.notice_quiet_seconds,
@@ -739,7 +751,6 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         claude_code_trim_enabled: Some(limits.claude_code_trim_enabled),
         claude_code_trim_at: limits.claude_code_trim_at,
         keep_warm_json: Some(serde_json::to_string(&limits.keep_warm)?),
-        keep_warm_snapshot_json: None,
         session_recovery_seconds: limits.session_recovery_seconds,
         disk_recovery_initial_seconds: limits.disk_recovery_initial_seconds,
         disk_recovery_max_seconds: limits.disk_recovery_max_seconds,
@@ -748,8 +759,65 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         claude_code: Some(claude_code_choice(st, &row.realm).await?),
         claude_code_tools: claude_code_tools(st, Some(&row.realm)).await?.tools,
         claude_code_tools_chosen: true,
-        worktree_spec: None,
+        ..Default::default()
     })
+}
+
+/// Build a settings-only command from the current row. Never give head or
+/// observed conversations a normal worker's prompt. The worker preserves
+/// its narrower tools and specialized prompt for local delegations.
+pub(crate) async fn refresh_spec(st: &HeadState, row: &SessionRow) -> anyhow::Result<Option<SessionCommand>> {
+    if row.observed
+        || st.assistant.head_id().is_some_and(|id| row.worker_id == id.to_string())
+        || row.all_labels().iter().any(|label| label == crate::assistant::LABEL)
+    {
+        return Ok(None);
+    }
+    Ok(Some(SessionCommand {
+        command_id: Uuid::now_v7().to_string(),
+        session_id: row.id.clone(),
+        ownership_epoch: row.ownership_epoch as u64,
+        kind: Some(session_command::Kind::RefreshSpec(
+            crate::store::SETTINGS_REALM.scope(row.realm.clone(), session_config(st, row)).await?.derived(),
+        )),
+    }))
+}
+
+/// Publish current settings after a successful mutation, including to idle
+/// actors whose next turn may be started by worker-local background work.
+/// Root edits can affect descendants in any realm; each row resolves its
+/// own effective settings rather than inheriting the editing request's scope.
+pub async fn refresh_specs(st: &HeadState, worker: Option<WorkerId>) -> anyhow::Result<()> {
+    let rows: Vec<SessionRow> =
+        sqlx::query_as("SELECT * FROM sessions WHERE archived = 0 AND last_seq > 0").fetch_all(&st.store.pool).await?;
+    for row in rows {
+        let result: anyhow::Result<()> = async {
+            let worker_id: WorkerId = row.worker_id.parse()?;
+            if worker.is_some_and(|id| id != worker_id) {
+                return Ok(());
+            }
+            let Some(live) = st.registry.get(worker_id) else { return Ok(()) };
+            if !live.capabilities.iter().any(|c| c == c6_proto::SESSION_SPEC_REFRESH_CAPABILITY)
+                || !st.store.session_routable(&row.id, worker_id, row.ownership_epoch).await?
+            {
+                return Ok(());
+            }
+            if let Some(mut command) = refresh_spec(st, &row).await? {
+                prepare_worker_subagents(&live.capabilities, &mut command)?;
+                // Never send a capability-filtered snapshot to a replacement
+                // connection whose runtime support may differ.
+                st.registry.send_spec_refresh(worker_id, live.conn_id, command).await;
+            }
+            Ok(())
+        }
+        .await;
+        // One malformed/stale session must not prevent refreshing the rest;
+        // creation, attach and the next durable turn retry current settings.
+        if let Err(error) = result {
+            warn!(session = %row.id, "refreshing session configuration: {error:#}");
+        }
+    }
+    Ok(())
 }
 
 /// The connections subagents in `realm` may run on: those the realm may use,
@@ -1073,7 +1141,7 @@ fn claude_code_subagents(capabilities: &[String]) -> bool {
 /// an explicit target, never erase it or silently inherit another model.
 pub(crate) fn prepare_worker_subagents(capabilities: &[String], command: &mut SessionCommand) -> anyhow::Result<()> {
     let spec = match &mut command.kind {
-        Some(session_command::Kind::Create(spec)) => Some(spec),
+        Some(session_command::Kind::Create(spec) | session_command::Kind::RefreshSpec(spec)) => Some(spec),
         Some(session_command::Kind::Restore(restore)) => restore.spec.as_mut(),
         Some(session_command::Kind::SetSubagentModel(change)) => {
             check_worker_subagent_target(capabilities, change.model.as_ref())?;

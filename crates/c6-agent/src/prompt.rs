@@ -1,5 +1,6 @@
-//! System prompt assembly. Built once per session and recorded in
-//! `SessionStarted`, so it stays a stable cache prefix for the whole session.
+//! System prompt assembly. Recorded in `SessionStarted` and rebuilt only at
+//! explicit runtime boundaries (placement, handoff or configuration refresh),
+//! so a running turn keeps a stable cache prefix.
 
 use std::path::{Path, PathBuf};
 

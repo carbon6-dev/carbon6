@@ -884,6 +884,7 @@ fn kind_name(e: &SessionEvent) -> &'static str {
         session_event::Kind::NoticeQueued(_) => "notice_queued",
         session_event::Kind::InputDelivered(_) => "input_delivered",
         session_event::Kind::PlaceChanged(_) => "place_changed",
+        session_event::Kind::SpecRefreshed(_) => "spec_refreshed",
     }
 }
 

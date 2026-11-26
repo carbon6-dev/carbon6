@@ -334,6 +334,9 @@ impl Subagents for Runner {
         let parent_model = p.spec.model.clone().unwrap_or_default();
         let connections = crate::session::subagent_connections(&p.spec);
         let model_spec = resolve_model(&parent_model, &default, agent.map_or("", |a| a.model.as_str()), choice, &connections)?;
+        if !p.spec.subagent_connections_json.is_empty() && !connections.iter().any(|c| c.id == model_spec.connection_id) {
+            return Err("that connection is no longer available to this session's subagents".into());
+        }
         // On Claude Code: a Claude Code session of its own, with Claude Code's
         // tools and prompt (carbon6's tools reach it over the bridge).
         let on_claude_code = model_spec.connection_kind == "claude_code";

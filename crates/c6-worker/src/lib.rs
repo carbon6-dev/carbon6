@@ -150,6 +150,7 @@ impl Worker {
         let link = Arc::new(link::HeadLink::default());
         let mut sessions = session::SessionManager::new(journal.clone(), link.clone(), state_dir.join("worktrees"));
         sessions.launch_pressure = Arc::new(gate);
+        sessions.await_initial_specs();
         sessions.recover().await?;
         // Keep the journal small: idle, fully synced sessions can be restored
         // from the head when they are used again.

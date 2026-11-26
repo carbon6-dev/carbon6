@@ -1539,6 +1539,19 @@ async fn load_session_in(tx: &mut sqlx::SqliteConnection, session_id: &str) -> a
     // available to replay notice guard acknowledgements and other history.
     for event in events.iter().filter(|event| event.seq > imported_through) {
         apply_notice_settings_snapshot(&mut spec, event);
+        match &event.kind {
+            Some(session_event::Kind::SubagentModelSet(model)) => {
+                spec.subagent_target_explicit = model.model.is_some();
+                spec.subagent_target.clone_from(&model.model);
+                spec.subagent_model.clear();
+            }
+            Some(session_event::Kind::SpecRefreshed(refresh)) => {
+                if let Some(fresh) = &refresh.spec {
+                    spec.apply_derived(fresh);
+                }
+            }
+            _ => {}
+        }
     }
     Ok(Some((spec, events)))
 }
@@ -2133,6 +2146,35 @@ mod ownership_tests {
 
     fn event(seq: u64) -> SessionEvent {
         SessionEvent { seq, ts_ms: 0, kind: Some(session_event::Kind::Started(c6_proto::SessionStarted::default())) }
+    }
+
+    #[tokio::test]
+    async fn imported_spec_wins_over_old_refresh_but_local_refresh_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let current = CreateSession {
+            cwd: "/current/place".into(),
+            labels: vec!["preserve".into()],
+            prompts_json: "current imported prompt".into(),
+            ..Default::default()
+        };
+        let snapshot = |seq, prompt: &str| SessionEvent {
+            seq,
+            kind: Some(session_event::Kind::SpecRefreshed(c6_proto::SpecRefreshed {
+                spec: Some(CreateSession { cwd: "/must/not/replace".into(), prompts_json: prompt.into(), ..Default::default() }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        journal.import("s", &current, &[event(1), snapshot(2, "historical prompt")]).await.unwrap();
+        let (loaded, _) = journal.load_session("s").await.unwrap().unwrap();
+        assert_eq!(loaded.prompts_json, current.prompts_json);
+        journal.append("s", &snapshot(3, "new local prompt")).await.unwrap();
+        let (loaded, _) = journal.load_session("s").await.unwrap().unwrap();
+        assert_eq!(loaded.prompts_json, "new local prompt");
+        assert_eq!(loaded.cwd, current.cwd);
+        assert_eq!(loaded.labels, current.labels);
+        journal.pool.close().await;
     }
 
     #[tokio::test]

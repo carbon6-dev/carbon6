@@ -44,6 +44,8 @@ pub struct SessionManager {
     /// Calls waiting on a remote subagent's turn, by `<session>/<call>`
     /// (docs/remote-subagents.md): the head's DelegationEnded goes there.
     remote_waits: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<c6_proto::DelegationEnded>>>>,
+    config_ready: Arc<std::sync::atomic::AtomicBool>,
+    config_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// One delegation counted against its tree's limit until dropped.
@@ -299,6 +301,9 @@ pub(crate) enum ActorMsg {
     ReleaseNotices,
     /// Refresh the notice settings when you explicitly continue a session.
     NoticeLimits(c6_proto::NoticeLimits),
+    /// Latest head-derived settings; coalesced until a quiet turn boundary.
+    RefreshSpec(Box<CreateSession>),
+    SpecsReady(u64),
     /// Its turn `.0` was cut short by a worker restart: it goes on
     /// (docs/restarts.md §4).
     Resume(u64),
@@ -803,7 +808,48 @@ impl SessionManager {
             },
             bridge: Arc::default(),
             remote_waits: Arc::default(),
+            config_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            config_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Recovered turns must not capture a legacy spec before the first head
+    /// handshake. Direct SessionManager test harnesses remain ready by default.
+    pub(crate) fn await_initial_specs(&self) -> u64 {
+        let _actors = self.actors.lock().unwrap();
+        self.config_ready.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.config_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    pub(crate) fn specs_ready(&self) {
+        self.specs_ready_for(self.config_generation.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    pub(crate) fn specs_ready_for(&self, generation: u64) {
+        let actors = self.actors.lock().unwrap();
+        if generation != self.config_generation.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        self.config_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        for actor in actors.values() {
+            let _ = actor.tx.send(ActorMsg::SpecsReady(generation));
+        }
+    }
+
+    pub(crate) async fn refresh_spec_for(&self, session_id: &str, spec: CreateSession, generation: u64) -> Result<(), String> {
+        if generation != self.config_generation.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        let actor = self.actor(session_id).await.map_err(|e| format!("worker error: {e:#}"))?;
+        // Loading can await I/O. Fence the final enqueue against a replacement
+        // attach so an old stream cannot overwrite its fresh snapshots.
+        let _actors = self.actors.lock().unwrap();
+        if generation == self.config_generation.load(std::sync::atomic::Ordering::SeqCst)
+            && let Some(actor) = actor
+        {
+            actor.send(ActorMsg::RefreshSpec(Box::new(spec))).map_err(|_| "session stopped before refreshing configuration")?;
+        }
+        Ok(())
     }
 
     /// Cached filesystem measurements, independent of the journal connection.
@@ -1406,6 +1452,10 @@ impl SessionManager {
     /// Applies a command from the head. `Err` is a rejection reason for the head.
     pub async fn handle(&self, cmd: SessionCommand) -> Result<(), String> {
         let internal = |e: anyhow::Error| format!("worker error: {e:#}");
+        if matches!(&cmd.kind, Some(session_command::Kind::SpecsReady(_))) {
+            self.specs_ready();
+            return Ok(());
+        }
         // The current owner's journal may have been lost. A head-authorized
         // Restore is the only normal command allowed to install a newer
         // incarnation, and must not reuse an earlier worker cache silently.
@@ -1592,6 +1642,13 @@ impl SessionManager {
                 // the report. Logging and silently returning Ok hid the
                 // delivery failure from the head and the parent's queue.
                 ack.await.unwrap_or_else(|_| Err("parent stopped before recording the report".into()))
+            }
+            Some(session_command::Kind::SpecsReady(_)) => {
+                self.specs_ready();
+                Ok(())
+            }
+            Some(session_command::Kind::RefreshSpec(spec)) => {
+                self.refresh_spec_for(&cmd.session_id, spec, self.config_generation.load(std::sync::atomic::Ordering::SeqCst)).await
             }
             Some(session_command::Kind::UpdateNoticeLimits(limits)) => {
                 // A trimmed/lost cache gets current settings in its Restore
@@ -2174,7 +2231,15 @@ impl SessionManager {
         } else {
             PathBuf::from(&started.cwd)
         };
+        let needs_config_rebuild = tools.is_none();
         let tools = match tools {
+            Some(_) | None if started.tool_profile == crate::claude_code::PROFILE && self.link.is_connected() => self
+                .session_tool_set(session_id, &spec, &started, ToolProfile::Claude)
+                .await
+                .tools
+                .into_iter()
+                .filter(|tool| tool.spec().name.starts_with("mcp__"))
+                .collect(),
             Some(t) => t,
             None if started.tool_profile == crate::claude_code::PROFILE => Vec::new(),
             None => {
@@ -2313,7 +2378,10 @@ impl SessionManager {
         let spec_default = spec.clone();
         let claude_code = Arc::new(std::sync::atomic::AtomicBool::new(started.tool_profile == crate::claude_code::PROFILE));
         self.disk.configure(&spec);
-        let actor = Actor {
+        let mut actor = Actor {
+            config_ready: self.config_ready.load(std::sync::atomic::Ordering::SeqCst),
+            config_generation: self.config_generation.load(std::sync::atomic::Ordering::SeqCst),
+            needs_config_rebuild,
             spec,
             launch_pressure,
             disk_admitted: turns > 0,
@@ -2374,8 +2442,13 @@ impl SessionManager {
             inbox: actor.inbox.clone(),
         };
         self.journal.check_ownership(session_id, epoch).await?;
+        // Register under the same lock as SpecsReady: an actor created during
+        // attach must either receive its marker or observe the released gate.
+        let mut actors = self.actors.lock().unwrap();
+        actor.config_ready = self.config_ready.load(std::sync::atomic::Ordering::SeqCst);
+        actor.config_generation = self.config_generation.load(std::sync::atomic::Ordering::SeqCst);
         tokio::spawn(actor.supervise(rx, recovery));
-        self.actors.lock().unwrap().insert(session_id.to_owned(), handle.clone());
+        actors.insert(session_id.to_owned(), handle.clone());
         Ok(handle)
     }
 }
@@ -2402,12 +2475,19 @@ fn conversation_from_log(spec: &mut CreateSession, events: &[SessionEvent]) -> C
     }) {
         spec.model = Some(m);
     }
-    // And its subagents' default, as last set.
-    if let Some(m) = events.iter().rev().find_map(|e| match &e.kind {
-        Some(session_event::Kind::SubagentModelSet(m)) => Some(m.model.clone()),
+    // The journal has already merged configuration snapshots (and a Restore
+    // may supersede older snapshots). Replay only the user's choice here,
+    // never reapply an old configuration over a freshly restored spec.
+    if let Some((index, model)) = events.iter().enumerate().rev().find_map(|(i, e)| match &e.kind {
+        Some(session_event::Kind::SubagentModelSet(m)) => Some((i, m.model.clone())),
         _ => None,
     }) {
-        set_subagent_default(spec, m);
+        if model.is_some() || !events[index + 1..].iter().any(|e| matches!(e.kind, Some(session_event::Kind::SpecRefreshed(_)))) {
+            set_subagent_default(spec, model);
+        } else {
+            spec.subagent_target_explicit = false;
+            spec.subagent_model.clear();
+        }
     }
     let current = spec.model.as_ref().map(key);
     let handoff = events.iter().rposition(|e| handoff_of(e).is_some()).map(|h| seed_len + h);
@@ -2503,6 +2583,9 @@ fn runtime_of(mut started: SessionStarted, events: &[SessionEvent]) -> SessionSt
             apply_handoff(&mut started, h);
         } else if let Some(session_event::Kind::PlaceChanged(place)) = &event.kind {
             apply_place(&mut started, place);
+        } else if let Some(session_event::Kind::SpecRefreshed(refresh)) = &event.kind {
+            started.system_prompt.clone_from(&refresh.system_prompt);
+            started.tools.clone_from(&refresh.tools);
         }
     }
     started
@@ -2805,6 +2888,7 @@ fn notices_of(events: &[SessionEvent]) -> (Vec<i64>, Vec<String>, Vec<(PendingIn
 /// Sets a spec's default for its subagents (`None`: the session's own
 /// model).
 fn set_subagent_default(spec: &mut CreateSession, model: Option<ModelSpec>) {
+    spec.subagent_target_explicit = model.is_some();
     spec.subagent_target = model;
     spec.subagent_model.clear();
 }
@@ -3493,6 +3577,9 @@ impl EventSink for TurnSink {
 }
 
 struct Actor {
+    config_ready: bool,
+    config_generation: u64,
+    needs_config_rebuild: bool,
     spec: CreateSession,
     launch_pressure: Arc<crate::resource_pressure::Gate>,
     /// Disk admission is for a new child, not subsequent turns or recovery.
@@ -3722,6 +3809,12 @@ fn recover_rewind_queue(
 }
 
 impl Actor {
+    fn spec_ready(&self) -> bool {
+        self.config_ready
+            && self.manager.config_ready.load(std::sync::atomic::Ordering::SeqCst)
+            && self.config_generation == self.manager.config_generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn cache_warm_candidate(&self) -> Option<(CacheWarmKey, String, CacheObservation)> {
         let settings = self
             .spec
@@ -4097,8 +4190,34 @@ impl Actor {
         let mut maintenance_running = false;
         let mut cache_warm_job: Option<CacheWarmJob> = None;
         let mut cache_warm_key: Option<CacheWarmKey> = None;
+        let mut pending_spec: Option<Box<CreateSession>> = None;
+        let mut pending_resumes = VecDeque::new();
         self.rewinds = recover_rewind_queue(self.runs_claude_code(), std::mem::take(&mut self.rewinds), reset);
         loop {
+            // Do not replace tools/hooks under an active loop, maintenance
+            // slot or Claude's native background work. Reading the final
+            // native-task notification will bring us back to this boundary.
+            if running.is_none() && pending_spec.is_some() && self.claude.as_ref().is_none_or(|p| p.trim_quiet()) {
+                if let Err(e) = self.refresh_spec(&pending_spec.take().expect("checked")).await {
+                    error!(session = %self.writer.session_id, "refreshing session configuration: {e:#}");
+                    return;
+                }
+                if self.claude.as_ref().is_some_and(|p| p.trim_quiet()) {
+                    *running = Some(self.start_claude_maintenance());
+                    maintenance_running = true;
+                    self.running_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            // Recovery's editable continuation text must be rendered from the
+            // refreshed prompts, not captured before the attach handshake.
+            if self.spec_ready()
+                && pending_spec.is_none()
+                && let Some(actor) = self.manager.live(&self.writer.session_id)
+            {
+                for resume in pending_resumes.drain(..) {
+                    let _ = actor.send(resume);
+                }
+            }
             while running.is_none()
                 && let Some((command_id, to_seq, restore)) = self.rewinds.front().cloned()
             {
@@ -4183,8 +4302,13 @@ impl Actor {
                     return;
                 }
             }
-            let can_start =
-                !rewind_blocked && !adoption_blocked && running.is_none() && !handoff_waits && !self.inbox.lock().unwrap().queue.is_empty();
+            let can_start = self.spec_ready()
+                && !rewind_blocked
+                && !adoption_blocked
+                && running.is_none()
+                && !handoff_waits
+                && pending_spec.is_none()
+                && !self.inbox.lock().unwrap().queue.is_empty();
             // New children require disk, memory and load admission. Existing
             // child turns retain memory/load admission, but disk recovery
             // resumes at its small headroom threshold, not the new-work 5%.
@@ -4480,6 +4604,13 @@ impl Actor {
                             error!(session = %self.writer.session_id, "recovering a subagent's report: {e:#}");
                         }
                     }
+                    Some(ActorMsg::RefreshSpec(spec)) => {
+                        pending_spec = Some(spec);
+                    }
+                    Some(ActorMsg::SpecsReady(generation)) => {
+                        self.config_ready = true;
+                        self.config_generation = generation;
+                    }
                     Some(ActorMsg::NoticeLimits(limits)) => {
                         let previous = crate::subagent::LaunchLimits::of(&self.spec);
                         crate::subagent::LaunchLimits::apply_notice_limits(&mut self.spec, &limits);
@@ -4587,6 +4718,10 @@ impl Actor {
                         }
                     }
                     Some(msg @ (ActorMsg::Resume(turn) | ActorMsg::ResumeFailed(turn))) => {
+                        if !self.spec_ready() || pending_spec.is_some() {
+                            pending_resumes.push_back(msg);
+                            continue;
+                        }
                         let failed = matches!(msg, ActorMsg::ResumeFailed(_));
                         let check = async {
                             let events = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
@@ -6375,6 +6510,7 @@ impl Actor {
             tools: names,
             worker: c6_core::build().into(),
             compile_cache_env_fingerprint: crate::claude_code::compile_cache_env_fingerprint(&self.session_tools.command_defaults()),
+            spec_fingerprint: c6_core::sha256_hex(&prost::Message::encode_to_vec(&self.spec.derived())),
             native: claude_code_native(&self.spec),
             extra_args: Vec::new(),
         };
@@ -6572,6 +6708,123 @@ impl Actor {
         self.started.tool_profile == crate::claude_code::PROFILE
     }
 
+    /// Install one head-authorized snapshot, never the session state carried
+    /// by a CreateSession envelope. Called only with no supervised turn and,
+    /// for Claude Code, no native task or unread output.
+    async fn refresh_spec(&mut self, fresh: &CreateSession) -> anyhow::Result<()> {
+        let mut spec = self.spec.clone();
+        spec.apply_derived(fresh);
+        if spec.delegation.is_some() {
+            // A local child's prompt includes its explicit Task instructions,
+            // and its cap was narrowed by its parent's and named-agent tools.
+            // A head row cannot reconstruct either worker-owned decision.
+            spec.base_prompt.clone_from(&self.spec.base_prompt);
+            spec.tools.clone_from(&self.spec.tools);
+        }
+        if spec.derived() == self.spec.derived() && !self.needs_config_rebuild {
+            // Recovery runs before the head link exists. Rehydrate external
+            // bridge clients now, without manufacturing a changed-config line.
+            if self.runs_claude_code() && self.tools.is_empty() && !matches!(spec.mcp_servers_json.as_str(), "" | "[]") {
+                let built = self.manager.session_tool_set(&self.writer.session_id, &spec, &self.started, ToolProfile::Claude).await;
+                self.tools = built.tools.into_iter().filter(|tool| tool.spec().name.starts_with("mcp__")).collect();
+            }
+            return Ok(());
+        }
+        let sid = self.writer.session_id.clone();
+        let cwd = self.session_tools.cwd();
+        let local = if self.started.ssh_target.is_empty() { cwd.clone() } else { self.manager.state_dir.join("scratch").join(&sid) };
+        let labels = session_labels(
+            &spec.labels,
+            &self.started.repo,
+            &self.started.cwd,
+            &self.started.home,
+            &spawn_model(&spec),
+            &self.started.ssh_target,
+        );
+        let (prompt, tools, errors) = if self.runs_claude_code() {
+            let built = self.manager.session_tool_set(&sid, &spec, &self.started, ToolProfile::Claude).await;
+            let tools = built.tools.into_iter().filter(|tool| tool.spec().name.starts_with("mcp__")).collect();
+            (self.started.system_prompt.clone(), tools, built.errors)
+        } else {
+            let date = time::OffsetDateTime::now_utc().date().to_string();
+            // Named-agent instructions belong to this child, not to the
+            // editable catalog or its inherited base_prompt. Read their
+            // original provenance, never an already refreshed runtime prompt.
+            let events = if spec.delegation.is_some() { self.journal.events_after(&sid, 0, u32::MAX).await? } else { Vec::new() };
+            let instructions = named_child_instructions(&spec, &events).unwrap_or(&spec.base_prompt);
+            let base = build_system_prompt(instructions, &cwd, &date);
+            let mut runtime_spec = spec.clone();
+            if spec.delegation.is_some() {
+                runtime_spec.tools = crate::subagent::saved_tools(&self.spec, &self.started).into_iter().collect();
+            }
+            let built = own_runtime(&self.link, &self.on_behalf_of, &runtime_spec, &local, &labels, base, "refresh").await;
+            (built.prompt, built.tools, built.errors)
+        };
+        let names = if self.runs_claude_code() {
+            claude_code_subagent_tools(&spec, &labels).iter().chain(tools.iter()).map(|t| t.spec().name).collect()
+        } else {
+            visible_tool_names(&spec, &tools)
+        };
+        self.needs_config_rebuild = false;
+        if spec.derived() == self.spec.derived() && prompt == self.started.system_prompt && names == self.started.tools {
+            self.tools = tools;
+            return Ok(());
+        }
+        let prompts_changed = spec.base_prompt != self.spec.base_prompt || spec.prompts_json != self.spec.prompts_json;
+        let message = if self.started.tools != names {
+            format!("This session's tools were updated: {}", names.join(", "))
+        } else if prompts_changed {
+            "This session's prompts were updated".into()
+        } else {
+            "This session's configuration was updated".into()
+        };
+        // Commit before publishing the runtime. Replay sees exactly this
+        // prompt and allowlist even if a later diagnostic write fails.
+        self.writer
+            .append(session_event::Kind::SpecRefreshed(c6_proto::SpecRefreshed {
+                spec: Some(spec.derived()),
+                system_prompt: prompt.clone(),
+                tools: names.clone(),
+            }))
+            .await?;
+        self.spec = spec;
+        self.started.system_prompt = prompt;
+        self.started.tools = names;
+        self.tools = tools;
+        self.writer.set_keep_warm_capture(&self.spec);
+        self.manager.disk.configure(&self.spec);
+        *self.subagent_default.lock().unwrap() = crate::subagent::SubagentDefault::of(&self.spec);
+        *self.launch_limits.lock().unwrap() = crate::subagent::LaunchLimits::of(&self.spec);
+        self.hooks = crate::hooks::HookRunner::new(&sid, &local, &self.spec.hooks_json, &labels).map(Arc::new);
+        let (approval_log, mut approvals) = mpsc::unbounded_channel();
+        self.policies = crate::policy::Policies::new(&self.spec.policies_json, &labels, approval_log);
+        if let Some(policies) = &self.policies {
+            policies.set_judge(self.session_tools.head());
+        }
+        if let Some(actor) = self.manager.live(&sid) {
+            tokio::spawn(async move {
+                while let Some(approval) = approvals.recv().await {
+                    if actor.send(ActorMsg::Approval(approval)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        self.session_tools.set_hooks(if self.runs_claude_code() { None } else { own_loop_hooks(&self.policies, &self.hooks) });
+        self.writer
+            .append(session_event::Kind::Notice(c6_proto::Notice {
+                title: "Session configuration refreshed".into(),
+                message,
+                priority: "low".into(),
+                quiet: true,
+            }))
+            .await?;
+        for message in errors {
+            self.writer.append(session_event::Kind::Error(ErrorEvent { message })).await?;
+        }
+        Ok(())
+    }
+
     /// Hands the session over between Claude Code and carbon6's own loop,
     /// at a turn boundary: the destination's tool profile, tools and system
     /// prompt are built afresh and recorded with the switch (so a reload
@@ -6678,7 +6931,9 @@ impl Actor {
         let model = self.spec.model.as_ref().map(|m| m.model.as_str()).unwrap_or_default();
         let labels =
             session_labels(&self.spec.labels, &self.started.repo, &self.started.cwd, &self.started.home, model, &self.started.ssh_target);
-        claude_code_subagent_tools(&self.spec, &labels)
+        let mut tools = claude_code_subagent_tools(&self.spec, &labels);
+        tools.extend(self.tools.iter().cloned());
+        tools
     }
 
     /// What a Claude Code session is told about carbon6's tools it gets,
@@ -6746,6 +7001,23 @@ impl Actor {
         let session_tools = self.session_tools.clone();
         let bridge_tools = self.claude_code_subagent_tools();
         let bridge_core = claude_code_core(&self.spec);
+        let mut launch = process.launch().clone();
+        launch.effort = self.spec.model.as_ref().and_then(|m| (!m.effort.is_empty()).then(|| m.effort.clone()));
+        launch.settings = Some(claude_code_settings(&self.spec, self.hooks.as_ref().map(|h| h.claude_settings()).as_deref()));
+        launch.system_prompt = Some(self.claude_code_system_prompt(&bridge_tools));
+        launch.native = claude_code_native(&self.spec);
+        launch.spec_fingerprint = c6_core::sha256_hex(&prost::Message::encode_to_vec(&self.spec.derived()));
+        launch.tools = bridge_tools
+            .iter()
+            .map(|tool| {
+                let name = tool.spec().name;
+                if bridge_core.iter().any(|core| c6_tools::tool_allowed(std::slice::from_ref(core), &name)) {
+                    format!("{name}*")
+                } else {
+                    name
+                }
+            })
+            .collect();
         let policies = self.policies.clone();
         let observer = Arc::new(crate::claude_code::Observer {
             tools: self.session_tools.clone(),
@@ -6787,6 +7059,7 @@ impl Actor {
             match maintain_claude_context(
                 &writer.session_id,
                 process,
+                Some(launch),
                 &session_tools.cwd(),
                 &model,
                 &stdin,
@@ -6911,6 +7184,9 @@ impl Actor {
             if !remote_session {
                 session_tools.set_command_env(crate::compile_cache::session_environment(manager.state_dir.clone()).await);
             }
+            // Clear revoked secrets too; an empty catalog must not retain
+            // the preceding turn's values in the command environment.
+            session_tools.set_secrets(Vec::new());
             if !secret_names.is_empty() {
                 let (values, errors) = fetch_secrets(&link, &on_behalf_of, &secret_names).await;
                 for e in errors {
@@ -7009,6 +7285,9 @@ impl Actor {
                     tools: bridge_names,
                     worker: c6_core::build().to_owned(),
                     compile_cache_env_fingerprint: crate::claude_code::compile_cache_env_fingerprint(&session_tools.command_defaults()),
+                    spec_fingerprint: c6_core::sha256_hex(&prost::Message::encode_to_vec(
+                        &spec_for_claude.as_ref().expect("Claude Code spec").derived(),
+                    )),
                     extra_args: Vec::new(),
                     native: claude_native,
                 };
@@ -7151,6 +7430,7 @@ impl ClaudeTrim {
 async fn maintain_claude_context(
     session: &str,
     process: crate::claude_code::Process,
+    desired_launch: Option<crate::claude_code::Launch>,
     cwd: &Path,
     model: &str,
     stdin: &crate::claude_code::Stdin,
@@ -7167,12 +7447,15 @@ async fn maintain_claude_context(
     // Settings can change while a turn or native background task runs. Resolve
     // the policy from the durable current spec, not the preceding turn's copy.
     let trim = journal.load_session(session).await?.and_then(|(spec, events)| ClaudeTrim::from_events(&spec, &events));
-    let Some(trim) = trim else { return Ok(Some(process)) };
-    let Some(path) = trim.candidate(&process, cwd) else { return Ok(Some(process)) };
+    let path = trim.as_ref().and_then(|trim| trim.candidate(&process, cwd));
+    let changed = desired_launch.as_ref().is_some_and(|launch| process.launch() != launch);
+    if !process.trim_quiet() || (!changed && path.is_none()) {
+        return Ok(Some(process));
+    }
     if cancel.is_cancelled() {
         return Ok(Some(process));
     }
-    let launch = process.launch().clone();
+    let launch = desired_launch.unwrap_or_else(|| process.launch().clone());
     if let Err(error) = process.close_for_replacement().await {
         if !error.is::<crate::claude_code::ReplacementBlocked>() {
             return Err(error);
@@ -7200,7 +7483,7 @@ async fn maintain_claude_context(
     if cancel.is_cancelled() {
         return Ok(None);
     }
-    if let Some(trim) = trim {
+    if let Some((trim, path)) = trim.zip(path) {
         trim.apply(&path, sink).await?;
     }
     if cancel.is_cancelled() {
@@ -7412,7 +7695,7 @@ async fn claude_turn(
         // A wait on carbon6-held shells or subagents starts now, not with
         // the next input. They survive this CLI's restart; its native tasks
         // do not, and candidate() refuses those. No model call is made here.
-        return maintain_claude_context(session, p, cwd, model, stdin, register, observer, claude_dir, sink, cancel).await;
+        return maintain_claude_context(session, p, None, cwd, model, stdin, register, observer, claude_dir, sink, cancel).await;
     }
     inbox.lock().unwrap().requeue(p.take_unsent());
     Ok(None)
@@ -7700,6 +7983,11 @@ pub(crate) fn session_agents(spec: &CreateSession, labels: &[String]) -> Vec<c6_
 /// The connections a session's subagents may run on (from the head).
 pub(crate) fn subagent_connections(spec: &CreateSession) -> Vec<c6_api::SubagentConnection> {
     let mut connections: Vec<c6_api::SubagentConnection> = serde_json::from_str(&spec.subagent_connections_json).unwrap_or_default();
+    // A present catalog, including [], is authoritative. Only journals from
+    // before catalogs existed may recover their previously authorized models.
+    if !spec.subagent_connections_json.is_empty() {
+        return connections;
+    }
     // Old journals predate the connection catalog. Model switches and
     // SetSubagentModel replay the head-authorized models, not that catalog.
     // Both the session's own connection and its chosen default are usable
@@ -8233,7 +8521,12 @@ impl CacheObservation {
             Some(session_event::Kind::Notice(notice)) if notice.quiet && notice.title == "Cache maintenance failed" => {
                 self.wait_started_ms = None;
             }
-            Some(session_event::Kind::ModelSwitched(_) | session_event::Kind::PlaceChanged(_) | session_event::Kind::Compaction(_)) => {
+            Some(
+                session_event::Kind::ModelSwitched(_)
+                | session_event::Kind::PlaceChanged(_)
+                | session_event::Kind::SpecRefreshed(_)
+                | session_event::Kind::Compaction(_),
+            ) => {
                 // A new account, runtime or rewritten prompt must earn its
                 // own completed-call evidence before maintenance can start.
                 *self = Self::default();
@@ -8595,6 +8888,34 @@ pub(crate) fn prompt_for_tools(spec: &CreateSession, prompt: &str, tools: &[Arc<
     c6_agent::base_prompt_for_tools(prompt, &tools.iter().map(|t| t.spec().name).collect::<Vec<_>>(), profile)
 }
 
+/// Local named agents replace the inherited system prompt at creation. The
+/// durable delegation names the agent even after its catalog entry is removed;
+/// Started retains its instructions independently of later runtime snapshots.
+/// Claude Code children instead received their instructions in their input.
+fn named_child_instructions<'a>(spec: &CreateSession, events: &'a [SessionEvent]) -> Option<&'a str> {
+    let delegation = spec.delegation.as_ref()?;
+    let agent: serde_json::Value = serde_json::from_str(&delegation.agent_json).ok()?;
+    if agent.get("name")?.as_str()?.is_empty() {
+        return None;
+    }
+    let started = events.iter().find_map(|event| match &event.kind {
+        Some(session_event::Kind::Started(started)) => Some(started),
+        _ => None,
+    })?;
+    if started.tool_profile == crate::claude_code::PROFILE {
+        return None;
+    }
+    // subagent::Runner appends this environment after the explicit prompt,
+    // before prompt_for_tools. Use the last marker: instructions may contain
+    // their own Environment heading. Do not retain stale derived sections.
+    Some(
+        started
+            .system_prompt
+            .rsplit_once("\n\n# Environment\n\nWorking directory: ")
+            .map_or(started.system_prompt.as_str(), |(instructions, _)| instructions),
+    )
+}
+
 /// The heading of the system prompt's skills index.
 pub(crate) const SKILLS_HEADING: &str = "\n\n# Skills\n\n";
 
@@ -8702,9 +9023,229 @@ mod claude_trim_tests {
 }
 
 #[cfg(test)]
+mod spec_generation_tests {
+    use super::*;
+
+    async fn barrier(manager: &SessionManager, name: &str) {
+        // Two separately acknowledged messages force a trip through the
+        // dispatch boundary after the first receipt, even if its journal
+        // append wakes this test before the actor reaches that boundary.
+        for round in 0..2 {
+            let command_id = format!("{name}-{round}");
+            manager
+                .actor("fenced")
+                .await
+                .unwrap()
+                .unwrap()
+                .send(ActorMsg::SetSubagentModel { command_id: command_id.clone(), model: None })
+                .unwrap();
+            c6_testkit::eventually("the spec generation actor barrier", async || {
+                manager
+                    .journal
+                    .events_after("fenced", 0, u32::MAX)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(
+                        |event| matches!(&event.kind, Some(session_event::Kind::SubagentModelSet(model)) if model.command_id == command_id),
+                    )
+                    .then_some(())
+            })
+            .await;
+        }
+    }
+
+    async fn assert_queued_without_a_turn(manager: &SessionManager) {
+        let actor = manager.actors.lock().unwrap().get("fenced").unwrap().clone();
+        assert!(!actor.running.load(std::sync::atomic::Ordering::SeqCst));
+        let queued: Vec<_> = actor.inbox.lock().unwrap().queue.iter().map(|(input, _)| input.command_id.clone()).collect();
+        assert_eq!(queued, ["queued-input"]);
+        let events = manager.journal.events_after("fenced", 0, u32::MAX).await.unwrap();
+        assert!(!events.iter().any(|event| matches!(&event.kind, Some(session_event::Kind::TurnStarted(_)))));
+    }
+
+    #[tokio::test]
+    async fn reconnect_requires_the_actors_generation_marker_before_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let link = Arc::new(HeadLink::default());
+        // No reconnect grace period is needed for this deliberately offline
+        // broker: the released turn can record its credential error at once.
+        link.stop_credentials();
+        let manager = SessionManager::new(journal, link, dir.path().join("worktrees"));
+        manager
+            .handle(SessionCommand {
+                command_id: "create-fenced".into(),
+                session_id: "fenced".into(),
+                kind: Some(session_command::Kind::Create(CreateSession {
+                    model: Some(ModelSpec {
+                        connection_id: "offline".into(),
+                        connection_kind: "openai_compat".into(),
+                        model: "test-model".into(),
+                        ..Default::default()
+                    }),
+                    cwd: dir.path().display().to_string(),
+                    tools: vec!["Read".into()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // This actor was registered in the previous, already-ready generation.
+        let stale_generation = manager.await_initial_specs();
+        manager.await_initial_specs();
+        manager
+            .handle(SessionCommand {
+                command_id: "queued-input".into(),
+                session_id: "fenced".into(),
+                kind: Some(session_command::Kind::Input(c6_proto::UserMessage {
+                    text: "wait for this attach".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        barrier(&manager, "global-gate-closed").await;
+        assert_queued_without_a_turn(&manager).await;
+
+        // A replaced stream cannot release the new attach or install its
+        // obsolete configuration, even if its command task finishes late.
+        manager.specs_ready_for(stale_generation);
+        assert!(!manager.config_ready.load(std::sync::atomic::Ordering::SeqCst));
+        manager
+            .refresh_spec_for("fenced", CreateSession { base_prompt: "STALE STREAM PROMPT".into(), ..Default::default() }, stale_generation)
+            .await
+            .unwrap();
+        barrier(&manager, "stale-stream-ignored").await;
+        assert_queued_without_a_turn(&manager).await;
+
+        // Release the worker-wide gate without delivering this actor's marker.
+        // Its old local ready flag is still true; only the generation mismatch
+        // prevents it from dispatching the queued input now.
+        manager.config_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        barrier(&manager, "actor-marker-missing").await;
+        assert_queued_without_a_turn(&manager).await;
+
+        manager.specs_ready();
+        c6_testkit::eventually("the matching spec generation to release the queued turn", async || {
+            manager
+                .journal
+                .events_after("fenced", 0, u32::MAX)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(&event.kind, Some(session_event::Kind::TurnStarted(_))))
+                .then_some(())
+        })
+        .await;
+        let (spec, events) = manager.journal.load_session("fenced").await.unwrap().unwrap();
+        assert!(!spec.base_prompt.contains("STALE STREAM PROMPT"));
+        assert!(!events.iter().any(|event| matches!(&event.kind, Some(session_event::Kind::SpecRefreshed(_)))));
+    }
+}
+
+#[cfg(test)]
 mod route_tool_tests {
     use super::*;
     use prost::Message;
+
+    #[tokio::test]
+    async fn named_child_refresh_preserves_original_instructions_after_catalog_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let model = ModelSpec { connection_kind: "anthropic".into(), model: "claude-sonnet-5-5".into(), ..Default::default() };
+        let old = CreateSession {
+            model: Some(model.clone()),
+            cwd: dir.path().display().to_string(),
+            base_prompt: "INHERITED PARENT PROMPT".into(),
+            tools: vec!["Read".into(), "Skill".into()],
+            skills_json: r#"[{"name":"obsolete","description":"Obsolete skill","body":"OLD SKILL"}]"#.into(),
+            agents_json: r#"[{"name":"reader","prompt":"CATALOG COPY"}]"#.into(),
+            delegation: Some(c6_proto::Delegation {
+                parent_session_id: "parent".into(),
+                root_session_id: "parent".into(),
+                agent_json: r#"{"name":"reader","tools":["Read","Skill"]}"#.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let instructions = "ONLY REVIEW, NEVER EDIT.\n\n# Environment\n\nWorking directory: an example in the instructions";
+        let started = SessionStarted {
+            model: Some(model),
+            cwd: old.cwd.clone(),
+            tool_profile: ToolProfile::Claude.as_str().into(),
+            system_prompt: format!("{instructions}\n\n# Environment\n\nWorking directory: {}\nToday's date: 2026-01-01", old.cwd),
+            tools: old.tools.clone(),
+            ..Default::default()
+        };
+        journal
+            .create_session(
+                "named",
+                &old,
+                &SessionEvent { seq: 1, kind: Some(session_event::Kind::Started(started)), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        let manager = SessionManager::new(journal.clone(), Arc::new(HeadLink::default()), dir.path().join("worktrees"));
+        for base in ["NEW ROOT PROMPT", "ANOTHER ROOT PROMPT"] {
+            let fresh = CreateSession {
+                base_prompt: base.into(),
+                agents_json: "[]".into(),
+                skills_json: "[]".into(),
+                // Force a second rebuild without changing the child's identity.
+                prompts_json: serde_json::json!({"session.task_cards": base}).to_string(),
+                ..Default::default()
+            };
+            manager
+                .handle(SessionCommand {
+                    session_id: "named".into(),
+                    kind: Some(session_command::Kind::RefreshSpec(fresh)),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let command = uuid::Uuid::now_v7().to_string();
+            manager
+                .actor("named")
+                .await
+                .unwrap()
+                .unwrap()
+                .send(ActorMsg::SetSubagentModel { command_id: command.clone(), model: None })
+                .unwrap();
+            c6_testkit::eventually("named child refresh mailbox barrier", async || {
+                journal
+                    .events_after("named", 0, u32::MAX)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(&event.kind, Some(session_event::Kind::SubagentModelSet(change)) if change.command_id == command))
+                    .then_some(())
+            })
+            .await;
+        }
+        let (spec, events) = journal.load_session("named").await.unwrap().unwrap();
+        assert_eq!(spec.agents_json, "[]", "the catalog entry really was removed");
+        assert_eq!(named_child_instructions(&spec, &events), Some(instructions));
+        let refreshes: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                Some(session_event::Kind::SpecRefreshed(refresh)) => Some(refresh),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refreshes.len(), 2);
+        for refresh in refreshes {
+            assert!(refresh.system_prompt.starts_with(instructions), "{}", refresh.system_prompt);
+            assert!(!refresh.system_prompt.contains("INHERITED PARENT PROMPT"));
+            assert!(!refresh.system_prompt.contains("ROOT PROMPT"));
+            assert!(!refresh.system_prompt.contains("2026-01-01"), "old environment is rebuilt");
+            assert!(!refresh.tools.iter().any(|name| name == "Skill"), "revoked skill tools are not preserved with the instructions");
+            assert!(refresh.tools.iter().any(|name| name == "Read"));
+        }
+    }
 
     fn spec() -> CreateSession {
         CreateSession {
@@ -9181,6 +9722,108 @@ mod label_tests {
 #[cfg(test)]
 mod claude_code_tools_tests {
     use super::*;
+
+    #[test]
+    fn present_connection_catalog_revokes_legacy_and_explicit_fallbacks() {
+        let model = ModelSpec { connection_id: "revoked".into(), connection_kind: "alias".into(), ..Default::default() };
+        let mut spec = CreateSession {
+            model: Some(model.clone()),
+            subagent_target: Some(model),
+            subagent_target_explicit: true,
+            ..Default::default()
+        };
+        assert_eq!(subagent_connections(&spec).len(), 1, "legacy absent catalogs retain their fallback");
+        for catalog in ["[]", "not valid JSON"] {
+            spec.subagent_connections_json = catalog.into();
+            assert!(subagent_connections(&spec).is_empty(), "a present catalog fails closed");
+        }
+    }
+
+    #[tokio::test]
+    async fn old_claude_journal_refreshes_delegation_and_prompts_without_changing_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let model =
+            ModelSpec { connection_id: "cc".into(), connection_kind: "claude_code".into(), model: "opus".into(), ..Default::default() };
+        // A pre-catalog wire spec has no target, catalog or editable prompts.
+        let old = CreateSession {
+            model: Some(model.clone()),
+            cwd: dir.path().display().to_string(),
+            labels: vec!["mine".into()],
+            ..Default::default()
+        };
+        let started = SessionStarted {
+            model: Some(model.clone()),
+            cwd: old.cwd.clone(),
+            tool_profile: crate::claude_code::PROFILE.into(),
+            system_prompt: crate::claude_code::SYSTEM_PROMPT.into(),
+            ..Default::default()
+        };
+        journal
+            .create_session(
+                "legacy",
+                &old,
+                &SessionEvent { seq: 1, kind: Some(session_event::Kind::Started(started)), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        let before =
+            journal_claude_conversation(&journal, "legacy", &old, &journal.events_after("legacy", 0, 100).await.unwrap()).await.unwrap().id;
+        let manager = SessionManager::new(journal.clone(), Arc::new(HeadLink::default()), dir.path().join("worktrees"));
+        let fresh = CreateSession {
+            base_prompt: "current base".into(),
+            prompts_json: r#"{"session.claude_code":"CURRENT EDITABLE PROMPT"}"#.into(),
+            subagent_target: Some(model.clone()),
+            subagent_connections_json: r#"[{"id":"cc","name":"Claude","kind":"claude_code","default_model":"opus"}]"#.into(),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            manager
+                .handle(SessionCommand {
+                    session_id: "legacy".into(),
+                    kind: Some(session_command::Kind::RefreshSpec(fresh.clone())),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            // A following explicit-event receipt is an actor mailbox barrier.
+            let command = uuid::Uuid::now_v7().to_string();
+            manager
+                .actor("legacy")
+                .await
+                .unwrap()
+                .unwrap()
+                .send(ActorMsg::SetSubagentModel { command_id: command.clone(), model: Some(model.clone()) })
+                .unwrap();
+            c6_testkit::eventually("the refresh mailbox barrier", async || {
+                journal
+                    .events_after("legacy", 0, 100)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(&e.kind, Some(session_event::Kind::SubagentModelSet(m)) if m.command_id == command))
+                    .then_some(())
+            })
+            .await;
+        }
+        let (spec, events) = journal.load_session("legacy").await.unwrap().unwrap();
+        assert_eq!(spec.model, old.model);
+        assert_eq!(spec.cwd, old.cwd);
+        assert_eq!(spec.labels, old.labels);
+        assert_eq!(journal_claude_conversation(&journal, "legacy", &spec, &events).await.unwrap().id, before);
+        let refreshes: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::SpecRefreshed(r)) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refreshes.len(), 1, "an unchanged snapshot is not another event");
+        assert!(refreshes[0].tools.iter().any(|tool| tool == "Task"));
+        assert!(refreshes[0].tools.iter().any(|tool| tool == "SendMessage"));
+        assert!(spec.prompts_json.contains("CURRENT EDITABLE PROMPT"));
+        assert!(claude_code_system_prompt(&spec, &[], &claude_code_subagent_tools(&spec, &[])).contains("CURRENT EDITABLE PROMPT"));
+    }
 
     #[test]
     fn legacy_journal_with_an_alias_default_keeps_delegation_after_replay() {

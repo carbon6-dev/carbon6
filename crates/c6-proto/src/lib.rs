@@ -15,6 +15,72 @@ pub const SESSION_MOVE_CAPABILITY: &str = "session_move_v1";
 /// The destination honors an explicit folder and worktree plan. Older fenced
 /// movers ignore these fields and must not receive a complete-target request.
 pub const SESSION_MOVE_TARGET_CAPABILITY: &str = "session_move_target_v1";
+/// The worker journals derived configuration and applies it between turns.
+pub const SESSION_SPEC_REFRESH_CAPABILITY: &str = "session_spec_refresh_v1";
+
+impl CreateSession {
+    /// Deliberate allowlist: a configuration refresh cannot change identity,
+    /// placement, model, history, delegation, labels or provider cache state.
+    /// Keep in sync with docs/session-specs.md when adding wire fields.
+    pub fn apply_derived(&mut self, fresh: &Self) {
+        macro_rules! copy {
+            ($($field:ident),* $(,)?) => { $(self.$field.clone_from(&fresh.$field);)* };
+        }
+        copy!(
+            base_prompt,
+            mcp_servers_json,
+            skills_json,
+            hooks_json,
+            agents_json,
+            secrets_json,
+            web_search_json,
+            memories_json,
+            policies_json,
+            memex_tools,
+            memex_mail,
+            memex_calendar,
+            memex_chat,
+            prompts_json,
+            max_subagent_depth,
+            max_running_subagents,
+            subagent_connections_json,
+            tools,
+            subagent_templates_json,
+            auto_turns_per_hour,
+            claude_code_idle_minutes,
+            claude_code_tools,
+            claude_code_tools_chosen,
+            claude_code,
+            notice_quiet_seconds,
+            notice_max_wait_seconds,
+            notice_no_progress_limit,
+            notice_failure_relaunch_limit,
+            notice_tokens_per_hour,
+            session_recovery_seconds,
+            notice_loop_backoff_rounds,
+            notice_loop_backoff_max_seconds,
+            disk_recovery_initial_seconds,
+            disk_recovery_max_seconds,
+            disk_warning_percent,
+            disk_warning_bytes,
+            claude_code_trim_enabled,
+            claude_code_trim_at,
+            keep_warm_json,
+        );
+        // Old creation specs can carry a model-only explicit choice without
+        // the newer provenance bit or a subsequent choice event.
+        if !self.subagent_target_explicit && self.subagent_model.is_empty() {
+            self.subagent_target.clone_from(&fresh.subagent_target);
+        }
+    }
+
+    /// A configuration-only wire snapshot, also used for no-op detection.
+    pub fn derived(&self) -> Self {
+        let mut derived = Self::default();
+        derived.apply_derived(self);
+        derived
+    }
+}
 
 /// Maintenance is accounted and replicated, but is not evidence of task
 /// progress. Quiet diagnostic titles are protocol markers, not agent prompts.
@@ -36,6 +102,67 @@ pub fn is_keep_warm_event(event: &SessionEvent) -> bool {
 mod tests {
     use super::*;
     use prost::Message;
+
+    #[test]
+    fn derived_refresh_cannot_replace_session_state() {
+        let model = ModelSpec { connection_id: "own".into(), model: "chosen".into(), ..Default::default() };
+        let mut spec = CreateSession {
+            model: Some(model.clone()),
+            cwd: "/chosen".into(),
+            worktree: true,
+            ssh_target: "host".into(),
+            labels: vec!["mine".into()],
+            depth: 2,
+            delegation: Some(Delegation { parent_session_id: "parent".into(), ..Default::default() }),
+            seed: vec![SessionEvent { seq: 7, ..Default::default() }],
+            memex_brief: "conversation context".into(),
+            keep_warm_snapshot_json: Some("prefix".into()),
+            subagent_model: "legacy choice".into(),
+            subagent_target: Some(model.clone()),
+            subagent_target_explicit: true,
+            ..Default::default()
+        };
+        let state = spec.clone();
+        let fresh = CreateSession {
+            base_prompt: "today's prompt".into(),
+            tools: vec!["Task".into(), "SendMessage".into()],
+            subagent_connections_json: "[]".into(),
+            subagent_target: Some(ModelSpec::default()),
+            ..Default::default()
+        };
+        spec.apply_derived(&fresh);
+        let mut expected = state;
+        expected.base_prompt.clone_from(&fresh.base_prompt);
+        expected.tools.clone_from(&fresh.tools);
+        expected.subagent_connections_json.clone_from(&fresh.subagent_connections_json);
+        assert_eq!(spec, expected);
+        assert_eq!(spec.subagent_target, Some(model));
+        let snapshot = spec.derived();
+        assert!(snapshot.model.is_none() && snapshot.cwd.is_empty() && snapshot.seed.is_empty());
+        assert!(snapshot.delegation.is_none() && snapshot.labels.is_empty());
+        assert!(snapshot.keep_warm_snapshot_json.is_none() && snapshot.memex_brief.is_empty());
+        assert!(!snapshot.subagent_target_explicit);
+    }
+
+    #[test]
+    fn spec_refresh_uses_new_wire_tags_and_old_specs_still_decode() {
+        assert_eq!(CreateSession::decode(&[][..]).unwrap(), CreateSession::default());
+        let cmd = SessionCommand { kind: Some(session_command::Kind::RefreshSpec(CreateSession::default())), ..Default::default() };
+        assert_eq!(cmd.encode_to_vec(), [0xc2, 0x01, 0]); // command tag 24
+        assert_eq!(SessionCommand::decode(cmd.encode_to_vec().as_slice()).unwrap(), cmd);
+        let event = SessionEvent { kind: Some(session_event::Kind::SpecRefreshed(SpecRefreshed::default())), ..Default::default() };
+        assert_eq!(event.encode_to_vec(), [0x92, 0x02, 0]); // event tag 34
+    }
+
+    #[test]
+    fn legacy_explicit_subagent_choice_is_not_replaced_by_a_default() {
+        let chosen = ModelSpec { connection_id: "chosen".into(), ..Default::default() };
+        let mut spec =
+            CreateSession { subagent_model: "legacy explicit model".into(), subagent_target: Some(chosen.clone()), ..Default::default() };
+        spec.apply_derived(&CreateSession { subagent_target: Some(ModelSpec::default()), ..Default::default() });
+        assert_eq!(spec.subagent_target, Some(chosen));
+        assert_eq!(spec.subagent_model, "legacy explicit model");
+    }
 
     #[test]
     fn machine_sample_uses_fresh_worker_tag_nine() {

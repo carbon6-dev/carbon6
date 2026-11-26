@@ -191,6 +191,7 @@ impl WorkerHub for HubSvc {
             machine_sample_secs: Some(st.machines.config.sample_secs.max(1)),
             machine_disk_hold_percent: Some(st.machines.config.disk_hold_percent),
             machine_disk_warn_percent: Some(st.machines.config.disk_warn_percent),
+            session_spec_refresh: hello.capabilities.iter().any(|c| c == c6_proto::SESSION_SPEC_REFRESH_CAPABILITY),
         };
         tx.send(Ok(head(head_msg::Msg::Welcome(welcome)))).await.ok();
 
@@ -206,6 +207,13 @@ impl WorkerHub for HubSvc {
                     tracing::warn!(worker = %worker_id, "refreshing session settings after reconnect: {e:#}");
                 }
             });
+            // Use the captured stream and its Hello. Do this before command
+            // replay, rather than racing delivery in a settings task.
+            if let Err(e) = refresh_attached_specs(&st, worker_id, &tx, &hello.capabilities, &hello.sessions).await {
+                warn!(worker = %worker_id, "refreshing session specs after reconnect: {e:#}");
+                let _ = tx.send(Err(attach_error(e))).await;
+                return;
+            }
             let reason = serve_worker(&st, &guard, &mut inbound, &tx, &hello.capabilities).await;
             st.store.touch_worker(worker_id, now_ms()).await.ok();
             info!(worker = %worker_id, %reason, "worker detached");
@@ -434,6 +442,44 @@ fn command_read_error(e: anyhow::Error) -> anyhow::Error {
     if sqlite_busy(&e) { CommandDeliveryBusy(e).into() } else { e }
 }
 
+async fn refresh_attached_specs(
+    st: &HeadState,
+    worker_id: WorkerId,
+    tx: &mpsc::Sender<Result<HeadMsg, Status>>,
+    capabilities: &[String],
+    cursors: &[c6_proto::SessionCursor],
+) -> anyhow::Result<()> {
+    if !capabilities.iter().any(|c| c == c6_proto::SESSION_SPEC_REFRESH_CAPABILITY) {
+        return Ok(());
+    }
+    let rows: Vec<crate::store::SessionRow> = sqlx::query_as("SELECT * FROM sessions WHERE worker_id = ? AND archived = 0")
+        .bind(worker_id.to_string())
+        .fetch_all(&st.store.pool)
+        .await?;
+    for row in rows {
+        // A pending Create or a lost cache is not installed on the worker yet.
+        // Its Create/Restore receives current settings in deliver_pending.
+        if cursors.iter().any(|c| c.session_id == row.id && c.ownership_epoch == row.ownership_epoch as u64)
+            && st.store.session_routable(&row.id, worker_id, row.ownership_epoch).await?
+            && let Some(mut refresh) = sessions::refresh_spec(st, &row).await?
+        {
+            sessions::prepare_worker_subagents(capabilities, &mut refresh)?;
+            if tx.send(Ok(head(head_msg::Msg::Command(refresh)))).await.is_err() {
+                break;
+            }
+        }
+    }
+    // The worker holds startup recovery until all snapshots ahead of this
+    // marker have passed through its serial command queue. Welcome alone
+    // must not release turns which were recovered before connecting.
+    let ready = c6_proto::SessionCommand {
+        kind: Some(c6_proto::session_command::Kind::SpecsReady(c6_proto::SessionSpecsReady {})),
+        ..Default::default()
+    };
+    let _ = tx.send(Ok(head(head_msg::Msg::Command(ready)))).await;
+    Ok(())
+}
+
 /// Sends pending commands newer than `delivered`, in order. Ok(false) if the
 /// stream closed.
 async fn deliver_pending(
@@ -462,6 +508,39 @@ async fn deliver_pending(
             if !st.store.session_routable(&cmd.session_id, worker_id, row.ownership_epoch).await.map_err(command_read_error)? {
                 *delivered = row.seq;
                 continue;
+            }
+            // Durable inputs (including remote notices) all pass this lane.
+            // Rebuild settings at delivery, not enqueue time, so an idle
+            // session's next turn sees edits made while it was waiting.
+            let mut refresh = None;
+            if capabilities.iter().any(|c| c == c6_proto::SESSION_SPEC_REFRESH_CAPABILITY)
+                && matches!(
+                    cmd.kind,
+                    Some(
+                        c6_proto::session_command::Kind::Create(_)
+                            | c6_proto::session_command::Kind::Restore(_)
+                            | c6_proto::session_command::Kind::Input(_)
+                            | c6_proto::session_command::Kind::DelegationEnded(_)
+                            | c6_proto::session_command::Kind::ReleaseNotices(_)
+                    )
+                )
+                && let Some(session) = st.store.session(&cmd.session_id).await.map_err(command_read_error)?
+                && let Some(fresh) = sessions::refresh_spec(st, &session).await.map_err(command_read_error)?
+            {
+                match (&mut cmd.kind, &fresh.kind) {
+                    (Some(c6_proto::session_command::Kind::Create(spec)), Some(c6_proto::session_command::Kind::RefreshSpec(settings))) => {
+                        spec.apply_derived(settings);
+                    }
+                    (
+                        Some(c6_proto::session_command::Kind::Restore(restore)),
+                        Some(c6_proto::session_command::Kind::RefreshSpec(settings)),
+                    ) => {
+                        if let Some(spec) = &mut restore.spec {
+                            spec.apply_derived(settings);
+                        }
+                    }
+                    _ => refresh = Some(fresh),
+                }
             }
             // Use this stream's Hello, not a replacement in the registry.
             let compatibility = match sessions::prepare_worker_subagents(capabilities, &mut cmd) {
@@ -496,6 +575,12 @@ async fn deliver_pending(
                 // Use this connection's Hello, not a replacement connection's
                 // capabilities while the previous delivery task is exiting.
                 sessions::prepare_worker_input(capabilities, input);
+            }
+            if let Some(mut refresh) = refresh {
+                sessions::prepare_worker_subagents(capabilities, &mut refresh)?;
+                if tx.send(Ok(head(head_msg::Msg::Command(refresh)))).await.is_err() {
+                    return Ok(false);
+                }
             }
             if tx.send(Ok(head(head_msg::Msg::Command(cmd)))).await.is_err() {
                 return Ok(false);

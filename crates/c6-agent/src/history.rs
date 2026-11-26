@@ -201,7 +201,7 @@ pub fn user_text(text: &str, attachments: &[c6_proto::Attachment]) -> String {
 }
 
 /// The events that still count: a `Rewound` drops the events of its own
-/// session from its `to_seq` on, except for placement changes. Each session's
+/// session from its `to_seq` on, except for placement and configuration changes. Each session's
 /// part of the list starts at its `Started` event (a side chat's list begins with its parents' events,
 /// whose seqs overlap its own).
 pub fn effective_events(events: &[SessionEvent]) -> Vec<SessionEvent> {
@@ -215,10 +215,13 @@ pub fn effective_events(events: &[SessionEvent]) -> Vec<SessionEvent> {
             }
             Some(session_event::Kind::Rewound(r)) => {
                 let cut = kept[segment..].iter().position(|e| e.seq >= r.to_seq).map_or(kept.len(), |p| segment + p);
-                // Placement is not rolled back with the conversation. Keep
-                // the facts the model needs about where it will run next.
-                let places: Vec<_> = kept.drain(cut..).filter(|e| matches!(e.kind, Some(session_event::Kind::PlaceChanged(_)))).collect();
-                kept.extend(places);
+                // Placement and current configuration are not rolled back
+                // with the conversation: neither revives revoked tools.
+                let runtime: Vec<_> = kept
+                    .drain(cut..)
+                    .filter(|e| matches!(e.kind, Some(session_event::Kind::PlaceChanged(_) | session_event::Kind::SpecRefreshed(_))))
+                    .collect();
+                kept.extend(runtime);
             }
             _ => kept.push(ev.clone()),
         }
@@ -1007,6 +1010,20 @@ mod tests {
 
     fn placement_rewind(to_seq: u64) -> session_event::Kind {
         session_event::Kind::Rewound(c6_proto::Rewound { to_seq, ..Default::default() })
+    }
+
+    #[test]
+    fn rewind_does_not_restore_revoked_configuration() {
+        let refresh = session_event::Kind::SpecRefreshed(c6_proto::SpecRefreshed {
+            system_prompt: "current guidance".into(),
+            tools: vec!["Read".into()],
+            ..Default::default()
+        });
+        let events = placement_events([placement_user("keep"), placement_user("discard"), refresh.clone(), placement_rewind(2)]);
+        let effective = effective_events(&events);
+        assert_eq!(effective.len(), 2);
+        assert_eq!(effective[1].kind.as_ref(), Some(&refresh));
+        assert_eq!(effective_events(&effective), effective);
     }
 
     #[test]

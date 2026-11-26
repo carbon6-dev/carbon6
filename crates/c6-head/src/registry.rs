@@ -228,6 +228,26 @@ impl Registry {
         }
     }
 
+    /// A snapshot was prepared for this exact connection's capabilities.
+    /// Reconnection retries it at attach; never redirect it to a replacement.
+    pub async fn send_spec_refresh(&self, worker_id: WorkerId, conn_id: u64, cmd: SessionCommand) -> bool {
+        let tx = self
+            .conns
+            .lock()
+            .unwrap()
+            .get(&worker_id)
+            .filter(|live| {
+                live.conn_id == conn_id
+                    && live.capabilities.iter().any(|c| c == c6_proto::SESSION_SPEC_REFRESH_CAPABILITY)
+                    && (cmd.ownership_epoch == 0 || live.capabilities.iter().any(|c| c == c6_proto::SESSION_MOVE_CAPABILITY))
+            })
+            .map(|live| live.tx.clone());
+        match tx {
+            Some(tx) => tx.send(Ok(HeadMsg { msg: Some(head_msg::Msg::Command(cmd)) })).await.is_ok(),
+            None => false,
+        }
+    }
+
     pub fn heartbeat(&self, worker_id: WorkerId, conn_id: u64, now: i64, rtt_us: Option<u32>) {
         let mut conns = self.conns.lock().unwrap();
         if let Some(c) = conns.get_mut(&worker_id).filter(|c| c.conn_id == conn_id) {

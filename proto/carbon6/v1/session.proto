@@ -35,7 +35,17 @@ message SessionEvent {
     NoticeQueued notice_queued = 31;
     InputDelivered input_delivered = 32;
     PlaceChanged place_changed = 33;
+    SpecRefreshed spec_refreshed = 34;
   }
+}
+
+// Derived configuration only. Session identity, placement, model and history
+// are never read from spec. The effective runtime prompt/tools make replay
+// independent of the version which originally created the session.
+message SpecRefreshed {
+  CreateSession spec = 1;
+  string system_prompt = 2;
+  repeated string tools = 3;
 }
 
 // Placement is part of session ownership, not of the rewindable conversation.
@@ -611,8 +621,14 @@ message SessionCommand {
     ChangePlace change_place = 21;
     // Refresh settings without acknowledging or discarding a guard's evidence.
     NoticeLimits update_notice_limits = 23;
+    // Requires session_spec_refresh_v1. Applied at a quiet turn boundary.
+    CreateSession refresh_spec = 24;
+    // Worker-wide attach barrier, no session or ownership epoch.
+    SessionSpecsReady specs_ready = 25;
   }
 }
+
+message SessionSpecsReady {}
 
 message ChangePlace {
   // Optimistic concurrency token: Started or the latest PlaceChanged seq.
@@ -721,7 +737,7 @@ message CreateSession {
   // Run in a new git worktree on a new branch instead of `cwd` itself.
   bool worktree = 4;
   // Head configuration snapshot for this session (JSON arrays): MCP servers
-  // and skills. Fixed for the session so the tool list stays stable.
+  // and skills. Refreshed at quiet turn boundaries on capable workers.
   string mcp_servers_json = 5;
   string skills_json = 6;
   // Side chats: the conversation they branch from (the parent's events up
@@ -836,6 +852,8 @@ message CreateSession {
   // Worker-local provider-ready prefix, transferred only with a move. No
   // credentials or headers. Ordinary restored history need not have one.
   optional string keep_warm_snapshot_json = 50;
+  // Session state, not derived configuration. SetSubagentModel owns this.
+  bool subagent_target_explicit = 53;
 }
 
 // How a new git worktree is made: the branch ({{id}} is the session's

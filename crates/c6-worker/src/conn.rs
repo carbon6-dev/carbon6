@@ -139,6 +139,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
     capabilities.push(c6_proto::SESSION_MOVE_CAPABILITY.into());
     capabilities.push(c6_proto::SESSION_MOVE_TARGET_CAPABILITY.into());
     capabilities.push("notice_settings_v1".into());
+    capabilities.push(c6_proto::SESSION_SPEC_REFRESH_CAPABILITY.into());
     let hello = Hello {
         protocol_version: c6_core::PROTOCOL_VERSION,
         version: c6_core::build().into(),
@@ -153,6 +154,9 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
             Err(e) => return Ended::Retry(e.context("reading journal")),
         },
     };
+    // Fence queued automatic work on reconnect too, not just Worker::open.
+    // Active turns/native work continue; new dispatch waits for this attach.
+    let spec_generation = worker.sessions.await_initial_specs();
     tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Hello(hello)) }).await.ok();
 
     let client = WorkerHubClient::new(channel.clone()).max_decoding_message_size(MAX_MESSAGE).max_encoding_message_size(MAX_MESSAGE);
@@ -168,6 +172,9 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
             let warning = w.machine_disk_warn_percent.filter(|n| n.is_finite() && (0.0..=100.0).contains(n)).unwrap_or(10.0);
             worker.machine_disk_warn_percent.store(warning.to_bits(), std::sync::atomic::Ordering::Relaxed);
             worker.sessions.launch_pressure.configure_disk(w.machine_disk_hold_percent);
+            if !w.session_spec_refresh {
+                worker.sessions.specs_ready_for(spec_generation);
+            }
             for ack in &w.acks {
                 if let Err(e) = worker.journal.set_acked_owned(&ack.session_id, ack.seq, ack.ownership_epoch).await {
                     return Ended::Retry(e.context("recording acks"));
@@ -209,7 +216,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                 let ownership_epoch = cmd.ownership_epoch;
                 // The manager can recover a lost cache via Restore before checking
                 // ownership. No other command can install a new incarnation.
-                if !matches!(&cmd.kind, Some(session_command::Kind::Restore(_)))
+                if !matches!(&cmd.kind, Some(session_command::Kind::Restore(_) | session_command::Kind::SpecsReady(_)))
                     && let Err(reason) = worker.journal.check_ownership(&session_id, ownership_epoch).await
                 {
                     // A lost cache has neither an ownership row nor a session.
@@ -229,6 +236,15 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                     continue;
                 }
                 let result = match cmd.kind {
+                    Some(session_command::Kind::RefreshSpec(spec)) => {
+                        worker.sessions.refresh_spec_for(&session_id, spec, spec_generation).await
+                    }
+                    Some(session_command::Kind::SpecsReady(_)) => {
+                        // An old connection's command task cannot release a
+                        // newer attach's generation while it is shutting down.
+                        worker.sessions.specs_ready_for(spec_generation);
+                        Ok(())
+                    }
                     Some(session_command::Kind::ChangePlace(place)) => {
                         // Put the move in the mailbox before dispatching the next command,
                         // but let the actor finish slow workspace preparation on its own.

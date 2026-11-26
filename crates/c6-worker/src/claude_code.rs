@@ -179,6 +179,10 @@ pub struct Launch {
     /// Older held processes have no managed cache environment recorded.
     #[serde(default)]
     pub compile_cache_env_fingerprint: String,
+    /// Tool schemas, MCP endpoints and prompt configuration can change while
+    /// their names stay identical. Old held metadata has no fingerprint.
+    #[serde(default)]
+    pub spec_fingerprint: String,
     /// More arguments: the head's Ask passes `--tools ""` and
     /// `--strict-mcp-config`, so Claude Code has only carbon6's tools there
     /// (docs/ask.md §3).
@@ -3507,7 +3511,7 @@ impl Process {
     /// unconfirmed input or background task can be lost. Quiet non-held
     /// processes are also promoted to the restart-surviving transport.
     pub(crate) fn replacement_ready(&self, launch: &Launch) -> bool {
-        (self.launch() != launch || !self.is_held()) && self.idle_until(Duration::ZERO).is_some()
+        (self.launch() != launch || !self.is_held()) && self.trim_quiet()
     }
 
     /// The next line it wrote (`None`: it exited). For a session's actor
@@ -7438,6 +7442,8 @@ cat > /dev/null
             };
             assert_ne!(p.launch(), &changed_cache);
             assert!(!p.replacement_ready(&changed_cache), "cache changes must not restart a process with running tasks");
+            let changed_spec = Launch { spec_fingerprint: "new-tools-and-prompts".into(), ..p.launch().clone() };
+            assert!(!p.replacement_ready(&changed_spec), "a spec refresh must wait for native background tasks too");
             // Backdate only the product clock: no wall-clock wait or race
             // with a real child process on a paused Tokio clock.
             p.idle_since = tokio::time::Instant::now() - IDLE - Duration::from_secs(1);
@@ -7449,7 +7455,7 @@ cat > /dev/null
                 }
             })
             .await;
-            assert!(p.replacement_ready(&changed_cache), "the next quiet turn may replace the process to apply cache changes");
+            assert!(!p.replacement_ready(&changed_spec), "the terminal notification still belongs to the old process");
             let after_first = vec_sink.0.lock().unwrap().len();
             let deadline = p.idle_until(IDLE).expect("no running tasks");
             write_line(&p.stdin, &serde_json::json!({"fixture": "reply"})).await.unwrap();
@@ -7471,6 +7477,8 @@ cat > /dev/null
             assert!(p.idle_line(v, &sink).await.unwrap());
             assert!(p.wake_due().is_none() && p.take_unwoken().is_none(), "no duplicate fallback notice");
             assert_eq!(run(&mut p, 2, &[], &sink).await.reason, Some(TurnEndReason::Completed));
+            assert!(p.replacement_ready(&changed_cache), "the quiet boundary may apply cache changes");
+            assert!(p.replacement_ready(&changed_spec), "the quiet boundary may apply refreshed tools and prompts");
             let events = vec_sink.0.lock().unwrap().clone();
             let reply = &events[after_first..];
             assert_eq!(

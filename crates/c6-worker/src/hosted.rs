@@ -83,6 +83,7 @@ impl HostedClaude {
             tools: names.clone(),
             worker: c6_core::build().to_owned(),
             compile_cache_env_fingerprint: String::new(),
+            spec_fingerprint: String::new(),
             extra_args: LOCKED_DOWN.iter().map(|a| (*a).to_owned()).collect(),
             // Locked down by its own flags: none of Claude Code's tools.
             native: None,

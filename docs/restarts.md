@@ -12,6 +12,15 @@ The goal: a worker can restart at any moment, and nothing that was running is lo
 
 ## 1. Where things stand
 
+Current session configuration is separate from restartable session state; see
+[Session state and current configuration](session-specs.md). Capable workers
+receive fresh derived specs before recovered turns can dispatch. Changed
+configuration applies at a quiet turn boundary, without resetting conversation,
+placement or explicit model choices. For Claude Code it waits for native work
+and pending notifications to finish, then uses the existing supervised
+replacement path to resume the same conversation with current guidance/tools.
+This does not replace the process-preservation layers described below.
+
 - **Busy means "a turn is running"** (`Sessions::running`, `crates/c6-worker/src/update.rs`). A session whose turn ended while its background work runs counts as idle, so the update restarts the worker under it.
 - **Everything is the worker's child or lives in its memory.**
   - Shell commands are its child processes; their process groups don't help, because a restart stops them all. systemd stops the whole cgroup (`c6w@.service`: `KillMode=mixed`), and launchd stops the job.
