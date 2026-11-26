@@ -165,11 +165,17 @@ async fn send_now_reaches_claude_code_as_a_send_now() {
     };
     // Once its command holds the turn.
     let holding = async |n: usize| {
-        eventually("the turn to wait on its command", async || {
-            let evs = events().await?;
-            (evs.iter().filter(|e| matches!(&e.kind, EventKind::BackgroundTask { state, .. } if state == "started")).count() >= n)
-                .then_some(())
-        })
+        let last = std::sync::Mutex::new(Vec::new());
+        c6_testkit::eventually_or(
+            "the turn to wait on its command",
+            async || {
+                let evs = events().await?;
+                *last.lock().unwrap() = evs.clone();
+                (evs.iter().filter(|e| matches!(&e.kind, EventKind::BackgroundTask { state, .. } if state == "started")).count() >= n)
+                    .then_some(())
+            },
+            || format!("events: {:#?}", last.lock().unwrap()),
+        )
         .await
     };
 
@@ -202,6 +208,16 @@ async fn send_now_reaches_claude_code_as_a_send_now() {
 
     // ⏵ Send now on a message already with the agent: Claude Code stops only
     // the turn, which ends interrupted; the message starts the next.
+    // A genuinely changed snapshot, not just the equivalent refresh sent
+    // before every input, must not block instructions to this still-running
+    // native process behind the background task those instructions can end.
+    http.put(format!("{api}/settings/prompts/session.base"))
+        .json(&json!({"body": "Updated guidance for the next quiet native boundary."}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     http.post(format!("{api}/sessions/{id}/messages")).json(&json!({"text": "build again"})).send().await.unwrap();
     holding(3).await;
     http.post(format!("{api}/sessions/{id}/messages")).json(&json!({"text": "later"})).send().await.unwrap();

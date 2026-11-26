@@ -574,6 +574,9 @@ pub(crate) struct Process {
     /// hasn't started a turn for them by itself.
     unwoken: Vec<(String, c6_proto::TaskNotice)>,
     wake_due: Option<tokio::time::Instant>,
+    /// A terminal update can precede the native reply it triggers. An empty
+    /// output queue alone is not a quiet replacement boundary in that gap.
+    native_reply_pending: bool,
     /// You stopped its last turn: until when a turn it starts by itself is
     /// taken as the stop's doing (`None` once one of its tasks ends on its
     /// own: a turn then is for that).
@@ -2657,6 +2660,7 @@ impl Process {
             subagent_tasks: HashSet::new(),
             unwoken: Vec::new(),
             wake_due: None,
+            native_reply_pending: false,
             after_stop: None,
             quiet: false,
             unshown: false,
@@ -3032,6 +3036,7 @@ impl Process {
             subagent_tasks,
             unwoken: Vec::new(),
             wake_due: None,
+            native_reply_pending: false,
             after_stop: None,
             quiet: false,
             unshown: false,
@@ -3505,6 +3510,7 @@ impl Process {
             })
             && self.unwoken.is_empty()
             && self.wake_due.is_none()
+            && !self.native_reply_pending
     }
 
     /// Changed launch settings (including cache defaults) wait until no turn,
@@ -3565,6 +3571,20 @@ impl Process {
             return Ok(true);
         }
         self.side_line(&v, sink).await?;
+        if v["parent_tool_use_id"].is_null() && v["type"] == "system" {
+            let status = match v["subtype"].as_str() {
+                Some("task_notification") => v["status"].as_str(),
+                Some("task_updated") => v["patch"]["status"].as_str(),
+                _ => None,
+            };
+            if matches!(status, Some("completed" | "failed" | "stopped" | "killed"))
+                && v["task_id"].as_str().is_some_and(|id| !self.subagent_tasks.contains(id))
+            {
+                self.native_reply_pending = true;
+            } else if v["subtype"] == "session_state_changed" && v["state"] == "idle" {
+                self.native_reply_pending = false;
+            }
+        }
         if v["type"] == "system"
             && v["subtype"] == "task_notification"
             && v["parent_tool_use_id"].is_null()
@@ -3598,6 +3618,12 @@ impl Process {
     pub fn take_unwoken(&mut self) -> Option<(String, c6_proto::TaskNotice)> {
         self.wake_due = None;
         let notices = std::mem::take(&mut self.unwoken);
+        if !notices.is_empty() {
+            // The actor now owns delivery, so the completion survives this
+            // CLI being replaced. An empty take must not release a stopped
+            // task's still-pending native reply.
+            self.native_reply_pending = false;
+        }
         (!notices.is_empty())
             .then(|| (notices.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join("\n"), combined_task_notice(&notices)))
     }
@@ -3974,6 +4000,7 @@ impl Process {
         // This turn hears about whatever ended before it.
         self.unwoken.clear();
         self.wake_due = None;
+        self.native_reply_pending = false;
         self.mapper.result = None;
         self.mapper.interrupted = false;
         // One it started by itself right after your stop (`idle_line`).
@@ -5865,6 +5892,31 @@ printf '{"wrapper":"%s","directory":"%s","size":"%s"}\n' "$RUSTC_WRAPPER" "$SCCA
     fn spawn(bin: &Path, cwd: &Path, conversation: &str, resume: bool, observer: Option<Arc<Observer>>) -> Process {
         let launch = Launch { conversation: conversation.into(), ..Default::default() };
         Process::spawn(bin, launch, resume, cwd, "opus", Arc::default(), None, observer).unwrap()
+    }
+
+    #[tokio::test]
+    async fn terminal_native_updates_wait_for_a_reply_or_authoritative_idle_before_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = live_claude(dir.path());
+        let mut p = spawn(&bin, dir.path(), "s", false, None);
+        let sink: Arc<dyn EventSink> = Arc::new(VecSink::default());
+        let changed = Launch { spec_fingerprint: "changed".into(), ..p.launch().clone() };
+        for (subtype, status) in [("task_notification", "stopped"), ("task_updated", "killed")] {
+            let mut terminal = serde_json::json!({"type":"system", "subtype":subtype, "task_id":"build"});
+            if subtype == "task_updated" {
+                terminal["patch"] = serde_json::json!({"status":status});
+            } else {
+                terminal["status"] = status.into();
+            }
+            assert!(!p.idle_line(terminal, &sink).await.unwrap());
+            assert!(p.idle_until(IDLE).is_some(), "the existing idle shutdown still applies when no reply arrives");
+            assert!(!p.replacement_ready(&changed), "an empty output queue does not prove the native exchange ended");
+            assert!(
+                !p.idle_line(serde_json::json!({"type":"system", "subtype":"session_state_changed", "state":"idle"}), &sink).await.unwrap()
+            );
+            assert!(p.replacement_ready(&changed), "the authoritative idle edge permits replacement without a fabricated turn");
+        }
+        p.close().await;
     }
 
     #[tokio::test]
@@ -10007,6 +10059,53 @@ while True:
         let sink: Arc<dyn EventSink> = Arc::new(VecSink::default());
         let end = run(&mut p, 2, &[input("retry", "continue")], &sink).await;
         assert_eq!(end, TurnEnd { reason: None, alive: false, no_conversation: true });
+    }
+
+    #[tokio::test]
+    async fn a_held_fixture_must_retain_its_writer_until_the_keeper_has_the_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin =
+            script(dir.path(), "claude-fifo-lifetime", "#!/bin/sh\nwhile IFS= read -r line; do printf 'ack\\n'; done\nprintf 'eof\\n'\n");
+        let p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "fifo-lifetime".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let record = held.join("fifo-lifetime");
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        c6_testkit::eventually("the fixture keeper before removing its writer", async || {
+            held_record_owned(&held, "fifo-lifetime").then_some(())
+        })
+        .await;
+        // Deterministically model the startup gap before the keeper opens
+        // the FIFO. Only the Process's writer now prevents native stdin EOF.
+        nix::sys::signal::kill(keeper, Signal::SIGKILL).unwrap();
+        c6_testkit::eventually("the fixture keeper to be reaped", async || nix::unistd::getpgid(Some(keeper)).is_err().then_some(())).await;
+        write_line(&p.stdin, &serde_json::json!({"type":"user"})).await.unwrap();
+        c6_testkit::eventually("the native CLI to acknowledge input while Process retains its writer", async || {
+            std::fs::read_to_string(record.join("out")).ok()?.contains("ack\n").then_some(())
+        })
+        .await;
+        drop(p);
+        c6_testkit::eventually("dropping the last FIFO writer to terminate the native CLI", async || {
+            (record.join("code").is_file() && std::fs::read_to_string(record.join("out")).ok()?.contains("eof\n")).then_some(())
+        })
+        .await;
+        c6_testkit::eventually("the EOF fixture's process group to disappear", async || {
+            matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)).then_some(())
+        })
+        .await;
     }
 
     #[tokio::test]

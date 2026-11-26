@@ -41,7 +41,7 @@ and saved routing constraints. **Mixed** has explicit provenance.
 | 24 | `max_running_subagents` | Derived: current concurrency limit. |
 | 25 | `memex_chat` | Derived: chat availability. |
 | 26 | `subagent_target` | Mixed: current connection default unless an explicit session choice is recorded. An explicit choice does not authorize a revoked connection. |
-| 27 | `subagent_connections_json` | Derived: current realm/SSH-filtered connection catalog. Present `[]` is authoritative; only absent legacy `""` uses the compatibility fallback. |
+| 27 | `subagent_connections_json` | Derived: current realm/SSH-filtered connection catalog. Present `[]` is authoritative; only absent legacy `""` permits the own/default execution fallback, never fabricated named choices. |
 | 28 | `tools` | Derived inventory constraint from the saved route. Refresh does not reroute a session or widen a local child's narrowed cap. |
 | 29 | `depth` | State: remote delegation tree position. |
 | 30 | `subagent_templates_json` | Derived: currently available worker templates. |
@@ -84,6 +84,10 @@ ordered marker arrives. `Welcome.session_spec_refresh` makes this two-sided:
 a new worker releases its gate for an old head, and an old worker receives no
 new refresh commands or startup marker.
 
+The attach inventory includes fully acknowledged idle journals, not just the
+uploader's unacknowledged cursors. Acknowledgment does not mean a journal's
+configuration is current; the event uploader retains its narrower work list.
+
 Each reconnect advances a local configuration generation. A previous stream's
 marker cannot release the new attach, nor can the worker-wide release bypass
 an actor's still-queued refresh. Actor registration and marker publication are
@@ -108,7 +112,7 @@ widen an existing session.
 
 An actor coalesces pending snapshots and applies the latest only between turns.
 A running turn and its tool continuations keep the runtime they captured.
-Queued inputs wait behind pending configuration. The worker rebuilds its own
+At a quiet boundary, queued inputs follow pending configuration. The worker rebuilds its own
 prompt, tools, hooks, policies, delegation defaults and limits without replacing
 conversation history, model choice, placement, labels or delegation identity.
 Revoked skills/agents disappear from advertisements and execution lookup;
@@ -130,7 +134,14 @@ snapshot event itself is not a transcript message.
 Native configuration is applied only when the process is genuinely quiet:
 no native background work, unread output or completion notification still
 owned by the old process. Already-started native work may continue and be
-recorded while configuration and queued new inputs wait. The supervised
+recorded while configuration waits. Input remains deliverable to that existing
+process while it owns native work; otherwise a message needed to finish a task
+could be blocked by the configuration waiting for that same task. Equivalent
+snapshots never gate input or trigger replacement. A terminal task update does
+not by itself prove the native exchange is over: replacement waits for its
+reply's completion, an authoritative idle edge, or transfer of its fallback
+completion notice to the actor for delivery. If no reply arrives, the
+existing idle shutdown policy still applies. The supervised
 maintenance slot retires the old process and resumes the same native
 conversation with fresh guidance, bridge inventory and external MCP clients.
 It retains the existing process-group absence, replacement-admission and Rewind
@@ -148,7 +159,9 @@ native process merely because it attached.
   decode, and additive command/event wire tags remain stable.
 - Worker integration `session_specs`: real journal restart/reattach after
   offline settings edits; queued mid-turn refresh and tool-continuation boundary;
-  skill/agent revocation; legacy peer compatibility over mTLS.
+  skill/agent revocation; named Task choices exactly match the realm catalog,
+  including aliases and local Claude Code eligibility; legacy peer compatibility
+  over mTLS.
 - Worker unit tests: pre-catalog Claude Code journals gain current delegation
   guidance without changing native conversation identity; authoritative empty
   connection catalogs revoke legacy fallbacks; import boundaries and rewind

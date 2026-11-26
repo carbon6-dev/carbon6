@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use c6_proto::{
-    CommandRejected, HeadMsg, Hello, Ping, RpcResponse, SessionCursor, SessionEvent, SessionEventBatch, WorkerMsg, head_msg,
-    session_command, worker_hub_client::WorkerHubClient, worker_msg,
+    CommandRejected, HeadMsg, Hello, Ping, RpcResponse, SessionEvent, SessionEventBatch, WorkerMsg, head_msg, session_command,
+    worker_hub_client::WorkerHubClient, worker_msg,
 };
 use prost::Message;
 use tokio::sync::{mpsc, watch};
@@ -147,10 +147,8 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
         os: c6_core::host_os().into(),
         arch: c6_core::host_arch().into(),
         capabilities,
-        sessions: match worker.journal.unacked().await {
-            Ok(cursors) => {
-                cursors.into_iter().map(|c| SessionCursor { session_id: c.session_id, seq: c.last_seq, ownership_epoch: c.epoch }).collect()
-            }
+        sessions: match worker.journal.session_cursors().await {
+            Ok(cursors) => cursors,
             Err(e) => return Ended::Retry(e.context("reading journal")),
         },
     };

@@ -1263,6 +1263,25 @@ impl Journal {
         Ok(events)
     }
 
+    /// Attach inventories every local journal, including fully acknowledged
+    /// idle sessions whose derived configuration still needs refreshing.
+    pub(crate) async fn session_cursors(&self) -> anyhow::Result<Vec<c6_proto::SessionCursor>> {
+        let rows = sqlx::query(
+            "SELECT id, last_seq, COALESCE(epoch, 0) AS epoch
+             FROM sessions LEFT JOIN session_ownership ON session_id = id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| c6_proto::SessionCursor {
+                session_id: r.get("id"),
+                seq: r.get::<i64, _>("last_seq") as u64,
+                ownership_epoch: r.get::<i64, _>("epoch") as u64,
+            })
+            .collect())
+    }
+
     /// Sessions with events the head has not acknowledged.
     pub async fn unacked(&self) -> anyhow::Result<Vec<Cursor>> {
         let rows = sqlx::query(
@@ -2146,6 +2165,32 @@ mod ownership_tests {
 
     fn event(seq: u64) -> SessionEvent {
         SessionEvent { seq, ts_ms: 0, kind: Some(session_event::Kind::Started(c6_proto::SessionStarted::default())) }
+    }
+
+    #[tokio::test]
+    async fn attach_inventory_includes_acked_journals_and_preserves_ownership_epochs() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let spec = CreateSession::default();
+        journal.import("idle", &spec, &[event(1)]).await.unwrap();
+        journal.import_owned("moved", &spec, &[event(1)], 7, "move").await.unwrap();
+        assert!(journal.unacked().await.unwrap().is_empty());
+        let mut cursors = journal.session_cursors().await.unwrap();
+        cursors.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        assert_eq!(
+            cursors,
+            [
+                c6_proto::SessionCursor { session_id: "idle".into(), seq: 1, ownership_epoch: 0 },
+                c6_proto::SessionCursor { session_id: "moved".into(), seq: 1, ownership_epoch: 7 },
+            ]
+        );
+        journal.append("idle", &event(2)).await.unwrap();
+        let unacked = journal.unacked().await.unwrap();
+        assert_eq!(unacked.len(), 1);
+        assert_eq!(unacked[0].session_id, "idle");
+        assert_eq!(unacked[0].last_seq, 2);
+        assert_eq!(journal.session_cursors().await.unwrap().len(), 2);
+        journal.pool.close().await;
     }
 
     #[tokio::test]

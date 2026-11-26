@@ -442,3 +442,10 @@ carbon6.v1.CreateSession 49 optional:string keep_warm_json
 carbon6.v1.CreateSession 50 optional:string keep_warm_snapshot_json
 carbon6.v1.NoticeLimits 10 optional:string keep_warm_json
 carbon6.v1.Usage 11 bool keep_warm
+carbon6.v1.CreateSession 53 bool subagent_target_explicit
+carbon6.v1.SessionCommand 24 CreateSession refresh_spec
+carbon6.v1.SessionCommand 25 SessionSpecsReady specs_ready
+carbon6.v1.SessionEvent 34 SpecRefreshed spec_refreshed
+carbon6.v1.SpecRefreshed 1 CreateSession spec
+carbon6.v1.SpecRefreshed 2 string system_prompt
+carbon6.v1.SpecRefreshed 3 repeated:string tools

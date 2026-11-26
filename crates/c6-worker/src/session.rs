@@ -4307,8 +4307,11 @@ impl Actor {
                 && !adoption_blocked
                 && running.is_none()
                 && !handoff_waits
-                && pending_spec.is_none()
                 && !self.inbox.lock().unwrap().queue.is_empty();
+            // If native work still owns the old process, input must remain
+            // deliverable there (including instructions to finish that work).
+            // The top-of-loop boundary installs pending configuration before
+            // dispatch as soon as replacing that process is safe.
             // New children require disk, memory and load admission. Existing
             // child turns retain memory/load admission, but disk recovery
             // resumes at its small headroom threshold, not the new-work 5%.
@@ -4605,7 +4608,12 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::RefreshSpec(spec)) => {
-                        pending_spec = Some(spec);
+                        let candidate = self.refreshed_spec(&spec);
+                        // Input delivery sends snapshots too. An equivalent
+                        // snapshot must not gate a live native task's next
+                        // input, and the latest snapshot can cancel an older
+                        // pending change without restarting anything.
+                        pending_spec = (self.needs_config_rebuild || candidate.derived() != self.spec.derived()).then_some(spec);
                     }
                     Some(ActorMsg::SpecsReady(generation)) => {
                         self.config_ready = true;
@@ -6708,19 +6716,24 @@ impl Actor {
         self.started.tool_profile == crate::claude_code::PROFILE
     }
 
+    fn refreshed_spec(&self, fresh: &CreateSession) -> CreateSession {
+        let mut spec = self.spec.clone();
+        spec.apply_derived(fresh);
+        if spec.delegation.is_some() {
+            // These are worker-owned parts of a local delegation, not head
+            // settings. Use the same effective snapshot for change detection
+            // and installation.
+            spec.base_prompt.clone_from(&self.spec.base_prompt);
+            spec.tools.clone_from(&self.spec.tools);
+        }
+        spec
+    }
+
     /// Install one head-authorized snapshot, never the session state carried
     /// by a CreateSession envelope. Called only with no supervised turn and,
     /// for Claude Code, no native task or unread output.
     async fn refresh_spec(&mut self, fresh: &CreateSession) -> anyhow::Result<()> {
-        let mut spec = self.spec.clone();
-        spec.apply_derived(fresh);
-        if spec.delegation.is_some() {
-            // A local child's prompt includes its explicit Task instructions,
-            // and its cap was narrowed by its parent's and named-agent tools.
-            // A head row cannot reconstruct either worker-owned decision.
-            spec.base_prompt.clone_from(&self.spec.base_prompt);
-            spec.tools.clone_from(&self.spec.tools);
-        }
+        let spec = self.refreshed_spec(fresh);
         if spec.derived() == self.spec.derived() && !self.needs_config_rebuild {
             // Recovery runs before the head link exists. Rehydrate external
             // bridge clients now, without manufacturing a changed-config line.
@@ -7502,7 +7515,19 @@ async fn maintain_claude_context(
         register(),
         Some(observer),
     ) {
-        Ok(process) => Ok(Some(process)),
+        Ok(process) => {
+            if changed {
+                sink.append(session_event::Kind::Notice(c6_proto::Notice {
+                    title: "Claude Code started again".into(),
+                    message: "to apply carbon6's settings as they are now (its tools, guidance or hooks); the conversation continues."
+                        .into(),
+                    priority: "low".into(),
+                    quiet: true,
+                }))
+                .await?;
+            }
+            Ok(Some(process))
+        }
         Err(e) => {
             warn!(session, "Claude Code context maintenance deferred resume: {e:#}");
             Ok(None)
@@ -7563,9 +7588,7 @@ async fn claude_turn(
     // simply defer maintenance, never the user's next turn.
     let trim_path = process.as_ref().zip(trim.as_ref()).and_then(|(p, trim)| trim.candidate(p, cwd));
     let worth_trimming = trim_path.is_some();
-    if let Some(p) =
-        process.take_if(|p| p.replacement_ready(&launch) || (worth_trimming && p.idle_until(std::time::Duration::ZERO).is_some()))
-    {
+    if let Some(p) = process.take_if(|p| p.replacement_ready(&launch) || (worth_trimming && p.trim_quiet())) {
         // A reset initializes non-held until its branch is confirmed. Promote
         // that quiet process to restart-surviving transport on its next turn;
         // this alone is not a settings/worker change to announce.
@@ -7982,27 +8005,10 @@ pub(crate) fn session_agents(spec: &CreateSession, labels: &[String]) -> Vec<c6_
 
 /// The connections a session's subagents may run on (from the head).
 pub(crate) fn subagent_connections(spec: &CreateSession) -> Vec<c6_api::SubagentConnection> {
-    let mut connections: Vec<c6_api::SubagentConnection> = serde_json::from_str(&spec.subagent_connections_json).unwrap_or_default();
-    // A present catalog, including [], is authoritative. Only journals from
-    // before catalogs existed may recover their previously authorized models.
-    if !spec.subagent_connections_json.is_empty() {
-        return connections;
-    }
-    // Old journals predate the connection catalog. Model switches and
-    // SetSubagentModel replay the head-authorized models, not that catalog.
-    // Both the session's own connection and its chosen default are usable
-    // even then (including an alias: keep its ID for call-time resolution).
-    for model in [spec.model.as_ref(), spec.subagent_target.as_ref()].into_iter().flatten() {
-        if !model.connection_id.is_empty() && !connections.iter().any(|c| c.id == model.connection_id) {
-            connections.push(c6_api::SubagentConnection {
-                id: model.connection_id.clone(),
-                name: model.connection_id.clone(),
-                kind: model.connection_kind.clone(),
-                default_model: model.model.clone(),
-            });
-        }
-    }
-    connections
+    // Only the head knows names, alias identities and realm eligibility.
+    // Replayed model/default events are not a replacement catalog: making
+    // rows from them advertises raw IDs and can widen an SSH session's list.
+    serde_json::from_str(&spec.subagent_connections_json).unwrap_or_default()
 }
 
 /// Those connections, as `Task` lists them.
@@ -8305,7 +8311,18 @@ fn claude_code_subagent_tools(spec: &CreateSession, labels: &[String]) -> Vec<Ar
     });
     let connections = task_connections(spec);
     let templates = task_templates(spec);
-    if (connections.is_empty() && templates.is_empty()) || !crate::subagent::may_delegate(spec, crate::subagent::depth_of(spec)) {
+    // Pre-catalog journals may still use their head-authorized default, but
+    // must not invent named choices from model metadata. Attach refresh fills
+    // the real catalog. A present empty/invalid catalog remains fail closed.
+    let legacy_default = spec.subagent_connections_json.is_empty()
+        && spec
+            .subagent_target
+            .as_ref()
+            .or(spec.model.as_ref())
+            .is_some_and(|m| !m.connection_id.is_empty() && !(m.connection_kind == "claude_code" && !spec.ssh_target.is_empty()));
+    if (connections.is_empty() && templates.is_empty() && !legacy_default)
+        || !crate::subagent::may_delegate(spec, crate::subagent::depth_of(spec))
+    {
         return tools;
     }
     let mut all: Vec<Arc<dyn Tool>> = vec![
@@ -9100,10 +9117,7 @@ mod spec_generation_tests {
             .handle(SessionCommand {
                 command_id: "queued-input".into(),
                 session_id: "fenced".into(),
-                kind: Some(session_command::Kind::Input(c6_proto::UserMessage {
-                    text: "wait for this attach".into(),
-                    ..Default::default()
-                })),
+                kind: Some(session_command::Kind::Input(c6_proto::UserInput { text: "wait for this attach".into(), ..Default::default() })),
                 ..Default::default()
             })
             .await
@@ -9724,6 +9738,28 @@ mod claude_code_tools_tests {
     use super::*;
 
     #[test]
+    fn legacy_ssh_claude_model_does_not_enable_a_native_task_target() {
+        let mut spec = CreateSession {
+            model: Some(ModelSpec {
+                connection_id: "cc".into(),
+                connection_kind: "claude_code".into(),
+                model: "opus".into(),
+                ..Default::default()
+            }),
+            ssh_target: "dev@box".into(),
+            ..Default::default()
+        };
+        assert!(!claude_code_subagent_tools(&spec, &[]).iter().any(|t| t.spec().name == "Task"));
+        spec.ssh_target.clear();
+        assert!(claude_code_subagent_tools(&spec, &[]).iter().any(|t| t.spec().name == "Task"));
+        assert!(task_connections(&spec).is_empty(), "neither case invents named targets");
+        spec.ssh_target = "dev@box".into();
+        spec.subagent_target = spec.model.clone();
+        spec.model.as_mut().unwrap().connection_kind = "openai_compat".into();
+        assert!(!claude_code_subagent_tools(&spec, &[]).iter().any(|t| t.spec().name == "Task"), "the chosen default governs eligibility");
+    }
+
+    #[test]
     fn present_connection_catalog_revokes_legacy_and_explicit_fallbacks() {
         let model = ModelSpec { connection_id: "revoked".into(), connection_kind: "alias".into(), ..Default::default() };
         let mut spec = CreateSession {
@@ -9732,10 +9768,12 @@ mod claude_code_tools_tests {
             subagent_target_explicit: true,
             ..Default::default()
         };
-        assert_eq!(subagent_connections(&spec).len(), 1, "legacy absent catalogs retain their fallback");
+        assert!(subagent_connections(&spec).is_empty(), "a legacy model is not a named connection catalog");
+        assert!(claude_code_subagent_tools(&spec, &[]).iter().any(|t| t.spec().name == "Task"), "legacy defaults retain delegation");
         for catalog in ["[]", "not valid JSON"] {
             spec.subagent_connections_json = catalog.into();
             assert!(subagent_connections(&spec).is_empty(), "a present catalog fails closed");
+            assert!(!claude_code_subagent_tools(&spec, &[]).iter().any(|t| t.spec().name == "Task"));
         }
     }
 
@@ -9861,15 +9899,23 @@ mod claude_code_tools_tests {
         assert_eq!(&names[..4], ["Task", "SendMessage", "TaskOutput", "TaskStop"]);
         assert!(claude_code_delegation_unavailable(&spec, &tools).is_none());
         let connections = subagent_connections(&spec);
-        assert_eq!(connections.len(), 2);
+        assert!(connections.is_empty(), "replayed models must not advertise raw IDs as names");
+        let task = tools.iter().find(|t| t.spec().name == "Task").unwrap().spec();
+        assert!(task.parameters["properties"]["connection"].get("enum").is_none());
+        assert!(!task.description.contains("Connections:\n"));
         assert_eq!(
             crate::subagent::resolve_model(&own, &crate::subagent::SubagentDefault::of(&spec), "", &Default::default(), &connections)
                 .unwrap(),
             target
         );
-        // A catalog entry keeps its human name; no duplicates on restore.
-        spec.subagent_connections_json = serde_json::to_string(&connections).unwrap();
-        assert_eq!(subagent_connections(&spec).len(), 2);
+        // An attach supplies the real catalog, with the alias's own name
+        // even when its effective provider kind is the target's kind.
+        spec.subagent_connections_json =
+            r#"[{"id":"subscription","name":"ChatGPT Subscription","kind":"chatgpt","default_model":"gpt-6.2-sol"}]"#.into();
+        let task = claude_code_subagent_tools(&spec, &[]).into_iter().find(|t| t.spec().name == "Task").unwrap().spec();
+        assert_eq!(task.parameters["properties"]["connection"]["enum"], serde_json::json!(["ChatGPT Subscription"]));
+        assert!(task.description.contains("- ChatGPT Subscription (chatgpt, default model gpt-6.2-sol)"));
+        assert!(!task.description.contains("- subscription (") && !task.description.contains("- cc ("));
     }
 
     #[test]
@@ -12759,6 +12805,7 @@ for line in sys.stdin:
         emit(dict(type='user', isReplay=True, uuid=v['uuid'], message=v['message'], parent_tool_use_id=None))
         emit(dict(type='assistant', message=dict(content=[dict(type='text', text=conversation)], stop_reason='end_turn'), parent_tool_use_id=None))
         emit(dict(type='result', subtype='success', is_error=False, usage={}))
+trace(dict(kind='eof'))
 "#).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         (spec, started, bin)
@@ -12776,30 +12823,33 @@ for line in sys.stdin:
             conversation: conversation.into(),
             settings: Some(claude_code_settings(spec, None)),
             system_prompt: Some(claude_code_system_prompt(spec, &[], &tools)),
+            spec_fingerprint: c6_core::sha256_hex(&prost::Message::encode_to_vec(&spec.derived())),
             worker: c6_core::build().to_owned(),
             native: claude_code_native(spec),
             ..Default::default()
         };
-        drop(
-            crate::claude_code::Process::spawn_held(
-                &manager.claude_dir().join("held"),
-                "s",
-                bin,
-                launch,
-                true,
-                cwd,
-                "opus",
-                Arc::default(),
-                None,
-                None,
-            )
-            .unwrap(),
-        );
+        let process = crate::claude_code::Process::spawn_held(
+            &manager.claude_dir().join("held"),
+            "s",
+            bin,
+            launch,
+            true,
+            cwd,
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
         let held = manager.claude_dir().join("held");
-        c6_testkit::eventually("the held runtime's CLI or keeper in its final image", async || {
+        c6_testkit::eventually("the held runtime's FIFO keeper in its final image", async || {
             crate::claude_code::held_record_owned(&held, conversation).then_some(())
         })
         .await;
+        // Keep the worker's FIFO writer until the keeper has opened its end.
+        // Dropping it first can give the CLI EOF before the keeper starts,
+        // leaving an owned keeper but no CLI for the adoption test to adopt.
+        drop(process);
     }
 
     fn held_trace(dir: &Path) -> Vec<serde_json::Value> {
@@ -12993,7 +13043,7 @@ for line in sys.stdin:
         );
         let trace = held_trace(dir.path());
         let inputs = trace.iter().filter(|v| v["kind"] == "input").collect::<Vec<_>>();
-        assert_eq!(inputs.len(), 1, "no implicit Resume, initialize, or duplicate input; events: {raw:#?}");
+        assert_eq!(inputs.len(), 1, "no implicit Resume, initialize, or duplicate input; trace: {trace:#?}; events: {raw:#?}");
         assert_eq!(inputs[0]["conversation"].as_str(), Some(fork.as_str()));
         assert!(inputs[0]["value"]["message"]["content"].to_string().contains("model-only"), "PendingInput.prompt reaches the CLI");
         assert!(!inputs[0]["value"]["message"]["content"].to_string().contains("display-only"));

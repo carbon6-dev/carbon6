@@ -131,8 +131,13 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     let s = post("system/updates/check", json!({})).await;
     assert_eq!(s["check_error"], "", "{s}");
     assert_eq!((s["releases"][0]["version"].as_str(), s["releases"][0]["state"].as_str()), (Some(V), Some("available")), "{s}");
-    let decisions = get("decisions").await;
-    let d = decisions.as_array().unwrap().iter().find(|d| d["title"] == format!("Update carbon6 to {V}?")).expect("a decision").clone();
+    // The startup check may already have inserted the release while it is
+    // still publishing its decision. Our manual check can then return on
+    // known/304 without owning that publication; await the decision itself.
+    let d = eventually("the verified release's approval decision to be published", async || {
+        get("decisions").await.as_array()?.iter().find(|d| d["title"] == format!("Update carbon6 to {V}?")).cloned()
+    })
+    .await;
     assert!(d["document"].as_str().unwrap().contains("Faster."));
     // Looking again, the release's file is unchanged: GitHub says so (304).
     let before = unchanged.load(Ordering::SeqCst);

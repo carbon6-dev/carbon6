@@ -181,6 +181,86 @@ fn tools(request: &Value) -> Vec<&str> {
 }
 
 #[tokio::test]
+async fn task_lists_exactly_the_realms_named_connections_after_legacy_attach() {
+    let env = Env::new().await;
+    // Subscription connections normally come from OAuth. This catalog-only
+    // fixture needs no login or provider calls, just an existing account row.
+    let mut account = env.head.state.store.connection(&env.connection).await.unwrap().unwrap();
+    account.id = uuid::Uuid::now_v7().to_string();
+    account.name = "ChatGPT Account".into();
+    account.kind = "chatgpt".into();
+    account.default_model = Some("gpt-6.2-sol".into());
+    env.head.state.store.insert_connection(&account).await.unwrap();
+    let target = json!({"id": account.id});
+    let alias = env.post("connections", json!({"name": "ChatGPT Subscription", "kind": "alias", "alias_target_id": target["id"]})).await;
+    let cc = env.post("connections", json!({"name": "Claude Code", "kind": "claude_code", "default_model": "opus"})).await;
+    env.post("realms", json!({"id": "elsewhere"})).await;
+    let forbidden = env.post("connections", json!({"name": "Forbidden", "base_url": env.mock.base_url()})).await;
+    env.put(&format!("connections/{}/realms", forbidden["id"].as_str().unwrap()), json!({"realms": ["elsewhere"]})).await;
+    env.post("connections", json!({"name": "Head pool", "kind": "pool", "members": [{"connection_id": env.connection, "slots": 1}]})).await;
+    let running = env.worker().await;
+    env.mock.push(Reply::Text("first".into()));
+    let s = env.start(&running, "start").await;
+    env.ended(&s.id, 1).await;
+    env.put(&format!("sessions/{}/subagent-model", s.id), json!({"connection_id": alias["id"], "model": "gpt-6.2-sol"})).await;
+    eventually("the selected alias to reach the journal", async || {
+        let (spec, _) = journal(&running, &s.id).await;
+        (spec.subagent_target.as_ref()?.connection_id == alias["id"].as_str().unwrap()).then_some(())
+    })
+    .await;
+    eventually("the alias default to be acknowledged before editing the stopped journal", async || {
+        running.worker().journal.unacked().await.unwrap().is_empty().then_some(())
+    })
+    .await;
+    running.stop().await;
+
+    // Exercise the live regression: an old journal has head-authorized model
+    // and alias-default events, but lacks the realm's connection catalog.
+    let local = c6_worker::journal::Journal::open(&env.state.path().join("journal.db")).await.unwrap();
+    let (mut old, events) = local.load_session(&s.id).await.unwrap().unwrap();
+    old.subagent_connections_json.clear();
+    assert_eq!(local.trim(i64::MAX, &[]).await.unwrap(), 1, "only the acknowledged idle fixture is replaced");
+    local.import(&s.id, &old, &events).await.unwrap();
+    drop(local);
+    let running = env.worker().await;
+    eventually("attach to restore the named realm catalog", async || {
+        let (spec, _) = journal(&running, &s.id).await;
+        (!spec.subagent_connections_json.is_empty()).then_some(())
+    })
+    .await;
+    env.mock.push(Reply::Text("second".into()));
+    env.say(&s.id, "list the current tools").await;
+    env.ended(&s.id, 2).await;
+    let (spec, _) = journal(&running, &s.id).await;
+    let catalog: Vec<c6_api::SubagentConnection> = serde_json::from_str(&spec.subagent_connections_json).unwrap();
+    let mut expected = vec![
+        (target["id"].as_str().unwrap(), "ChatGPT Account"),
+        (alias["id"].as_str().unwrap(), "ChatGPT Subscription"),
+        (env.connection.as_str(), "main"),
+    ];
+    // Exactly the pre-existing native-worker eligibility rule. The guarded
+    // integration run has no CLI; installed/fake-CLI runs may advertise it.
+    let live = env.head.state.registry.get(running.worker().identity.meta.worker_id).unwrap();
+    if live.capabilities.iter().any(|c| c == "claude_code_subagents_v1") {
+        expected.push((cc["id"].as_str().unwrap(), "Claude Code"));
+    }
+    let actual: std::collections::BTreeMap<_, _> = catalog.iter().map(|c| (c.id.as_str(), c.name.as_str())).collect();
+    assert_eq!(actual, expected.into_iter().collect(), "no pool, forbidden connection or fabricated model row");
+    let requests = env.mock.requests();
+    let task = requests[1]["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "task").unwrap();
+    let names: Vec<_> = catalog.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(task["function"]["parameters"]["properties"]["connection"]["enum"], json!(names));
+    let description = task["function"]["description"].as_str().unwrap();
+    for c in &catalog {
+        assert!(description.contains(&format!("- {} ({}", c.name, c.kind)), "{description}");
+        assert!(!description.contains(&c.id), "raw connection IDs must not replace names: {description}");
+    }
+    assert!(description.contains("ChatGPT Subscription (chatgpt"), "the alias keeps its name, not its target's");
+    running.stop().await;
+    env.head.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn attaching_refreshes_an_old_journal_without_recreating_the_conversation() {
     let env = Env::new().await;
     env.prompt("SPEC-OLD: original instructions.").await;
@@ -192,6 +272,10 @@ async fn attaching_refreshes_an_old_journal_without_recreating_the_conversation(
     assert!(refreshes(&before).is_empty(), "creation already uses current settings");
     assert!(system(&env.mock.requests()[0]).contains("SPEC-OLD"));
     assert!(!tools(&env.mock.requests()[0]).contains(&"load_skill"));
+    eventually("the idle journal to be fully acknowledged before restart", async || {
+        running.worker().journal.unacked().await.unwrap().is_empty().then_some(())
+    })
+    .await;
     running.stop().await;
 
     // No worker is connected while these settings change. Its existing

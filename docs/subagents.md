@@ -344,6 +344,13 @@ The effort carries over only while the subagent stays on the same connection. It
 
 The head sends each session the connections its realm may use (`CreateSession.subagent_connections_json`), Claude Code ones included, except for SSH sessions, which can't start the CLI on their host. The worker refuses anything else with an error that lists the available connections. The parent's own connection is always allowed. A worker gets a connection's credentials only if some realm it serves may use that connection.
 
+`Task` lists exactly that head-supplied catalog, with connection display names
+and an alias's own name (not its target's name or its raw ID). Replayed model
+and subagent-default events do not add advertised connections. A pre-catalog
+journal can still use its head-authorized default without naming a connection
+(never a Claude Code default over SSH); the next attach refresh supplies the
+real realm/SSH/worker-capability-filtered named choices.
+
 Until 2026-11-09 Claude Code was left out. A Claude Code session's agent then named the API connection for its subagents to run at all, which billed every one per call instead of on the Claude Code plan. Claude Code sessions are now told their subagents run on Claude Code unless the user asks for another model (`CLAUDE_CODE_NOTE`).
 
 ### Long conversations shed old tool output
