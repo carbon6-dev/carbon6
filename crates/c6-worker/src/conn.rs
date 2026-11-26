@@ -165,6 +165,8 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
         Ok(Ok(Some(HeadMsg { msg: Some(head_msg::Msg::Welcome(w)) }))) => {
             info!(worker = %w.worker_id, name = %w.worker_name, head = %w.head_version, "attached to head");
             worker.machine_sample_secs.store(w.machine_sample_secs.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+            let warning = w.machine_disk_warn_percent.filter(|n| n.is_finite() && (0.0..=100.0).contains(n)).unwrap_or(10.0);
+            worker.machine_disk_warn_percent.store(warning.to_bits(), std::sync::atomic::Ordering::Relaxed);
             worker.sessions.launch_pressure.configure_disk(w.machine_disk_hold_percent);
             for ack in &w.acks {
                 if let Err(e) = worker.journal.set_acked_owned(&ack.session_id, ack.seq, ack.ownership_epoch).await {

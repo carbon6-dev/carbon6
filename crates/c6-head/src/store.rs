@@ -1193,13 +1193,20 @@ impl Store {
     }
 
     pub async fn set_archived(&self, id: &str, archived: bool) -> anyhow::Result<bool> {
+        self.set_archived_at(id, archived, c6_core::now_ms()).await
+    }
+
+    async fn set_archived_at(&self, id: &str, archived: bool, now_ms: i64) -> anyhow::Result<bool> {
         // With its side chats and subagents, all the way down.
         let r = sqlx::query(
             "WITH RECURSIVE tree(id) AS (SELECT ? UNION SELECT s.id FROM sessions s JOIN tree ON s.parent_id = tree.id) \
-             UPDATE sessions SET archived = ? WHERE id IN (SELECT id FROM tree)",
+             UPDATE sessions SET archived = ?, archived_at_ms = CASE WHEN ? = 0 THEN NULL WHEN archived = 0 THEN ? ELSE COALESCE(archived_at_ms, ?) END WHERE id IN (SELECT id FROM tree)",
         )
         .bind(id)
         .bind(archived as i64)
+        .bind(archived as i64)
+        .bind(now_ms)
+        .bind(now_ms)
         .execute(&self.pool)
         .await?;
         Ok(r.rows_affected() > 0)
@@ -2562,6 +2569,35 @@ async fn input_recorded_on(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn build_folder_archive_clock_is_durable_and_only_rearms_after_unarchive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("head.db");
+        let store = Store::open(&path).await.unwrap();
+        let worker = WorkerId::new();
+        store.create_session(&session("parent", worker), &[], false).await.unwrap();
+        let mut child = session("child", worker);
+        child.parent_id = Some("parent".into());
+        store.create_session(&child, &[], false).await.unwrap();
+        store.set_archived_at("parent", true, 100).await.unwrap();
+        store.set_archived_at("parent", true, 200).await.unwrap();
+        let archived: Vec<Option<i64>> =
+            sqlx::query_scalar("SELECT archived_at_ms FROM sessions ORDER BY id").fetch_all(&store.pool).await.unwrap();
+        assert_eq!(archived, [Some(100), Some(100)]);
+        store.set_archived_at("parent", false, 300).await.unwrap();
+        let archived: Vec<Option<i64>> =
+            sqlx::query_scalar("SELECT archived_at_ms FROM sessions ORDER BY id").fetch_all(&store.pool).await.unwrap();
+        assert_eq!(archived, [None, None]);
+        store.set_archived_at("parent", true, 400).await.unwrap();
+        store.pool.close().await;
+        let store = Store::open(&path).await.unwrap();
+        store.set_archived_at("parent", true, 500).await.unwrap();
+        let archived: Vec<Option<i64>> =
+            sqlx::query_scalar("SELECT archived_at_ms FROM sessions ORDER BY id").fetch_all(&store.pool).await.unwrap();
+        assert_eq!(archived, [Some(400), Some(400)]);
+        store.pool.close().await;
+    }
 
     /// Actual fork wire bytes, not a new-schema input with a renamed field.
     pub(crate) fn legacy_input_command(command_id: &str, session_id: &str, mut input: c6_proto::UserInput) -> Vec<u8> {

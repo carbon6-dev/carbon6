@@ -122,6 +122,8 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
     // Sessions this worker imports from Claude Code and Codex (docs/imports.md).
     match method {
         "disk.pressure" => return disk_pressure(st, from, &params).await,
+        "build_folders.context" => return build_folder_context(st, from, &params).await,
+        "build_folders.cleaned" => return build_folders_cleaned(st, from, &params).await,
         "quotas.codex.config" => return crate::quotas::codex_config(st, from).await,
         "quotas.codex.report" => {
             crate::quotas::from_codex(st, from, serde_json::from_value(params)?).await?;
@@ -301,6 +303,51 @@ async fn disk_pressure(st: &HeadState, from: WorkerId, params: &Value) -> anyhow
     Ok(Value::Null)
 }
 
+async fn build_folder_context(st: &HeadState, from: WorkerId, params: &Value) -> anyhow::Result<Value> {
+    use sqlx::Row;
+    require_build_folder_worker(st, from).await?;
+    let ids: Vec<String> = serde_json::from_value(params["session_ids"].clone())?;
+    if ids.len() > 512 || ids.iter().any(|id| id.is_empty() || id.len() > 128) {
+        return Err(bad_request("invalid build folder session ids"));
+    }
+    let rows = sqlx::query("SELECT id, CASE WHEN archived != 0 THEN archived_at_ms END AS archived_at_ms FROM sessions WHERE worker_id = ? AND id IN (SELECT value FROM json_each(?))")
+        .bind(from.to_string()).bind(serde_json::to_string(&ids)?).fetch_all(&st.store.pool).await?;
+    let sessions: Vec<_> = ids
+        .into_iter()
+        .map(|id| {
+            let archived =
+                rows.iter().find(|row| row.get::<String, _>("id") == id).and_then(|row| row.get::<Option<i64>, _>("archived_at_ms"));
+            json!({"session_id": id, "archived_at_ms": archived})
+        })
+        .collect();
+    Ok(json!({"sessions": sessions}))
+}
+
+async fn require_build_folder_worker(st: &HeadState, from: WorkerId) -> anyhow::Result<crate::store::WorkerRow> {
+    let worker = st.store.worker(from).await?.filter(|w| w.revoked_at.is_none()).ok_or_else(|| bad_request("unknown or revoked worker"))?;
+    if !st.registry.get(from).is_some_and(|live| live.role == "worker") {
+        return Err(bad_request("build folder reports require a connected worker"));
+    }
+    Ok(worker)
+}
+
+async fn build_folders_cleaned(st: &HeadState, from: WorkerId, params: &Value) -> anyhow::Result<Value> {
+    let worker = require_build_folder_worker(st, from).await?;
+    let message = params["message"]
+        .as_str()
+        .filter(|m| !m.is_empty() && m.len() <= 4096)
+        .ok_or_else(|| bad_request("cleanup message is required"))?;
+    st.notifier.send(crate::notify::Note {
+        event: "notice",
+        title: format!("Build folders cleaned on {}", worker.name),
+        message: message.into(),
+        priority: "normal",
+        labels: serde_json::from_str(&worker.labels).unwrap_or_default(),
+        ..Default::default()
+    });
+    Ok(Value::Null)
+}
+
 /// The scope a read grant allows: its kinds, else what the session may see.
 fn granted_scope(params: &Value, kinds: &[String]) -> Value {
     if kinds.is_empty() { params["scope"].clone() } else { json!(kinds) }
@@ -369,6 +416,76 @@ pub async fn get_granted(st: &HeadState, realm: &str, by: &str, params: Value) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn build_folder_context_and_cleanup_notice_are_worker_scoped_and_notify_without_a_session() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let worker = WorkerId::new();
+        let params = json!({"session_ids": ["session", "foreign"]});
+        assert!(handle(st, worker, "build_folders.context", params.clone()).await.is_err());
+        st.store
+            .insert_worker(
+                &crate::store::NewWorker {
+                    id: worker,
+                    name: "build-test",
+                    hostname: "host",
+                    os: "test",
+                    arch: "test",
+                    version: "test",
+                    cert_serial: "build-test",
+                },
+                "",
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(handle(st, worker, "build_folders.context", params.clone()).await.is_err());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let _live = st.registry.attach(worker, 1, tx, vec![], "worker").await;
+        sqlx::query("UPDATE sessions SET worker_id = ?, archived = 1, archived_at_ms = 123 WHERE id = 'session'")
+            .bind(worker.to_string())
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, archived, archived_at_ms) VALUES ('foreign', 'other', 'foreign', '', 'cc', 'opus', 'idle', 1, 1, 1, 999)")
+            .execute(&st.store.pool).await.unwrap();
+        let context = handle(st, worker, "build_folders.context", params.clone()).await.unwrap();
+        assert_eq!(context["sessions"][0]["archived_at_ms"], 123);
+        assert!(context["sessions"][1]["archived_at_ms"].is_null(), "foreign archive state is not disclosed");
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let hook = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(value): axum::Json<Value>| {
+                let sent = sent.clone();
+                async move {
+                    sent.send(value).unwrap();
+                    "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async { axum::serve(listener, hook).await.unwrap() });
+        st.store
+            .set_setting(
+                crate::notify::CHANNELS,
+                &json!([{"name":"cleanup", "kind":"webhook", "url":url, "events":["notice"]}]).to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(handle(st, worker, "build_folders.cleaned", json!({"message":""})).await.is_err());
+        handle(st, worker, "build_folders.cleaned", json!({"message":"Removed archived build output"})).await.unwrap();
+        st.notifier.send(crate::notify::Note { event: "notice", title: "cleanup barrier".into(), ..Default::default() });
+        let note = c6_testkit::within("machine cleanup notification", received.recv()).await.unwrap();
+        assert_eq!(note["title"], "Build folders cleaned on build-test");
+        assert_eq!(note["message"], "Removed archived build output");
+        assert_eq!(c6_testkit::within("cleanup notice barrier", received.recv()).await.unwrap()["title"], "cleanup barrier");
+        sqlx::query("UPDATE workers SET revoked_at = 1 WHERE id = ?").bind(worker.to_string()).execute(&st.store.pool).await.unwrap();
+        assert!(handle(st, worker, "build_folders.context", params).await.is_err());
+        assert!(handle(st, worker, "build_folders.cleaned", json!({"message":"not allowed"})).await.is_err());
+        server.abort();
+    }
 
     #[tokio::test]
     async fn disk_pressure_notifies_only_active_transitions_from_known_live_workers() {

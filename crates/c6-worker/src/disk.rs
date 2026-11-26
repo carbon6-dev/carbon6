@@ -266,7 +266,7 @@ pub(crate) async fn wait(monitor: &Monitor, path: &Path, delay: Duration, mut wa
 }
 
 #[allow(clippy::unnecessary_cast)] // statvfs block counters are u32 on Darwin, u64 on Linux.
-fn sample(path: &Path) -> Option<Space> {
+pub(crate) fn sample(path: &Path) -> Option<Space> {
     use std::ffi::CString;
     use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
     let existing = path.ancestors().find(|p| p.exists())?.canonicalize().ok()?;

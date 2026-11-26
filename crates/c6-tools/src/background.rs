@@ -227,6 +227,8 @@ pub struct Background {
     shell_owner: Mutex<Option<Arc<dyn ShellOwner>>>,
     shell_contexts: Mutex<Vec<CancellationToken>>,
     secrets: crate::Secrets,
+    /// Non-secret local defaults, shared with the session's foreground tools.
+    command_env: Mutex<Vec<(String, String)>>,
     /// Commands run here, or on this SSH target.
     ssh: Option<Arc<crate::remote::SshHost>>,
     /// Where shell commands keep their output and exit code, so they outlive
@@ -331,6 +333,23 @@ fn emit(sink: &Mutex<Option<TaskSink>>, secrets: &crate::Secrets, id: &str, p: &
 impl Background {
     pub fn with_secrets(secrets: crate::Secrets, ssh: Option<Arc<crate::remote::SshHost>>) -> Self {
         Self { secrets, ssh, ..Default::default() }
+    }
+
+    pub(crate) fn set_command_env(&self, env: Vec<(String, String)>) {
+        *self.command_env.lock().unwrap() = env;
+    }
+
+    pub(crate) fn command_defaults(&self) -> Vec<(String, String)> {
+        self.command_env.lock().unwrap().clone()
+    }
+
+    pub(crate) fn command_env(&self) -> Vec<(String, String)> {
+        let mut env = self.command_defaults();
+        for (name, value) in self.secrets.env() {
+            env.retain(|(key, _)| key != &name);
+            env.push((name, value));
+        }
+        env
     }
 
     /// Keeps shell commands' output and exit code in `dir`, so they outlive
@@ -770,7 +789,7 @@ impl Background {
                     .env("PAGER", "cat")
                     .env("GIT_PAGER", "cat")
                     .env("NO_COLOR", "1")
-                    .envs(self.secrets.env())
+                    .envs(self.command_env())
                     .stdin(Stdio::null())
                     .stdout(Stdio::from(stdout_writer))
                     .stderr(Stdio::from(stderr_writer))
@@ -881,7 +900,7 @@ impl Background {
             .env("PAGER", "cat")
             .env("GIT_PAGER", "cat")
             .env("NO_COLOR", "1")
-            .envs(self.secrets.env())
+            .envs(self.command_env())
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
@@ -1553,6 +1572,40 @@ mod tests {
 
     async fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<TaskEvent>) -> TaskEvent {
         tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn command_env_defaults_and_secret_overrides_reach_background_and_held_shells() {
+        for held in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let session = crate::SessionTools::new(dir.path().to_owned());
+            let bg = &session.background;
+            if held {
+                bg.set_held_dir(dir.path().join("held"));
+            }
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            bg.set_sink(Some(tx));
+            // Set these after constructing Background to verify live sharing.
+            session.set_command_env(vec![
+                ("SCCACHE_DIR".into(), "/tmp/visible-cache".into()),
+                ("RUSTC_WRAPPER".into(), "default-wrapper".into()),
+            ]);
+            session.set_secrets(vec![("RUSTC_WRAPPER".into(), "user-wrapper".into())]);
+            let id = bg
+                .spawn(
+                    "test \"$RUSTC_WRAPPER\" = user-wrapper && printf '%s:%s' \"$SCCACHE_DIR\" \"$RUSTC_WRAPPER\"",
+                    dir.path(),
+                    true,
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(next(&mut rx).await.state, TaskState::Started);
+            let done = next(&mut rx).await;
+            assert_eq!(done.exit_code, Some(0));
+            assert_eq!(done.output, "/tmp/visible-cache:[secret:RUSTC_WRAPPER]");
+            assert_eq!(bg.snapshot(&id).unwrap().stdout.text, done.output);
+        }
     }
 
     #[tokio::test]

@@ -52,10 +52,17 @@ mod tests {
         let old = Welcome::decode(&[][..]).unwrap();
         assert_eq!(old.machine_sample_secs, None);
         assert_eq!(old.machine_disk_hold_percent, None);
-        let welcome = Welcome { machine_sample_secs: Some(15), machine_disk_hold_percent: Some(5.0), ..Default::default() };
+        assert_eq!(old.machine_disk_warn_percent, None);
+        let welcome = Welcome {
+            machine_sample_secs: Some(15),
+            machine_disk_hold_percent: Some(5.0),
+            machine_disk_warn_percent: Some(12.0),
+            ..Default::default()
+        };
         let bytes = welcome.encode_to_vec();
         assert_eq!(bytes[0..2], [0x30, 15]);
         assert_eq!(bytes[2], 0x39);
+        assert_eq!(bytes[11], 0x41);
         assert_eq!(Welcome::decode(bytes.as_slice()).unwrap(), welcome);
     }
 

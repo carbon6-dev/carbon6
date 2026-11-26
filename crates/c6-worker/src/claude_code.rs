@@ -174,6 +174,11 @@ pub struct Launch {
     /// The worker that started it: a new one starts it again (with what it
     /// passes now).
     pub worker: String,
+    /// Identity of the non-secret compiler-cache environment at launch.
+    /// Session secrets are never included, even when they override a default.
+    /// Older held processes have no managed cache environment recorded.
+    #[serde(default)]
+    pub compile_cache_env_fingerprint: String,
     /// More arguments: the head's Ask passes `--tools ""` and
     /// `--strict-mcp-config`, so Claude Code has only carbon6's tools there
     /// (docs/ask.md §3).
@@ -183,6 +188,15 @@ pub struct Launch {
     /// settings files, skills or plugins but `agents-md`, and a hook denies
     /// any other tool (docs/background.md §4, Claude Code's own tools).
     pub native: Option<Vec<String>>,
+}
+
+pub(crate) fn compile_cache_env_fingerprint(defaults: &[(String, String)]) -> String {
+    if defaults.is_empty() {
+        return String::new();
+    }
+    // Match Command's last-value-wins semantics and ignore insertion order.
+    let env: std::collections::BTreeMap<_, _> = defaults.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+    c6_core::sha256_hex(&serde_json::to_vec(&env).expect("string environment serializes"))
 }
 
 /// The built-in plugins a locked-down process keeps: `agents-md`, which
@@ -2480,7 +2494,7 @@ impl Process {
     #[allow(clippy::too_many_arguments)]
     fn spawn_with(
         bin: &Path,
-        launch: Launch,
+        mut launch: Launch,
         resume: bool,
         cwd: &Path,
         model: &str,
@@ -2497,6 +2511,11 @@ impl Process {
             }
         };
         let mut cmd = c6_tools::process::session_command(bin);
+        launch.compile_cache_env_fingerprint =
+            compile_cache_env_fingerprint(&observer.as_ref().map(|o| o.tools.command_defaults()).unwrap_or_default());
+        if let Some(observer) = &observer {
+            cmd.envs(observer.tools.command_env());
+        }
         if let Some(root) = &output_root {
             cmd.env("CLAUDE_CODE_TMPDIR", &root.0);
         }
@@ -3482,6 +3501,13 @@ impl Process {
             })
             && self.unwoken.is_empty()
             && self.wake_due.is_none()
+    }
+
+    /// Changed launch settings (including cache defaults) wait until no turn,
+    /// unconfirmed input or background task can be lost. Quiet non-held
+    /// processes are also promoted to the restart-surviving transport.
+    pub(crate) fn replacement_ready(&self, launch: &Launch) -> bool {
+        (self.launch() != launch || !self.is_held()) && self.idle_until(Duration::ZERO).is_some()
     }
 
     /// The next line it wrote (`None`: it exited). For a session's actor
@@ -5763,6 +5789,75 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}
         })
     }
 
+    #[test]
+    fn compile_cache_launch_identity_tracks_defaults_without_secrets_and_reads_legacy_metadata() {
+        let tools = c6_tools::SessionTools::new(PathBuf::from("/work"));
+        let baseline = Launch::default();
+        assert_eq!(compile_cache_env_fingerprint(&tools.command_defaults()), baseline.compile_cache_env_fingerprint);
+        let enabled = vec![
+            ("RUSTC_WRAPPER".into(), "/worker/sccache".into()),
+            ("SCCACHE_DIR".into(), "/worker/cache".into()),
+            ("SCCACHE_CACHE_SIZE".into(), "1000".into()),
+        ];
+        tools.set_command_env(enabled.clone());
+        let cached = Launch { compile_cache_env_fingerprint: compile_cache_env_fingerprint(&tools.command_defaults()), ..baseline.clone() };
+        assert_ne!(cached, baseline, "enabling the cache changes launch identity");
+        let mut reordered = enabled.clone();
+        reordered.reverse();
+        assert_eq!(compile_cache_env_fingerprint(&reordered), cached.compile_cache_env_fingerprint);
+        for secret in ["first-private-wrapper", "replacement-private-wrapper"] {
+            tools.set_secrets(vec![("RUSTC_WRAPPER".into(), secret.into())]);
+            assert_eq!(compile_cache_env_fingerprint(&tools.command_defaults()), cached.compile_cache_env_fingerprint);
+            assert!(!serde_json::to_string(&cached).unwrap().contains(secret));
+        }
+        for changed in [
+            vec![("SCCACHE_DIR".into(), "/worker/new-cache".into())],
+            vec![("SCCACHE_CACHE_SIZE".into(), "2000".into())],
+            vec![("CC".into(), "/worker/cache-cc".into())],
+        ] {
+            tools.set_command_env(changed);
+            let changed =
+                Launch { compile_cache_env_fingerprint: compile_cache_env_fingerprint(&tools.command_defaults()), ..baseline.clone() };
+            assert_ne!(changed, cached, "new cache settings change launch identity");
+        }
+        tools.set_command_env(Vec::new());
+        let disabled =
+            Launch { compile_cache_env_fingerprint: compile_cache_env_fingerprint(&tools.command_defaults()), ..baseline.clone() };
+        assert_ne!(disabled, cached, "disabling the cache changes launch identity");
+        assert_eq!(disabled, baseline);
+        let mut legacy = serde_json::to_value(&cached).unwrap();
+        legacy.as_object_mut().unwrap().remove("compile_cache_env_fingerprint");
+        assert_eq!(serde_json::from_value::<Launch>(legacy).unwrap(), baseline, "pre-cache held metadata still loads");
+    }
+
+    #[tokio::test]
+    async fn compile_cache_environment_reaches_claude_launch_and_keeps_user_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script(
+            dir.path(),
+            "claude-cache-env",
+            r#"#!/bin/sh
+printf '{"wrapper":"%s","directory":"%s","size":"%s"}\n' "$RUSTC_WRAPPER" "$SCCACHE_DIR" "$SCCACHE_CACHE_SIZE"
+"#,
+        );
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        tools.set_command_env(vec![
+            ("RUSTC_WRAPPER".into(), "/worker/sccache".into()),
+            ("SCCACHE_DIR".into(), "/worker/cache".into()),
+            ("SCCACHE_CACHE_SIZE".into(), "1000".into()),
+        ]);
+        tools.set_secrets(vec![("RUSTC_WRAPPER".into(), "/user/wrapper".into())]);
+        let fingerprint = compile_cache_env_fingerprint(&tools.command_defaults());
+        assert!(tools.command_defaults().iter().all(|(_, value)| value != "/user/wrapper"), "defaults exclude the secret override");
+        let observer = observer(dir.path(), tools).await;
+        let mut process = spawn(&bin, dir.path(), "compile-cache-env", false, Some(observer));
+        assert_eq!(process.launch().compile_cache_env_fingerprint, fingerprint, "spawn records the actual non-secret launch defaults");
+        assert!(!serde_json::to_string(process.launch()).unwrap().contains("/user/wrapper"));
+        let output = c6_testkit::within("Claude Code's compile-cache launch environment", process.next_line()).await.unwrap();
+        assert_eq!(output, serde_json::json!({"wrapper":"/user/wrapper","directory":"/worker/cache","size":"1000"}));
+        process.close().await;
+    }
+
     fn spawn(bin: &Path, cwd: &Path, conversation: &str, resume: bool, observer: Option<Arc<Observer>>) -> Process {
         let launch = Launch { conversation: conversation.into(), ..Default::default() };
         Process::spawn(bin, launch, resume, cwd, "opus", Arc::default(), None, observer).unwrap()
@@ -7337,6 +7432,12 @@ cat > /dev/null
             assert_eq!(run(&mut p, 1, &[input("c1", "build it")], &sink).await.reason, Some(TurnEndReason::Completed));
             assert!(p.tasks_running());
             assert!(p.idle_until(IDLE).is_none(), "running tasks keep the process up");
+            let changed_cache = Launch {
+                compile_cache_env_fingerprint: compile_cache_env_fingerprint(&[("SCCACHE_DIR".into(), "/new/cache".into())]),
+                ..p.launch().clone()
+            };
+            assert_ne!(p.launch(), &changed_cache);
+            assert!(!p.replacement_ready(&changed_cache), "cache changes must not restart a process with running tasks");
             // Backdate only the product clock: no wall-clock wait or race
             // with a real child process on a paused Tokio clock.
             p.idle_since = tokio::time::Instant::now() - IDLE - Duration::from_secs(1);
@@ -7348,6 +7449,7 @@ cat > /dev/null
                 }
             })
             .await;
+            assert!(p.replacement_ready(&changed_cache), "the next quiet turn may replace the process to apply cache changes");
             let after_first = vec_sink.0.lock().unwrap().len();
             let deadline = p.idle_until(IDLE).expect("no running tasks");
             write_line(&p.stdin, &serde_json::json!({"fixture": "reply"})).await.unwrap();

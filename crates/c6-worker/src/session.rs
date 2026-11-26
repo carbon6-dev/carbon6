@@ -1028,6 +1028,24 @@ impl SessionManager {
             .is_some_and(|a| !a.tx.is_closed() && a.running.load(std::sync::atomic::Ordering::SeqCst))
     }
 
+    /// Reuse the ordinary durable Notice event and head notification routing;
+    /// never send an ephemeral telemetry message as the only cleanup notice.
+    pub(crate) async fn build_cleanup_notice(&self, sessions: &[String], message: String) -> anyhow::Result<()> {
+        for session in sessions {
+            if let Some(actor) = self.actor(session).await? {
+                actor
+                    .send(ActorMsg::Notice(c6_tools::Notice {
+                        title: "Build folders cleaned under disk pressure".into(),
+                        message,
+                        priority: "normal".into(),
+                    }))
+                    .map_err(|_| anyhow::anyhow!("session stopped before receiving cleanup notice"))?;
+                return Ok(());
+            }
+        }
+        anyhow::bail!("cleanup notice has no retained local session")
+    }
+
     /// The session's actor, started from the journal if needed (boxed: an
     /// actor reaches others, whose actors it may start).
     pub(crate) fn actor_for<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, anyhow::Result<Option<mpsc::UnboundedSender<ActorMsg>>>> {
@@ -1163,6 +1181,7 @@ impl SessionManager {
         events: &[SessionEvent],
         mut change: c6_proto::PlaceChanged,
     ) -> anyhow::Result<SessionEvent> {
+        let _build_use = self.journal.build_folder_lifecycle.clone().read_owned().await;
         let from = change.from.as_ref().ok_or_else(|| anyhow::anyhow!("move has no source place"))?;
         let to = change.to.as_ref().ok_or_else(|| anyhow::anyhow!("move has no destination place"))?;
         let cwd = Path::new(&to.cwd);
@@ -1638,6 +1657,7 @@ impl SessionManager {
     }
 
     async fn create(&self, session_id: &str, command_id: &str, spec: CreateSession) -> Result<(), String> {
+        let _build_use = self.journal.build_folder_lifecycle.read().await;
         if !spec.ssh_target.trim().is_empty() {
             return self.create_remote(session_id, command_id, spec).await;
         }
@@ -1958,6 +1978,7 @@ impl SessionManager {
     }
 
     async fn load_with_task_loss(&self, session_id: &str, cause: TaskLossCause) -> anyhow::Result<Option<Handle>> {
+        let _build_use = self.journal.build_folder_lifecycle.read().await;
         let _loading = self.load_gate(session_id).lock_owned().await;
         let (_, blocked, _) = self.journal.ownership(session_id).await?;
         anyhow::ensure!(!blocked, "session ownership is released or awaiting adoption");
@@ -2177,6 +2198,9 @@ impl SessionManager {
         let launch_pressure =
             Arc::new(if remote { (*self.launch_pressure).clone() } else { self.launch_pressure.scoped(Path::new(&started.cwd)) });
         let session_tools = Arc::new(SessionTools::with_ssh(PathBuf::from(&started.cwd), ssh));
+        if !remote {
+            session_tools.set_command_env(crate::compile_cache::session_environment(self.state_dir.clone()).await);
+        }
         session_tools.set_kit_admission(launch_pressure.clone());
         session_tools.background.set_shell_owner(self.journal.shell_owner(session_id, &on_behalf_of));
         // Unlogged starts still own IDs. Reserve before exposing tools, not
@@ -3865,6 +3889,7 @@ impl Actor {
     }
 
     async fn recover_once(&mut self, cli_retired: &mut bool) -> anyhow::Result<()> {
+        let _build_use = self.journal.build_folder_lifecycle.clone().read_owned().await;
         self.journal.recover_connection().await?;
         if self.runs_claude_code() && !*cli_retired {
             // A held reader may already have advanced past the
@@ -5866,6 +5891,7 @@ impl Actor {
     }
 
     async fn change_place(&mut self, command_id: &str, request: c6_proto::ChangePlace) -> anyhow::Result<()> {
+        let _build_use = self.journal.build_folder_lifecycle.clone().read_owned().await;
         let sid = self.writer.session_id.clone();
         anyhow::ensure!(
             self.spec.delegation.is_none()
@@ -6180,6 +6206,7 @@ impl Actor {
     }
 
     async fn reset_claude(&mut self, events: &[SessionEvent], command_id: &str, to_seq: u64, restore_files: bool) -> anyhow::Result<()> {
+        let _build_use = self.journal.build_folder_lifecycle.clone().read_owned().await;
         use crate::claude_code::{Launch, Observer, Process, Reset};
         let sid = &self.writer.session_id;
         let previous = self.journal.claude_rewind(sid).await?;
@@ -6347,6 +6374,7 @@ impl Actor {
             system_prompt: (!tools.is_empty()).then(|| self.claude_code_system_prompt(&tools)),
             tools: names,
             worker: c6_core::build().into(),
+            compile_cache_env_fingerprint: crate::claude_code::compile_cache_env_fingerprint(&self.session_tools.command_defaults()),
             native: claude_code_native(&self.spec),
             extra_args: Vec::new(),
         };
@@ -6472,6 +6500,7 @@ impl Actor {
     /// writes from here on comes in as it would have (a turn it carries on
     /// shows as one it started by itself).
     async fn take_up_held(&mut self) -> anyhow::Result<()> {
+        let _build_use = self.journal.build_folder_lifecycle.clone().read_owned().await;
         if !self.runs_claude_code() || self.claude.is_some() {
             return Ok(());
         }
@@ -6541,6 +6570,7 @@ impl Actor {
     /// (`conversation_from_log`, `claude_conversation`), never as native
     /// state. Claude Code runs only top-level sessions on the worker itself.
     async fn hand_off(&mut self, model: ModelSpec) -> anyhow::Result<()> {
+        let _build_use = self.journal.build_folder_lifecycle.clone().read_owned().await;
         let sid = self.writer.session_id.clone();
         // Leaving Claude Code: its process goes, with its background tasks.
         if let Some(mut p) = self.claude.take() {
@@ -6893,6 +6923,7 @@ impl Actor {
         let trim_spec = self.spec.clone();
         let task_fence = (subagent || self.spec.depth > 0).then(|| self.task_fence.clone());
         let task = tokio::spawn(async move {
+            let _build_use = journal.build_folder_lifecycle.clone().read_owned().await;
             let sink: Arc<dyn EventSink> = Arc::new(TurnSink { writer: writer.clone(), inbox: inbox.clone(), task_fence });
             if !claude_code {
                 cfg.context_window = link.context_window(&on_behalf_of, &model).await;
@@ -6900,6 +6931,9 @@ impl Actor {
                 cfg.trim_at = trim_at(&trim_spec, cfg.context_window);
             }
             // Secrets for this turn's commands (values only in memory).
+            if !remote_session {
+                session_tools.set_command_env(crate::compile_cache::session_environment(manager.state_dir.clone()).await);
+            }
             if !secret_names.is_empty() {
                 let (values, errors) = fetch_secrets(&link, &on_behalf_of, &secret_names).await;
                 for e in errors {
@@ -6971,6 +7005,7 @@ impl Actor {
                     system_prompt: bridge_prompt,
                     tools: bridge_names,
                     worker: c6_core::build().to_owned(),
+                    compile_cache_env_fingerprint: crate::claude_code::compile_cache_env_fingerprint(&session_tools.command_defaults()),
                     extra_args: Vec::new(),
                     native: claude_native,
                 };
@@ -7240,7 +7275,7 @@ async fn claude_turn(
     let trim_path = process.as_ref().zip(trim.as_ref()).and_then(|(p, trim)| trim.candidate(p, cwd));
     let worth_trimming = trim_path.is_some();
     if let Some(p) =
-        process.take_if(|p| (p.launch() != &launch || !p.is_held() || worth_trimming) && p.idle_until(std::time::Duration::ZERO).is_some())
+        process.take_if(|p| p.replacement_ready(&launch) || (worth_trimming && p.idle_until(std::time::Duration::ZERO).is_some()))
     {
         // A reset initializes non-held until its branch is confirmed. Promote
         // that quiet process to restart-surviving transport on its next turn;

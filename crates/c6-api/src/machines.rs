@@ -63,6 +63,34 @@ pub struct MachineDiskScan {
     pub partial: bool,
     /// Largest directories, in descending byte order. Sizes include descendants.
     pub folders: Vec<MachineFolderUsage>,
+    /// Recognized Rust build directories. Unlike `folders`, these include
+    /// attribution and are not restricted to the largest generic directories.
+    #[serde(default)]
+    pub build_folders: Vec<MachineBuildFolder>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MachineBuildFolder {
+    pub path: String,
+    pub bytes: u64,
+    pub modified_ms: Option<i64>,
+    /// Most recent recorded use or observed descendant modification. This is
+    /// not filesystem atime (which is commonly disabled).
+    pub last_used_ms: Option<i64>,
+    pub carbon6_owned: bool,
+    pub active: bool,
+    /// Only set when every attributed session has archived; the latest archive
+    /// starts the grace period for shared build directories.
+    pub archived_at_ms: Option<i64>,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    #[serde(default)]
+    pub repositories: Vec<String>,
+    /// An incremental subdirectory can be explicitly removed independently.
+    pub incremental: bool,
+    /// Size or attribution could not be fully determined; never auto-cleaned.
+    pub partial: bool,
 }
 
 // Inventory and history contracts (head-owned).

@@ -48,8 +48,88 @@ worktrees/scratch and large home directories (including targets and .cargo),
 and temporary files. Traversal does not follow symlinks, stays bounded by elapsed
 time and entry count, tolerates unreadable paths, and reports partial results,
 folder sizes and last-modified times. It is an explicit authorized machine
-operation, not an automatically callable free read for agents. No deletion or
-cleanup is performed.
+operation, not an automatically callable free read for agents. Investigation
+itself never deletes files. A separate build-folder list includes recognized
+Rust target and incremental directories, sizes, modification/last-use times,
+repository/session attribution, carbon6 ownership, archive state and whether
+the folder is active or the scan is partial. Last use is recorded use or
+observed descendant modification, not unreliable filesystem atime. Target
+sizes include incremental descendants, so rows must not be summed as unique
+disk usage.
+
+Current placement is projected durably when sessions are created/imported and
+as events are appended, so a move remains attributed after a long conversation.
+Legacy journals backfill in 64-event pages, at most 256 events per investigation,
+with checkpoints retained across restarts. Until a session's placement is proven,
+attribution is partial and cleanup is refused. Missing or unreadable history
+stays fail-closed; it is never replaced by a guess from the original workspace.
+
+The console offers a separate removal control on inactive, completely scanned
+build folders. Every click requires confirmation naming the exact path and
+warning that compiler outputs must be rebuilt. Incremental rows remove only
+those incremental outputs. Active or partial rows cannot be removed from the
+UI; the worker independently rechecks live references before removal. External
+folders require explicit confirmation and are never automatic cleanup targets.
+After removal the old scan is cleared: investigate again for fresh sizes and
+attribution. The head has no worker build-folder cleanup controls.
+
+## Shared compile cache
+
+Each worker's Machines detail has a **Shared compile cache** panel in the
+console. It reports disabled/ready/missing state, the effective directory and
+size cap, cache size, hits/misses, hit rate and compile time saved. Unknown or
+unsupported statistics are displayed as unavailable, not zero. If the worker
+estimates saved compilation time from mean compilation duration, cache hits
+and cache-read time, the UI labels it **Estimated compile time saved** rather
+than presenting it as measured. Status refreshes every minute while the detail
+is open and also has an explicit refresh button; refreshes preserve unsaved
+configuration edits. Statistics may remain unavailable until the first
+compilation starts the cache server.
+When sccache is missing the panel shows `cargo install sccache --locked` for the
+user to run on that worker. carbon6 does not install it automatically.
+
+Caching is **disabled by default**, independently on every worker. The console
+can opt in and configure an absolute cache directory, a positive size cap in
+bytes, Rust and C/C++ flags, and the archived build-folder grace period (default
+three days). Blank directory/cap inputs restore worker defaults: `sccache` under
+the worker state directory and the smaller of 100 GiB or 10% of the containing
+filesystem (100 GiB if capacity is unavailable). Rust is selected by default
+but has no effect while caching is disabled; C/C++ is off by default.
+Configuration is persisted in the worker's
+state directory as `compile-cache.json`; it is not written into repository
+configuration. It applies on the next turn, not already-running builds. Claude
+Code takes changes up through its existing safe-idle replacement path: running
+tasks, unconfirmed inputs and in-flight turns are never interrupted for caching.
+
+The cache shares compiler outputs rather than Cargo target directories or
+linker outputs. Rust uses `RUSTC_WRAPPER` while preserving an existing wrapper;
+opt-in C/C++ uses worker-owned compiler wrappers only where `CC`/`CXX` were not
+already selected by the worker or session. Disabling the cache leaves
+ordinary builds available and does not delete cached data. Archived automatic
+cleanup is restricted to carbon6-owned, inactive, completely scanned folders
+after the configured grace; external folders are never automatic targets.
+The worker uses `SCCACHE_SERVER_UDS` under its state directory, keyed by cache
+directory and size cap, rather than attaching builds to the user's default
+server. A configuration change starts the matching server on demand; existing
+builds finish on their original server, which follows normal idle expiry.
+Filesystem preparation has a two-second wait and at most two outstanding
+blocking probes, including timed-out probes until they finish. Missing tools
+or an explicit cap avoid unnecessary capacity probes. Overlong Unix socket
+paths are reported as unavailable and caching is skipped, rather than making
+ordinary builds fail. Relative worker state paths become absolute before they
+are exported to a session.
+
+Console-only worker endpoints are `GET /api/v1/machines/{id}/compile_cache`,
+`PUT /api/v1/machines/{id}/compile_cache` with
+`{enabled,directory,max_bytes,rust,c_cpp,archived_grace_days}`, and
+`POST /api/v1/machines/{id}/build_folders/remove` with
+`{path,incremental_only,confirmed}`. They are not general agent operations.
+The status response includes `config`, `status`, `install_command`, effective
+`directory`/`max_bytes`, and nullable `stats` with optional
+`cache_size_bytes`, `cache_hits`, `cache_misses`, `hit_rate` (0–1), and
+`compile_time_saved_seconds`, plus `compile_time_saved_estimated` to distinguish
+an estimate from a directly reported duration. A failed stats read may include
+`stats_error`.
 
 ## Warnings and admission
 

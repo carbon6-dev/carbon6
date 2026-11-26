@@ -2,12 +2,14 @@
 
 use std::time::Duration;
 
-use c6_api::machines::{Machine, MachineDiskScan, MachineSample};
+use c6_api::machines::{Machine, MachineBuildFolder, MachineDiskScan, MachineSample};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use serde_json::Value;
 
 use crate::{
     api,
+    api::Request,
     icons::{Icon, Size, icon},
     workspace::{Go, View},
 };
@@ -34,6 +36,67 @@ fn bytes(n: u64) -> String {
 
 fn percent(used: u64, total: u64) -> f64 {
     if total == 0 { f64::NAN } else { used as f64 / total as f64 * 100.0 }
+}
+
+// These console-only endpoints are intentionally not agent RPCs. Keep the
+// selected realm on every request, including configuration and removal.
+async fn machine_request(machine: &str, action: &str, method: &str, body: Option<serde_json::Value>) -> Result<Value, String> {
+    let realm = api::realm().get_untracked();
+    let query = if realm.is_empty() { String::new() } else { format!("?realm={}", api::enc(&realm)) };
+    let url = format!("/api/v1/machines/{}/{}{}", api::enc(machine), action, query);
+    let request = match method {
+        "PUT" => Request::put(&url),
+        "POST" => Request::post(&url),
+        _ => Request::get(&url),
+    };
+    let response = if let Some(body) = body { request.json(&body).map_err(|e| e.to_string())?.send().await } else { request.send().await }
+        .map_err(|e| e.to_string())?;
+    if !response.ok() {
+        if response.status() == 401 {
+            api::signed_out().set(true);
+        }
+        return Err(response.json::<c6_api::ApiError>().await.map(|e| e.error).unwrap_or_else(|_| response.status_text()));
+    }
+    response.json().await.map_err(|e| e.to_string())
+}
+
+fn cache_hit_rate(rate: Option<f64>) -> String {
+    rate.filter(|r| r.is_finite() && (0.0..=1.0).contains(r)).map(|r| format!("{:.1}%", r * 100.0)).unwrap_or_else(|| "unavailable".into())
+}
+
+// Use the existing JSON decoder and one renderer for all metric rows rather
+// than adding response-specific Serde/fetch state and four view specializations.
+fn cache_metrics(value: &Value) -> [(&'static str, String); 4] {
+    let stats = &value["stats"];
+    let count = |key: &str| stats[key].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "unavailable".into());
+    [
+        ("Cache size", stats["cache_size_bytes"].as_u64().map(bytes).unwrap_or_else(|| "unavailable".into())),
+        ("Cache hits / misses", format!("{} / {}", count("cache_hits"), count("cache_misses"))),
+        ("Hit rate", cache_hit_rate(stats["hit_rate"].as_f64())),
+        (
+            if stats["compile_time_saved_estimated"].as_bool() == Some(true) {
+                "Estimated compile time saved"
+            } else {
+                "Compile time saved"
+            },
+            cache_time_saved(stats["compile_time_saved_seconds"].as_f64()),
+        ),
+    ]
+}
+
+fn cache_time_saved(seconds: Option<f64>) -> String {
+    seconds
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .map(|s| {
+            if s < 60.0 {
+                format!("{s:.1} s")
+            } else if s < 3600.0 {
+                format!("{:.1} min", s / 60.0)
+            } else {
+                format!("{:.1} h", s / 3600.0)
+            }
+        })
+        .unwrap_or_else(|| "unavailable".into())
 }
 
 fn fullest(s: &MachineSample) -> f64 {
@@ -300,6 +363,7 @@ pub fn MachineDetails(machine_id: String) -> impl IntoView {
                 },
                 Err(e) => view! { <crate::util::ErrorBox message=e /> }.into_any(),
             })}</Transition>
+            {(machine_id.get_value() != "head" && crate::place::is_console()).then(move || view! { <CompileCache machine_id=machine_id.get_value() /> })}
             <DiskScan machine_id=machine_id.get_value() />
         </section>
     }
@@ -383,17 +447,248 @@ fn SessionUsage(title: &'static str, sessions: Vec<c6_api::machines::MachineSess
 }
 
 #[component]
+fn CompileCache(machine_id: String) -> impl IntoView {
+    let machine_id = StoredValue::new(machine_id);
+    let status = LocalResource::new(move || {
+        api::realm().get();
+        async move {
+            let value = machine_request(&machine_id.get_value(), "compile_cache", "GET", None).await?;
+            if !value["config"].is_object() {
+                return Err("Worker returned an invalid cache configuration".into());
+            }
+            Ok::<Value, String>(value)
+        }
+    });
+    // Poll telemetry without replacing the editor or losing unsaved changes.
+    let initial = RwSignal::new(None::<Value>);
+    Effect::new(move || {
+        if initial.with_untracked(Option::is_none)
+            && let Some(Ok(value)) = status.get()
+        {
+            initial.set(Some(value["config"].clone()));
+        }
+    });
+    let poll = set_interval_with_handle(move || status.refetch(), Duration::from_secs(60)).ok();
+    on_cleanup(move || {
+        if let Some(poll) = poll {
+            poll.clear();
+        }
+    });
+    view! {
+        <div class="space-y-3 border-t border-zinc-200 pt-4 dark:border-zinc-800">
+            <div class="flex flex-wrap items-center justify-between gap-2"><h3 class="text-sm font-semibold">"Shared compile cache"</h3>
+                <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| status.refetch()>"Refresh cache status"</button>
+            </div>
+            <p class="text-xs text-muted">"Opt-in per worker. Shares compiler outputs, not Cargo target directories. Existing compiler selections are not overwritten. Changes apply on the next turn; Claude Code takes them up at its next safe idle restart, never interrupting running tasks. Status refreshes every minute."</p>
+            <Transition fallback=|| view! { <p class="text-xs text-muted">"Loading compile cache…"</p> }>
+                {move || status.get().map(|r| match r {
+                    Ok(value) => view! { <CacheTelemetry value /> }.into_any(),
+                    Err(e) => view! { <crate::util::ErrorBox message=e /> }.into_any(),
+                })}
+            </Transition>
+            <Show when=move || initial.with(Option::is_some)>
+                <CacheSettings machine_id=machine_id.get_value() config=initial.get_untracked().expect("initial cache configuration") refresh=Callback::new(move |()| status.refetch()) />
+            </Show>
+        </div>
+    }
+}
+
+#[component]
+fn CacheTelemetry(value: Value) -> impl IntoView {
+    let directory = value["directory"].as_str().unwrap_or("unavailable").to_owned();
+    let status = value["status"].as_str().unwrap_or("unavailable").to_owned();
+    let cap = value["max_bytes"].as_u64().map(bytes).unwrap_or_else(|| "unavailable".into());
+    let install = (status == "missing").then(|| value["install_command"].as_str().unwrap_or("cargo install sccache --locked").to_owned());
+    let error = value["stats_error"].as_str().map(str::to_owned);
+    view! {
+        <div class="space-y-3 text-xs">
+            <p role="status" class="break-all">{format!("{status} · {directory} · cap {cap}")}</p>
+            {install.map(|command| view! { <div class="space-y-1 rounded bg-amber-50 p-3 dark:bg-amber-950">
+                <p>"sccache is missing on this worker. Run this there, then refresh (nothing is installed automatically):"</p>
+                <code class="block break-all select-all">{command}</code>
+            </div> })}
+            <dl class="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                {cache_metrics(&value).into_iter().map(|(label, text)| view! { <div><dt class="text-muted">{label}</dt><dd>{text}</dd></div> }).collect_view()}
+            </dl>
+            {error.map(|e| view! { <p class="text-muted">"Statistics unavailable: "{e}</p> })}
+        </div>
+    }
+}
+
+#[component]
+fn CacheSettings(machine_id: String, config: Value, refresh: Callback<()>) -> impl IntoView {
+    let machine_id = StoredValue::new(machine_id);
+    let enabled = RwSignal::new(config["enabled"].as_bool().unwrap_or(false));
+    let directory = RwSignal::new(config["directory"].as_str().unwrap_or_default().to_owned());
+    let cap = RwSignal::new(config["max_bytes"].as_u64().map(|n| n.to_string()).unwrap_or_default());
+    let rust = RwSignal::new(config["rust"].as_bool().unwrap_or(true));
+    let c_cpp = RwSignal::new(config["c_cpp"].as_bool().unwrap_or(false));
+    let grace = RwSignal::new(config["archived_grace_days"].as_u64().unwrap_or(3).to_string());
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let alive = StoredValue::new(true);
+    on_cleanup(move || alive.set_value(false));
+    let save = move |_| {
+        if busy.get_untracked() || !crate::place::is_console() {
+            return;
+        }
+        let max_bytes = match cap.get_untracked().trim() {
+            "" => None,
+            n => match n.parse::<u64>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => {
+                    error.set(Some("Size cap must be a positive number of bytes, or blank for the worker default.".into()));
+                    return;
+                }
+            },
+        };
+        let archived_grace_days = match grace.get_untracked().trim().parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => {
+                error.set(Some("Archive grace period must be a whole number of days.".into()));
+                return;
+            }
+        };
+        let path = directory.get_untracked().trim().to_owned();
+        let config = serde_json::json!({
+            "enabled": enabled.get_untracked(), "directory": (!path.is_empty()).then_some(path),
+            "max_bytes": max_bytes, "rust": rust.get_untracked(), "c_cpp": c_cpp.get_untracked(),
+            "archived_grace_days": archived_grace_days,
+        });
+        busy.set(true);
+        error.set(None);
+        spawn_local(async move {
+            let saved = machine_request(&machine_id.get_value(), "compile_cache", "PUT", Some(config)).await;
+            if alive.try_get_value().unwrap_or(false) {
+                busy.set(false);
+                match saved {
+                    Ok(_) => refresh.run(()),
+                    Err(e) => error.set(Some(e)),
+                }
+            }
+        });
+    };
+    view! {
+        <div class="space-y-3 text-xs">
+            <fieldset class="space-y-3" disabled=move || busy.get() || !crate::place::is_console()>
+                <div class="flex flex-wrap gap-4">
+                    {[("Enable shared compile cache", enabled), ("Rust", rust), ("C / C++", c_cpp)].into_iter().map(|(label, flag)| view! {
+                        <label class="flex items-center gap-2"><input type="checkbox" prop:checked=move || flag.get() on:change=move |e| flag.set(event_target_checked(&e)) />{label}</label>
+                    }).collect_view()}
+                </div>
+                <div class="grid gap-3 sm:grid-cols-2">
+                    {[("Cache directory (blank: worker default)", directory, "text"), ("Size cap in bytes (blank: worker default)", cap, "numeric"), ("Archived build-folder grace period (days)", grace, "numeric")].into_iter().map(|(label, text, mode)| view! {
+                        <label class="space-y-1">{label}<input class="w-full rounded border border-zinc-300 bg-transparent p-2 dark:border-zinc-700" type="text" inputmode=mode prop:value=move || text.get() on:input=move |e| text.set(event_target_value(&e)) /></label>
+                    }).collect_view()}
+                </div>
+                <button class="rounded border border-zinc-300 px-3 py-1.5 disabled:opacity-50 dark:border-zinc-700" on:click=save>{move || if busy.get() { "Saving…" } else { "Save cache settings" }}</button>
+            </fieldset>
+            {(!crate::place::is_console()).then(|| view! { <p class="text-muted">"Cache configuration is available in the console."</p> })}
+            {move || error.get().map(|e| view! { <crate::util::ErrorBox message=e /> })}
+        </div>
+    }
+}
+
+#[component]
+fn BuildFolderRow(machine_id: String, folder: MachineBuildFolder, removed: Callback<String>) -> impl IntoView {
+    let machine_id = StoredValue::new(machine_id);
+    let path = StoredValue::new(folder.path.clone());
+    let incremental = folder.incremental;
+    let protected = folder.active || folder.partial;
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let alive = StoredValue::new(true);
+    on_cleanup(move || alive.set_value(false));
+    let remove = move |_| {
+        if busy.get_untracked() || protected || !crate::place::is_console() {
+            return;
+        }
+        let target = path.get_value();
+        let message = format!(
+            "Remove {}\n\n{}\n\nThis permanently deletes all files in the selected build-output folder and cannot be undone. The next build must rebuild its outputs. The worker rechecks that no session or terminal is using this folder. Continue?",
+            if incremental { "this incremental build folder?" } else { "this build folder and all its outputs?" },
+            target
+        );
+        if !window().confirm_with_message(&message).unwrap_or(false) {
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        spawn_local(async move {
+            let response = machine_request(
+                &machine_id.get_value(),
+                "build_folders/remove",
+                "POST",
+                Some(serde_json::json!({
+                    "path": target, "incremental_only": incremental, "confirmed": true,
+                })),
+            )
+            .await;
+            if alive.try_get_value().unwrap_or(false) {
+                busy.set(false);
+                match response {
+                    Ok(value) => {
+                        let errors: Vec<_> = value
+                            .get("errors")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect();
+                        let count = value.get("removed").and_then(serde_json::Value::as_array).map_or(0, Vec::len);
+                        if errors.is_empty() && count > 0 {
+                            removed.run(format!(
+                                "Removed {count} build folder(s). Investigate again to refresh folder sizes and attribution."
+                            ));
+                        } else if errors.is_empty() {
+                            error.set(Some("No build folders were removed. Investigate again; the folder may now be active or the new scan incomplete.".into()));
+                        } else {
+                            error.set(Some(errors.join("; ")));
+                        }
+                    }
+                    Err(e) => error.set(Some(e)),
+                }
+            }
+        });
+    };
+    let sessions = folder.session_ids.clone();
+    view! {
+        <div class="space-y-2 rounded border border-zinc-200 p-3 dark:border-zinc-800">
+            <div class="flex flex-wrap justify-between gap-2"><span class="min-w-0 break-all font-mono">{folder.path}</span><span>{bytes(folder.bytes)}</span></div>
+            <p class="text-muted">{format!("{} · {}{}{}", if folder.carbon6_owned { "carbon6-owned" } else { "external — never automatically cleaned" },
+                if folder.active { "active — protected" } else if folder.archived_at_ms.is_some() { "archived" } else { "inactive" },
+                if folder.incremental { " · incremental" } else { "" }, if folder.partial { " · partial scan — protected" } else { "" })}</p>
+            <p class="text-muted">{folder.last_used_ms.map(|ms| format!("Last used {}", crate::when::ago(now_ms() - ms))).unwrap_or_else(|| "Last use unknown".into())}
+                " · "{folder.modified_ms.map(|ms| format!("modified {}", crate::when::ago(now_ms() - ms))).unwrap_or_else(|| "modified unknown".into())}
+                {folder.archived_at_ms.map(|ms| format!(" · archived {}", crate::when::ago(now_ms() - ms)))}
+            </p>
+            {(!folder.repositories.is_empty()).then(|| view! { <p class="break-all text-muted">"Repositories: "{folder.repositories.join(", ")}</p> })}
+            {(!sessions.is_empty()).then(|| view! { <div class="flex flex-wrap gap-2"><span class="text-muted">"Sessions:"</span>{sessions.into_iter().map(|id| view! {
+                <Go to=View::session(&id) class="break-all text-sky-700 hover:underline dark:text-sky-400">{id}</Go>
+            }).collect_view()}</div> })}
+            <button class="rounded border border-red-300 px-3 py-1.5 text-red-700 disabled:opacity-50 dark:border-red-900 dark:text-red-400"
+                disabled=move || protected || busy.get() || !crate::place::is_console() on:click=remove>
+                {move || if busy.get() { "Removing…" } else if incremental { "Remove incremental outputs…" } else { "Remove build folder…" }}
+            </button>
+            {move || error.get().map(|e| view! { <crate::util::ErrorBox message=e /> })}
+        </div>
+    }
+}
+
+#[component]
 fn DiskScan(machine_id: String) -> impl IntoView {
     let machine_id = StoredValue::new(machine_id);
     let busy = RwSignal::new(false);
     let result = RwSignal::new(None::<MachineDiskScan>);
     let error = RwSignal::new(None::<String>);
+    let notice = RwSignal::new(None::<String>);
     let alive = StoredValue::new(true);
     on_cleanup(move || alive.set_value(false));
     let start = move |_| {
         busy.set(true);
         error.set(None);
         result.set(None);
+        notice.set(None);
         spawn_local(async move {
             // The server runs its bounded traversal off the async runtime;
             // this explicit request returns the completed (possibly partial)
@@ -411,11 +706,20 @@ fn DiskScan(machine_id: String) -> impl IntoView {
     view! {
         <div class="space-y-2 border-t border-zinc-200 pt-4 dark:border-zinc-800"><button class="rounded border border-zinc-300 px-3 py-1.5 text-sm disabled:opacity-50 dark:border-zinc-700" disabled=move || busy.get() || !crate::place::is_console() on:click=start>{move || if busy.get() { "Investigating disk…" } else { "What's using the disk?" }}</button>
             {(!crate::place::is_console()).then(|| view! { <p class="text-xs text-muted">"Disk investigation is available in the console."</p> })}
-            <p class="text-xs text-muted">"Explicit bounded background scan. No files are deleted; inaccessible folders and scan limits may produce partial results."</p>
+            <p class="text-xs text-muted">"Investigation never deletes files. Inaccessible folders and scan limits may produce partial results. Recognized inactive build folders can be removed separately with confirmation; active or incompletely scanned folders are protected."</p>
             {move || error.get().map(|e| view! { <crate::util::ErrorBox message=e /> })}
+            {move || notice.get().map(|n| view! { <p role="status" class="text-xs text-muted">{n}</p> })}
             {move || result.get().map(|r| view! { <div class="space-y-2 text-xs">
                 <p class="text-muted">{format!("{} entries checked · {}", r.entries, if r.partial { "partial results" } else { "complete" })}</p>
                 <div class="max-h-72 space-y-2 overflow-auto">{r.folders.into_iter().map(|f| view! { <div class="flex flex-wrap justify-between gap-x-4"><span class="min-w-0 break-all font-mono">{f.path}</span><span>{bytes(f.bytes)}" · "{f.modified_ms.map(|ms| format!("modified {}", crate::when::ago(now_ms() - ms))).unwrap_or_else(|| "modified unknown".into())}</span></div> }).collect_view()}</div>
+                {(machine_id.get_value() != "head").then(|| view! {
+                    <h3 class="pt-3 text-sm font-semibold">"Build folders"</h3>
+                    <p class="text-muted">"Sizes include descendants; target and incremental rows may overlap. Removal is permanent and requires a rebuild. External folders are never automatically cleaned."</p>
+                    {(r.build_folders.is_empty()).then(|| view! { <p class="text-muted">"No recognized build folders in this scan."</p> })}
+                    <div class="max-h-96 space-y-3 overflow-auto">{r.build_folders.into_iter().map(|folder| view! {
+                        <BuildFolderRow machine_id=machine_id.get_value() folder removed=Callback::new(move |message| { result.set(None); notice.set(Some(message)); }) />
+                    }).collect_view()}</div>
+                })}
             </div> })}
         </div>
     }
@@ -424,6 +728,76 @@ fn DiskScan(machine_id: String) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_status() -> serde_json::Value {
+        serde_json::json!({
+            "config": {"enabled": false, "directory": null, "max_bytes": null, "rust": true, "c_cpp": false, "archived_grace_days": 3},
+            "status": "disabled", "install_command": "cargo install sccache --locked",
+            "directory": "/worker/sccache", "max_bytes": 1024, "stats": null,
+        })
+    }
+
+    #[test]
+    fn cache_status_accepts_unavailable_and_partial_statistics() {
+        let mut value = cache_status();
+        let metrics = cache_metrics(&value);
+        assert_eq!(metrics[0].1, "unavailable");
+        assert_eq!(metrics[1].1, "unavailable / unavailable");
+        assert_eq!(metrics[2].1, "unavailable");
+        assert_eq!(metrics[3].1, "unavailable");
+        value["stats"] = serde_json::json!({"cache_hits": 12, "compile_time_saved_seconds": 120.0, "compile_time_saved_estimated": true});
+        let metrics = cache_metrics(&value);
+        assert_eq!(metrics[1].1, "12 / unavailable");
+        assert_eq!(metrics[3], ("Estimated compile time saved", "2.0 min".into()));
+    }
+
+    #[test]
+    fn cache_metrics_never_invent_missing_savings_or_hit_rate() {
+        assert_eq!(cache_hit_rate(None), "unavailable");
+        assert_eq!(cache_hit_rate(Some(f64::NAN)), "unavailable");
+        assert_eq!(cache_hit_rate(Some(2.0)), "unavailable");
+        assert_eq!(cache_hit_rate(Some(0.25)), "25.0%");
+        assert_eq!(cache_time_saved(None), "unavailable");
+        assert_eq!(cache_time_saved(Some(-1.0)), "unavailable");
+        assert_eq!(cache_time_saved(Some(f64::INFINITY)), "unavailable");
+        assert_eq!(cache_time_saved(Some(1.5)), "1.5 s");
+        assert_eq!(cache_time_saved(Some(150.0)), "2.5 min");
+        assert_eq!(cache_time_saved(Some(7200.0)), "2.0 h");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cache_markup_shows_missing_install_command_and_labels_estimates() {
+        let mut value = cache_status();
+        value["status"] = serde_json::json!("missing");
+        let html = view! { <CacheTelemetry value=value.clone() /> }.to_html();
+        assert!(html.contains("cargo install sccache --locked"));
+        assert!(html.contains("nothing is installed automatically"));
+        assert!(html.contains("unavailable"));
+        value["stats"] = serde_json::json!({"compile_time_saved_seconds": 120.0, "compile_time_saved_estimated": true});
+        let html = view! { <CacheTelemetry value /> }.to_html();
+        assert!(html.contains("Estimated compile time saved"));
+        assert!(html.contains("2.0 min"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cache_cleanup_markup_protects_active_and_partial_folders() {
+        Owner::new().with(|| {
+            for (active, partial, label) in [(true, false, "active — protected"), (false, true, "partial scan — protected")] {
+                let folder = MachineBuildFolder { path: "/work/repo/target".into(), active, partial, ..Default::default() };
+                let html =
+                    view! { <BuildFolderRow machine_id="worker".to_owned() folder removed=Callback::new(|_: String| ()) /> }.to_html();
+                assert!(html.contains(label));
+                assert!(html.contains("disabled"));
+                assert!(html.contains("external — never automatically cleaned"));
+                assert!(html.contains("Remove build folder…"));
+            }
+            let folder = MachineBuildFolder { path: "/work/repo/target/debug/incremental".into(), incremental: true, ..Default::default() };
+            let html = view! { <BuildFolderRow machine_id="worker".to_owned() folder removed=Callback::new(|_: String| ()) /> }.to_html();
+            assert!(html.contains("Remove incremental outputs…"));
+        });
+    }
 
     #[test]
     fn card_history_merges_late_initial_history_without_losing_polls() {

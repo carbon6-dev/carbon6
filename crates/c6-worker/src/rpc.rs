@@ -169,6 +169,10 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
                 .await?
         }
         "machine.disk_scan" => crate::machines::disk_scan(worker).await,
+        "machine.build_folders.remove" => crate::machines::remove_build_folders(worker, params).await,
+        "machine.build_folders.archives" => crate::machines::build_folder_archives(worker, params).await,
+        "machine.compile_cache.status" => crate::compile_cache::status(worker.state_dir.clone()).await,
+        "machine.compile_cache.configure" => crate::compile_cache::configure(worker.state_dir.clone(), params).await,
         "kit.cancel" => {
             let id = params["job_id"].as_str().context("job_id required")?;
             let jobs = worker.kit_cancels.lock().unwrap();
@@ -225,7 +229,10 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
         "session.queue_op" => session_queue_op(worker, &params).await,
         "update.apply" => crate::update::apply(worker, &params).await,
         "update.now" => crate::update::now(worker),
-        "pty.open" => Ok(serde_json::to_value(worker.terminals.open(serde_json::from_value(params)?)?)?),
+        "pty.open" => {
+            let _build_use = worker.journal.build_folder_lifecycle.read().await;
+            Ok(serde_json::to_value(worker.terminals.open(serde_json::from_value(params)?)?)?)
+        }
         "pty.list" => Ok(serde_json::to_value(worker.terminals.list())?),
         "pty.close" => Ok(json!({ "closed": worker.terminals.close(params["terminal_id"].as_str().unwrap_or_default()) })),
         "pty.attach" => {

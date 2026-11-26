@@ -33,6 +33,9 @@ impl std::error::Error for StopUnconfirmed {}
 
 pub struct Journal {
     pool: SqlitePool,
+    /// Cleanup owns the write side; session setup/turns and shell launch
+    /// reservations own the read side. Recheck process barriers under write.
+    pub(crate) build_folder_lifecycle: Arc<tokio::sync::RwLock<()>>,
     #[cfg(test)]
     recovery_error: std::sync::Mutex<Option<(i32, Arc<std::sync::atomic::AtomicBool>)>>,
     /// Serialize reset publication/retry authorization with exceptional
@@ -67,9 +70,91 @@ struct ShellOwner {
     root_session_id: String,
 }
 
+#[derive(Default)]
+struct BuildFolderPlace {
+    checkpoint_seq: i64,
+    known: bool,
+    backfill_blocked: bool,
+    cwd: String,
+    repository: String,
+    worker_id: String,
+    local: bool,
+}
+
+impl BuildFolderPlace {
+    fn from_spec(spec: &CreateSession) -> Self {
+        Self {
+            known: !spec.cwd.is_empty() || !spec.ssh_target.is_empty(),
+            cwd: spec.cwd.clone(),
+            local: spec.ssh_target.is_empty(),
+            ..Self::default()
+        }
+    }
+
+    fn apply(&mut self, event: &SessionEvent) {
+        match &event.kind {
+            Some(session_event::Kind::Started(started)) => {
+                self.cwd.clone_from(&started.cwd);
+                self.repository.clone_from(&started.repo_root);
+                self.worker_id.clear();
+                self.local = started.ssh_target.is_empty();
+                self.known = !self.local || !self.cwd.is_empty();
+            }
+            Some(session_event::Kind::PlaceChanged(place)) => {
+                if let Some(to) = &place.to {
+                    self.cwd.clone_from(&to.cwd);
+                    self.repository.clone_from(&to.repo_root);
+                    self.worker_id.clone_from(&to.worker_id);
+                    self.local = true;
+                    self.known = !self.cwd.is_empty();
+                } else {
+                    self.known = false;
+                }
+            }
+            _ => {}
+        }
+        self.checkpoint_seq = event.seq as i64;
+    }
+}
+
+async fn build_folder_place_in(tx: &mut sqlx::SqliteConnection, session_id: &str) -> anyhow::Result<Option<BuildFolderPlace>> {
+    Ok(sqlx::query(
+        "SELECT checkpoint_seq, known, backfill_blocked, cwd, repository, worker_id, local FROM build_folder_places WHERE session_id = ?",
+    )
+    .bind(session_id)
+    .fetch_optional(tx)
+    .await?
+    .map(|row| BuildFolderPlace {
+        checkpoint_seq: row.get("checkpoint_seq"),
+        known: row.get("known"),
+        backfill_blocked: row.get("backfill_blocked"),
+        cwd: row.get("cwd"),
+        repository: row.get("repository"),
+        worker_id: row.get("worker_id"),
+        local: row.get("local"),
+    }))
+}
+
+async fn save_build_folder_place_in(tx: &mut sqlx::SqliteConnection, session_id: &str, place: &BuildFolderPlace) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO build_folder_places (session_id, checkpoint_seq, known, backfill_blocked, cwd, repository, worker_id, local) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET checkpoint_seq = excluded.checkpoint_seq, known = excluded.known, backfill_blocked = excluded.backfill_blocked, cwd = excluded.cwd, repository = excluded.repository, worker_id = excluded.worker_id, local = excluded.local")
+        .bind(session_id).bind(place.checkpoint_seq).bind(place.known).bind(place.backfill_blocked).bind(&place.cwd).bind(&place.repository)
+        .bind(&place.worker_id).bind(place.local).execute(&mut *tx).await?;
+    // Retain unarchived references too: a session can be trimmed before the
+    // first head archive refresh and still share an archived session's output.
+    sqlx::query(
+        "INSERT OR IGNORE INTO build_folder_archives (session_id, last_used_ms) SELECT ?, last_activity FROM sessions WHERE id = ?",
+    )
+    .bind(session_id)
+    .bind(session_id)
+    .execute(tx)
+    .await?;
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl c6_tools::ShellOwner for ShellOwner {
     async fn reserve(&self, task_id: &str) -> std::io::Result<String> {
+        let _build_use = self.journal.build_folder_lifecycle.read().await;
         let id = uuid::Uuid::now_v7().to_string();
         // One write statement serializes admission with rewind preparation
         // and freeze. A launch either owns a durable unknown barrier first,
@@ -366,6 +451,161 @@ impl Journal {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().filter_map(|(pid, session)| u32::try_from(pid).ok().map(|pid| (pid, session))).collect())
+    }
+
+    /// Advance legacy projections by at most 256 events per investigation,
+    /// in pages of 64. Each page and its checkpoint commit together. Appends
+    /// cannot race a backfill page because both hold the SQLite writer lock.
+    async fn backfill_build_folder_places(&self) -> anyhow::Result<()> {
+        const BUDGET: i64 = 256;
+        const PAGE: i64 = 64;
+        let mut tx = self.begin_write().await?;
+        let sessions = sqlx::query("SELECT s.id, s.last_seq, CASE WHEN length(s.spec) <= 65536 THEN s.spec END AS spec FROM sessions s LEFT JOIN build_folder_places p ON p.session_id = s.id WHERE p.session_id IS NULL OR (p.checkpoint_seq < s.last_seq AND p.backfill_blocked = 0) ORDER BY COALESCE(p.checkpoint_seq, 0), s.id LIMIT 256")
+            .fetch_all(&mut *tx).await?;
+        let mut remaining = BUDGET;
+        for row in sessions {
+            if remaining == 0 {
+                break;
+            }
+            let session: String = row.get("id");
+            let mut place = match build_folder_place_in(&mut tx, &session).await? {
+                Some(place) => place,
+                None => match row.get::<Option<Vec<u8>>, _>("spec").and_then(|data| CreateSession::decode(data.as_slice()).ok()) {
+                    Some(spec) => BuildFolderPlace::from_spec(&spec),
+                    None => {
+                        let place = BuildFolderPlace { backfill_blocked: true, ..Default::default() };
+                        save_build_folder_place_in(&mut tx, &session, &place).await?;
+                        continue;
+                    }
+                },
+            };
+            let events: Vec<(i64, Option<Vec<u8>>)> = sqlx::query_as("SELECT seq, CASE WHEN length(data) <= 65536 THEN data END FROM events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?")
+                .bind(&session).bind(place.checkpoint_seq).bind(PAGE.min(remaining)).fetch_all(&mut *tx).await?;
+            remaining -= events.len() as i64;
+            if events.is_empty() && place.checkpoint_seq < row.get::<i64, _>("last_seq") {
+                place.known = false;
+                place.backfill_blocked = true;
+            }
+            for (seq, data) in events {
+                // A missing, unreadable or oversized receipt may contain a
+                // move. Never jump its checkpoint or infer a current path.
+                if seq != place.checkpoint_seq + 1 {
+                    place.known = false;
+                    place.backfill_blocked = true;
+                    break;
+                }
+                let Some(data) = data else {
+                    place.known = false;
+                    place.backfill_blocked = true;
+                    break;
+                };
+                let Ok(event) = SessionEvent::decode(data.as_slice()) else {
+                    place.known = false;
+                    place.backfill_blocked = true;
+                    break;
+                };
+                if event.seq as i64 != seq {
+                    place.known = false;
+                    place.backfill_blocked = true;
+                    break;
+                }
+                place.apply(&event);
+            }
+            save_build_folder_place_in(&mut tx, &session, &place).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Bounded placement input for build-folder inventory. Normal sessions
+    /// use the append-maintained projection, independent of history length.
+    /// Legacy rows remain partial until paginated backfill proves placement.
+    pub(crate) async fn build_folder_places(&self, worker: &str) -> anyhow::Result<(Vec<crate::machines::build_folders::Reference>, bool)> {
+        use crate::machines::build_folders::Reference;
+        const LIMIT: i64 = 256;
+        self.backfill_build_folder_places().await?;
+        let rows = sqlx::query("SELECT s.id, s.last_seq, s.last_activity, a.archived_at_ms, p.checkpoint_seq, p.known, p.cwd, p.repository, p.worker_id, p.local FROM sessions s LEFT JOIN build_folder_archives a ON a.session_id = s.id LEFT JOIN build_folder_places p ON p.session_id = s.id ORDER BY s.last_activity DESC LIMIT ?")
+            .bind(LIMIT + 1).fetch_all(&self.pool).await?;
+        let mut partial = rows.len() > LIMIT as usize;
+        let mut places = Vec::new();
+        for row in rows.into_iter().take(LIMIT as usize) {
+            let session: String = row.get("id");
+            if row.get::<Option<i64>, _>("checkpoint_seq") != Some(row.get("last_seq")) || row.get::<Option<bool>, _>("known") != Some(true)
+            {
+                partial = true;
+                continue;
+            }
+            let owner: String = row.get("worker_id");
+            if !row.get::<bool, _>("local") || (!owner.is_empty() && owner != worker) {
+                continue;
+            }
+            let cwd: String = row.get("cwd");
+            if cwd.is_empty() {
+                partial = true;
+                continue;
+            }
+            // Canonicalization and ownership checks belong on the blocking
+            // pool, together with the actual filesystem investigation.
+            places.push(Reference {
+                path: cwd.into(),
+                scope: true,
+                session_id: session,
+                repository: row.get("repository"),
+                carbon6_owned: false,
+                active: false,
+                archived_at_ms: row.get("archived_at_ms"),
+                last_used_ms: Some(row.get("last_activity")),
+            });
+        }
+        let retained = sqlx::query("SELECT a.session_id, a.archived_at_ms, a.last_used_ms, p.known, p.cwd, p.repository, p.worker_id, p.local FROM build_folder_archives a LEFT JOIN build_folder_places p ON p.session_id = a.session_id WHERE (p.known = 0 OR p.local = 1 OR a.cwd != '' OR p.session_id IS NULL) AND NOT EXISTS (SELECT 1 FROM sessions WHERE id = a.session_id) LIMIT 257")
+            .fetch_all(&self.pool).await?;
+        partial |= retained.len() > LIMIT as usize;
+        for row in retained.into_iter().take(LIMIT as usize) {
+            if row.get::<Option<bool>, _>("known") != Some(true) {
+                partial = true;
+                continue;
+            }
+            let owner: String = row.get("worker_id");
+            if !row.get::<bool, _>("local") || (!owner.is_empty() && owner != worker) {
+                continue;
+            }
+            places.push(Reference {
+                path: std::path::PathBuf::from(row.get::<String, _>("cwd")),
+                scope: true,
+                session_id: row.get("session_id"),
+                repository: row.get("repository"),
+                carbon6_owned: false,
+                active: false,
+                archived_at_ms: row.get("archived_at_ms"),
+                last_used_ms: row.get("last_used_ms"),
+            });
+        }
+        Ok((places, partial))
+    }
+
+    pub(crate) async fn set_build_folder_archives(&self, worker: &str, states: &[(String, Option<i64>)]) -> anyhow::Result<()> {
+        let (places, _) = self.build_folder_places(worker).await?;
+        let mut tx = self.begin_write().await?;
+        for (session, archived) in states {
+            sqlx::query("INSERT INTO build_folder_archives (session_id, archived_at_ms) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET archived_at_ms = excluded.archived_at_ms")
+                .bind(session).bind(archived).execute(&mut *tx).await?;
+            if let Some(place) = places.iter().find(|place| &place.session_id == session) {
+                sqlx::query("UPDATE build_folder_archives SET cwd = ?, repository = ?, last_used_ms = ? WHERE session_id = ?")
+                    .bind(place.path.to_string_lossy().as_ref())
+                    .bind(&place.repository)
+                    .bind(place.last_used_ms)
+                    .bind(session)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn build_folder_active_sessions(&self) -> anyhow::Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT session_id FROM shell_writers WHERE absent = 0 UNION SELECT session_id FROM claude_processes UNION SELECT id FROM sessions WHERE open_turn IS NOT NULL OR open_tasks > 0")
+            .fetch_all(&self.pool).await?)
     }
 
     /// Only callers that observed ESRCH may retire a cleanup barrier.
@@ -694,6 +934,7 @@ impl Journal {
         sqlx::migrate!("./migrations").run(&pool).await.context("journal migrations")?;
         Ok(Self {
             pool,
+            build_folder_lifecycle: Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(test)]
             recovery_error: std::sync::Mutex::new(None),
             claude_rewind_ownership: tokio::sync::Mutex::new(()),
@@ -866,6 +1107,7 @@ impl Journal {
             .bind(now)
             .execute(&mut *tx)
             .await?;
+        save_build_folder_place_in(&mut tx, session_id, &BuildFolderPlace::from_spec(spec)).await?;
         append_in(&mut tx, session_id, started).await?;
         tx.commit().await?;
         self.appended.notify_one();
@@ -1124,6 +1366,10 @@ impl Journal {
             if keep.contains(&id) {
                 continue;
             }
+            // Never turn a partially backfilled legacy projection into a
+            // trusted retained placement by deleting its remaining history.
+            sqlx::query("UPDATE build_folder_places SET known = 0 WHERE session_id = ? AND checkpoint_seq != (SELECT last_seq FROM sessions WHERE id = ?)")
+                .bind(&id).bind(&id).execute(&mut *tx).await?;
             sqlx::query("DELETE FROM events WHERE session_id = ?").bind(&id).execute(&mut *tx).await?;
             sqlx::query("DELETE FROM applied_commands WHERE session_id = ?").bind(&id).execute(&mut *tx).await?;
             sqlx::query("DELETE FROM keep_warm_snapshots WHERE session_id = ?").bind(&id).execute(&mut *tx).await?;
@@ -1375,6 +1621,7 @@ async fn import_in(
         .bind(now)
         .execute(&mut *tx)
         .await?;
+    save_build_folder_place_in(tx, session_id, &BuildFolderPlace::from_spec(spec)).await?;
     // An adoption may replace a blocked incarnation. Import is the only
     // writer allowed to bypass append_in's barrier; its result stays blocked.
     for event in events {
@@ -1411,12 +1658,24 @@ async fn write_event_in(tx: &mut sqlx::SqliteConnection, session_id: &str, event
         .execute(&mut *tx)
         .await
         .with_context(|| format!("appending seq {} to {session_id}", event.seq))?;
+    if let Some(mut place) = build_folder_place_in(tx, session_id).await?
+        && !place.backfill_blocked
+        && place.checkpoint_seq + 1 == event.seq as i64
+    {
+        place.apply(event);
+        save_build_folder_place_in(tx, session_id, &place).await?;
+    }
     let open_turn: Option<Option<i64>> = match &event.kind {
         Some(session_event::Kind::TurnStarted(t)) => Some(Some(t.turn as i64)),
         Some(session_event::Kind::TurnEnded(_)) => Some(None),
         _ => None,
     };
     let now = c6_core::now_ms();
+    sqlx::query("UPDATE build_folder_archives SET last_used_ms = ? WHERE session_id = ?")
+        .bind(now)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
     let updated = match open_turn {
         Some(turn) => {
             sqlx::query("UPDATE sessions SET last_seq = ?, open_turn = ?, last_activity = ? WHERE id = ?")
@@ -1632,6 +1891,227 @@ mod ownership_tests {
         journal.clear_keep_warm_snapshot("s", 2).await.unwrap();
         // Loading a spec must not resurrect its older embedded transfer copy.
         assert!(journal.load_session("s").await.unwrap().unwrap().0.keep_warm_snapshot_json.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_folder_projection_preserves_old_moves_and_backfills_legacy_pages_after_reopen() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+        let journal = Journal::open(&path).await.unwrap();
+        for (id, cwd) in [("archived", "/worker/worktrees/repo/archived"), ("active", "/old-workspace")] {
+            let started = SessionEvent {
+                seq: 1,
+                kind: Some(session_event::Kind::Started(c6_proto::SessionStarted { cwd: cwd.into(), ..Default::default() })),
+                ..Default::default()
+            };
+            journal.create_session(id, &CreateSession::default(), &started).await.unwrap();
+        }
+        journal.set_build_folder_archives("worker", &[("archived".into(), Some(1)), ("active".into(), None)]).await.unwrap();
+        journal
+            .append(
+                "active",
+                &SessionEvent {
+                    seq: 2,
+                    kind: Some(session_event::Kind::PlaceChanged(c6_proto::PlaceChanged {
+                        to: Some(c6_proto::SessionPlace { cwd: "/worker/worktrees/repo/archived".into(), ..Default::default() }),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (places, partial) = journal.build_folder_places("worker").await.unwrap();
+        assert!(!partial);
+        assert_eq!(places.iter().find(|p| p.session_id == "active").unwrap().path, std::path::Path::new("/worker/worktrees/repo/archived"));
+        for seq in 3..=330 {
+            journal.append("active", &SessionEvent { seq, ..Default::default() }).await.unwrap();
+        }
+        let (places, partial) = journal.build_folder_places("worker").await.unwrap();
+        assert!(!partial, "new sessions must not lose attribution as conversations grow");
+        assert_eq!(places.iter().find(|p| p.session_id == "active").unwrap().path, std::path::Path::new("/worker/worktrees/repo/archived"));
+        sqlx::query("DELETE FROM build_folder_places WHERE session_id = 'active'").execute(&journal.pool).await.unwrap();
+        let (places, partial) = journal.build_folder_places("worker").await.unwrap();
+        assert!(partial, "an incomplete legacy checkpoint must disable cleanup");
+        assert!(!places.iter().any(|p| p.session_id == "active"));
+        let checkpoint: i64 = sqlx::query_scalar("SELECT checkpoint_seq FROM build_folder_places WHERE session_id = 'active'")
+            .fetch_one(&journal.pool)
+            .await
+            .unwrap();
+        assert_eq!(checkpoint, 64, "one investigation must only read a bounded page");
+        journal.pool.close().await;
+        let journal = Journal::open(&path).await.unwrap();
+        for expected in [128, 192, 256, 320] {
+            assert!(journal.build_folder_places("worker").await.unwrap().1);
+            let checkpoint: i64 = sqlx::query_scalar("SELECT checkpoint_seq FROM build_folder_places WHERE session_id = 'active'")
+                .fetch_one(&journal.pool)
+                .await
+                .unwrap();
+            assert_eq!(checkpoint, expected, "backfill must resume instead of rereading recent history");
+        }
+        let (places, partial) = journal.build_folder_places("worker").await.unwrap();
+        assert!(!partial);
+        assert_eq!(places.iter().find(|p| p.session_id == "active").unwrap().path, std::path::Path::new("/worker/worktrees/repo/archived"));
+        journal.pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_folder_legacy_gap_and_incomplete_trim_never_trust_stale_placement() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        journal
+            .create_session(
+                "legacy",
+                &CreateSession::default(),
+                &SessionEvent {
+                    seq: 1,
+                    kind: Some(session_event::Kind::Started(c6_proto::SessionStarted {
+                        cwd: "/old-workspace".into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        journal.set_build_folder_archives("worker", &[("legacy".into(), Some(1))]).await.unwrap();
+        journal.append("legacy", &SessionEvent { seq: 3, ..Default::default() }).await.unwrap();
+        sqlx::query("DELETE FROM build_folder_places WHERE session_id = 'legacy'").execute(&journal.pool).await.unwrap();
+        let (places, partial) = journal.build_folder_places("worker").await.unwrap();
+        assert!(partial);
+        assert!(places.is_empty());
+        journal.set_acked("legacy", 3).await.unwrap();
+        assert_eq!(journal.trim(i64::MAX, &[]).await.unwrap(), 1);
+        let (places, partial) = journal.build_folder_places("worker").await.unwrap();
+        assert!(partial, "trimming must not promote an incomplete legacy snapshot");
+        assert!(places.is_empty());
+        journal.pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_folder_import_projects_current_worker_and_replaces_old_spec_placement() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let spec = CreateSession { cwd: "/spec-workspace".into(), ssh_target: "old-ssh-host".into(), ..Default::default() };
+        let mut events = vec![
+            SessionEvent {
+                seq: 1,
+                kind: Some(session_event::Kind::Started(c6_proto::SessionStarted {
+                    cwd: "/initial-workspace".into(),
+                    ssh_target: "old-ssh-host".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            SessionEvent {
+                seq: 2,
+                kind: Some(session_event::Kind::PlaceChanged(c6_proto::PlaceChanged {
+                    to: Some(c6_proto::SessionPlace {
+                        cwd: "/current-workspace".into(),
+                        repo_root: "/repo".into(),
+                        worker_id: "worker".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ];
+        events.extend((3..=130).map(|seq| SessionEvent { seq, ..Default::default() }));
+        journal.import("restored", &spec, &events).await.unwrap();
+        let (places, partial) = journal.build_folder_places("worker").await.unwrap();
+        assert!(!partial);
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].path, std::path::Path::new("/current-workspace"));
+        assert_eq!(places[0].repository, "/repo");
+        let (places, partial) = journal.build_folder_places("other-worker").await.unwrap();
+        assert!(!partial);
+        assert!(places.is_empty(), "foreign placements are not local just because Started was imported");
+        journal.pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_folder_unarchived_reference_survives_trim_before_head_refresh() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        journal
+            .create_session(
+                "unarchived",
+                &CreateSession::default(),
+                &SessionEvent {
+                    seq: 1,
+                    kind: Some(session_event::Kind::Started(c6_proto::SessionStarted {
+                        cwd: "/shared-workspace".into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        journal.set_acked("unarchived", 1).await.unwrap();
+        assert_eq!(journal.trim(i64::MAX, &[]).await.unwrap(), 1);
+        let (places, partial) = journal.build_folder_places("worker").await.unwrap();
+        assert!(!partial);
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].path, std::path::Path::new("/shared-workspace"));
+        assert_eq!(places[0].archived_at_ms, None, "missing head archive state must protect shared output");
+        journal.pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_folder_archive_placement_survives_trim_and_unarchive() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+        let journal = Journal::open(&path).await.unwrap();
+        let started = SessionEvent {
+            seq: 1,
+            ts_ms: 10,
+            kind: Some(session_event::Kind::Started(c6_proto::SessionStarted {
+                cwd: "/worker/worktrees/repo/session".into(),
+                repo_root: "/repo".into(),
+                ..Default::default()
+            })),
+        };
+        journal.create_session("archived", &CreateSession::default(), &started).await.unwrap();
+        journal.set_build_folder_archives("worker", &[("archived".into(), Some(123))]).await.unwrap();
+        journal.set_acked("archived", 1).await.unwrap();
+        assert_eq!(journal.trim(i64::MAX, &[]).await.unwrap(), 1);
+        let (places, partial) = journal.build_folder_places("worker").await.unwrap();
+        assert!(!partial);
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].path, std::path::Path::new("/worker/worktrees/repo/session"));
+        assert_eq!(places[0].archived_at_ms, Some(123));
+        journal.pool.close().await;
+        let journal = Journal::open(&path).await.unwrap();
+        assert_eq!(journal.build_folder_places("worker").await.unwrap().0[0].archived_at_ms, Some(123));
+        journal.set_build_folder_archives("worker", &[("archived".into(), None)]).await.unwrap();
+        let places = journal.build_folder_places("worker").await.unwrap().0;
+        assert_eq!(places[0].archived_at_ms, None);
+        assert_eq!(places[0].path, std::path::Path::new("/worker/worktrees/repo/session"));
+        journal.pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_folder_active_sessions_include_unknown_launches_and_held_roots() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let owner = journal.shell_owner("shell-session", "shell-session");
+        let reserved = owner.reserve("task").await.unwrap();
+        journal.track_claude_process("held-session", 123).await.unwrap();
+        let mut active = journal.build_folder_active_sessions().await.unwrap();
+        active.sort();
+        assert_eq!(active, ["held-session", "shell-session"]);
+        owner.not_launched(&reserved).await.unwrap();
+        journal.untrack_claude_process("held-session", 123).await.unwrap();
+        assert!(journal.build_folder_active_sessions().await.unwrap().is_empty());
+        journal.pool.close().await;
     }
 
     #[tokio::test]

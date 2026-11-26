@@ -27,6 +27,46 @@ cargo test --locked -p c6-worker --lib native_trim_settings
 cargo test --locked -p c6-worker --test claude_code_trim
 ```
 
+## Worker compiler cache and build-folder cleanup
+
+The compile-cache tests inject executable discovery inputs, filesystem capacity
+and sccache JSON; they do not install sccache or compile a real repository.
+They cover opt-in/default-off behavior, preserved user wrappers, the partition
+size cap, explicit C/C++ launcher generation inside worker state, atomic settings
+persistence, missing-tool status, per-worker server isolation, language/compiler
+counter deduplication and labelled time-saving estimates. The Claude Code launch
+test uses a local executable fixture and checks the actual child environment.
+Shell/Bash and background/held-shell tests check the same defaults and secret
+override precedence, without redacting ordinary cache paths.
+
+Build-folder discovery and cleanup take injected filesystem entries, elapsed
+time, wall-clock timestamps, active references and removal callbacks. Tests cover
+bounded traversal, custom Cargo output markers, shared references, symlinks,
+three-day archive grace, oldest-first owned-only disk cleanup, exact confirmed
+external/incremental removal, fresh activity exclusion and truthful cleanup
+notices. A lifecycle-lock test synchronizes acquisition directly, not with sleeps.
+Head tests check console authorization, unconfirmed-request refusal, forwarding
+and agent-catalog exclusion. Machines shaping tests cover unknown metrics and
+confirmed destructive actions.
+
+Journal placement regressions move a session into an archived shared workspace
+then append more than 64 events. New/imported sessions retain their current
+placement without rescanning history. Legacy backfill reads 64-event pages with
+a shared 256-event budget per investigation; a reopen test checks that progress
+is durable and incomplete attribution remains fail-closed until the checkpoint
+catches up. Missing receipts and trimming incomplete histories must never make
+a stale workspace trustworthy. Confirmation also cannot override a partial
+filesystem scan. These tests use temporary journals and explicit event sequences,
+not sleeps or real builds.
+
+```sh
+cargo test --locked -p c6-worker --lib compile_cache
+cargo test --locked -p c6-worker --lib build_folder
+cargo test --locked -p c6-tools --lib command_env
+cargo test --locked -p c6-head --lib compile_cache
+cargo test --locked -p c6-ui --bin c6-ui machines::tests
+```
+
 ## Disk-space recovery and early warnings
 
 The disk monitor takes an injected filesystem sampler: its regressions never

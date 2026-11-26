@@ -324,6 +324,24 @@ impl SessionTools {
         *self.secrets.0.lock().unwrap() = secrets;
     }
 
+    /// Sets non-secret defaults for local command launches. These values are
+    /// not redacted; session secrets with the same name take precedence.
+    /// Local defaults are not forwarded to SSH shells.
+    pub fn set_command_env(&self, env: Vec<(String, String)>) {
+        self.background.set_command_env(env);
+    }
+
+    /// Non-secret launch defaults only, without session secret overrides.
+    pub fn command_defaults(&self) -> Vec<(String, String)> {
+        self.background.command_defaults()
+    }
+
+    /// Command defaults merged with the session's secrets (secrets win).
+    /// Unlike `secrets()`, this is for launching commands, not redaction.
+    pub fn command_env(&self) -> Vec<(String, String)> {
+        self.background.command_env()
+    }
+
     pub fn secrets(&self) -> &Secrets {
         &self.secrets
     }

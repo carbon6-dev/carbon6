@@ -142,6 +142,7 @@ message Welcome {
   repeated SessionCursor acks = 5;
   optional uint64 machine_sample_secs = 6;
   optional double machine_disk_hold_percent = 7;
+  optional double machine_disk_warn_percent = 8;
 }
 
 message Ping {

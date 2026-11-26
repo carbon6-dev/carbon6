@@ -8,6 +8,7 @@ pub mod claude_code;
 mod claude_trim;
 pub mod codex_limits;
 pub mod commands;
+mod compile_cache;
 pub mod conn;
 mod disk;
 pub mod enroll;
@@ -91,6 +92,7 @@ pub struct Worker {
     machine_sampler: Arc<Mutex<machines::SampleFn>>,
     machine_sampling: Arc<tokio::sync::Semaphore>,
     machine_sample_secs: std::sync::atomic::AtomicU64,
+    machine_disk_warn_percent: std::sync::atomic::AtomicU64,
     disk_scan: Arc<tokio::sync::Semaphore>,
     kit_cancels: Mutex<std::collections::HashMap<String, rpc::KitJobState>>,
     pub identity: Identity,
@@ -113,6 +115,10 @@ pub struct Worker {
 }
 
 impl Worker {
+    pub(crate) fn disk_warning_percent(&self) -> f64 {
+        f64::from_bits(self.machine_disk_warn_percent.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     pub async fn open(state_dir: &Path, identity: Identity) -> anyhow::Result<Arc<Self>> {
         Self::open_with_gate(state_dir, identity, resource_pressure::Gate::for_state(state_dir)).await
     }
@@ -162,6 +168,7 @@ impl Worker {
             machine_sampler: Arc::new(Mutex::new(machines::sampler())),
             machine_sampling: Arc::new(tokio::sync::Semaphore::new(1)),
             machine_sample_secs: std::sync::atomic::AtomicU64::new(0),
+            machine_disk_warn_percent: std::sync::atomic::AtomicU64::new(10.0_f64.to_bits()),
             disk_scan: Arc::new(tokio::sync::Semaphore::new(1)),
             kit_cancels: Mutex::default(),
             identity,

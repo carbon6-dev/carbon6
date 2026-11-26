@@ -113,7 +113,7 @@ async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result
         .env("GIT_PAGER", "cat")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("NO_COLOR", "1")
-        .envs(ctx.session.secrets().env())
+        .envs(ctx.session.command_env())
         .stdin(Stdio::null())
         .stdout(Stdio::from(writer.try_clone()?))
         .stderr(Stdio::from(writer))
@@ -555,6 +555,59 @@ mod tests {
         ctx.session.background.finish_agent(&id, Ok("found it".into()));
         let done = next(&mut rx).await;
         assert_eq!((done.state, done.exit_code, done.output.as_str()), (TaskState::Finished, Some(0), "found it"));
+    }
+
+    #[tokio::test]
+    async fn command_env_defaults_and_secret_overrides_reach_bash_and_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let streamed = Arc::new(Mutex::new(String::new()));
+        let ctx = ctx(dir.path(), streamed.clone());
+        ctx.session
+            .set_command_env(vec![("SCCACHE_DIR".into(), "/tmp/visible-cache".into()), ("RUSTC_WRAPPER".into(), "default-wrapper".into())]);
+        ctx.session.set_secrets(vec![("RUSTC_WRAPPER".into(), "user-wrapper".into())]);
+        assert_eq!(
+            ctx.session.command_env(),
+            vec![("SCCACHE_DIR".into(), "/tmp/visible-cache".into()), ("RUSTC_WRAPPER".into(), "user-wrapper".into())]
+        );
+        let command = "test \"$RUSTC_WRAPPER\" = user-wrapper && printf '%s:%s' \"$SCCACHE_DIR\" \"$RUSTC_WRAPPER\"";
+        for out in [
+            Bash.call(&ctx, json!({"command": command})).await,
+            crate::profiles::Shell.call(&ctx, json!({"command": ["bash", "-lc", command]})).await,
+        ] {
+            assert!(!out.is_error, "{out:?}");
+            assert_eq!(out.content, "/tmp/visible-cache:[secret:RUSTC_WRAPPER]");
+        }
+        assert!(!streamed.lock().unwrap().contains("user-wrapper"));
+
+        ctx.session.set_command_env(vec![("CC".into(), "cache-cc".into())]);
+        ctx.session.set_secrets(vec![("CXX".into(), "private-cxx".into())]);
+        assert_eq!(ctx.session.command_env(), vec![("CC".into(), "cache-cc".into()), ("CXX".into(), "private-cxx".into())]);
+        let other = SessionTools::new(dir.path().to_owned());
+        assert!(other.command_env().is_empty(), "defaults must be per-session");
+    }
+
+    #[tokio::test]
+    async fn command_env_local_defaults_are_not_forwarded_to_ssh() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = crate::remote::tests::fake_ssh(dir.path());
+        c6_testkit::runnable(&program, &[]).await;
+        let host = Arc::new(crate::remote::SshHost::new("fake", "/tmp").with_program(&program));
+        let mut ctx = ctx(dir.path(), Default::default());
+        ctx.session = Arc::new(SessionTools::with_ssh(dir.path().to_owned(), Some(host)));
+        ctx.session.set_command_env(vec![("C6_LOCAL_CACHE_DEFAULT".into(), "/tmp/local-only-cache".into())]);
+        ctx.session.set_secrets(vec![("C6_REMOTE_SECRET".into(), "private-remote-value".into())]);
+        let command = "test -z \"${C6_LOCAL_CACHE_DEFAULT+x}\" && printf '%s' \"$C6_REMOTE_SECRET\"";
+        let out = Bash.call(&ctx, json!({"command": command})).await;
+        assert!(!out.is_error, "{out:?}");
+        assert_eq!(out.content, "[secret:C6_REMOTE_SECRET]\n");
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.session.background.set_sink(Some(tx));
+        ctx.session.background.spawn(command, dir.path(), true, &ctx.cancel).await.unwrap();
+        c6_testkit::within("remote shell start", rx.recv()).await.unwrap();
+        let done = c6_testkit::within("remote shell completion", rx.recv()).await.unwrap();
+        assert_eq!(done.exit_code, Some(0));
+        assert_eq!(done.output, "[secret:C6_REMOTE_SECRET]");
     }
 
     #[tokio::test]

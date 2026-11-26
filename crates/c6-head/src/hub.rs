@@ -190,6 +190,7 @@ impl WorkerHub for HubSvc {
             acks,
             machine_sample_secs: Some(st.machines.config.sample_secs.max(1)),
             machine_disk_hold_percent: Some(st.machines.config.disk_hold_percent),
+            machine_disk_warn_percent: Some(st.machines.config.disk_warn_percent),
         };
         tx.send(Ok(head(head_msg::Msg::Welcome(welcome)))).await.ok();
 

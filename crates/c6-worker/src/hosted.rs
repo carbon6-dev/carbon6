@@ -82,6 +82,7 @@ impl HostedClaude {
             system_prompt: Some(t.system_prompt.clone()).filter(|p| !p.trim().is_empty()),
             tools: names.clone(),
             worker: c6_core::build().to_owned(),
+            compile_cache_env_fingerprint: String::new(),
             extra_args: LOCKED_DOWN.iter().map(|a| (*a).to_owned()).collect(),
             // Locked down by its own flags: none of Claude Code's tools.
             native: None,

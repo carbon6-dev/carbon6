@@ -81,6 +81,9 @@ pub fn scope(name: &str) -> Option<Scope> {
     // (or that are carbon6-wide today): the console's, until they do.
     const ADMIN: &[&str] = &[
         "machines.disk_scan",
+        "machines.compile_cache.status",
+        "machines.compile_cache.configure",
+        "machines.build_folders.remove",
         "imports.list",
         "imports.settings.get",
         "imports.settings.put",
@@ -396,6 +399,9 @@ fn build() -> Vec<Op> {
         op!("machines.list", "fleet", "GET" "/api/v1/machines", Read, Input::None, "Head and realm-visible workers with their last resource sample and warnings. Head administration metadata is console-only."),
         op!("machines.samples", "fleet", "GET" "/api/v1/machines/{id}/samples", Read, Input::Query(schema::<api::machines::MachineSamplesQuery>), "Bounded machine resource history; from_ms, to_ms and limit (max 2000). Downsampled points preserve peaks.", choices = &[("id", "machines.list")]),
         op!("machines.disk_scan", "fleet", "POST" "/api/v1/machines/{id}/disk_scan", Read, Input::None, "Explicit bounded filesystem investigation; console only, never an automatic agent read. Returns MachineDiskScan after the bounded background read. Does not delete anything.", choices = &[("id", "machines.list")]),
+        op!("machines.compile_cache.status", "fleet", "GET" "/api/v1/machines/{id}/compile_cache", Read, Input::None, "Worker compile cache configuration, installation status and statistics. Console only; unsupported on the head; never agent callable.", choices = &[("id", "machines.list")]),
+        op!("machines.compile_cache.configure", "fleet", "PUT" "/api/v1/machines/{id}/compile_cache", Write, Input::Body(schema::<crate::api::CompileCacheConfig>), "Configures a worker's compile cache: enabled, directory, max_bytes, rust, c_cpp, archived_grace_days. Console only; unsupported on the head; never agent callable.", choices = &[("id", "machines.list")]),
+        op!("machines.build_folders.remove", "fleet", "POST" "/api/v1/machines/{id}/build_folders/remove", Destructive, Input::Body(schema::<crate::api::BuildFolderRemove>), "Removes a worker build folder (or only its incremental data) after explicit confirmation: path, incremental_only, confirmed. Console only; unsupported on the head; never agent callable. Worker validates the path and active-session safety.", choices = &[("id", "machines.list")]),
         op!("workers.enrollments.create", "fleet", "POST" "/api/v1/workers/enrollments", Secret, Input::Body(schema::<api::CreateEnrollment>), "Creates a one-time enrollment token for a new worker (c6w enroll <token>); valid for an hour.", secret = &["token"]),
         op!("workers.revoke", "fleet", "POST" "/api/v1/workers/{id}/revoke", Destructive, Input::None, "Revokes a worker: it is disconnected and can no longer attach; its sessions stop.", choices = &[("id", "workers.list")]),
         op!("workers.delete", "fleet", "DELETE" "/api/v1/workers/{id}", Destructive, Input::None, "Deletes a revoked worker and its records.", choices = &[("id", "workers.list")]),
@@ -1443,6 +1449,21 @@ pub fn openapi(urls: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compile_cache_and_build_folder_operations_are_console_only() {
+        for (name, method, path, effect) in [
+            ("machines.compile_cache.status", "GET", "/api/v1/machines/worker/compile_cache", Effect::Read),
+            ("machines.compile_cache.configure", "PUT", "/api/v1/machines/worker/compile_cache", Effect::Write),
+            ("machines.build_folders.remove", "POST", "/api/v1/machines/worker/build_folders/remove", Effect::Destructive),
+        ] {
+            let op = find(name).unwrap();
+            assert_eq!(op.effect, effect, "{name}");
+            assert_eq!(scope(name), Some(Scope::Admin), "{name}");
+            assert_eq!(route_scope(method, path), Scope::Admin, "{name}");
+            assert_eq!(crate::agent_ops::class(op), crate::agent_ops::Class::Never, "{name}");
+        }
+    }
 
     #[test]
     fn liveness_is_read_only_and_does_not_open_global_activity_to_realms() {

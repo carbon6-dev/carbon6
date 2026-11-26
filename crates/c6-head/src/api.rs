@@ -22,6 +22,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/machines", get(list_machines))
         .route("/api/v1/machines/{id}/samples", get(machine_samples))
         .route("/api/v1/machines/{id}/disk_scan", post(machine_disk_scan))
+        .route("/api/v1/machines/{id}/compile_cache", get(machine_compile_cache_status).put(machine_compile_cache_configure))
+        .route("/api/v1/machines/{id}/build_folders/remove", post(machine_build_folder_remove))
         .route("/api/v1/workers", get(list_workers))
         .route("/api/v1/workers/enrollments", post(create_enrollment))
         .route("/api/v1/workers/{id}/revoke", post(revoke_worker))
@@ -410,6 +412,90 @@ async fn machine_disk_scan(
     .await
     .map_err(anyhow::Error::from)?;
     Ok(Json(scan))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompileCacheConfig {
+    pub enabled: bool,
+    pub directory: Option<String>,
+    pub max_bytes: Option<u64>,
+    pub rust: bool,
+    pub c_cpp: bool,
+    pub archived_grace_days: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BuildFolderRemove {
+    pub path: String,
+    pub incremental_only: bool,
+    pub confirmed: bool,
+}
+
+async fn machine_console_worker(st: &HeadState, caller: &Caller, id: &str) -> ApiResult<WorkerId> {
+    // Like disk investigation, cache administration and build-folder removal
+    // expose paths across realms and must never be callable by an agent.
+    if caller.realm.is_some() || crate::agent_ops::actor().is_some() {
+        return Err(crate::forbidden("machine build administration requires the console").into());
+    }
+    crate::machines::authorize(st, caller, id).await?;
+    if id == "head" {
+        return Err(crate::bad_request("compile cache and build-folder administration are unsupported on the head; select a worker").into());
+    }
+    parse_worker_id(id)
+}
+
+async fn machine_compile_cache_status(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let worker = machine_console_worker(&st, &caller, &id).await?;
+    let result = st
+        .registry
+        .call(worker, "machine.compile_cache.status", serde_json::json!({}), Duration::from_secs(15))
+        .await
+        .map_err(|e| ApiErr(StatusCode::CONFLICT, e))?;
+    Ok(Json(result))
+}
+
+async fn machine_compile_cache_configure(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(config): Json<CompileCacheConfig>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let worker = machine_console_worker(&st, &caller, &id).await?;
+    let result = st
+        .registry
+        .call(
+            worker,
+            "machine.compile_cache.configure",
+            serde_json::to_value(config).map_err(anyhow::Error::from)?,
+            Duration::from_secs(15),
+        )
+        .await
+        .map_err(|e| ApiErr(StatusCode::CONFLICT, e))?;
+    Ok(Json(result))
+}
+
+async fn machine_build_folder_remove(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(request): Json<BuildFolderRemove>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let worker = machine_console_worker(&st, &caller, &id).await?;
+    if !request.confirmed {
+        return Err(crate::bad_request("build-folder removal requires explicit confirmation").into());
+    }
+    let result = st
+        .registry
+        .call(worker, "machine.build_folders.remove", serde_json::to_value(request).map_err(anyhow::Error::from)?, Duration::from_secs(120))
+        .await
+        .map_err(|e| ApiErr(StatusCode::CONFLICT, e))?;
+    Ok(Json(result))
 }
 
 pub async fn workers_snapshot(st: &HeadState) -> anyhow::Result<Vec<api::Worker>> {
@@ -5423,6 +5509,101 @@ async fn decision_discussion_session(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn compile_cache_routes_authorize_and_forward_worker_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let worker = WorkerId::new();
+        head.state
+            .store
+            .insert_worker(
+                &crate::store::NewWorker {
+                    id: worker,
+                    name: "build worker",
+                    hostname: "build-host",
+                    os: "linux",
+                    arch: "aarch64",
+                    version: "test",
+                    cert_serial: "test",
+                },
+                "test-secret-hash",
+                0,
+            )
+            .await
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let connection = head.state.registry.attach(worker, 0, tx, vec![], "worker").await;
+        let config =
+            json!({"enabled": false, "directory": null, "max_bytes": null, "rust": true, "c_cpp": false, "archived_grace_days": 3});
+        let removal = json!({"path": "/work/repo/target", "incremental_only": true, "confirmed": true});
+        let client = reqwest::Client::new();
+        let base = format!("http://{}/api/v1/machines", head.ui_addrs[0]);
+        for (method, suffix, params, rpc_method) in [
+            (reqwest::Method::GET, "compile_cache", json!({}), "machine.compile_cache.status"),
+            (reqwest::Method::PUT, "compile_cache", config, "machine.compile_cache.configure"),
+            (reqwest::Method::POST, "build_folders/remove", removal, "machine.build_folders.remove"),
+        ] {
+            for id in ["head".to_owned(), WorkerId::new().to_string(), worker.to_string()] {
+                let response = client
+                    .request(method.clone(), format!("{base}/{id}/{suffix}"))
+                    .header("x-c6-realm", "home")
+                    .json(&params)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            }
+            let response = client.request(method.clone(), format!("{base}/head/{suffix}")).json(&params).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(response.text().await.unwrap().contains("unsupported on the head"));
+            let response =
+                client.request(method.clone(), format!("{base}/{}/{suffix}", WorkerId::new())).json(&params).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let expected_result = json!({"forwarded": rpc_method});
+            let responder = async {
+                let message = rx.recv().await.unwrap().unwrap();
+                let Some(c6_proto::head_msg::Msg::RpcRequest(request)) = message.msg else { panic!("expected worker RPC") };
+                assert_eq!(request.method, rpc_method);
+                assert_eq!(serde_json::from_slice::<serde_json::Value>(&request.params_json).unwrap(), params);
+                connection.rpc_response(c6_proto::RpcResponse {
+                    id: request.id,
+                    result_json: serde_json::to_vec(&expected_result).unwrap(),
+                    error: String::new(),
+                });
+            };
+            let request = client.request(method, format!("{base}/{worker}/{suffix}")).json(&params).send();
+            let (response, ()) = c6_testkit::within("compile cache RPC forwarding", async { tokio::join!(request, responder) }).await;
+            let response = response.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.json::<serde_json::Value>().await.unwrap(), expected_result);
+        }
+        let response = client
+            .post(format!("{base}/{worker}/build_folders/remove"))
+            .json(&json!({"path": "/work/repo/target", "incremental_only": false, "confirmed": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(rx.try_recv().is_err(), "unconfirmed removal must not reach the worker");
+        let error = crate::agent_ops::ACTOR
+            .scope("session:test".into(), machine_console_worker(&head.state, &Caller::root(), &worker.to_string()))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        drop(connection);
+        head.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn disk_recovery_settings_validate_delays_and_allow_disabled_warning_thresholds() {
