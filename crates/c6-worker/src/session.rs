@@ -7158,6 +7158,9 @@ async fn maintain_claude_context(
     cancel: &CancellationToken,
 ) -> anyhow::Result<Option<crate::claude_code::Process>> {
     let journal = observer.journal.clone();
+    // Idle-boundary maintenance can respawn outside a turn. Keep cleanup
+    // excluded across the gap between retiring the old process and its launch.
+    let _build_use = journal.build_folder_lifecycle.clone().read_owned().await;
     // Settings can change while a turn or native background task runs. Resolve
     // the policy from the durable current spec, not the preceding turn's copy.
     let trim = journal.load_session(session).await?.and_then(|(spec, events)| ClaudeTrim::from_events(&spec, &events));
