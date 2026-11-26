@@ -16,7 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 /// The fake writes a real-shaped native JSONL and separately streams the full
 /// outputs. Its trace and resumed snapshots are independent of carbon6's log.
-/// There are no timing gates: result/TurnEnded and the next input are barriers.
+/// Explicit socket/provider gates, result/TurnEnded and the next input are
+/// barriers; synchronization does not depend on timing sleeps.
 const FAKE_CLAUDE: &str = r#"#!/usr/bin/env python3
 import json, os, re, socket, sys, urllib.request, uuid
 from pathlib import Path
@@ -136,6 +137,12 @@ for line in sys.stdin:
             Path('carbon-task.json').write_text(json.dumps(response))
             emit(dict(type='user', message=dict(content=[dict(type='tool_result', tool_use_id='carbon-held-call',
                 content=response['result']['content'][0]['text'])])))
+            # Task's background acknowledgement precedes the child's async
+            # setup. The test proves it is running BEFORE this turn ends.
+            with socket.socket(socket.AF_UNIX) as gate:
+                gate.connect('carbon-gate.sock')
+                gate.sendall(b'ready\n')
+                assert gate.makefile('rb').read(2) == b'go'
         seeded = True
     answer = message('assistant', [dict(type='text', text='finished ' + text)])
     answer['message'].update(id=answer['uuid'], model='claude-opus-5-5', stop_reason='end_turn',
@@ -475,6 +482,7 @@ async fn native_context_is_trimmed_only_between_quiet_turns_and_resumed_without_
         api.limits(enabled, at).await;
         let project = tempfile::tempdir().unwrap();
         std::fs::write(project.path().join("fixture.json"), serde_json::to_vec(&fixture).unwrap()).unwrap();
+        let gate = fixture.get("carbon_held").map(|_| UnixListener::bind(project.path().join("carbon-gate.sock")).unwrap());
         let session = api
             .post(
                 "/sessions",
@@ -483,6 +491,19 @@ async fn native_context_is_trimmed_only_between_quiet_turns_and_resumed_without_
             )
             .await;
         let id = session["id"].as_str().unwrap();
+        if let Some(gate) = gate {
+            let (mut signal, _) = within("the carbon6 task's fixture-only setup gate", gate.accept()).await.unwrap();
+            let mut ready = [0; 6];
+            within("the parent to acknowledge its background Task", signal.read_exact(&mut ready)).await.unwrap();
+            assert_eq!(&ready, b"ready\n");
+            eventually("the carbon6-held child to reach its explicit provider gate before parent maintenance", async || {
+                mock.requests().iter().any(|request| request.to_string().contains("CARBON_HELD_TRIM")).then_some(())
+            })
+            .await;
+            assert_eq!(launches(project.path()).len(), 1, "the child is running before parent retirement");
+            assert_eq!(trims(&api.events(id).await), 0);
+            signal.write_all(b"go").await.unwrap();
+        }
         api.idle(id, 1).await;
         let initial = wait_launches(project.path(), if should_trim { 2 } else { 1 }).await;
         let first = api.events(id).await;
@@ -512,19 +533,29 @@ async fn native_context_is_trimmed_only_between_quiet_turns_and_resumed_without_
             );
         }
         let carbon_child = if name == "carbon-held" {
+            // Under load the bridge can legitimately use its fallback MCP
+            // call ID before the streamed tool call reaches the journal.
+            // Link this unique fixture task by its actual background ID.
+            let task = first
+                .iter()
+                .find_map(|e| match &e.kind {
+                    EventKind::BackgroundTask { task_id, kind, description, state, .. }
+                        if kind == "agent" && description == "Carbon-held trim probe" && state == "started" =>
+                    {
+                        Some(task_id)
+                    }
+                    _ => None,
+                })
+                .expect("the MCP Task started real carbon6-owned background work");
             let child = first
                 .iter()
                 .find_map(|e| match &e.kind {
-                    EventKind::SubagentSpawned { call_id, child_session_id, .. } if call_id == "carbon-held-call" => {
+                    EventKind::SubagentSpawned { background_task_id, child_session_id, .. } if background_task_id == task => {
                         Some(child_session_id.clone())
                     }
                     _ => None,
                 })
                 .expect("a real carbon6-owned Task was started over MCP");
-            eventually("the carbon6-held child to reach its explicit provider gate", async || {
-                mock.requests().iter().any(|request| request.to_string().contains("CARBON_HELD_TRIM")).then_some(())
-            })
-            .await;
             assert_eq!(
                 api.detail(&child).await.session.status,
                 SessionStatus::Running,
