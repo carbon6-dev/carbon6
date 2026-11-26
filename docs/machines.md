@@ -125,6 +125,8 @@ already selected by the worker or session. Disabling the cache leaves
 ordinary builds available and does not delete cached data. Archived automatic
 cleanup is restricted to carbon6-owned, inactive, completely scanned folders
 after the configured grace; external folders are never automatic targets.
+This archived-output maintenance is independent of the compile-cache opt-in:
+disabling caching does not disable the three-day archived-folder grace policy.
 The worker uses `SCCACHE_SERVER_UDS` under its state directory, keyed by cache
 directory and size cap, rather than attaching builds to the user's default
 server. A configuration change starts the matching server on demand; existing
