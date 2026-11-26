@@ -7599,14 +7599,26 @@ done
     async fn orphans_are_stopped_but_not_strangers() {
         let dir = tempfile::tempdir().unwrap();
         let records = dir.path().join("claude");
-        let bin = script(dir.path(), "claude-orphan", "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nwhile true; do sleep 0.1; done\n");
+        let bin =
+            script(dir.path(), "claude-orphan", "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nprintf ready > \"$3\"\nread -r release\n");
         c6_testkit::runnable(&bin, &["--version"]).await;
-        let orphan = std::process::Command::new(&bin).args(["--resume", "conv-1"]).process_group(0).spawn().unwrap();
+        let ready = dir.path().join("ready");
+        let orphan = std::process::Command::new(&bin)
+            .args(["--resume", "conv-1"])
+            .arg(&ready)
+            .stdin(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
         let mut stranger = std::process::Command::new("sleep").arg("300").process_group(0).spawn().unwrap();
         std::fs::create_dir_all(&records).unwrap();
         std::fs::write(records.join("conv-1.pid"), format!("{}\nconv-1\n", orphan.id())).unwrap();
         std::fs::write(records.join("conv-2.pid"), format!("{}\nconv-2\n", stranger.id())).unwrap();
         let mut orphan = orphan;
+        // An argv snapshot can become readable before Darwin finishes exec's
+        // argument transition. Wait for the script itself, then keep it in a
+        // shell builtin rather than repeatedly launching child processes.
+        c6_testkit::eventually("the orphan script to finish starting", async || ready.exists().then_some(())).await;
         c6_testkit::eventually("the orphan's exact argv to prove ownership", async || {
             is_claude_for(orphan.id() as i32, "conv-1").then_some(())
         })
