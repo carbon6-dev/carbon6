@@ -132,6 +132,8 @@ impl Checkpoints {
 
     fn command(&self, args: &[&str], lock: &File) -> tokio::process::Command {
         let mut cmd = c6_tools::process::session_command("git");
+        crate::git_trust::configure(cmd.as_std_mut(), &self.work_tree);
+        crate::git_trust::created_dir(cmd.as_std_mut(), &self.git_dir);
         cmd.arg("--git-dir")
             .arg(&self.git_dir)
             .arg("--work-tree")
@@ -139,7 +141,6 @@ impl Checkpoints {
             .args(["-c", "user.name=carbon6", "-c", "user.email=carbon6@localhost", "-c", "core.autocrlf=false", "-c", "gc.auto=0"])
             .args(args)
             .env("LC_ALL", "C")
-            .env_remove("GIT_INDEX_FILE")
             .current_dir(&self.work_tree)
             .kill_on_drop(true);
         let fd = lock.as_raw_fd();
@@ -160,10 +161,26 @@ impl Checkpoints {
 
     async fn git(&self, args: &[&str], lock: &File) -> anyhow::Result<String> {
         for attempt in 0..2 {
-            let out = tokio::time::timeout(TIMEOUT, self.command(args, lock).output())
-                .await
-                .context("git timed out")?
-                .context("running git (is it installed?)")?;
+            let out = tokio::time::timeout(TIMEOUT, async {
+                use std::process::Stdio;
+                use tokio::io::AsyncReadExt;
+                let mut child = self.command(args, lock).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+                let mut stdout = child.stdout.take().unwrap().take(32 * 1024 * 1024 + 1);
+                let stderr = child.stderr.take().unwrap();
+                let mut bytes = Vec::new();
+                let read = async {
+                    stdout.read_to_end(&mut bytes).await?;
+                    if bytes.len() > 32 * 1024 * 1024 {
+                        return Err(std::io::Error::other("Git checkpoint output exceeds its size limit"));
+                    }
+                    Ok(())
+                };
+                let (status, _, stderr) = tokio::try_join!(child.wait(), read, crate::git_trust::stderr(stderr))?;
+                Ok::<_, anyhow::Error>(std::process::Output { status, stdout: bytes, stderr })
+            })
+            .await
+            .context("git timed out")?
+            .context("running git (is it installed?)")?;
             if out.status.success() {
                 return Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned());
             }
@@ -176,7 +193,7 @@ impl Checkpoints {
                 tracing::info!(repo = %self.git_dir.display(), command = ?args.first(), "retrying checkpoint git after stale lock recovery");
                 continue;
             }
-            anyhow::bail!("git {}: {}", args.first().unwrap_or(&""), String::from_utf8_lossy(&out.stderr).trim());
+            anyhow::bail!("{}", crate::git_trust::diagnostic(&out.stderr));
         }
         unreachable!("at most one checkpoint retry")
     }

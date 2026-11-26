@@ -11,6 +11,7 @@ pub mod commands;
 pub mod conn;
 mod disk;
 pub mod enroll;
+mod git_trust;
 pub mod hooks;
 pub mod hosted;
 pub mod identity;

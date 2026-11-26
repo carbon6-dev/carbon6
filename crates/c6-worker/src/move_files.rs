@@ -92,6 +92,8 @@ struct Selected {
     identity: (u64, u64),
     #[serde(default)]
     clone: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    empty_identity: Option<(u64, u64)>,
     #[serde(default)]
     worktree: Option<WorktreeChoice>,
 }
@@ -300,22 +302,8 @@ impl Export {
 
 fn command(dir: &Path, args: &[&str]) -> Command {
     let mut c = Command::new("git");
-    for (k, _) in std::env::vars_os().filter(|(k, _)| k.as_bytes().starts_with(b"GIT_")) {
-        c.env_remove(k);
-    }
-    c.current_dir(dir)
-        .process_group(0)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.protectHFS=true", "-c", "core.protectNTFS=true"])
-        .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .stdout(Stdio::piped());
+    crate::git_trust::configure(&mut c, dir);
+    c.current_dir(dir).process_group(0).args(args).stdin(Stdio::null()).stderr(Stdio::piped()).stdout(Stdio::piped());
     c
 }
 
@@ -323,32 +311,47 @@ fn git_to(mut c: Command, limit: u64, out: &mut impl Write) -> Result<u64> {
     let mut child = c.spawn().context("starting Git for move")?;
     let result = (|| {
         let mut stdout = child.stdout.take().context("opening Git output")?;
-        let fd = stdout.as_raw_fd();
+        let mut stderr = child.stderr.take().context("opening Git diagnostics")?;
+        let mut diagnostic = Vec::new();
+        let mut pipes = [
+            libc::pollfd { fd: stdout.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: stderr.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        ];
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut size = 0;
         let mut buf = [0_u8; 32 * 1024];
-        loop {
-            let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        while pipes.iter().any(|p| p.fd >= 0) {
             let wait = deadline.saturating_duration_since(Instant::now());
             ensure!(!wait.is_zero(), "Git timed out preparing a move");
             // No other thread reads this pipe; POLLIN/HUP gives a bounded read.
-            let ready = unsafe { libc::poll(&mut poll, 1, wait.as_millis().max(1) as _) };
+            let ready = unsafe { libc::poll(pipes.as_mut_ptr(), pipes.len() as _, wait.as_millis().max(1) as _) };
             if ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             ensure!(ready > 0, "Git timed out or its pipe failed preparing a move");
-            let n = stdout.read(&mut buf)?;
-            if n == 0 {
-                break;
+            for (i, pipe) in pipes.iter_mut().enumerate() {
+                if pipe.fd < 0 || pipe.revents == 0 {
+                    continue;
+                }
+                let n = if i == 0 { stdout.read(&mut buf)? } else { stderr.read(&mut buf)? };
+                if n == 0 {
+                    pipe.fd = -1;
+                } else if i == 0 {
+                    size += n as u64;
+                    ensure!(size <= limit, "Git move artifact exceeds its size limit");
+                    out.write_all(&buf[..n])?;
+                } else {
+                    // Drain even after the diagnostic cap, so verbose Git/SSH
+                    // cannot deadlock against the stdout pipe.
+                    let keep = n.min((64 * 1024_usize).saturating_sub(diagnostic.len()));
+                    diagnostic.extend_from_slice(&buf[..keep]);
+                }
             }
-            size += n as u64;
-            ensure!(size <= limit, "Git move artifact exceeds its size limit");
-            out.write_all(&buf[..n])?;
         }
         loop {
             if let Some(status) = child.try_wait()? {
                 // Don't include argv: a configured remote can carry credentials.
-                return if status.success() { Ok(size) } else { bail!("Git {:?} failed ({status})", c.get_args().nth(8)) };
+                return if status.success() { Ok(size) } else { bail!("{} ({status})", crate::git_trust::diagnostic(&diagnostic)) };
             }
             ensure!(Instant::now() < deadline, "Git timed out preparing a move");
             std::thread::sleep(Duration::from_millis(10));
@@ -632,13 +635,54 @@ fn clean_checkout(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolve on the worker, where checkout identity and folder contents are known.
+fn clone_destination(source: &Source, cwd: &Path) -> Result<PathBuf> {
+    let repo = source.repo.as_ref().context("Folder: scratch moves do not clone repositories")?;
+    if !cwd.exists() {
+        return Ok(cwd.to_owned());
+    }
+    ensure!(fs::symlink_metadata(cwd)?.is_dir(), "Folder: choose a directory, not a symlink or file");
+    if cwd.ancestors().any(|p| p.join(".git").exists()) {
+        // Do not hide a Git/SSH diagnostic behind an attempted nested clone.
+        let root = repo_root(cwd)?;
+        if remote(&root)?.0 == repo.remote {
+            return Ok(cwd.to_owned());
+        }
+    }
+    if fs::read_dir(cwd)?.next().is_none() {
+        return Ok(cwd.to_owned());
+    }
+    let name = repo.remote.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
+    let name = if name.to_ascii_lowercase().ends_with(".git") { &name[..name.len() - 4] } else { name };
+    ensure!(
+        !name.is_empty() && name != "." && name != ".." && !name.contains([':', '\\']),
+        "Folder: repository has no safe clone folder name"
+    );
+    Ok(cwd.join(name))
+}
+
 /// An explicit destination bypasses discovery ambiguity entirely. Its identity
 /// is frozen into the head's plan and checked again before any target writes.
 pub(crate) fn preflight_selected(source: &Source, state: &Path, id: Uuid, request: &serde_json::Value) -> Result<Target> {
     let raw = request["cwd"].as_str().context("Folder: choose a destination folder")?;
-    let cwd = crate::expand_home(raw);
+    let mut cwd = crate::expand_home(raw);
     ensure!(cwd.is_absolute(), "Folder: choose an absolute destination folder");
-    let cwd = match cwd.canonicalize() {
+    let mut empty_identity = None;
+    if request["clone"] == true {
+        if cwd.exists() {
+            cwd = cwd.canonicalize().context("Folder: cannot resolve the chosen folder")?;
+        }
+        cwd = clone_destination(source, &cwd)?;
+        if let Ok(meta) = fs::symlink_metadata(&cwd)
+            && meta.is_dir()
+            && fs::read_dir(&cwd)?.next().is_none()
+            && !cwd.ancestors().any(|p| p.join(".git").exists())
+        {
+            empty_identity = Some((meta.dev(), meta.ino()));
+        }
+    }
+    let resolved = if empty_identity.is_some() { Err(io::Error::from(io::ErrorKind::NotFound)) } else { cwd.canonicalize() };
+    let cwd = match resolved {
         Ok(cwd) => cwd,
         Err(e) if e.kind() == io::ErrorKind::NotFound && request["clone"] == true => {
             ensure!(source.repo.is_some(), "Folder: scratch moves do not clone repositories");
@@ -650,12 +694,12 @@ pub(crate) fn preflight_selected(source: &Source, state: &Path, id: Uuid, reques
             let name = cwd.file_name().context("Folder: choose a new clone folder")?;
             let cwd = parent.join(name);
             ensure!(
-                fs::symlink_metadata(&cwd).is_err_and(|e| e.kind() == io::ErrorKind::NotFound),
+                empty_identity.is_some() || fs::symlink_metadata(&cwd).is_err_and(|e| e.kind() == io::ErrorKind::NotFound),
                 "Folder: clone destination already exists"
             );
             let meta = open_root(&parent)?.metadata()?;
             let mut target = preflight_with_clone(source, &[], state, true)?;
-            target.selected = Some(Selected { cwd, identity: (meta.dev(), meta.ino()), clone: true, worktree: None });
+            target.selected = Some(Selected { cwd, identity: (meta.dev(), meta.ino()), clone: true, empty_identity, worktree: None });
             if !request["worktree"].is_null() {
                 // Clone is separately authorized inventory creation, not part
                 // of the session ownership transaction. Publish a clean seed
@@ -669,20 +713,26 @@ pub(crate) fn preflight_selected(source: &Source, state: &Path, id: Uuid, reques
                 let seed = target.repo_root.as_ref().unwrap();
                 let (_, url) = remote(seed)?;
                 let url = strip_remote_credentials(&url).context("Folder: unsafe clone remote")?;
-                let mut cmd = command(&work, &["clone", "--no-hardlinks", "--no-checkout", "--template=", "--", path_str(seed)?, "."]);
+                let mut cmd = command(&work, &[]);
+                crate::git_trust::created_dir(&mut cmd, seed);
+                cmd.args(["clone", "--no-hardlinks", "--no-checkout", "--template=", "--", path_str(seed)?, "."]);
                 cmd.env("GIT_ALLOW_PROTOCOL", "file");
                 git_to(cmd, MAX_JSON, &mut io::sink()).context("Folder: cannot initialize selected clone")?;
                 git(&work, &["remote", "set-url", "origin", &url])?;
                 git(&work, &["reset", "--hard", "HEAD"])?;
                 publish_clone(&dir, &target, &work)?;
-                return preflight_selected(source, state, id, request);
+                let mut request = request.clone();
+                request["cwd"] = serde_json::json!(target.selected.as_ref().unwrap().cwd);
+                request["clone"] = serde_json::json!(false);
+                return preflight_selected(source, state, id, &request);
             }
             return Ok(target);
         }
         Err(e) => return Err(e).context("Folder: choose an existing destination folder, or enable Clone here for a new folder"),
     };
     let identity = open_root(&cwd)?.metadata()?;
-    let mut selected = Selected { cwd: cwd.clone(), identity: (identity.dev(), identity.ino()), clone: false, worktree: None };
+    let mut selected =
+        Selected { cwd: cwd.clone(), identity: (identity.dev(), identity.ino()), clone: false, empty_identity: None, worktree: None };
     let Some(repo) = &source.repo else {
         ensure!(request["worktree"].is_null(), "Worktree: scratch moves cannot create a repository worktree");
         return Ok(Target { repo_root: None, remote: None, selected: Some(selected) });
@@ -811,7 +861,10 @@ pub fn preflight_with_clone(source: &Source, known_folders: &[PathBuf], state: &
             &stage,
             &["clone", "--bare", "--single-branch", "--no-tags", "--depth=1", "--no-local", "--template=", "--", &url, "."],
         );
-        cmd.env("GIT_ALLOW_PROTOCOL", protocol).env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+        cmd.env("GIT_ALLOW_PROTOCOL", protocol);
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
+            cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+        }
         // Git streams the compressed pack to disk. Keep even that temporary
         // file bounded; the full stored tree is checked again before publish.
         unsafe {
@@ -1494,6 +1547,15 @@ fn publish_clone(dir: &Path, target: &Target, work: &Path) -> Result<PathBuf> {
         store(dir, "clone-publish", &receipt)?;
         receipt
     };
+    if let Some(identity) = selected.empty_identity
+        && let Ok(meta) = fs::symlink_metadata(&receipt.cwd)
+        && (meta.dev(), meta.ino()) != receipt.identity
+    {
+        ensure!(meta.is_dir() && (meta.dev(), meta.ino()) == identity, "Folder: empty clone destination was replaced");
+        // remove_dir is atomic and refuses a folder that gained any contents.
+        // Publication below is still no-replace, including a racing creator.
+        fs::remove_dir(&receipt.cwd).context("Folder: clone destination is no longer empty")?;
+    }
     if receipt.cwd.exists() {
         let meta = open_root(&receipt.cwd)?.metadata()?;
         ensure!(
@@ -1902,6 +1964,12 @@ fn rollback_selected(dir: &Path, id: Uuid) -> Result<()> {
         if let Some(receipt) = load::<CloneReceipt>(dir, "clone-publish")? {
             match fs::symlink_metadata(&receipt.cwd) {
                 Ok(meta) => {
+                    if selected.empty_identity == Some((meta.dev(), meta.ino())) && (meta.dev(), meta.ino()) != receipt.identity {
+                        // Publication refused an originally empty folder that
+                        // gained contents. It is still the user's folder, not
+                        // our clone, and rollback must leave it untouched.
+                        return Ok(());
+                    }
                     ensure!(
                         (meta.dev(), meta.ino()) == receipt.identity && meta.is_dir() && checkout_digest(&receipt.cwd)? == receipt.digest,
                         "Folder: cloned destination changed; refusing to remove it"
@@ -2230,8 +2298,9 @@ mod tests {
         git(&source, &["add", "."]).unwrap();
         git(&source, &["commit", "-qm", "base"]).unwrap();
         let destination = root.join("destination");
-        let mut clone =
-            command(root, &["clone", "--no-hardlinks", "--template=", "--", path_str(&source).unwrap(), path_str(&destination).unwrap()]);
+        let mut clone = command(&source, &[]);
+        crate::git_trust::created_dir(&mut clone, &destination);
+        clone.args(["clone", "--no-hardlinks", "--template=", "--", path_str(&source).unwrap(), path_str(&destination).unwrap()]);
         clone.env("GIT_ALLOW_PROTOCOL", "file");
         git_to(clone, MAX_JSON, &mut io::sink()).unwrap();
         for repo in [&source, &destination] {
@@ -2241,6 +2310,85 @@ mod tests {
             git(repo, &["config", "user.email", "move@example.invalid"]).unwrap();
         }
         (from, to, source, destination)
+    }
+
+    #[test]
+    fn selected_preflight_trusts_dubious_checkout() {
+        // Run in a separate process: never change the shared test process's
+        // environment while other tests may be issuing Git commands.
+        const CHILD: &str = "C6_TEST_DUBIOUS_MOVE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "move_files::tests::selected_preflight_trusts_dubious_checkout", "--nocapture"])
+                .env(CHILD, "1")
+                .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let (_, to, source, destination) = selected_repositories(t.path());
+        let baseline = Command::new("git")
+            .env("LC_ALL", "C")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_CONFIG_COUNT")
+            .args(["-C", destination.to_str().unwrap(), "rev-parse", "--show-toplevel"])
+            .output()
+            .unwrap();
+        if baseline.status.success() {
+            eprintln!("skipping dubious ownership simulation: this Git lacks GIT_TEST_ASSUME_DIFFERENT_OWNER support");
+            return;
+        }
+        assert!(String::from_utf8_lossy(&baseline.stderr).contains("dubious ownership"));
+        let descriptor = describe(&source, true, None).unwrap();
+        let target = preflight_selected(&descriptor, &to, Uuid::now_v7(), &serde_json::json!({"cwd": destination})).unwrap();
+        assert_eq!(target.selected.unwrap().cwd, destination.canonicalize().unwrap());
+        // Linked worktrees need trust for both the administrative and common
+        // directories, not only their .git file's containing folder.
+        let linked = t.path().join("linked");
+        git(&destination, &["worktree", "add", "-b", "linked-test", linked.to_str().unwrap()]).unwrap();
+        preflight_selected(&descriptor, &to, Uuid::now_v7(), &serde_json::json!({"cwd": linked})).unwrap();
+    }
+
+    #[test]
+    fn move_git_failure_carries_stderr_without_debug_option() {
+        let t = tempfile::tempdir().unwrap();
+        let error = git(t.path(), &["rev-parse", "--show-toplevel"]).unwrap_err().to_string();
+        assert!(error.contains("not a git repository"), "{error}");
+        assert!(!error.contains("Some("), "{error}");
+    }
+
+    #[test]
+    fn clone_surfaces_ssh_error_instead_of_progress() {
+        let t = tempfile::tempdir().unwrap();
+        let ssh = t.path().join("ssh");
+        fs::write(&ssh, "#!/bin/sh\nprintf 'git@example.invalid: Permission denied (publickey).\\n' >&2\nexit 1\n").unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut cmd = command(t.path(), &["clone", "--bare", "--template=", "--", "git@example.invalid:team/repo.git", "clone"]);
+        cmd.env("GIT_SSH_COMMAND", &ssh).env("GIT_SSH_VARIANT", "ssh");
+        let error = git_to(cmd, MAX_JSON, &mut io::sink()).unwrap_err().to_string();
+        assert!(error.contains("git@example.invalid: Permission denied (publickey)."), "{error}");
+        assert!(!error.contains("Cloning into"), "{error}");
+    }
+
+    #[test]
+    fn clone_destination_reuses_matching_checkout_and_distinguishes_parent_from_empty() {
+        let t = tempfile::tempdir().unwrap();
+        let (_, to, source, destination) = selected_repositories(t.path());
+        let descriptor = describe(&source, true, None).unwrap();
+        assert_eq!(clone_destination(&descriptor, &destination).unwrap(), destination);
+        let selected =
+            preflight_selected(&descriptor, &to, Uuid::now_v7(), &serde_json::json!({"cwd": destination, "clone": true})).unwrap();
+        assert!(!selected.selected.unwrap().clone);
+        let empty = folder(t.path(), "empty");
+        assert_eq!(clone_destination(&descriptor, &empty).unwrap(), empty);
+        let new = t.path().join("new");
+        assert_eq!(clone_destination(&descriptor, &new).unwrap(), new);
+        let parent = folder(t.path(), "parent");
+        fs::write(parent.join("keep"), "keep").unwrap();
+        assert_eq!(clone_destination(&descriptor, &parent).unwrap(), parent.join("falcon"));
     }
 
     fn dirty_source(source: &Path) {
@@ -2382,6 +2530,35 @@ mod tests {
         abort_import(&to, id).unwrap();
         assert!(!cwd.exists());
         assert_eq!(fs::read(source.join("tracked")).unwrap(), b"unstaged\n");
+    }
+
+    #[test]
+    fn selected_empty_clone_publishes_in_place_and_refuses_new_contents() {
+        let t = tempfile::tempdir().unwrap();
+        let (from, to, source, _) = selected_repositories(t.path());
+        git(&source, &["remote", "set-url", "origin", path_str(&source).unwrap()]).unwrap();
+        let descriptor = describe(&source, true, None).unwrap();
+        for mutate in [false, true] {
+            let id = Uuid::now_v7();
+            let cwd = folder(t.path(), if mutate { "changed-empty" } else { "empty-clone" }).canonicalize().unwrap();
+            let target = preflight_selected(&descriptor, &to, id, &serde_json::json!({"cwd": cwd, "clone": true})).unwrap();
+            assert!(cwd.is_dir() && fs::read_dir(&cwd).unwrap().next().is_none());
+            let manifest = prepare_export(&from, id, "session", &source, &descriptor, None, &[]).unwrap();
+            replay(&from, &to, &manifest, &target);
+            if mutate {
+                fs::write(cwd.join("external"), "keep").unwrap();
+                let error = finalize_import(&to, id, None).unwrap_err();
+                assert!(format!("{error:#}").contains("no longer empty"), "{error:#}");
+                abort_import(&to, id).unwrap();
+                assert_eq!(fs::read(cwd.join("external")).unwrap(), b"keep");
+            } else {
+                let prepared = finalize_import(&to, id, None).unwrap();
+                assert_eq!(prepared.cwd, cwd);
+                assert_eq!(fs::read(cwd.join("tracked")).unwrap(), b"base\n");
+                assert!(!cwd.join("source").exists());
+                assert_eq!(finalize_import(&to, id, None).unwrap(), prepared);
+            }
+        }
     }
 
     #[test]

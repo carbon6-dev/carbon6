@@ -185,9 +185,27 @@ workspaces or a reusable repository cache.
   SSH/HTTPS forms, default ports, trailing `.git`/slashes and host case match;
   GitHub repository path case also matches. Nondefault ports and case-sensitive
   paths on other hosts remain distinct. The dialog lists matches and an
-  explicit folder resolves ambiguity. **Clone here** takes a chosen parent and
-  explicitly authorizes a new repository folder; supported URLs can populate a
-  reusable bare seed under the destination worker's state directory.
+  explicit folder resolves ambiguity. **Clone here** explicitly authorizes a
+  clone if needed, without changing the Folder field in the browser. The
+  destination worker resolves it: a matching checkout is used as-is (never
+  `repo/repo`); an empty or nonexistent folder is the exact destination; a
+  nonempty parent gets `<parent>/<repository name>`. A nonexistent destination
+  requires an existing parent. An empty destination is checked by identity and
+  must still be empty when published; it is never overwritten if it gained
+  files. Supported URLs can populate a reusable bare seed under the destination
+  worker's state directory.
+  Isolated Git commands retain disabled system/global configuration, hooks and
+  fsmonitor. The worker reads the user's protected system/global
+  `safe.directory` entries once and passes them explicitly, in order (including
+  resets). It also trusts the exact selected or carbon6-created folder, its
+  Git directory, and a linked worktree's common directory. It never grants
+  wildcard trust unless the user's own protected configuration does.
+  Git errors retain a bounded stderr diagnostic, including ownership guidance
+  and SSH failures instead of an opaque exit status. SSH inherits the worker's
+  `HOME`, keys/known_hosts, `SSH_AUTH_SOCK`, and any `GIT_SSH`, `GIT_SSH_COMMAND`
+  or `GIT_SSH_VARIANT` customization. Noninteractive batch SSH is the default
+  only when no custom SSH command is supplied; the worker still needs access
+  to credentials for private remotes.
   The move itself never pushes.
   It carries the current branch and its reachable commits (including unpushed
   commits) in a bundle, separate staged and unstaged patches, and non-ignored

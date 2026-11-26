@@ -2167,16 +2167,19 @@ struct PlacementDraft {
 
 impl PlacementDraft {
     fn clone_destination(&self) -> Option<String> {
-        let parent = self.cwd.trim().trim_end_matches('/');
-        if self.cwd.trim().is_empty() {
+        let cwd = self.cwd.trim();
+        if cwd.is_empty() || self.candidates.remote.as_deref().is_none_or(str::is_empty) {
             return None;
         }
-        let remote = self.candidates.remote.as_deref()?.trim_end_matches('/');
-        let name = remote.rsplit('/').next()?.trim_end_matches(".git");
-        if name.is_empty() || matches!(name, "." | "..") || name.contains(':') {
+        if self.candidates.folders.iter().any(|folder| {
+            let folder = folder.trim_end_matches('/');
+            cwd.trim_end_matches('/') == folder || cwd.strip_prefix(folder).is_some_and(|rest| rest.starts_with('/'))
+        }) {
             return None;
         }
-        Some(format!("{parent}/{name}"))
+        // Only the selected worker can tell whether this is an empty/new
+        // destination, a parent, or an undiscovered matching checkout.
+        Some(cwd.to_owned())
     }
 
     fn select_worker(&mut self, worker: String) -> u64 {
@@ -2504,7 +2507,7 @@ fn PlacementDestination(
                                 d.clone = true;
                             }
                         })>"Clone here"</button>
-                        <p class="break-all text-xs text-muted">{move || draft.with(|d| d.clone_destination().map(|path| format!("Use the chosen folder as parent; clone into {path}.")))}</p>
+                        <p class="text-xs text-muted">"An empty or new folder is used directly; a nonempty parent gets a repository-named subfolder. A matching checkout is used as-is."</p>
                     })}
                 </div>
                 {move || {
@@ -2560,8 +2563,8 @@ fn PlacementDestination(
                     <label class="block space-x-2 text-sm">
                         <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || draft.with(|d| d.clone)
                             on:change=move |ev| draft.update(|d| d.clone = event_target_checked(&ev)) />
-                        <span>"Allow cloning the repository into the selected folder if needed"</span>
-                        <span class="block text-xs text-muted">"The Folder field is the exact clone destination, not its parent. Clone here fills it from a chosen parent."</span>
+                        <span>"Allow cloning the repository if needed"</span>
+                        <span class="block text-xs text-muted">"A matching checkout is used as-is. An empty or new folder is the clone destination; otherwise clone into <Folder>/<repository name>."</span>
                         {move || draft.with(|d| d.candidates.remote.clone()).filter(|remote| !remote.is_empty()).map(|remote| view! {
                             <span class="block break-all text-xs text-muted">{remote}</span>
                         })}
@@ -9605,15 +9608,27 @@ mod tests {
     }
 
     #[test]
-    fn placement_clone_here_builds_exact_destination_from_chosen_parent() {
+    fn placement_clone_here_keeps_chosen_folder_for_worker_resolution() {
         let mut draft = PlacementDraft {
+            worker: "destination".into(),
             cwd: " /home/dev/projects/ ".into(),
             candidates: api::PlacementCandidates { remote: Some("example.invalid/team/carbon6.git".into()), folders: Vec::new() },
             ..Default::default()
         };
-        assert_eq!(draft.clone_destination().as_deref(), Some("/home/dev/projects/carbon6"));
+        assert_eq!(draft.clone_destination().as_deref(), Some("/home/dev/projects/"));
         draft.cwd = "/".into();
-        assert_eq!(draft.clone_destination().as_deref(), Some("/carbon6"));
+        assert_eq!(draft.clone_destination().as_deref(), Some("/"));
+        draft.cwd = "/home/dev/projects/carbon6".into();
+        draft.candidates.folders.push(draft.cwd.clone());
+        assert!(draft.clone_destination().is_none(), "do not offer a nested clone in a matching checkout");
+        draft.cwd.push_str("/src");
+        assert!(draft.clone_destination().is_none(), "a folder inside a matching checkout is also already usable");
+        draft.cwd = "/home/dev/projects/carbon6-other".into();
+        assert_eq!(draft.clone_destination().as_deref(), Some("/home/dev/projects/carbon6-other"));
+        draft.clone = true;
+        let request = serde_json::to_value(draft.request().unwrap()).unwrap();
+        assert_eq!(request["cwd"], draft.cwd);
+        assert_eq!(request["clone"], true);
         draft.cwd.clear();
         assert!(draft.clone_destination().is_none());
         draft.cwd = "/parent".into();

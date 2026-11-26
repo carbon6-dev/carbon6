@@ -63,15 +63,12 @@ async fn git_bytes(dir: &Path, args: &[&str], input: Option<&[u8]>, no_index_dif
         }
         None => Stdio::null(),
     };
-    let mut child = c6_tools::process::session_command("git")
+    let mut command = c6_tools::process::session_command("git");
+    crate::git_trust::configure(command.as_std_mut(), dir);
+    let mut child = command
         .arg("-C")
         .arg(dir)
         .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -80,12 +77,12 @@ async fn git_bytes(dir: &Path, args: &[&str], input: Option<&[u8]>, no_index_dif
         .map_err(|e| format!("running git: {e}"))?;
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    let (status, stdout, stderr) = tokio::try_join!(child.wait(), bounded_output(stdout, PATCH_BYTES), bounded_output(stderr, 64 * 1024))
+    let (status, stdout, stderr) = tokio::try_join!(child.wait(), bounded_output(stdout, PATCH_BYTES), crate::git_trust::stderr(stderr))
         .map_err(|e| format!("running git {}: {e}", args.join(" ")))?;
     if status.success() || (no_index_diff && status.code() == Some(1) && !stdout.is_empty()) {
         Ok(stdout)
     } else {
-        Err(format!("git {} failed ({status}): {}", args.join(" "), tail(String::from_utf8_lossy(&stderr).trim())))
+        Err(format!("{} ({status})", crate::git_trust::diagnostic(&stderr)))
     }
 }
 
