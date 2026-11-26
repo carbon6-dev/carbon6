@@ -64,6 +64,14 @@ with checkpoints retained across restarts. Until a session's placement is proven
 attribution is partial and cleanup is refused. Missing or unreadable history
 stays fail-closed; it is never replaced by a guess from the original workspace.
 
+Placement reads admit up to 256 journal sessions and 256 retained references.
+Build discovery is bounded to 64 roots, 100,000 entries, 256 folders, depth 64
+and five seconds. Reaching an attribution or discovery bound protects the
+outputs rather than authorizing cleanup from an incomplete inventory. Removal
+also has entry/depth/time bounds and never follows symlinks. This maintenance
+removes generated build output, not source worktrees or branches; the existing
+explicit work-ending worktree removal is unchanged.
+
 The console offers a separate removal control on inactive, completely scanned
 build folders. Every click requires confirmation naming the exact path and
 warning that compiler outputs must be rebuilt. Incremental rows remove only
