@@ -127,6 +127,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
         },
         Kind::Usage(u) => api::EventKind::Usage {
             model: u.model.clone(),
+            keep_warm: u.keep_warm,
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             cache_read_tokens: u.cache_read_tokens,
@@ -272,6 +273,8 @@ pub fn session(r: &SessionRow, head: Option<WorkerId>) -> api::Session {
         archived: r.archived != 0,
         error: r.error.clone(),
         liveness_loss: None,
+        waiting_on: String::new(),
+        keep_warm_next_ms: None,
         effort: r.effort.clone(),
         parent_id: r.parent_id.clone(),
         parent_call_id: r.parent_call_id.clone(),
@@ -360,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_alias_metadata_is_additive() {
+    fn usage_alias_and_keep_warm_metadata_is_additive() {
         let to_json = |usage| {
             let shown = event(&SessionEvent { kind: Some(session_event::Kind::Usage(usage)), ..Default::default() }).unwrap();
             let json = serde_json::to_value(&shown).unwrap();
@@ -368,6 +371,11 @@ mod tests {
             json
         };
         let legacy = to_json(c6_proto::Usage::default());
+        assert_eq!(legacy["keep_warm"], false);
+        let mut old = legacy.clone();
+        old.as_object_mut().unwrap().remove("keep_warm");
+        assert!(matches!(serde_json::from_value::<api::Event>(old).unwrap().kind, api::EventKind::Usage { keep_warm: false, .. }));
+        assert_eq!(to_json(c6_proto::Usage { keep_warm: true, ..Default::default() })["keep_warm"], true);
         assert!(legacy.get("alias_connection_name").is_none());
         assert!(legacy.get("resolved_connection_name").is_none());
         assert!(legacy.get("resolved_connection_id").is_none());

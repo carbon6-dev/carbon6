@@ -12,6 +12,7 @@ pub mod attention;
 pub mod auth;
 pub mod backups;
 mod brief_cache;
+pub mod cache_lifetime;
 pub mod card_chat;
 pub mod catalog;
 pub mod catchup;
@@ -438,6 +439,7 @@ async fn start_bound(
     notify::spawn(state.clone());
     machines::spawn(&state);
     usage::spawn_backfill(state.clone());
+    cache_lifetime::spawn_backfill(state.clone());
     analytics::spawn_backfill(state.clone());
     hosts::spawn_checks(state.clone());
     workflows::spawn(state.clone());

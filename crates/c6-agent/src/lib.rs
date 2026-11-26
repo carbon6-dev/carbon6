@@ -43,6 +43,8 @@ carbon6's Task run on Claude Code, as you do, unless the user asks for another m
 (API connections are billed per call). For a quick helper that needs nothing of carbon6's, your own Agent tool is fine too.";
 
 pub const SESSION_MESSAGE_NOTE: &str = "This message is from the agent of another session, not from the user. Act on it as part of your work if it is relevant. Reply with the message-session tool (to: its id) only when it asks for something or needs an answer; do not reply just to acknowledge it.";
+/// The tiny, editable maintenance input used while background work runs.
+pub const KEEP_WARM_NOTE: &str = "Your background work is still running; nothing to do yet. Reply only: ok";
 pub const NOTICE_LOOP_WARNING: &str = "The session detected {{evidence}}. Automatic notices may slow or pause if this continues. Before acting on this report, check what has changed. Avoid repeating the same task or replying only to acknowledge a message. If you cannot identify a concrete next step, stop and tell the user what would unblock the work.";
 
 /// What a subagent is told when you resume it after a turn that did not

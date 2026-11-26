@@ -15,12 +15,17 @@ cd "$(dirname "$0")/.."
 # After simplifying the banner and
 # sharing JSON serialization, record the measured Linux release raw size;
 # the compressed build still fits its existing allowance below.
-accepted_raw=11178393
+# 2026-11-26: cache-lifetime/keep-warm settings, waiting status and cost
+# breakdown, combined with quiet-turn trim controls, measure 11,528,007 raw
+# bytes after sharing the existing Settings field renderers. Retain these
+# controls rather than remove functionality to fit the previous allowance.
+accepted_raw=11528007
 # 2026-11-21: aliases add creation/switch controls and per-account transcript
 # metadata. After sharing Settings renderers, the measured Linux release is
 # 2,790,904 bytes Brotli (82,824 above the previous accepted build); raw WASM
 # still fits its existing allowance, so retain that baseline.
-accepted_br=2790904
+# The same combined Linux release measures 2,874,984 Brotli bytes.
+accepted_br=2874984
 dist=${UI_DIST:-crates/c6-ui/dist}
 shopt -s nullglob
 wasm=("$dist"/*_bg.wasm)

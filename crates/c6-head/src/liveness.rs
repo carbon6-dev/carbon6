@@ -54,6 +54,42 @@ pub(crate) async fn progress(st: &HeadState, session: &str) {
     st.liveness.progress.lock().unwrap().insert(session.to_owned(), Progress { at: now_ms(), generation });
 }
 
+/// Project ephemeral actor state onto authorized API rows, never persisting it
+/// as a second source of session/task state. A previous connection or ownership
+/// epoch cannot advertise a pending warm-up for the current actor.
+pub(crate) async fn hydrate_sessions(st: &HeadState, sessions: &mut [c6_api::Session]) -> anyhow::Result<()> {
+    let _fence = st.registry.liveness_commit.lock().await;
+    let ids = serde_json::to_string(&sessions.iter().map(|s| &s.id).collect::<Vec<_>>())?;
+    let owners: HashMap<String, (String, i64)> = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT id, worker_id, ownership_epoch FROM sessions WHERE id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(ids)
+    .fetch_all(st.store.pool())
+    .await?
+    .into_iter()
+    .map(|(id, worker, epoch)| (id, (worker, epoch)))
+    .collect();
+    let progress = st.liveness.progress.lock().unwrap();
+    let evidence = st.liveness.evidence.lock().unwrap();
+    for session in sessions {
+        session.waiting_on.clear();
+        session.keep_warm_next_ms = None;
+        let Some((worker, epoch)) = owners.get(&session.id) else { continue };
+        let Some(e) = evidence.get(&session.id).filter(|e| {
+            e.worker == c6_core::WorkerId(session.worker_id)
+                && e.worker.to_string() == *worker
+                && e.report.ownership_epoch as i64 == *epoch
+                && st.registry.connection_stamp(e.worker).live == Some(e.connection)
+                && e.fresh_after(progress.get(&session.id).copied())
+        }) else {
+            continue;
+        };
+        session.waiting_on = e.report.waiting_on.clone();
+        session.keep_warm_next_ms = (e.report.keep_warm_next_ms > 0).then_some(e.report.keep_warm_next_ms);
+    }
+    Ok(())
+}
+
 /// Called on the control lane, never behind worker event persistence. The
 /// narrow loss commit fence orders a newer report against a declaration.
 pub(crate) async fn report(st: &HeadState, worker: WorkerId, connection: u64, report: SessionLivenessReport) {
@@ -469,6 +505,8 @@ pub async fn snapshot(st: &HeadState) -> anyhow::Result<Value> {
             "running_background_tasks": e.map_or(0, |e| e.report.running_background_tasks),
             "running_background_processes": e.map_or(0, |e| e.report.running_background_processes),
             "waiting_on_subagents": e.is_some_and(|e| e.report.waiting_on_subagents),
+            "waiting_on": e.map(|e| e.report.waiting_on.as_str()).unwrap_or(""),
+            "keep_warm_next_ms": e.and_then(|e| (e.report.keep_warm_next_ms > 0).then_some(e.report.keep_warm_next_ms)),
         })
     }).collect();
     Ok(json!({"incidents": incidents, "sessions": evidence}))
@@ -477,6 +515,67 @@ pub async fn snapshot(st: &HeadState) -> anyhow::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn api_waits_use_only_current_connection_owner_and_progress() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let _sweep = st.liveness.sweep.lock().await;
+        let worker = WorkerId::new();
+        sqlx::query("UPDATE sessions SET worker_id = ?, ownership_epoch = 3 WHERE id = 'session'")
+            .bind(worker.to_string())
+            .execute(st.store.pool())
+            .await
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let live = st.registry.attach(worker, 1, tx, vec![], "worker").await;
+        let health = |epoch, next| SessionLivenessReport {
+            sessions: vec![c6_proto::SessionLiveness {
+                session_id: "session".into(),
+                ownership_epoch: epoch,
+                waiting_on: "background".into(),
+                keep_warm_next_ms: next,
+                ..Default::default()
+            }],
+        };
+        let mut rows = vec![crate::convert::session(&st.store.session("session").await.unwrap().unwrap(), None)];
+        report(st, worker, live.conn_id, health(3, 123_000)).await;
+        crate::api::project_session_health(st, &mut rows).await.unwrap();
+        assert_eq!(rows[0].waiting_on, "background");
+        assert_eq!(rows[0].keep_warm_next_ms, Some(123_000));
+
+        progress(st, "session").await;
+        hydrate_sessions(st, &mut rows).await.unwrap();
+        assert!(rows[0].waiting_on.is_empty(), "progress invalidates the previous actor report");
+        assert_eq!(rows[0].keep_warm_next_ms, None);
+        report(st, worker, live.conn_id, health(3, 0)).await;
+        hydrate_sessions(st, &mut rows).await.unwrap();
+        assert_eq!(rows[0].waiting_on, "background");
+        assert_eq!(rows[0].keep_warm_next_ms, None, "zero is not a scheduled warm-up");
+
+        report(st, worker, live.conn_id, health(2, 123_000)).await;
+        hydrate_sessions(st, &mut rows).await.unwrap();
+        assert!(rows[0].waiting_on.is_empty(), "an old owner cannot certify a wait");
+        report(st, worker, live.conn_id, health(3, 123_000)).await;
+        sqlx::query("UPDATE sessions SET ownership_epoch = 4 WHERE id = 'session'").execute(st.store.pool()).await.unwrap();
+        hydrate_sessions(st, &mut rows).await.unwrap();
+        assert_eq!(rows[0].keep_warm_next_ms, None, "ownership transfer invalidates the old deadline");
+        sqlx::query("UPDATE sessions SET ownership_epoch = 3 WHERE id = 'session'").execute(st.store.pool()).await.unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let replacement = st.registry.attach(worker, 1, tx, vec![], "worker").await;
+        hydrate_sessions(st, &mut rows).await.unwrap();
+        assert!(rows[0].waiting_on.is_empty(), "reconnection invalidates previous connection evidence");
+        report(st, worker, live.conn_id, health(3, 123_000)).await;
+        hydrate_sessions(st, &mut rows).await.unwrap();
+        assert_eq!(rows[0].keep_warm_next_ms, None, "superseded connections cannot update evidence");
+        report(st, worker, replacement.conn_id, health(3, 456_000)).await;
+        hydrate_sessions(st, &mut rows).await.unwrap();
+        assert_eq!(rows[0].keep_warm_next_ms, Some(456_000));
+        drop(replacement);
+        hydrate_sessions(st, &mut rows).await.unwrap();
+        assert_eq!(rows[0].keep_warm_next_ms, None, "disconnect clears the projected schedule");
+    }
 
     #[tokio::test]
     async fn disk_wait_is_not_terminal_even_after_recovery_deadline_or_held_process_exit() {

@@ -170,6 +170,10 @@ message SessionLiveness {
   uint32 running_background_processes = 8;
   // activity_kind remains TOOL for compatibility with older heads.
   bool waiting_on_subagents = 9;
+  // Absolute Unix milliseconds of the next cache-warming request; zero if none.
+  int64 keep_warm_next_ms = 10;
+  // Idle dependency: background, schedule, user, or nothing; empty while active or unknown.
+  string waiting_on = 11;
 }
 
 enum SessionActorState {

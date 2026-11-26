@@ -34,6 +34,18 @@ async function check(browser, origin, engine, theme, view) {
         }, now),
       });
     const { page } = f;
+    if (!before) {
+      await f.setState('idle', { waiting_on: 'background', keep_warm_next_ms: now + 23 * 60_000 });
+      const waiting = page.locator('[data-session-waiting]');
+      await waiting.getByText('waiting on background · keeping cache warm · next in 23 min', { exact: true }).waitFor();
+      assert.equal(await waiting.getAttribute('title'), 'waiting on background · keeping cache warm · next in 23 min');
+      assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${name}: waiting badge fits viewport`);
+      await page.screenshot({ path: path.join(shots, `keep-warm-${name}.png`) });
+      await f.setState('idle', { waiting_on: 'schedule', keep_warm_next_ms: null });
+      await waiting.getByText('waiting on schedule', { exact: true }).waitFor();
+      await f.setState('working', { waiting_on: '', keep_warm_next_ms: null });
+      await waiting.waitFor({ state: 'hidden' });
+    }
     // Keep a desktop viewport but constrain the actual tile/reading column.
     if (view === 'narrow') {
       await page.addStyleTag({ content: '[data-tile-motion] { width: 338px !important; }' });

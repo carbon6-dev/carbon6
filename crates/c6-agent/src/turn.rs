@@ -488,6 +488,7 @@ impl Turn<'_> {
         self.sink
             .append(session_event::Kind::Usage(Usage {
                 model: self.cfg.model.clone(),
+                keep_warm: false,
                 input_tokens: u.input_tokens,
                 output_tokens: u.output_tokens,
                 cache_read_tokens: u.cache_read_tokens,

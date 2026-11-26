@@ -116,6 +116,9 @@ fn Report(r: UsageReport) -> impl IntoView {
             <Stat label="Input tokens" value=format!("{} (+{} cached)", tokens(t.input), tokens(t.cache_read)) />
             <Stat label="Output tokens" value=tokens(t.output) />
         </div>
+        {(r.keep_warm.calls > 0).then(|| view! {
+            <p class="text-xs text-muted">{format!("Includes {} keep-warm calls ({}) to preserve prompt caches during background work. Rewrite savings are unverified: repeated pings may protect a single resume.", r.keep_warm.calls, usd(r.keep_warm.cost))}</p>
+        })}
         {(!r.unpriced_models.is_empty()).then(|| view! {
             <p class="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
                 "No price for " {r.unpriced_models.join(", ")} ": those calls count as $0. Add prices in "

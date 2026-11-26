@@ -239,6 +239,8 @@ pub enum LiveEvent {
     Attention,
 }
 
+pub mod cache;
+
 // --- LLM connections --------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -499,6 +501,13 @@ pub struct Session {
     /// worker event or a startup error; it clears when work resumes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub liveness_loss: Option<String>,
+    /// Current worker-reported dependency: background, schedule, user, or nothing.
+    /// Empty when no current, ownership-fenced report is available.
+    #[serde(default)]
+    pub waiting_on: String,
+    /// Next cache-warming request, in absolute Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_warm_next_ms: Option<i64>,
     pub effort: Option<String>,
     /// Subagent sessions: the parent session and the Task call that ran it.
     #[serde(default)]
@@ -707,6 +716,8 @@ mod session_tests {
     #[test]
     fn session_activity_wire_defaults_and_round_trip() {
         let mut s = session();
+        assert!(s.waiting_on.is_empty());
+        assert_eq!(s.keep_warm_next_ms, None);
         assert_eq!(s.side_chats_running, 0);
         assert_eq!(s.subagents_running, 0);
         let wire = serde_json::to_value(&s).unwrap();
@@ -714,6 +725,8 @@ mod session_tests {
         assert!(wire.get("subagents_running").is_none());
         s.side_chats_running = 3;
         s.subagents_running = 2;
+        s.waiting_on = "background".into();
+        s.keep_warm_next_ms = Some(123_000);
         let wire = serde_json::to_value(&s).unwrap();
         assert_eq!(wire["side_chats_running"], 3);
         assert_eq!(serde_json::from_value::<Session>(wire).unwrap(), s);
@@ -2209,12 +2222,36 @@ pub struct SendMessage {
     pub send_now: bool,
 }
 
+/// Realm policy for keeping a large session's cache warm while its background work runs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct KeepWarmSettings {
+    pub enabled: bool,
+    /// Minimum context size before keeping a cache warm is worthwhile.
+    pub threshold_tokens: u64,
+    /// Maximum lead time before expiry; the scheduler also caps this at 20% of the lifetime.
+    pub margin_seconds: u32,
+    /// Maximum duration to keep a cache warm during one background wait.
+    pub cap_seconds: u32,
+    /// Connection IDs for which keep-warm is disabled.
+    pub disabled_connections: Vec<String>,
+}
+
+impl Default for KeepWarmSettings {
+    fn default() -> Self {
+        Self { enabled: true, threshold_tokens: 50_000, margin_seconds: 300, cap_seconds: 43_200, disabled_connections: Vec::new() }
+    }
+}
+
 /// `GET`/`PUT /api/v1/settings/subagent-limits`: how far subagents may go
 /// (docs/subagents.md §7), and how much agents do on their own
 /// (docs/background.md §4-5).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SubagentLimits {
+    #[serde(default)]
+    pub keep_warm: KeepWarmSettings,
     /// How deep subagents nest: 1 lets a session start subagents that start
     /// none of their own.
     #[serde(default = "default_subagent_depth")]
@@ -2435,6 +2472,7 @@ fn default_running_subagents() -> u32 {
 impl Default for SubagentLimits {
     fn default() -> Self {
         Self {
+            keep_warm: KeepWarmSettings::default(),
             max_depth: DEFAULT_SUBAGENT_DEPTH,
             max_running: DEFAULT_RUNNING_SUBAGENTS,
             notice_quiet_seconds: DEFAULT_NOTICE_QUIET_SECONDS,
@@ -2481,6 +2519,17 @@ mod notice_settings_tests {
             assert_eq!(serde_json::from_value::<SubagentLimits>(json).unwrap(), settings);
             assert_eq!(SubagentLimits::from_stored_json(&settings.to_stored_json().unwrap()).unwrap(), settings);
         }
+    }
+
+    #[test]
+    fn keep_warm_defaults_and_explicit_settings_round_trip() {
+        let defaults = KeepWarmSettings::default();
+        assert!(defaults.enabled);
+        assert_eq!((defaults.threshold_tokens, defaults.margin_seconds, defaults.cap_seconds), (50_000, 300, 43_200));
+        assert_eq!(serde_json::from_str::<SubagentLimits>("{}").unwrap().keep_warm, defaults);
+        let settings: SubagentLimits = serde_json::from_str(r#"{"keep_warm":{"enabled":false,"disabled_connections":["local"]}}"#).unwrap();
+        assert_eq!(settings.keep_warm, KeepWarmSettings { enabled: false, disabled_connections: vec!["local".into()], ..defaults });
+        assert_eq!(SubagentLimits::from_stored_json(&settings.to_stored_json().unwrap()).unwrap(), settings);
     }
 
     #[test]
@@ -2911,6 +2960,9 @@ pub enum EventKind {
     },
     Usage {
         model: String,
+        /// A cache-maintenance call, included in total usage and spending.
+        #[serde(default)]
+        keep_warm: bool,
         input_tokens: u64,
         output_tokens: u64,
         cache_read_tokens: u64,
@@ -4569,6 +4621,11 @@ pub struct BudgetStatus {
 pub struct UsageReport {
     pub since_ms: i64,
     pub total: UsageRow,
+    /// Cache-maintenance calls only; a subset of `total`, not extra spending.
+    /// Rewrite savings are unverified, not inferred per ping: several pings
+    /// may preserve the same context for one real resume.
+    #[serde(default)]
+    pub keep_warm: UsageRow,
     pub by_day: Vec<UsageRow>,
     pub by_model: Vec<UsageRow>,
     pub by_connection: Vec<UsageRow>,
@@ -4621,6 +4678,11 @@ pub struct ActivityRow {
     /// Of that, running tools (parallel calls each count).
     pub tool_ms: u64,
     pub calls: u64,
+    /// Cache-maintenance calls, already included in `calls` and `cost`.
+    #[serde(default)]
+    pub keep_warm_calls: u64,
+    #[serde(default)]
+    pub keep_warm_cost: f64,
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,

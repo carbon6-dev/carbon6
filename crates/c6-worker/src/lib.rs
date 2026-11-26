@@ -17,6 +17,7 @@ pub mod hosted;
 pub mod identity;
 pub mod imports;
 pub mod journal;
+mod keep_warm;
 pub mod link;
 mod machines;
 mod mcp_bridge;

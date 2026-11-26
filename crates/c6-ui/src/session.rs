@@ -1936,6 +1936,7 @@ pub fn SessionControls(chrome: SessionChrome) -> impl IntoView {
     let changed = move || chrome.git.get().flatten().map(|g| g.0).filter(|n| *n > 0);
     let glance_open = move || chrome.wide.get() || chrome.glance_at.get().is_some() || chrome.sheet.get();
     view! {
+        <SessionWaiting chrome />
         <button id=chrome.ring_id() class=SESSION_SLOT
             aria-label=move || format!("{} Open session sheet", chrome.ring_description())
             title=move || format!("{} Open session sheet (⌘I)", chrome.ring_description())
@@ -1958,6 +1959,54 @@ pub fn SessionControls(chrome: SessionChrome) -> impl IntoView {
                 aria-label="Terminal" title="Terminal (⌘-click: a new tile)" aria-pressed=move || chrome.pane_open(Pane::Terminal).to_string()
                 on:click=move |ev| chrome.toggle_pane(Pane::Terminal, &ev)>{crate::icons::square_terminal()}</button>
         </div>
+    }
+}
+
+/// Display worker evidence, not a second client-side task/wake tracker.
+fn session_waiting_text(waiting_on: &str, keep_warm_next_ms: Option<i64>, now: i64) -> Option<String> {
+    let waiting = match waiting_on {
+        "background" => Some("waiting on background"),
+        "schedule" => Some("waiting on schedule"),
+        "user" => Some("waiting on you"),
+        "nothing" => Some("waiting on nothing"),
+        _ => None,
+    };
+    let warm = keep_warm_next_ms.filter(|at| *at > 0).map(|at| {
+        let remaining = at.saturating_sub(now).max(0);
+        let next = if remaining == 0 {
+            "due now".into()
+        } else if remaining < 60_000 {
+            "in less than a minute".into()
+        } else {
+            format!("in {} min", remaining / 60_000 + i64::from(remaining % 60_000 != 0))
+        };
+        format!("keeping cache warm · next {next}")
+    });
+    match (waiting, warm) {
+        // Nothing is an idle state, not an extra dependency to emphasize.
+        (Some(waiting), Some(warm)) if waiting_on != "nothing" => Some(format!("{waiting} · {warm}")),
+        (_, Some(warm)) => Some(warm),
+        (Some(waiting), None) => Some(waiting.into()),
+        (None, None) => None,
+    }
+}
+
+#[component]
+fn SessionWaiting(chrome: SessionChrome) -> impl IntoView {
+    let live = api::live();
+    let now = RwSignal::new(now_ms());
+    let ticker = set_interval_with_handle(move || now.set(now_ms()), std::time::Duration::from_secs(30)).ok();
+    on_cleanup(move || {
+        if let Some(t) = ticker {
+            t.clear();
+        }
+    });
+    move || {
+        let session = live.session(&chrome.id.get_value()).or_else(|| chrome.detail.get().and_then(Result::ok).map(|d| d.session));
+        let text = session.and_then(|s| session_waiting_text(&s.waiting_on, s.keep_warm_next_ms, now.get()));
+        text.map(|text| view! {
+            <span role="status" data-session-waiting="true" class="mx-1 min-w-0 max-w-[min(28rem,40vw)] truncate rounded-full bg-zinc-100 px-2 py-1 text-[11px] text-muted dark:bg-zinc-800" title=text.clone()>{text.clone()}</span>
+        })
     }
 }
 
@@ -7800,6 +7849,27 @@ fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoVi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_waiting_text_uses_reported_deadline_and_dependency() {
+        let now = 100_000;
+        assert_eq!(super::session_waiting_text("", None, now), None);
+        assert_eq!(super::session_waiting_text("user", None, now).as_deref(), Some("waiting on you"));
+        assert_eq!(super::session_waiting_text("background", None, now).as_deref(), Some("waiting on background"));
+        assert_eq!(super::session_waiting_text("schedule", None, now).as_deref(), Some("waiting on schedule"));
+        assert_eq!(super::session_waiting_text("nothing", None, now).as_deref(), Some("waiting on nothing"));
+        assert_eq!(
+            super::session_waiting_text("nothing", Some(now + 23 * 60_000), now).as_deref(),
+            Some("keeping cache warm · next in 23 min")
+        );
+        assert_eq!(
+            super::session_waiting_text("background", Some(now + 22 * 60_000 + 1), now).as_deref(),
+            Some("waiting on background · keeping cache warm · next in 23 min")
+        );
+        assert_eq!(super::session_waiting_text("", Some(now + 1), now).as_deref(), Some("keeping cache warm · next in less than a minute"));
+        assert_eq!(super::session_waiting_text("", Some(now - 1), now).as_deref(), Some("keeping cache warm · next due now"));
+        assert_eq!(super::session_waiting_text("unknown", Some(0), now), None);
+    }
+
     #[test]
     fn pauses_read_as_minutes_and_hours() {
         assert_eq!(super::pause(45 * 60_000), "45 min");

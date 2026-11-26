@@ -32,6 +32,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/connections/{id}/alias/switch", post(switch_connection_alias))
         .route("/api/v1/connections/{id}/alias/history", get(connection_alias_history))
         .route("/api/v1/connections/{id}/models", get(connection_models))
+        .route("/api/v1/connections/{id}/cache_lifetimes", get(connection_cache_lifetimes))
         .route("/api/v1/connections/chatgpt/start", post(chatgpt_start))
         .route("/api/v1/connections/chatgpt/complete", post(chatgpt_complete))
         .route("/callback", get(chatgpt_callback))
@@ -991,6 +992,14 @@ async fn connection_models(
     connection_models_of(&st, &c, generation).await.map(Json)
 }
 
+async fn connection_cache_lifetimes(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<api::cache::ModelCacheLifetime>>> {
+    Ok(Json(crate::cache_lifetime::list(&st, &id, caller.realm.as_deref()).await?))
+}
+
 async fn model_connection(st: &HeadState, id: &str, realm: Option<&str>) -> ApiResult<crate::store::ConnectionRow> {
     let resolved = st
         .store
@@ -1119,12 +1128,13 @@ pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Resul
     Ok(sessions)
 }
 
-/// Project losses and leased recovery stops on the already-authorized rows.
-/// Neither appears in the worker-authored session journal.
+/// Project losses, leased recovery stops, and current actor waits on authorized rows.
+/// These do not appear in the worker-authored session journal.
 pub(crate) async fn project_session_health(st: &HeadState, sessions: &mut [api::Session]) -> anyhow::Result<()> {
     if sessions.is_empty() {
         return Ok(());
     }
+    crate::liveness::hydrate_sessions(st, sessions).await?;
     let ids = serde_json::to_string(&sessions.iter().map(|s| &s.id).collect::<Vec<_>>())?;
     let losses: std::collections::HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
         "SELECT session_id, cause FROM active_liveness_losses \

@@ -1539,9 +1539,10 @@ impl Store {
             } else if notice_holds_changed {
                 refresh_notice_waiting(&mut tx, session_id).await?;
             }
-            sqlx::query("UPDATE sessions SET last_seq = ?, status = ?, updated_at = ? WHERE id = ?")
+            sqlx::query("UPDATE sessions SET last_seq = ?, status = ?, updated_at = CASE WHEN ? THEN ? ELSE updated_at END WHERE id = ?")
                 .bind(last as i64)
                 .bind(&status)
+                .bind(stored.iter().any(|event| !c6_proto::is_keep_warm_event(event)))
                 .bind(c6_core::now_ms())
                 .bind(session_id)
                 .execute(&mut *tx)
@@ -2689,6 +2690,42 @@ pub(crate) mod tests {
                 ..Default::default()
             })),
         }
+    }
+
+    #[tokio::test]
+    async fn keep_warm_accounts_without_advancing_session_progress() {
+        use c6_proto::{SessionEvent, Usage, session_event::Kind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = WorkerId::new();
+        let mut row = session("warm", worker);
+        row.status = "waiting".into();
+        row.updated_at = 17;
+        store.create_session(&row, &[], false).await.unwrap();
+        let event = |seq, kind| SessionEvent { seq, ts_ms: 25, kind: Some(kind) };
+        let events = [
+            event(
+                1,
+                Kind::Notice(c6_proto::Notice {
+                    title: "Cache maintenance attempted".into(),
+                    message: "1".into(),
+                    quiet: true,
+                    ..Default::default()
+                }),
+            ),
+            event(2, Kind::Usage(Usage { model: "m".into(), cache_read_tokens: 50_000, keep_warm: true, ..Default::default() })),
+            event(3, Kind::Notice(c6_proto::Notice { title: "Kept the cache warm".into(), quiet: true, ..Default::default() })),
+        ];
+        store.ingest(worker, "warm", &events).await.unwrap().unwrap();
+        let row = store.session("warm").await.unwrap().unwrap();
+        assert_eq!(row.last_seq, 3, "maintenance is still replicated and accounted");
+        assert_eq!(row.updated_at, 17, "cache maintenance is not task progress");
+        assert_eq!(row.status, "waiting");
+        let work =
+            event(4, Kind::Notice(c6_proto::Notice { title: "Cache maintenance started work".into(), quiet: true, ..Default::default() }));
+        store.ingest(worker, "warm", &[work]).await.unwrap().unwrap();
+        assert!(store.session("warm").await.unwrap().unwrap().updated_at > 17);
     }
 
     #[tokio::test]

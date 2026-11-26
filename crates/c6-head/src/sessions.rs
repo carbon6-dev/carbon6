@@ -514,6 +514,7 @@ async fn create_assistant_with_origin(
             connection_kind: connection.kind,
         }),
         base_prompt: crate::assistant::prompt(st, &req.context, &realm).await,
+        keep_warm_json: Some(serde_json::to_string(&limits.keep_warm)?),
         labels,
         notice_quiet_seconds: limits.notice_quiet_seconds,
         notice_max_wait_seconds: limits.notice_max_wait_seconds,
@@ -737,6 +738,8 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         claude_code_idle_minutes: limits.claude_code_idle_minutes,
         claude_code_trim_enabled: Some(limits.claude_code_trim_enabled),
         claude_code_trim_at: limits.claude_code_trim_at,
+        keep_warm_json: Some(serde_json::to_string(&limits.keep_warm)?),
+        keep_warm_snapshot_json: None,
         session_recovery_seconds: limits.session_recovery_seconds,
         disk_recovery_initial_seconds: limits.disk_recovery_initial_seconds,
         disk_recovery_max_seconds: limits.disk_recovery_max_seconds,
@@ -1990,6 +1993,7 @@ pub async fn refresh_notice_limits(st: &HeadState, worker: Option<WorkerId>) -> 
                 max_running_subagents: Some(limits.max_running),
                 claude_code_trim_enabled: Some(limits.claude_code_trim_enabled),
                 claude_code_trim_at: Some(limits.claude_code_trim_at),
+                keep_warm_json: Some(serde_json::to_string(&limits.keep_warm)?),
             })),
         };
         // Offline sessions receive the latest settings when restored. Do not
@@ -2796,6 +2800,7 @@ pub async fn release_notices(st: &HeadState, session_id: &str) -> anyhow::Result
                 max_running_subagents: Some(limits.max_running),
                 claude_code_trim_enabled: Some(limits.claude_code_trim_enabled),
                 claude_code_trim_at: Some(limits.claude_code_trim_at),
+                keep_warm_json: Some(serde_json::to_string(&limits.keep_warm)?),
             }),
         })),
     };
@@ -3016,7 +3021,9 @@ async fn ingest_batch(
         publish_queue(st, &batch.session_id).await;
     }
     if !ing.events.is_empty() {
-        crate::liveness::progress(st, &batch.session_id).await;
+        if ing.events.iter().any(|event| !c6_proto::is_keep_warm_event(event)) {
+            crate::liveness::progress(st, &batch.session_id).await;
+        }
         for event in &ing.events {
             if let Some(session_event::Kind::SubagentReported(r)) = &event.kind
                 && r.status == "waiting"
@@ -3431,16 +3438,32 @@ async fn connections_used(st: &HeadState, root: &str) -> anyhow::Result<std::col
 /// the connection is available to its realm. Err: why not.
 async fn may_use(st: &HeadState, worker_id: WorkerId, session_id: &str, conn: &crate::store::ConnectionRow) -> Result<String, String> {
     let s = live_session(st, worker_id, session_id).await?;
+    may_use_connection(st, &s, conn).await
+}
+
+/// Shared by credential requests and the session's cache-lifetime query. The
+/// caller has already checked worker ownership; do not resolve a pinned target
+/// back through its alias, whose next regular call may use a different account.
+pub(crate) async fn may_use_connection(st: &HeadState, s: &SessionRow, conn: &crate::store::ConnectionRow) -> Result<String, String> {
+    if s.status == "failed" {
+        return Err("no live session".into());
+    }
     let root = s.root_id.as_deref().unwrap_or(&s.id);
     let used = connections_used(st, root).await.map_err(|e| {
-        warn!("connections of session {session_id}: {e:#}");
+        warn!(session = %s.id, "connections of session: {e:#}");
         "internal error".to_owned()
     })?;
-    if !used.contains(&conn.id) && subagent_connections(std::slice::from_ref(conn), &s.realm, !s.ssh_target.is_empty()).is_empty() {
-        return Err(format!("session {session_id} does not use the connection {}, and its subagents may not run on it", conn.name));
-    }
     if !crate::realms::available(&conn.realms, &s.realm) {
         return Err(format!("the connection {} is not available to realm {}", conn.name, s.realm));
+    }
+    if !used.contains(&conn.id) {
+        let granted = crate::aliases::prior_target_allowed(&st.store, s, conn).await.map_err(|e| {
+            warn!(session = %s.id, "previous alias target permission: {e:#}");
+            "internal error".to_owned()
+        })?;
+        if !granted && subagent_connections(std::slice::from_ref(conn), &s.realm, !s.ssh_target.is_empty()).is_empty() {
+            return Err(format!("session {} does not use the connection {}, and its subagents may not run on it", s.id, conn.name));
+        }
     }
     Ok(root.to_owned())
 }
@@ -3739,6 +3762,22 @@ mod input_compatibility_tests {
         let spec = session_spec(st, &session, false, Vec::new()).await.unwrap();
         assert_eq!(spec.disk_warning_percent, Some(0));
         assert_eq!(spec.disk_warning_bytes, Some(0));
+    }
+
+    #[tokio::test]
+    async fn session_spec_includes_effective_keep_warm_settings() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let session = st.store.session("session").await.unwrap().unwrap();
+        st.store.set_setting(SUBAGENT_LIMITS, "{}").await.unwrap();
+        let spec = session_spec(st, &session, false, Vec::new()).await.unwrap();
+        let policy: api::KeepWarmSettings = serde_json::from_str(spec.keep_warm_json.as_deref().unwrap()).unwrap();
+        assert_eq!(policy, api::KeepWarmSettings::default());
+        st.store.set_setting(SUBAGENT_LIMITS, r#"{"keep_warm":{"enabled":false,"disabled_connections":["local"]}}"#).await.unwrap();
+        let spec = session_spec(st, &session, false, Vec::new()).await.unwrap();
+        let policy: api::KeepWarmSettings = serde_json::from_str(spec.keep_warm_json.as_deref().unwrap()).unwrap();
+        assert!(!policy.enabled);
+        assert_eq!(policy.disabled_connections, ["local"]);
     }
 
     #[tokio::test]

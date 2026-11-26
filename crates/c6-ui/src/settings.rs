@@ -2225,6 +2225,28 @@ fn ContextWindow(value: RwSignal<String>) -> AnyView {
     )
 }
 
+/// Observations only: changing this display cannot change provider cache TTLs.
+#[component]
+fn CacheLifetimes(id: String) -> AnyView {
+    let lifetimes = LocalResource::new(move || api::cache_lifetimes(&id));
+    view! {
+        <Suspense fallback=|| ()>
+            {move || lifetimes.get().map(|result| match result {
+                Ok(rows) => rows.into_iter().map(|row| {
+                    let e = row.estimate;
+                    let lifetime = e.lifetime_seconds.map(|s| format!("{}m {}s", s / 60, s % 60)).unwrap_or_else(|| "unknown".into());
+                    let source = if e.learned { "learned" } else if e.lifetime_seconds.is_some() { "provider default" } else { "no provider default" };
+                    let observed = if e.cache_observed { "cache observed" } else { "cache not yet observed" };
+                    let price = e.read_to_rewrite_ratio.map(|r| format!(" · read/rewrite price {:.2}", r)).unwrap_or_default();
+                    let model = if row.model.is_empty() { "default".into() } else { row.model };
+                    view! { <div class="mt-1 text-xs text-muted">{format!("Cache · {model}: {lifetime} ({source}; {observed}){price}")}</div> }
+                }).collect_view().into_any(),
+                Err(error) => view! { <div class="mt-1 text-xs text-muted">{format!("Cache estimates unavailable: {error}")}</div> }.into_any(),
+            })}
+        </Suspense>
+    }.into_any()
+}
+
 /// What sessions on a connection do by default to spend fewer tokens.
 #[component]
 fn SessionDefaults(subagent_model: RwSignal<String>, compact_at: RwSignal<String>) -> AnyView {
@@ -2351,6 +2373,7 @@ fn ConnectionRow(
                     let id = c.id.clone();
                     move || crate::quota::of(&id).map(|q| view! { <div class="mt-1"><crate::quota::QuotaBars q /></div> })
                 }
+                <CacheLifetimes id=c.id.clone() />
             </div>
             {editable.then(|| connection_action(format!("{BUTTON_QUIET} text-muted"), "Edit", None, Callback::new(move |_| editing.update(|e| *e = !*e))))}
             {chatgpt.then(|| connection_action(format!("{BUTTON_QUIET} text-muted"), "Sign in again", Some("Sign this account in again"),
@@ -4189,20 +4212,36 @@ fn SecretsSetting() -> impl IntoView {
 #[component]
 fn SubagentLimitsSetting() -> impl IntoView {
     let setting = RwSignal::new(c6_api::SubagentLimits::default());
+    // Reuse the shared input renderer; parse the draft values only when saving.
+    let threshold_tokens = RwSignal::new(setting.with_untracked(|s| s.keep_warm.threshold_tokens.to_string()));
+    let margin_seconds = RwSignal::new(setting.with_untracked(|s| s.keep_warm.margin_seconds.to_string()));
+    let cap_seconds = RwSignal::new(setting.with_untracked(|s| s.keep_warm.cap_seconds.to_string()));
+    let disabled_connections = RwSignal::new(String::new());
     let loaded = crate::resources::setting("subagent-limits");
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
-            setting.set(serde_json::from_value(v).unwrap_or_default());
+            let limits: c6_api::SubagentLimits = serde_json::from_value(v).unwrap_or_default();
+            threshold_tokens.set(limits.keep_warm.threshold_tokens.to_string());
+            margin_seconds.set(limits.keep_warm.margin_seconds.to_string());
+            cap_seconds.set(limits.keep_warm.cap_seconds.to_string());
+            disabled_connections.set(limits.keep_warm.disabled_connections.join(", "));
+            setting.set(limits);
         }
     });
     let status = RwSignal::new(None::<Result<&'static str, String>>);
     let save = move |_| {
-        let v = serde_json::to_value(setting.get_untracked()).unwrap_or_default();
+        let mut limits = setting.get_untracked();
+        limits.keep_warm.threshold_tokens = threshold_tokens.get_untracked().trim().parse().unwrap_or(0);
+        limits.keep_warm.margin_seconds = margin_seconds.get_untracked().trim().parse().unwrap_or(0);
+        limits.keep_warm.cap_seconds = cap_seconds.get_untracked().trim().parse().unwrap_or(0);
+        limits.keep_warm.disabled_connections =
+            disabled_connections.get_untracked().split(',').map(str::trim).filter(|id| !id.is_empty()).map(str::to_owned).collect();
+        let v = serde_json::to_value(limits).unwrap_or_default();
         spawn_local(async move {
             status.set(Some(
                 api::put_setting("subagent-limits", v)
                     .await
-                    .map(|_| "Saved. Running sessions use the new notice guard settings at their next delivery decision."),
+                    .map(|_| "Saved. Running sessions take up the new agent limits and keep-warm settings."),
             ));
         });
     };
@@ -4226,6 +4265,29 @@ fn SubagentLimitsSetting() -> impl IntoView {
                     <input type="number" min="0" max="64" class=format!("{INPUT} py-1")
                         prop:value=move || setting.with(|s| s.max_running.to_string()) on:input=move |ev| setting.update(|s| s.max_running = number(&ev)) />
                 </label>
+            </div>
+            <div>
+                <h3 class="font-medium">"Keep the context cache warm"</h3>
+                <p class="text-sm text-muted">
+                    "While a session waits on its own background work, make a minimal request before its cache expires. Never runs while waiting on you. The expiry margin is at most 20% of the cache lifetime, with at least 60 seconds between requests."
+                </p>
+            </div>
+            <label class="flex items-center gap-2 text-sm">
+                <input type="checkbox" prop:checked=move || setting.with(|s| s.keep_warm.enabled)
+                    on:change=move |ev| setting.update(|s| s.keep_warm.enabled = event_target_checked(&ev)) />
+                "Keep large contexts warm during background work"
+            </label>
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
+                {connection_field("Minimum context tokens", threshold_tokens, Signal::stored(""), ConnectionInput {
+                    kind: Some("number"), range: Some(("0", "")), ..Default::default()
+                }, false)}
+                {connection_field("Maximum expiry margin (seconds)", margin_seconds, Signal::stored(""), ConnectionInput {
+                    kind: Some("number"), range: Some(("0", "")), ..Default::default()
+                }, false)}
+                {connection_field("Maximum keep-warm duration per wait (seconds)", cap_seconds, Signal::stored(""), ConnectionInput {
+                    kind: Some("number"), range: Some(("0", "")), ..Default::default()
+                }, false)}
+                {connection_field("Disabled connection IDs (comma separated)", disabled_connections, Signal::stored(""), ConnectionInput::default(), false)}
             </div>
             <div>
                 <h3 class="font-medium">"Automatic notice delivery"</h3>

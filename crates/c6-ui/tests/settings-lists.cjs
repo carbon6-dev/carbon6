@@ -20,6 +20,9 @@ async function check(browser, origin, phone, theme, engine) {
       worktree_options: { base: 'main', setup: ['one', 'two'], fetch: false }, enabled: true }],
     views: [{ name: 'board', kind: 'board', source: { collection: 'deals' }, actions: [], enabled: true }],
     'mcp-servers': [{ name: 'initial', transport: 'http', url: 'https://example.invalid/initial' }],
+    'subagent-limits': { claude_code_trim_enabled: false, claude_code_trim_at: 123456,
+      keep_warm: { enabled: true, threshold_tokens: 50000, margin_seconds: 300, cap_seconds: 43200,
+        disabled_connections: ['local'] } },
     routes: {
       root: [{ name: 'root-rule', tools: ['old'], enabled: true }],
       home: [{ name: 'home-rule', tools: [], enabled: true }],
@@ -166,6 +169,38 @@ async function check(browser, origin, phone, theme, engine) {
     await (await remountRead).finished();
     await page.waitForFunction(el => el.value.includes('"fixture"'), await json.elementHandle());
     assert.deepEqual(JSON.parse(await json.inputValue()), mcp, 'a fresh owner reloads the saved JSON setting');
+
+    step('keep-warm');
+    await navigateSection(page, 'agents', 'Agents');
+    const limits = page.getByRole('heading', { name: 'Limits', exact: true }).locator('xpath=../..');
+    const warmField = name => limits.getByLabel(name, { exact: true });
+    const threshold = warmField('Minimum context tokens');
+    const exclusions = warmField('Disabled connection IDs (comma separated)');
+    // The numeric defaults already match before the async setting loads.
+    // Wait for a fixture-only value before asserting or editing the form.
+    await page.waitForFunction(el => el.value === 'local', await exclusions.elementHandle());
+    assert.equal(await threshold.inputValue(), '50000');
+    assert.equal(await warmField('Maximum expiry margin (seconds)').inputValue(), '300');
+    assert.equal(await warmField('Maximum keep-warm duration per wait (seconds)').inputValue(), '43200');
+    assert.equal(await exclusions.inputValue(), 'local');
+    await threshold.fill('65000');
+    await warmField('Maximum expiry margin (seconds)').fill('120');
+    await warmField('Maximum keep-warm duration per wait (seconds)').fill('7200');
+    await exclusions.fill('local,  expensive, ,');
+    await limits.getByRole('checkbox', { name: 'Keep large contexts warm during background work' }).uncheck();
+    await limits.getByRole('button', { name: 'Save', exact: true }).click();
+    await limits.getByText('Saved. Running sessions take up the new agent limits and keep-warm settings.', { exact: true }).waitFor();
+    assert.equal(writes.at(-1).key, 'subagent-limits');
+    assert.deepEqual(writes.at(-1).value.keep_warm, { enabled: false, threshold_tokens: 65000,
+      margin_seconds: 120, cap_seconds: 7200, disabled_connections: ['local', 'expensive'] });
+    assert.equal(writes.at(-1).value.claude_code_trim_enabled, false, 'saving keep-warm preserves trim policy');
+    assert.equal(writes.at(-1).value.claude_code_trim_at, 123456);
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'agent settings fit the viewport');
+    if (process.env.SCREENSHOTS) {
+      fs.mkdirSync(process.env.SCREENSHOTS, { recursive: true });
+      await threshold.scrollIntoViewIfNeeded();
+      await page.screenshot({ path: path.join(process.env.SCREENSHOTS, `keep-warm-${engine}-${phone ? 'phone' : 'desktop'}-${theme}.png`) });
+    }
 
     step('routing');
     await f.navigate(origin + '/admin/settings/routing', { waitUntil: 'domcontentloaded' });

@@ -223,6 +223,84 @@ impl HeadLink {
         self.credential_with("", connection_id, false).await
     }
 
+    /// Refresh only the concrete account that wrote this prefix. Never resolve
+    /// an alias, run replay preparation, or fall back to another account.
+    pub async fn keep_warm(
+        &self,
+        session_id: &str,
+        snapshot: &crate::journal::KeepWarmSnapshot,
+        text: &str,
+    ) -> anyhow::Result<c6_proto::Usage> {
+        tokio::time::timeout(CALL_TIMEOUT, self.keep_warm_inner(session_id, snapshot, text, None))
+            .await
+            .map_err(|_| anyhow!("keep-warm call timed out"))?
+    }
+
+    /// Cache freshness bounds credential refresh too, not just dispatch. The
+    /// actor computes this monotonic deadline from the prefix's remaining TTL.
+    pub async fn keep_warm_until(
+        &self,
+        session_id: &str,
+        snapshot: &crate::journal::KeepWarmSnapshot,
+        text: &str,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<c6_proto::Usage> {
+        let limit = deadline.min(tokio::time::Instant::now() + CALL_TIMEOUT);
+        let deadline = crate::keep_warm::CacheDeadline::new(deadline);
+        tokio::time::timeout_at(limit, self.keep_warm_inner(session_id, snapshot, text, Some(deadline)))
+            .await
+            .map_err(|_| anyhow!("keep-warm call timed out before cache expiry"))?
+    }
+
+    async fn keep_warm_inner(
+        &self,
+        session_id: &str,
+        snapshot: &crate::journal::KeepWarmSnapshot,
+        text: &str,
+        deadline: Option<crate::keep_warm::CacheDeadline>,
+    ) -> anyhow::Result<c6_proto::Usage> {
+        anyhow::ensure!(deadline.is_none_or(|deadline| !deadline.expired()), "keep-warm cache already expired");
+        let response = snapshot.response.as_ref().ok_or_else(|| anyhow!("keep-warm snapshot has no completed assistant response"))?;
+        let g = self.fresh_credential(session_id, &snapshot.connection_id).await?;
+        anyhow::ensure!(
+            !g.is_alias
+                && g.connection_id == snapshot.connection_id
+                && (g.resolved_connection_id.is_empty() || g.resolved_connection_id == snapshot.connection_id),
+            "keep-warm target is no longer the recorded concrete connection"
+        );
+        anyhow::ensure!(g.kind == snapshot.kind && g.base_url == snapshot.base_url, "keep-warm provider configuration changed");
+        let mut client = c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?;
+        if g.kind == "chatgpt"
+            && let Some(hook) = self.chatgpt_limits_hook(&snapshot.connection_id)
+        {
+            client.set_chatgpt_limits_hook(hook);
+        }
+        let mut request = snapshot.request.clone();
+        request.messages.push(response.clone());
+        request.messages.push(c6_llm::Message::user_text(text));
+        request.max_output_tokens = Some(1);
+        anyhow::ensure!(deadline.is_none_or(|deadline| !deadline.expired()), "keep-warm cache expired during credential refresh");
+        let mut stream = client.stream(&request).await?;
+        let mut usage = c6_llm::Usage::default();
+        while let Some(event) = stream.next().await {
+            if let c6_llm::ModelEvent::Usage(observed) = event? {
+                usage = observed;
+            }
+        }
+        Ok(c6_proto::Usage {
+            model: request.model,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            resolved_connection_id: snapshot.connection_id.clone(),
+            resolved_connection_name: g.resolved_connection_name,
+            keep_warm: true,
+            ..Default::default()
+        })
+    }
+
     /// Credentials for a realm's in-process knowledge work. Authorize each
     /// request as that realm rather than sharing the worker credential cache.
     pub async fn realm_credential(&self, realm: &str, connection_id: &str) -> anyhow::Result<CredentialGrant> {
@@ -512,8 +590,9 @@ impl LinkedClient {
 
     async fn stream_with_grant(&self, req: &c6_llm::ModelRequest, g: &CredentialGrant) -> Result<c6_llm::EventStream, c6_llm::LlmError> {
         let client = self.client(g)?;
+        let call_ms = self.activity.as_ref().map_or(0, |writer| writer.now_ms());
         if !g.is_alias {
-            return client.stream(req).await;
+            return self.capture_request(req, g, client.stream(req).await?, call_ms).await;
         }
         let mut req = req.clone();
         let replay = self.link.alias_history.prepare(&mut req, &self.connection_id, &g.kind, &g.resolved_connection_id);
@@ -525,13 +604,93 @@ impl LinkedClient {
             // (not the root that authorized a subagent's grant).
             req.cache_key = Some(format!("{key}:{}", g.resolved_connection_id));
         }
-        let stream = replay.track(client.stream(&req).await?);
+        let stream = self.capture_request(&req, g, replay.track(client.stream(&req).await?), call_ms).await?;
         let account = c6_llm::ModelAccount {
             resolved_connection_id: g.resolved_connection_id.clone(),
             resolved_connection_name: g.resolved_connection_name.clone(),
             alias_connection_name: g.alias_connection_name.clone(),
         };
         Ok(futures::stream::iter([Ok(c6_llm::ModelEvent::Account(account))]).chain(stream).boxed())
+    }
+
+    /// Called only after all provider/account transformations, with the exact
+    /// request the concrete client accepted. The writer belongs to the actual
+    /// caller (including children), not the root authorizing its credentials.
+    async fn capture_request(
+        &self,
+        req: &c6_llm::ModelRequest,
+        grant: &CredentialGrant,
+        stream: c6_llm::EventStream,
+        call_ms: i64,
+    ) -> Result<c6_llm::EventStream, c6_llm::LlmError> {
+        let Some(writer) = self.activity.clone() else { return Ok(stream) };
+        if !writer.keep_warm_capture().0 {
+            return Ok(stream);
+        }
+        let snapshot = crate::journal::KeepWarmSnapshot {
+            request: req.clone(),
+            response: None,
+            connection_id: if grant.resolved_connection_id.is_empty() {
+                self.connection_id.clone()
+            } else {
+                grant.resolved_connection_id.clone()
+            },
+            kind: grant.kind.clone(),
+            base_url: grant.base_url.clone(),
+            last_call_ms: call_ms,
+            usage: c6_llm::Usage::default(),
+        };
+        let generation = writer
+            .journal
+            .reserve_keep_warm_snapshot(&writer.session_id, &snapshot.connection_id, snapshot.last_call_ms, writer.ownership_epoch)
+            .await
+            .map_err(|e| c6_llm::LlmError::Config(format!("reserving keep-warm request: {e:#}")))?;
+        Ok(futures::stream::unfold(
+            (stream, writer, snapshot, c6_llm::Accumulator::default(), generation, false, false),
+            |(mut stream, writer, mut snapshot, mut accumulator, generation, mut usage_seen, mut persisted)| async move {
+                let event = stream.next().await?;
+                let recorded = async {
+                    if let Ok(model_event) = &event {
+                        if snapshot.response.is_none() {
+                            accumulator.push(model_event);
+                        }
+                        match model_event {
+                            c6_llm::ModelEvent::Usage(usage) => {
+                                snapshot.usage = *usage;
+                                usage_seen = true;
+                            }
+                            c6_llm::ModelEvent::Done { .. } if snapshot.response.is_none() => {
+                                snapshot.response = Some(std::mem::take(&mut accumulator).finish(true));
+                            }
+                            _ => {}
+                        }
+                        // Serialize the full input/output once, and only after
+                        // real usage proves this complete context is eligible.
+                        if !persisted && usage_seen && snapshot.response.is_some() {
+                            let (enabled, threshold) = writer.keep_warm_capture();
+                            if enabled && crate::keep_warm::context_tokens(&snapshot.usage) >= threshold {
+                                writer
+                                    .journal
+                                    .complete_keep_warm_snapshot(&writer.session_id, &generation, &snapshot, writer.ownership_epoch)
+                                    .await
+                                    .map_err(|e| c6_llm::LlmError::Config(format!("saving keep-warm output: {e:#}")))?;
+                                persisted = true;
+                            }
+                        }
+                    } else {
+                        writer
+                            .journal
+                            .invalidate_keep_warm_generation(&writer.session_id, &generation, writer.ownership_epoch)
+                            .await
+                            .map_err(|e| c6_llm::LlmError::Config(format!("invalidating keep-warm request: {e:#}")))?;
+                    }
+                    Ok(())
+                }
+                .await;
+                Some((recorded.and(event), (stream, writer, snapshot, accumulator, generation, usage_seen, persisted)))
+            },
+        )
+        .boxed())
     }
 }
 
@@ -540,6 +699,11 @@ impl c6_llm::ModelClient for LinkedClient {
     async fn stream(&self, req: &c6_llm::ModelRequest) -> Result<c6_llm::EventStream, c6_llm::LlmError> {
         if let Some(writer) = &self.activity {
             writer.set_activity(c6_proto::SessionActivityKind::Model);
+            writer
+                .journal
+                .clear_keep_warm_snapshot(&writer.session_id, writer.ownership_epoch)
+                .await
+                .map_err(|e| c6_llm::LlmError::Config(format!("invalidating keep-warm request: {e:#}")))?;
         }
         let unreachable = |e: anyhow::Error| c6_llm::LlmError::Network(format!("credentials from the head: {e:#}"));
         let g = self.link.model_credential(&self.session_id, &self.connection_id).await.map_err(unreachable)?;
@@ -885,6 +1049,482 @@ mod tests {
         }
         assert_eq!(text, "hi");
         assert_eq!(head.0.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn keep_warm_reuses_saved_transformed_alias_prefix_after_restart() {
+        use c6_llm::ModelClient;
+        use serde_json::Value;
+
+        struct Head {
+            url: String,
+            grants: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl LocalHead for Head {
+            async fn call(&self, _: &str, _: Value) -> Result<Value, String> {
+                Err("unused".into())
+            }
+            async fn credential(&self, connection_id: &str) -> CredentialGrant {
+                self.grants.lock().unwrap().push(connection_id.into());
+                CredentialGrant {
+                    connection_id: connection_id.into(),
+                    resolved_connection_id: "account".into(),
+                    is_alias: connection_id == "alias",
+                    kind: "chatgpt".into(),
+                    base_url: self.url.clone(),
+                    bearer: "DO-NOT-PERSIST".into(),
+                    ..Default::default()
+                }
+            }
+        }
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let app = axum::Router::new().route("/responses", axum::routing::post({
+            let requests = requests.clone();
+            move |axum::Json(body): axum::Json<Value>| {
+                let n = {
+                    let mut requests = requests.lock().unwrap();
+                    requests.push(body);
+                    requests.len()
+                };
+                async move {
+                    let reasoning = serde_json::json!({
+                        "type": "response.output_item.done", "output_index": 0,
+                        "item": {"type": "reasoning", "id": format!("rs_{n}"), "encrypted_content": format!("private-prefix-{n}"), "summary": []}
+                    });
+                    let message = serde_json::json!({
+                        "type": "response.output_item.done", "output_index": 1,
+                        "item": {"type": "message", "role": "assistant", "content": [{"type":"output_text", "text":format!("final assistant output {n}")}]}
+                    });
+                    let completed = serde_json::json!({
+                        "type": "response.completed", "response": {"usage": {"input_tokens":70000, "input_tokens_details":{"cached_tokens":69000}, "output_tokens":1}}
+                    });
+                    ([("content-type", "text/event-stream")], format!("data: {reasoning}\n\ndata: {message}\n\ndata: {completed}\n\n"))
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let head = Arc::new(Head { url: format!("http://{}", listener.local_addr().unwrap()), grants: Default::default() });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+        let journal = Arc::new(crate::journal::Journal::open(&path).await.unwrap());
+        journal.import("child", &c6_proto::CreateSession::default(), &[]).await.unwrap();
+        let link = Arc::new(HeadLink::local(head.clone()));
+        let writer = Arc::new(crate::session::Writer::new("child".into(), journal.clone(), link.clone(), 1));
+        let client = LinkedClient::new(link.clone(), "root", "alias").track_activity(&writer);
+        let mut request = c6_llm::ModelRequest {
+            model: "m".into(),
+            system: "unchanged system".into(),
+            messages: vec![c6_llm::Message::user_text("hi")],
+            tools: vec![c6_llm::ToolSpec {
+                name: "lookup".into(),
+                description: "unchanged tool prefix".into(),
+                parameters: serde_json::json!({"type":"object", "properties":{"q":{"type":"string"}}}),
+            }],
+            max_output_tokens: None,
+            cache_key: Some("child".into()),
+            effort: Some("high".into()),
+            web_search: true,
+            json: true,
+        };
+        for n in 0..2 {
+            let mut acc = c6_llm::Accumulator::default();
+            let mut stream = client.stream(&request).await.unwrap();
+            while let Some(event) = stream.next().await {
+                acc.push(&event.unwrap());
+            }
+            if n == 0 {
+                request.messages.push(acc.finish(true));
+                request.messages.push(c6_llm::Message::user_text("wait"));
+            }
+        }
+        let saved = journal.load_keep_warm_snapshot("child").await.unwrap().unwrap();
+        assert_eq!(saved.connection_id, "account");
+        assert_eq!(saved.request.cache_key.as_deref(), Some("child:account"));
+        assert_eq!(saved.usage.cache_read_tokens, 69_000);
+        assert_eq!(saved.request.messages.len(), request.messages.len(), "capture never mutates the original input");
+        let response = saved.response.as_ref().unwrap();
+        assert_eq!(response.role, c6_llm::Role::Assistant);
+        assert!(response.blocks.iter().any(|b| b.text() == Some("final assistant output 2")));
+        assert!(!serde_json::to_string(&saved).unwrap().contains("DO-NOT-PERSIST"));
+        // The move spec carries the same snapshot without any head history.
+        let (spec, _) = journal.load_session("child").await.unwrap().unwrap();
+        let moved = crate::journal::Journal::open(&dir.path().join("moved.db")).await.unwrap();
+        moved.import_owned("child", &spec, &[], 2, "move").await.unwrap();
+        assert_eq!(
+            serde_json::to_value(moved.load_keep_warm_snapshot("child").await.unwrap()).unwrap(),
+            serde_json::to_value(Some(&saved)).unwrap()
+        );
+        drop(client);
+        drop(writer);
+        drop(journal);
+        drop(link);
+        let restarted_journal = crate::journal::Journal::open(&path).await.unwrap();
+        let snapshot = restarted_journal.load_keep_warm_snapshot("child").await.unwrap().unwrap();
+        let restarted_link = HeadLink::local(head.clone());
+        let usage = restarted_link.keep_warm("root", &snapshot, "still waiting").await.unwrap();
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), serde_json::to_value(&saved).unwrap(), "pings never mutate captured history");
+        assert!(usage.keep_warm);
+        assert_eq!(usage.resolved_connection_id, "account");
+        assert_eq!(usage.cache_read_tokens, 69_000);
+        assert_eq!(*head.grants.lock().unwrap(), ["alias", "alias", "account"]);
+        let mut changed = snapshot.clone();
+        changed.kind = "anthropic".into();
+        assert!(restarted_link.keep_warm("root", &changed, "must not run").await.is_err());
+        changed = snapshot.clone();
+        changed.base_url.push_str("/changed");
+        assert!(restarted_link.keep_warm("root", &changed, "must not run").await.is_err());
+        changed = snapshot.clone();
+        changed.connection_id = "alias".into();
+        assert!(restarted_link.keep_warm("root", &changed, "must not route").await.is_err());
+        let mut old_snapshot = serde_json::to_value(&snapshot).unwrap();
+        old_snapshot.as_object_mut().unwrap().remove("response");
+        let old_snapshot = serde_json::from_value(old_snapshot).unwrap();
+        assert!(restarted_link.keep_warm("root", &old_snapshot, "must not run").await.is_err());
+        let requests = requests.lock().unwrap();
+        let previous = requests[1]["input"].as_array().unwrap();
+        let ping = requests[2]["input"].as_array().unwrap();
+        assert!(previous.iter().any(|item| item["encrypted_content"] == "private-prefix-1"));
+        assert_eq!(serde_json::to_vec(previous).unwrap(), serde_json::to_vec(&ping[..previous.len()]).unwrap());
+        assert_eq!(ping.len(), previous.len() + 3);
+        assert_eq!(ping[previous.len()]["encrypted_content"], "private-prefix-2");
+        assert_eq!(ping[previous.len() + 1]["role"], "assistant");
+        assert_eq!(ping[previous.len() + 1]["content"][0]["text"], "final assistant output 2");
+        assert_eq!(ping.last().unwrap()["role"], "user");
+        assert_eq!(ping.last().unwrap()["content"][0]["text"], "still waiting");
+        assert_eq!(requests[1]["prompt_cache_key"], requests[2]["prompt_cache_key"]);
+        assert_eq!(requests[1]["instructions"], requests[2]["instructions"]);
+        assert_eq!(requests[1]["tools"], requests[2]["tools"]);
+        let mut expected_body = requests[1].clone();
+        expected_body["input"] = requests[2]["input"].clone();
+        assert_eq!(expected_body, requests[2], "all non-history provider settings stay unchanged");
+        assert_eq!(requests.len(), 3, "changed configurations and aliases never dispatch");
+        server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keep_warm_timeout_covers_credentials_and_cancels_the_future() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        struct Head(Arc<AtomicBool>);
+        #[async_trait::async_trait]
+        impl LocalHead for Head {
+            async fn call(&self, _: &str, _: serde_json::Value) -> Result<serde_json::Value, String> {
+                unreachable!()
+            }
+            async fn credential(&self, _: &str) -> CredentialGrant {
+                let _guard = DropFlag(self.0.clone());
+                std::future::pending().await
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let link = HeadLink::local(Arc::new(Head(dropped.clone())));
+        let snapshot = crate::journal::KeepWarmSnapshot {
+            response: Some(c6_llm::Message { role: c6_llm::Role::Assistant, blocks: vec![c6_llm::Block::Text("done".into())] }),
+            request: c6_llm::ModelRequest {
+                model: "m".into(),
+                system: String::new(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: None,
+                cache_key: None,
+                effort: None,
+                web_search: false,
+                json: false,
+            },
+            connection_id: "account".into(),
+            kind: "chatgpt".into(),
+            base_url: String::new(),
+            last_call_ms: 1,
+            usage: c6_llm::Usage::default(),
+        };
+        let start = tokio::time::Instant::now();
+        assert!(link.keep_warm("s", &snapshot, "wait").await.unwrap_err().to_string().contains("timed out"));
+        assert_eq!(start.elapsed(), CALL_TIMEOUT);
+        assert!(dropped.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keep_warm_credential_refresh_cannot_outlive_cache_freshness() {
+        struct Head {
+            url: String,
+            started: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl LocalHead for Head {
+            async fn call(&self, _: &str, _: serde_json::Value) -> Result<serde_json::Value, String> {
+                Err("unused".into())
+            }
+            async fn credential(&self, connection_id: &str) -> CredentialGrant {
+                self.started.store(true, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                CredentialGrant {
+                    connection_id: connection_id.into(),
+                    kind: "openai_compat".into(),
+                    base_url: self.url.clone(),
+                    ..Default::default()
+                }
+            }
+        }
+        let calls = Arc::new(AtomicU64::new(0));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post({
+                let calls = calls.clone();
+                move || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    async { "data: [DONE]\n\n" }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let started = Arc::new(AtomicBool::new(false));
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let link = HeadLink::local(Arc::new(Head { url: url.clone(), started: started.clone() }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let snapshot = crate::journal::KeepWarmSnapshot {
+            request: c6_llm::ModelRequest {
+                model: "m".into(),
+                system: String::new(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: None,
+                cache_key: None,
+                effort: None,
+                web_search: false,
+                json: false,
+            },
+            response: Some(c6_llm::Message { role: c6_llm::Role::Assistant, blocks: vec![c6_llm::Block::Text("done".into())] }),
+            connection_id: "account".into(),
+            kind: "openai_compat".into(),
+            base_url: url,
+            last_call_ms: 1,
+            usage: c6_llm::Usage::default(),
+        };
+        let start = tokio::time::Instant::now();
+        assert!(link.keep_warm_until("s", &snapshot, "wait", start + Duration::from_secs(1)).await.is_err());
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(started.load(Ordering::Relaxed));
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "expired prefixes never reach the provider after a slow refresh");
+        started.store(false, Ordering::Relaxed);
+        assert!(link.keep_warm_until("s", &snapshot, "wait", start).await.is_err());
+        assert!(!started.load(Ordering::Relaxed), "already-expired requests do not refresh credentials");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn keep_warm_capture_waits_for_done_and_invalidates_stream_errors() {
+        use c6_llm::{Block, LlmError, ModelEvent, ModelRequest};
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        journal.import("s", &c6_proto::CreateSession::default(), &[]).await.unwrap();
+        let link = Arc::new(HeadLink::default());
+        let writer = Arc::new(crate::session::Writer::new("s".into(), journal.clone(), link.clone(), 1));
+        let client = LinkedClient::new(link, "s", "account").track_activity(&writer);
+        let request = ModelRequest {
+            model: "m".into(),
+            system: "exact system".into(),
+            messages: vec![c6_llm::Message::user_text("input")],
+            tools: vec![],
+            max_output_tokens: Some(123),
+            cache_key: Some("s".into()),
+            effort: Some("high".into()),
+            web_search: true,
+            json: true,
+        };
+        let grant = CredentialGrant { kind: "anthropic".into(), base_url: "http://localhost".into(), ..Default::default() };
+        let events = futures::stream::iter([
+            Ok(ModelEvent::Block { index: 0, block: Block::SignedThinking { text: "reasoning".into(), signature: "signature".into() } }),
+            Ok(ModelEvent::Block { index: 1, block: Block::Text("final answer".into()) }),
+            Ok(ModelEvent::Usage(c6_llm::Usage { input_tokens: 70_000, ..Default::default() })),
+            Ok(ModelEvent::Done { stop_reason: "stop".into() }),
+            Err(LlmError::Network("stream failed".into())),
+        ])
+        .boxed();
+        let mut stream = client.capture_request(&request, &grant, events, writer.now_ms()).await.unwrap();
+        for _ in 0..3 {
+            stream.next().await.unwrap().unwrap();
+        }
+        assert!(journal.load_keep_warm_snapshot("s").await.unwrap().is_none(), "usage alone never serializes an incomplete response");
+        stream.next().await.unwrap().unwrap();
+        let completed = journal.load_keep_warm_snapshot("s").await.unwrap().unwrap();
+        assert_eq!(serde_json::to_value(&completed.request).unwrap(), serde_json::to_value(&request).unwrap());
+        assert_eq!(
+            completed.response.unwrap().blocks,
+            [Block::SignedThinking { text: "reasoning".into(), signature: "signature".into() }, Block::Text("final answer".into()),]
+        );
+        assert!(stream.next().await.unwrap().is_err());
+        assert!(journal.load_keep_warm_snapshot("s").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn keep_warm_capture_skips_small_or_unmeasured_context_and_fences_superseded_streams() {
+        use c6_llm::{LlmError, ModelEvent, ModelRequest, Usage};
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        journal.import("s", &c6_proto::CreateSession::default(), &[]).await.unwrap();
+        let link = Arc::new(HeadLink::default());
+        let writer = Arc::new(crate::session::Writer::new("s".into(), journal.clone(), link.clone(), 1));
+        let client = LinkedClient::new(link, "s", "account").track_activity(&writer);
+        let mut request = ModelRequest {
+            model: "old".into(),
+            system: String::new(),
+            messages: vec![c6_llm::Message::user_text("input")],
+            tools: vec![],
+            max_output_tokens: None,
+            cache_key: None,
+            effort: None,
+            web_search: false,
+            json: false,
+        };
+        let grant = CredentialGrant { kind: "anthropic".into(), base_url: "http://localhost".into(), ..Default::default() };
+        for usage in [None, Some(Usage { input_tokens: 49_999, ..Default::default() })] {
+            let mut events = vec![ModelEvent::TextDelta("output".into())];
+            if let Some(usage) = usage {
+                events.push(ModelEvent::Usage(usage));
+            }
+            events.push(ModelEvent::Done { stop_reason: "stop".into() });
+            let source = futures::stream::iter(events.clone().into_iter().map(Ok)).boxed();
+            let stream = client.capture_request(&request, &grant, source, writer.now_ms()).await.unwrap();
+            let actual: Vec<_> = stream.map(Result::unwrap).collect().await;
+            assert_eq!(actual, events, "capture never changes the model stream");
+            assert!(journal.load_keep_warm_snapshot("s").await.unwrap().is_none());
+            assert!(journal.load_session("s").await.unwrap().unwrap().0.keep_warm_snapshot_json.is_none());
+        }
+        let complete = || {
+            vec![
+                Ok(ModelEvent::Usage(Usage { input_tokens: 50_000, ..Default::default() })),
+                Ok(ModelEvent::Done { stop_reason: "stop".into() }),
+            ]
+        };
+        let old_source = futures::stream::iter(complete().into_iter().chain([Err(LlmError::Network("late failure".into()))])).boxed();
+        let mut old = client.capture_request(&request, &grant, old_source, writer.now_ms()).await.unwrap();
+        request.model = "new".into();
+        let mut new = client.capture_request(&request, &grant, futures::stream::iter(complete()).boxed(), writer.now_ms()).await.unwrap();
+        for _ in 0..2 {
+            old.next().await.unwrap().unwrap();
+        }
+        assert!(journal.load_keep_warm_snapshot("s").await.unwrap().is_none(), "superseded stream cannot populate a newer reservation");
+        while let Some(event) = new.next().await {
+            event.unwrap();
+        }
+        assert!(old.next().await.unwrap().is_err());
+        assert_eq!(
+            journal.load_keep_warm_snapshot("s").await.unwrap().unwrap().request.model,
+            "new",
+            "old errors cannot invalidate a newer prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_warm_disabled_foreground_clears_old_snapshot_without_capturing_large_usage() {
+        struct Head(String);
+        #[async_trait::async_trait]
+        impl LocalHead for Head {
+            async fn call(&self, _: &str, _: serde_json::Value) -> Result<serde_json::Value, String> {
+                Err("unused".into())
+            }
+            async fn credential(&self, connection_id: &str) -> CredentialGrant {
+                CredentialGrant {
+                    connection_id: connection_id.into(),
+                    kind: "openai_compat".into(),
+                    base_url: self.0.clone(),
+                    ..Default::default()
+                }
+            }
+        }
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    [("content-type", "text/event-stream")],
+                    concat!(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100000,\"completion_tokens\":1}}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let link = Arc::new(HeadLink::local(Arc::new(Head(format!("http://{}/v1", listener.local_addr().unwrap())))));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let model = c6_proto::ModelSpec {
+            connection_id: "account".into(),
+            connection_kind: "openai_compat".into(),
+            model: "m".into(),
+            ..Default::default()
+        };
+        let spec = c6_proto::CreateSession {
+            model: Some(model.clone()),
+            cwd: dir.path().display().to_string(),
+            keep_warm_json: Some(r#"{"enabled":false}"#.into()),
+            ..Default::default()
+        };
+        let started = c6_proto::SessionEvent {
+            seq: 1,
+            ts_ms: c6_core::now_ms(),
+            kind: Some(c6_proto::session_event::Kind::Started(c6_proto::SessionStarted {
+                model: Some(model),
+                cwd: spec.cwd.clone(),
+                tool_profile: "generic".into(),
+                ..Default::default()
+            })),
+        };
+        journal.import("s", &spec, &[started]).await.unwrap();
+        let old = crate::journal::KeepWarmSnapshot {
+            request: c6_llm::ModelRequest {
+                model: "m".into(),
+                system: String::new(),
+                messages: vec![],
+                tools: vec![],
+                max_output_tokens: None,
+                cache_key: None,
+                effort: None,
+                web_search: false,
+                json: false,
+            },
+            response: Some(c6_llm::Message { role: c6_llm::Role::Assistant, blocks: vec![c6_llm::Block::Text("old".into())] }),
+            connection_id: "account".into(),
+            kind: "openai_compat".into(),
+            base_url: String::new(),
+            last_call_ms: 100,
+            usage: c6_llm::Usage::default(),
+        };
+        journal.save_keep_warm_snapshot("s", &old, 0).await.unwrap();
+        let manager = crate::session::SessionManager::new(journal.clone(), link, dir.path().join("worktrees"));
+        manager
+            .handle(c6_proto::SessionCommand {
+                session_id: "s".into(),
+                command_id: "input".into(),
+                kind: Some(c6_proto::session_command::Kind::Input(c6_proto::UserInput { text: "hello".into(), ..Default::default() })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let events = journal.events_after("s", 0, 100).await.unwrap();
+                if events.iter().any(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::TurnEnded(_)))) {
+                    break events;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(events.iter().any(|e| matches!(&e.kind, Some(c6_proto::session_event::Kind::Usage(u)) if u.input_tokens == 100_000)));
+        assert!(journal.load_keep_warm_snapshot("s").await.unwrap().is_none());
+        assert!(journal.keep_warm_call_ms("s").await.unwrap().is_none());
+        server.abort();
     }
 
     #[tokio::test]

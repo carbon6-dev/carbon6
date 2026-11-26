@@ -29,6 +29,9 @@ pub const PROFILE: &str = "claude_code";
 /// What the log shows as a Claude Code session's system prompt.
 pub const SYSTEM_PROMPT: &str = "(Claude Code's own system prompt)";
 
+#[allow(clippy::unnecessary_cast)] // PIPE_BUF is usize on Linux and c_int on Darwin.
+const ATOMIC_INPUT_LIMIT: usize = nix::libc::PIPE_BUF as usize;
+
 #[cfg(test)]
 pub(crate) fn replace_test_bin(bin: Option<PathBuf>) -> Option<PathBuf> {
     std::mem::replace(&mut *tests::BIN.lock().unwrap(), bin)
@@ -347,6 +350,10 @@ struct HeldMeta {
     token: Option<String>,
     #[serde(default)]
     launch: Launch,
+    /// Published before maintenance input reaches the FIFO. Adoption resumes
+    /// reading this exchange; an ambiguous write is never sent a second time.
+    #[serde(default)]
+    keep_warm: Option<WarmReply>,
 }
 
 /// Observes leader exit without taking reaping away from `Process::wait_exit`.
@@ -533,6 +540,11 @@ pub(crate) struct Process {
     unconfirmed: std::collections::VecDeque<Written>,
     /// A line read while idle that begins a turn.
     pending: Option<Value>,
+    /// Maintenance replies are held until known to be just an acknowledgement.
+    keep_warm: Option<WarmReply>,
+    /// If maintenance starts real work, replay its buffered output normally.
+    warm_lines: std::collections::VecDeque<Value>,
+    warm_work: bool,
     /// Background-task notifications since the last turn ended.
     notified: Vec<(String, c6_proto::TaskNotice)>,
     /// SDK task ids are not session ids. Keep their structured labels separately.
@@ -584,6 +596,34 @@ pub(crate) struct Process {
     /// starts after a crash can stop it ([`sweep_orphans`]).
     pidfile: Option<PathBuf>,
     _output_root: Option<OutputRoot>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct WarmReply {
+    uuid: String,
+    lines: std::collections::VecDeque<Value>,
+    text: String,
+    /// Output safely represented by this snapshot, rather than just read.
+    offset: u64,
+    /// Restore the existing registry, not a second registry or restarted work.
+    native_tasks: Vec<Value>,
+    task_labels: HashMap<String, (String, String)>,
+    subagent_tasks: HashSet<String>,
+    /// The receipt is durable before any usage append. On adoption, the
+    /// session journal after this seq is authoritative for billed usage.
+    #[serde(default)]
+    accounting_start_seq: Option<u64>,
+    #[serde(default)]
+    usages_logged: usize,
+    /// A terminal result can have been read while accounting was unfinished.
+    #[serde(default)]
+    pending_result: Option<Value>,
+    /// After unexpected work, lines remains a durable normal-turn replay
+    /// queue until each frame's transcript/tool handling has completed.
+    #[serde(default)]
+    converted: bool,
+    #[serde(default)]
+    request_started_ms: i64,
 }
 
 impl Drop for Process {
@@ -1453,6 +1493,7 @@ mod held_stub_tests {
             output_root: None,
             token: None,
             launch: Launch { conversation: "unstarted".into(), ..Default::default() },
+            keep_warm: None,
         };
         let bytes = serde_json::to_vec(&meta).unwrap();
         std::fs::write(dir.join("meta.json"), &bytes).unwrap();
@@ -1483,6 +1524,7 @@ mod held_stub_tests {
             output_root: None,
             token: None,
             launch: launch.clone(),
+            keep_warm: None,
         };
         std::fs::write(alias.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
         let exact = held.join("selected");
@@ -2562,6 +2604,9 @@ impl Process {
             mapper,
             unconfirmed: Default::default(),
             pending: None,
+            keep_warm: None,
+            warm_lines: Default::default(),
+            warm_work: false,
             notified: Vec::new(),
             task_labels: HashMap::new(),
             subagent_tasks: HashSet::new(),
@@ -2679,6 +2724,7 @@ impl Process {
             output_root: output_root.map(|r| r.0.clone()),
             token: mcp.map(|m| m.token().to_owned()),
             launch: launch.clone(),
+            keep_warm: None,
         };
         let publish = |meta: &HeldMeta| -> std::io::Result<()> {
             let tmp = dir.join("meta.next");
@@ -2877,10 +2923,13 @@ impl Process {
         }
         let writer = std::fs::OpenOptions::new().read(true).write(true).open(dir.join("in")).ok()?;
         *stdin.try_lock().ok()? = Some(ClaudeInput::Fifo(tokio::net::unix::pipe::Sender::from_file(writer).ok()?));
-        let offset = std::fs::read_to_string(dir.join("offset")).ok().and_then(|o| o.trim().parse::<u64>().ok()).unwrap_or(0);
+        let offset =
+            meta.keep_warm.as_ref().map(|warm| warm.offset).unwrap_or_else(|| {
+                std::fs::read_to_string(dir.join("offset")).ok().and_then(|o| o.trim().parse::<u64>().ok()).unwrap_or(0)
+            });
         let lines = follow_held(dir.clone(), offset, pg);
         info!(conversation = %launch.conversation, offset, "took up a Claude Code process the previous worker held");
-        let mapper = Mapper {
+        let mut mapper = Mapper {
             turn: 0,
             scope: launch.conversation.clone(),
             output_root: meta.output_root.clone(),
@@ -2897,6 +2946,20 @@ impl Process {
             call_usage: HashMap::new(),
             per_call: false,
         };
+        if let Some(warm) = &meta.keep_warm {
+            for task in &warm.native_tasks {
+                mapper.native_task(task);
+            }
+        }
+        let task_labels = meta.keep_warm.as_ref().map(|warm| warm.task_labels.clone()).unwrap_or_default();
+        let subagent_tasks = meta.keep_warm.as_ref().map(|warm| warm.subagent_tasks.clone()).unwrap_or_default();
+        let warm_work = meta.keep_warm.as_ref().is_some_and(|warm| warm.converted);
+        let mut warm_lines = if warm_work { meta.keep_warm.as_ref().expect("checked").lines.clone() } else { Default::default() };
+        // The last frame is the one that woke the normal turn. next_line
+        // offers it to the actor; the turn replays its predecessors first.
+        if warm_work {
+            warm_lines.pop_back();
+        }
         Some(Self {
             child: None,
             stdin,
@@ -2916,9 +2979,12 @@ impl Process {
             mapper,
             unconfirmed: Default::default(),
             pending: None,
+            keep_warm: meta.keep_warm,
+            warm_lines,
+            warm_work,
             notified: Vec::new(),
-            task_labels: HashMap::new(),
-            subagent_tasks: HashSet::new(),
+            task_labels,
+            subagent_tasks,
             unwoken: Vec::new(),
             wake_due: None,
             after_stop: None,
@@ -2974,8 +3040,16 @@ impl Process {
             && end > 0
         {
             h.offset.store(end, std::sync::atomic::Ordering::SeqCst);
-            if v["type"] != "stream_event" {
+            if v["type"] != "stream_event" && self.keep_warm.is_none() {
                 let _ = std::fs::write(h.dir.join("offset"), end.to_string());
+            }
+        }
+        if let Some(warm) = self.keep_warm.as_mut().filter(|warm| warm.converted) {
+            // Once maintenance turns into work, every newly read frame is a
+            // durable replay item until its normal handler acknowledges it.
+            warm.lines.push_back(v.clone());
+            if let Err(error) = self.persist_keep_warm() {
+                warn!(%error, "persisting converted Claude Code maintenance output; retaining the prior replay cursor");
             }
         }
     }
@@ -3061,10 +3135,319 @@ impl Process {
             .is_some_and(|o| o.tools.background.list().iter().any(|t| t.kind == c6_tools::TaskKind::ClaudeCode && t.running))
     }
 
+    pub fn keep_warm_pending(&self) -> bool {
+        self.keep_warm.is_some()
+    }
+
+    /// A conservative request-start bound, persisted before maintenance is
+    /// written. The SDK does not expose the server's actual dispatch time.
+    pub fn keep_warm_request_started_ms(&self) -> Option<i64> {
+        self.keep_warm.as_ref().filter(|warm| !warm.converted).map(|warm| warm.request_started_ms).filter(|ms| *ms > 0)
+    }
+
+    fn acknowledge_warm_work(&mut self, line: &Value) -> anyhow::Result<()> {
+        let Some(warm) = self.keep_warm.as_mut().filter(|warm| warm.converted) else { return Ok(()) };
+        anyhow::ensure!(warm.lines.front() == Some(line), "Claude Code converted maintenance replay is out of order");
+        warm.lines.pop_front();
+        self.persist_keep_warm()?;
+        Ok(())
+    }
+
+    fn finish_warm_work(&mut self) -> anyhow::Result<()> {
+        if self.keep_warm.as_ref().is_some_and(|warm| warm.converted) {
+            anyhow::ensure!(
+                self.keep_warm.as_ref().expect("checked").lines.is_empty(),
+                "Claude Code converted maintenance still has unhandled output"
+            );
+            self.keep_warm = None;
+            self.persist_keep_warm()?;
+        }
+        Ok(())
+    }
+
+    /// The maintenance state and its output cursor advance together. While it
+    /// exists, attach uses this cursor rather than the ordinary read offset.
+    fn persist_keep_warm(&mut self) -> std::io::Result<()> {
+        let Some(held) = &self.held else { return Ok(()) };
+        let offset = held.offset.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some(warm) = &mut self.keep_warm {
+            warm.offset = offset;
+            warm.task_labels = self.task_labels.clone();
+            warm.subagent_tasks = self.subagent_tasks.clone();
+            warm.native_tasks = self
+                .mapper
+                .observer
+                .as_ref()
+                .into_iter()
+                .flat_map(|o| o.tools.background.list())
+                .filter(|t| t.kind == c6_tools::TaskKind::ClaudeCode && t.running)
+                .filter_map(|task| {
+                    let id: Vec<String> = serde_json::from_str(task.id.strip_prefix("claude:")?).ok()?;
+                    if id.len() != 4 || id[0] != self.mapper.scope {
+                        return None;
+                    }
+                    let native_type = self.task_labels.get(&id[1]).map(|(_, kind)| kind.as_str()).unwrap_or_default();
+                    Some(serde_json::json!({
+                        "type":"system", "subtype":"task_started", "task_id":id[1],
+                        "run_id":(id[2] == "run").then_some(&id[3]),
+                        "description":task.description, "task_type":native_type,
+                        "is_backgrounded":true, "owned_by_subagent":self.subagent_tasks.contains(&id[1]),
+                    }))
+                })
+                .collect();
+        }
+        let mut meta = read_held_metadata(&held.dir.join("meta.json"))?;
+        meta.keep_warm = self.keep_warm.clone();
+        if meta.keep_warm.is_none() {
+            // Clear only after the ordinary cursor covers the completed
+            // exchange. A crash before the rename still restores its UUID.
+            std::fs::write(held.dir.join("offset"), offset.to_string())?;
+        }
+        let tmp = held.dir.join("meta.next");
+        std::fs::write(&tmp, serde_json::to_vec(&meta).map_err(std::io::Error::other)?)?;
+        std::fs::rename(tmp, held.dir.join("meta.json"))
+    }
+
+    /// Writes a maintenance input to this same runtime. In particular, native
+    /// tasks must never be restarted to trim their context: defer trimming
+    /// until they finish and the session is quiet.
+    /// The actor checks background-wait eligibility: carbon6-held work also
+    /// qualifies even when this process has no native tasks of its own.
+    #[cfg(test)]
+    pub async fn send_keep_warm(&mut self, text: &str, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
+        self.send_keep_warm_inner(text, sink, None).await
+    }
+
+    pub async fn send_keep_warm_until(
+        &mut self,
+        text: &str,
+        sink: &Arc<dyn EventSink>,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        self.send_keep_warm_inner(text, sink, Some(crate::keep_warm::CacheDeadline::new(deadline))).await
+    }
+
+    async fn send_keep_warm_inner(
+        &mut self,
+        text: &str,
+        _sink: &Arc<dyn EventSink>,
+        deadline: Option<crate::keep_warm::CacheDeadline>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.keep_warm.is_none() && self.pending.is_none() && self.warm_lines.is_empty() && self.unconfirmed.is_empty(),
+            "Claude Code already has input or output pending"
+        );
+        let uuid = uuid::Uuid::now_v7().to_string();
+        let line = serde_json::json!({
+            "type": "user", "uuid": uuid, "session_id": "", "parent_tool_use_id": null,
+            "message": {"role": "user", "content": text},
+        });
+        // A maintenance input must fit one atomic pipe write. A worker lost
+        // during a long, partial JSON write must not corrupt the next input
+        // or require killing the CLI and its native background tasks.
+        anyhow::ensure!(line.to_string().len() < ATOMIC_INPUT_LIMIT, "Claude Code keep-warm prompt exceeds the atomic pipe-write limit");
+        anyhow::ensure!(deadline.is_none_or(|at| !at.expired()), "Claude Code keep-warm deadline expired before dispatch");
+        self.track().await?;
+        self.keep_warm = Some(WarmReply {
+            uuid: uuid.clone(),
+            lines: Default::default(),
+            text: String::new(),
+            offset: 0,
+            native_tasks: Vec::new(),
+            task_labels: HashMap::new(),
+            subagent_tasks: HashSet::new(),
+            accounting_start_seq: None,
+            usages_logged: 0,
+            pending_result: None,
+            converted: false,
+            request_started_ms: c6_core::now_ms(),
+        });
+        self.persist_keep_warm()?;
+        info!(session = %self.launch.conversation, request_started_ms = ?self.keep_warm_request_started_ms(), "Claude Code cache maintenance input persisted");
+        if deadline.is_some_and(|at| at.expired()) {
+            // Nothing has reached stdin. Expiry during tracking/persistence is
+            // therefore unambiguous, unlike cancellation of an actual write.
+            self.keep_warm = None;
+            self.persist_keep_warm()?;
+            anyhow::bail!("Claude Code keep-warm deadline expired before stdin write");
+        }
+        // Unlike write_in_turn, cancellation of this atomic write never
+        // retires the runtime. Keep the marker on timeout: delivery may have
+        // happened, and adoption must not retry an ambiguous ping.
+        let write_limit = tokio::time::Instant::now() + Duration::from_secs(5);
+        let write_limit = deadline.map_or(write_limit, |at| at.instant.min(write_limit));
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(write_limit) => anyhow::bail!("Claude Code keep-warm input timed out; delivery remains pending"),
+            written = write_line(&self.stdin, &line) => written?,
+        }
+        Ok(())
+    }
+
+    /// Returns true when this line is part of the maintenance exchange, not
+    /// ordinary work. Only the final result commits the quiet accounting.
+    async fn warm_line(&mut self, v: &Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<bool> {
+        if self.keep_warm.is_some() && v["type"] == "system" && v["subtype"] == "init" {
+            self.check_init(v, sink).await?;
+        }
+        let Some(warm) = self.keep_warm.as_mut() else { return Ok(false) };
+        if warm.converted {
+            return Ok(false);
+        }
+        if !v["parent_tool_use_id"].is_null() {
+            return Ok(false);
+        }
+        if v["type"] == "user" && v["uuid"].as_str() == Some(warm.uuid.as_str()) {
+            self.ended_on_idle = false;
+            self.persist_keep_warm()?;
+            return Ok(true);
+        }
+        let main = matches!(v["type"].as_str(), Some("assistant" | "stream_event" | "result" | "user"))
+            || (v["type"] == "system" && matches!(v["subtype"].as_str(), Some("init" | "session_state_changed")));
+        if !main {
+            return Ok(false);
+        }
+        if v["type"] == "stream_event" && v["event"]["delta"]["type"] == "text_delta" {
+            warm.text.push_str(v["event"]["delta"]["text"].as_str().unwrap_or_default());
+        }
+        let tools = v["event"]["content_block"]["type"] == "tool_use";
+        let work = tools
+            || !"ok".starts_with(warm.text.trim())
+            || (v["type"] == "user")
+            || (v["type"] == "assistant"
+                && v["message"]["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|b| b["type"] == "tool_use" || (b["type"] == "text" && b["text"].as_str().is_some_and(|s| s.trim() != "ok"))))
+            || (v["type"] == "result"
+                && v["is_error"] != true
+                && v["result"].as_str().is_some_and(|s| !s.trim().is_empty() && s.trim() != "ok"));
+        if work {
+            self.warm_lines.extend(warm.lines.iter().cloned());
+            warm.lines.push_back(v.clone());
+            warm.converted = true;
+            self.warm_work = true;
+            self.ended_on_idle = false;
+            // Persist the entire conversion, including its triggering frame,
+            // before letting the actor start normal transcript/tool handling.
+            self.persist_keep_warm()?;
+            info!(session = %self.launch.conversation, "Claude Code started work during cache maintenance; continuing as a normal turn");
+            sink.append(session_event::Kind::Notice(c6_proto::Notice {
+                title: "Cache maintenance started work".into(),
+                message: "Claude Code did more than acknowledge the keep-warm input; its work continues as a normal turn.".into(),
+                quiet: true,
+                ..Default::default()
+            }))
+            .await?;
+            return Ok(false);
+        }
+        warm.lines.push_back(v.clone());
+        if v["type"] != "result" {
+            self.persist_keep_warm()?;
+            return Ok(true);
+        }
+        let warm = self.keep_warm.as_mut().expect("checked");
+        warm.pending_result = Some(v.clone());
+        let mut calls = std::collections::BTreeMap::new();
+        for line in &warm.lines {
+            if line["type"] == "assistant" && line["message"]["usage"].is_object() {
+                let message = &line["message"];
+                calls.insert(
+                    message["id"].as_str().unwrap_or_default().to_owned(),
+                    (message["model"].as_str().unwrap_or_default().to_owned(), message["usage"].clone()),
+                );
+            }
+        }
+        if calls.is_empty() && v["usage"].is_object() {
+            let model = v["modelUsage"].as_object().and_then(|m| m.keys().next().cloned()).unwrap_or_default();
+            calls.insert(String::new(), (model, v["usage"].clone()));
+        }
+        let mut usages = Vec::new();
+        for (model, observed) in calls.into_values() {
+            let window = v["modelUsage"][&model]["contextWindow"].as_u64().unwrap_or_else(|| window_of(&model));
+            let mut used = usage(model, &observed, window);
+            used.keep_warm = true;
+            // Missing/empty usage is not evidence of a refreshed cache. In
+            // particular an SDK error must not fabricate a successful ping.
+            if used.input_tokens > 0 || used.output_tokens > 0 || used.cache_read_tokens > 0 || used.cache_write_tokens > 0 {
+                usages.push(used);
+            }
+        }
+        let cache_observed = usages.iter().any(|u| u.cache_read_tokens > 0 || u.cache_write_tokens > 0);
+        let failed = v["is_error"] == true || !cache_observed;
+        if self.keep_warm.as_ref().expect("checked").accounting_start_seq.is_none() {
+            let seq = sink
+                .append(session_event::Kind::Notice(c6_proto::Notice {
+                    title: if failed { "Cache maintenance failed" } else { "Kept cache warm" }.into(),
+                    message: if v["is_error"] == true {
+                        v["result"].as_str().unwrap_or("Claude Code could not keep the cache warm.").into()
+                    } else if !cache_observed {
+                        "Claude Code returned no cache telemetry; no cache refresh was confirmed.".into()
+                    } else {
+                        String::new()
+                    },
+                    quiet: true,
+                    ..Default::default()
+                }))
+                .await?;
+            self.keep_warm.as_mut().expect("checked").accounting_start_seq = Some(seq);
+            self.persist_keep_warm()?;
+        }
+        // Appending usage and clearing a JSON record cannot be one atomic
+        // transaction. Reconcile against the actual journal, not just an
+        // in-memory counter: a worker may die immediately after append returns.
+        let recorded = self.warm_accounting_events().await?;
+        let committed: Vec<_> = recorded
+            .iter()
+            .filter_map(|event| match &event.kind {
+                Some(session_event::Kind::Usage(used)) if used.keep_warm => Some(used),
+                _ => None,
+            })
+            .collect();
+        anyhow::ensure!(
+            committed.len() <= usages.len() && committed.iter().zip(&usages).all(|(a, b)| *a == b),
+            "Claude Code maintenance accounting disagrees with its durable receipt"
+        );
+        let logged = if self.mapper.observer.is_some() { committed.len() } else { self.keep_warm.as_ref().expect("checked").usages_logged };
+        for (index, used) in usages.into_iter().enumerate().skip(logged) {
+            sink.append(session_event::Kind::Usage(used)).await?;
+            self.keep_warm.as_mut().expect("checked").usages_logged = index + 1;
+            self.persist_keep_warm()?;
+        }
+        if failed {
+            // Bill real error usage, but don't let its timestamp certify a
+            // successful refresh. Reuse the actor's durable attempt claim to
+            // disqualify that new usage clock until real work makes a call.
+            let events = self.warm_accounting_events().await?;
+            if let Some(call_ms) = events.iter().rev().find_map(|event| {
+                matches!(&event.kind, Some(session_event::Kind::Usage(used)) if used.keep_warm).then_some(event.ts_ms)
+            }) && !events.iter().any(|event| matches!(&event.kind,
+                Some(session_event::Kind::Notice(note)) if note.quiet && note.title == "Cache maintenance attempted" && note.message == call_ms.to_string())) {
+                sink.append(session_event::Kind::Notice(c6_proto::Notice {
+                    title: "Cache maintenance attempted".into(), message: call_ms.to_string(), quiet: true,
+                    priority: "low".into(),
+                })).await?;
+            }
+        }
+        self.keep_warm = None;
+        self.persist_keep_warm()?;
+        // A later idle edge belongs to this exchange, not the previous turn.
+        self.ended_on_idle = false;
+        Ok(true)
+    }
+
+    async fn warm_accounting_events(&self) -> anyhow::Result<Vec<SessionEvent>> {
+        let Some(observer) = &self.mapper.observer else { return Ok(Vec::new()) };
+        let Some(seq) = self.keep_warm.as_ref().and_then(|warm| warm.accounting_start_seq) else { return Ok(Vec::new()) };
+        observer.journal.events_after_owned(&observer.session_id, seq, u32::MAX, observer.ownership_epoch).await
+    }
+
     /// When it may be closed, after `idle` with nothing to do; `None` while
     /// it has work.
     pub fn idle_until(&self, idle: Duration) -> Option<tokio::time::Instant> {
-        (self.unconfirmed.is_empty() && self.pending.is_none() && !self.tasks_running()).then_some(self.idle_since + idle)
+        (self.unconfirmed.is_empty() && self.pending.is_none() && !self.keep_warm_pending() && !self.tasks_running())
+            .then_some(self.idle_since + idle)
     }
 
     /// Context maintenance must not lose native work or a notification waiting
@@ -3082,6 +3465,16 @@ impl Process {
     /// The next line it wrote (`None`: it exited). For a session's actor
     /// while no turn runs; pass the line to [`Process::idle_line`].
     pub async fn next_line(&mut self) -> Option<Value> {
+        if self.warm_work
+            && self.pending.is_none()
+            && let Some(warm) = self.keep_warm.as_ref().filter(|warm| warm.converted)
+            && !warm.lines.is_empty()
+        {
+            return warm.lines.back().cloned();
+        }
+        if let Some(result) = self.keep_warm.as_mut().and_then(|warm| warm.pending_result.take()) {
+            return Some(result);
+        }
         let (end, v) = self.lines.recv().await?;
         self.consumed(end, &v);
         Some(v)
@@ -3098,6 +3491,9 @@ impl Process {
         if self.trailing_result(&v) {
             return Ok(false);
         }
+        if self.warm_line(&v, sink).await? {
+            return Ok(false);
+        }
         // A long task can end after the last turn's idle deadline. Once
         // its update clears tasks_running(), give Claude Code a fresh idle
         // interval to reply, rather than closing stdin on the next actor
@@ -3109,7 +3505,7 @@ impl Process {
             // for the notifications it queued during the one you stopped
             // (seen with 2.1.311): that is the stop's doing, so it is stopped
             // too, and they reach the agent with your next message.
-            self.quiet = self.unconfirmed.is_empty() && self.after_stop.is_some_and(|t| tokio::time::Instant::now() < t);
+            self.quiet = !self.warm_work && self.unconfirmed.is_empty() && self.after_stop.is_some_and(|t| tokio::time::Instant::now() < t);
             self.pending = Some(v);
             // It woke by itself: that turn hears about what ended.
             self.unwoken.clear();
@@ -3133,6 +3529,10 @@ impl Process {
                 self.wake_due.get_or_insert_with(|| tokio::time::Instant::now() + WAKE_GRACE);
             }
         }
+        if self.keep_warm.is_some() {
+            self.persist_keep_warm()?;
+        }
+        self.acknowledge_warm_work(&v)?;
         Ok(false)
     }
 
@@ -3457,6 +3857,11 @@ impl Process {
         if *started {
             return Ok(());
         }
+        if std::mem::take(&mut self.warm_work) {
+            sink.append(session_event::Kind::TurnStarted(TurnStarted { turn: self.mapper.turn, ..Default::default() })).await?;
+            *started = true;
+            return Ok(());
+        }
         let texts = if quiet {
             self.queued_notices().await
         } else if self.notified.is_empty() {
@@ -3527,6 +3932,9 @@ impl Process {
             sink.start_turn(turn, &inputs).await?;
             started = true;
         }
+        if started {
+            self.warm_work = false;
+        }
         let mut alive = true;
         if !model.is_empty() && model != "default" && model != self.model {
             let request = serde_json::json!({"subtype": "set_model", "model": model});
@@ -3552,7 +3960,12 @@ impl Process {
         }
         let mut interrupted_at: Option<tokio::time::Instant> = None;
         while alive {
-            let v = match self.pending.take() {
+            let mut v = match self
+                .warm_lines
+                .pop_front()
+                .or_else(|| self.pending.take())
+                .or_else(|| self.keep_warm.as_mut().and_then(|warm| warm.pending_result.take()))
+            {
                 Some(v) => v,
                 None => tokio::select! {
                     _ = cancel.cancelled(), if interrupted_at.is_none() => {
@@ -3605,6 +4018,19 @@ impl Process {
             };
             if self.trailing_result(&v) {
                 continue;
+            }
+            // A real input can arrive before the maintenance result. Let it
+            // queue in the same CLI, but keep the maintenance reply separate.
+            let warming = self.keep_warm.as_ref().is_some_and(|warm| !warm.converted);
+            if self.warm_line(&v, sink).await? {
+                continue;
+            }
+            if warming && self.keep_warm.as_ref().is_some_and(|warm| warm.converted) && !self.warm_lines.is_empty() {
+                self.warm_lines.push_back(v);
+                v = self.warm_lines.pop_front().expect("just buffered");
+            }
+            if started {
+                self.warm_work = false;
             }
             let main = v["parent_tool_use_id"].is_null();
             if main {
@@ -3702,6 +4128,8 @@ impl Process {
                     self.ended_on_idle = v["type"] != "result";
                     self.notified.clear();
                     self.idle_since = tokio::time::Instant::now();
+                    self.acknowledge_warm_work(&v)?;
+                    self.finish_warm_work()?;
                     return Ok(TurnEnd { reason: Some(reason), alive: true, no_conversation: false });
                 }
                 // In a turn stopped as it began, Claude Code's "[Request
@@ -3714,6 +4142,7 @@ impl Process {
                 }
                 _ => self.side_line(&v, sink).await?,
             }
+            self.acknowledge_warm_work(&v)?;
         }
         // The process is gone (or going): it ended without a result.
         let interrupted = self.mapper.interrupted;
@@ -6144,6 +6573,495 @@ done
         assert_eq!(kinds(&vec_sink), [["user", "turn_started", "assistant", "usage", "turn_ended"]; 2].concat());
         assert_eq!(std::fs::read_to_string(dir.path().join("spawns.txt")).unwrap().lines().count(), 1);
         assert!(p.idle_until(IDLE).is_some(), "an idle process with no tasks may be closed later");
+        p.close().await;
+    }
+
+    /// No sleeps or restart: each input is the fixture's synchronization edge.
+    fn warming_claude(dir: &Path) -> PathBuf {
+        script(
+            dir,
+            "claude-warming",
+            r#"#!/bin/sh
+echo $$ >> spawns.txt
+while read -r line; do
+  case "$line" in *'"control_request"'*) continue;; esac
+  printf '%s\n' "$line" >> inputs.txt
+  for metadata in held/*/meta.json; do
+    if [ -f "$metadata" ]; then cp "$metadata" delivered-meta.json; fi
+  done
+  printf '%s\n' '{"type":"system","subtype":"init"}'
+  uuid=$(printf '%s' "$line" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
+  printf '{"type":"user","isReplay":true,"uuid":"%s","parent_tool_use_id":null}\n' "$uuid"
+  case "$line" in
+    *start-build*)
+      printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"build","description":"Build","task_type":"local_bash","is_backgrounded":true}'
+      printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Build is running."}]}}'
+      printf '%s\n' '{"type":"result","is_error":false,"usage":{"input_tokens":50000}}';;
+    *do-work*)
+      printf '%s\n' '{"type":"stream_event","event":{"type":"message_start"}}'
+      printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"probe","name":"Bash"}}}'
+      printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"probe","name":"Bash","input":{"command":"pwd"}}]}}'
+      printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"probe","content":"workspace"}]}}'
+      printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}'
+      printf '%s\n' '{"type":"result","is_error":false,"result":"Done.","usage":{"input_tokens":10,"output_tokens":4}}';;
+    *)
+      printf '%s\n' '{"type":"system","subtype":"task_progress","task_id":"build","description":"Still building"}'
+      printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}}'
+      printf '%s\n' '{"type":"assistant","message":{"id":"warm","model":"claude-opus-5-5","usage":{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":50000},"content":[{"type":"text","text":"ok"}]}}'
+      printf '%s\n' '{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":99999},"modelUsage":{"claude-opus-5-5":{"contextWindow":1000000}}}';;
+  esac
+done
+"#,
+        )
+    }
+
+    #[tokio::test]
+    async fn keep_warm_uses_same_process_without_user_or_turn_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = warming_claude(dir.path());
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let obs = observer(dir.path(), tools.clone()).await;
+        let recorded = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = recorded.clone();
+        let mut p = spawn(&bin, dir.path(), "s", false, Some(obs));
+        assert_eq!(run(&mut p, 1, &[input("start", "start-build")], &sink).await.reason, Some(TurnEndReason::Completed));
+        assert!(p.tasks_running());
+        assert!(p.send_keep_warm(&"x".repeat(ATOMIC_INPUT_LIMIT), &sink).await.is_err());
+        assert!(!p.keep_warm_pending(), "oversized editable prompts are rejected before writing or reserving a ping");
+        let before = recorded.0.lock().unwrap().len();
+        for _ in 0..2 {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(55 * 60)).await;
+            tokio::time::resume();
+            p.send_keep_warm(c6_agent::KEEP_WARM_NOTE, &sink).await.unwrap();
+            assert!(p.keep_warm_pending());
+            // The preceding turn may have ended at its idle edge, leaving
+            // its result queued before this ping's first activity.
+            p.ended_on_idle = true;
+            assert!(!p.idle_line(serde_json::json!({"type":"result", "usage":{"input_tokens":999999}}), &sink).await.unwrap());
+            assert!(p.keep_warm_pending(), "an old result cannot finish this ping");
+            assert!(p.idle_until(IDLE).is_none());
+            assert!(p.send_keep_warm("duplicate", &sink).await.is_err());
+            while p.keep_warm_pending() {
+                let line = p.next_line().await.expect("same process stays live");
+                assert!(!p.idle_line(line, &sink).await.unwrap());
+            }
+            assert!(p.tasks_running(), "maintenance leaves native work alone");
+            assert!(tools.background.list().iter().any(|t| t.running && t.description == "Still building"));
+        }
+        let events = recorded.0.lock().unwrap().clone();
+        assert_eq!(events[before..].iter().map(kind).collect::<Vec<_>>(), ["other", "usage", "other", "usage"]);
+        for pair in events[before..].chunks(2) {
+            let Some(session_event::Kind::Usage(u)) = &pair[1].kind else { panic!() };
+            assert!(u.keep_warm);
+            assert_eq!((u.input_tokens, u.cache_read_tokens, u.output_tokens, u.context_window), (2, 50000, 1, 1000000));
+            let Some(session_event::Kind::Notice(n)) = &pair[0].kind else { panic!() };
+            assert!(n.quiet);
+            assert_eq!(n.title, "Kept cache warm");
+        }
+        assert_eq!(std::fs::read_to_string(dir.path().join("spawns.txt")).unwrap().lines().count(), 1);
+        let lines = std::fs::read_to_string(dir.path().join("inputs.txt")).unwrap();
+        let sent: Value = serde_json::from_str(lines.lines().last().unwrap()).unwrap();
+        assert_eq!(sent["message"]["content"], c6_agent::KEEP_WARM_NOTE);
+        assert!(sent["origin"].is_null(), "maintenance never claims human provenance");
+        p.close().await;
+    }
+
+    #[tokio::test]
+    async fn keep_warm_reply_stays_separate_when_a_real_input_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = warming_claude(dir.path());
+        let recorded = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = recorded.clone();
+        let mut p = spawn(&bin, dir.path(), "s", false, None);
+        p.send_keep_warm(c6_agent::KEEP_WARM_NOTE, &sink).await.unwrap();
+        assert_eq!(run(&mut p, 1, &[input("real", "real-input")], &sink).await.reason, Some(TurnEndReason::Completed));
+        assert!(!p.keep_warm_pending());
+        let events = recorded.0.lock().unwrap().clone();
+        assert_eq!(kinds(&recorded), ["user", "turn_started", "other", "usage", "assistant", "usage", "turn_ended"]);
+        let Some(session_event::Kind::Usage(warm)) = &events[3].kind else { panic!() };
+        assert!(warm.keep_warm);
+        let Some(session_event::Kind::Usage(real)) = &events[5].kind else { panic!() };
+        assert!(!real.keep_warm);
+        let Some(session_event::Kind::User(user)) = &events[0].kind else { panic!() };
+        assert_eq!(user.text, "real-input");
+        p.close().await;
+    }
+
+    #[tokio::test]
+    async fn keep_warm_does_not_swallow_a_native_childs_normal_work_or_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = warming_claude(dir.path());
+        let recorded = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = recorded.clone();
+        let child = Arc::new(VecSink::default());
+        let mut p = spawn(&bin, dir.path(), "s", false, None);
+        p.mapper.children.insert(
+            "agent-call".into(),
+            Child {
+                id: "native-child".into(),
+                log: child.clone(),
+                depth: 1,
+                open: true,
+                parent_log: sink.clone(),
+                spawn: SubagentSpawned::default(),
+            },
+        );
+        p.send_keep_warm(c6_agent::KEEP_WARM_NOTE, &sink).await.unwrap();
+        for line in [
+            serde_json::json!({"type":"assistant", "parent_tool_use_id":"agent-call", "message":{
+                "id":"child-model-call", "model":"claude-opus-5-5", "usage":{"input_tokens":7,"output_tokens":3},
+                "content":[{"type":"tool_use","id":"child-bash","name":"Bash","input":{"command":"pwd"}}]
+            }}),
+            serde_json::json!({"type":"user", "parent_tool_use_id":"agent-call", "message":{
+                "content":[{"type":"tool_result","tool_use_id":"child-bash","content":"workspace"}]
+            }}),
+        ] {
+            assert!(!p.idle_line(line, &sink).await.unwrap());
+            assert!(p.keep_warm_pending());
+        }
+        assert!(recorded.0.lock().unwrap().is_empty(), "child work is not a maintenance reply or a parent turn");
+        assert_eq!(kinds(&child), ["assistant", "usage", "tool_result"]);
+        let events = child.0.lock().unwrap().clone();
+        let Some(session_event::Kind::Usage(used)) = &events[1].kind else { panic!() };
+        assert!(!used.keep_warm);
+        assert_eq!((used.input_tokens, used.output_tokens), (7, 3));
+        while p.keep_warm_pending() {
+            let line = p.next_line().await.unwrap();
+            assert!(!p.idle_line(line, &sink).await.unwrap());
+        }
+        assert_eq!(kinds(&recorded), ["other", "usage"]);
+        p.close().await;
+    }
+
+    #[tokio::test]
+    async fn keep_warm_survives_worker_restart_without_resending_or_restarting_native_work() {
+        for cut in ["before-output", "read-not-handled", "after-assistant"] {
+            let dir = tempfile::tempdir().unwrap();
+            let held = dir.path().join("held");
+            let _cleanup = HeldFixtureCleanup(held.clone());
+            let bin = warming_claude(dir.path());
+            let recorded = Arc::new(VecSink::default());
+            let sink: Arc<dyn EventSink> = recorded.clone();
+            let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+            let obs = observer(dir.path(), tools).await;
+            let launch = Launch { conversation: "warm-resume".into(), ..Default::default() };
+            let mut p = Process::spawn_held(&held, "s", &bin, launch, false, dir.path(), "opus", Arc::default(), None, Some(obs)).unwrap();
+            assert_eq!(run(&mut p, 1, &[input("build", "start-build")], &sink).await.reason, Some(TurnEndReason::Completed));
+            assert!(p.tasks_running());
+            let pg = p.pgid.unwrap();
+            let keeper = p.held.as_ref().unwrap().keeper;
+            c6_testkit::eventually("held maintenance fixture ownership", async || {
+                keeper_holds_fifo(keeper, pg, &held.join("warm-resume")).then_some(())
+            })
+            .await;
+            let before = recorded.0.lock().unwrap().len();
+            p.send_keep_warm(c6_agent::KEEP_WARM_NOTE, &sink).await.unwrap();
+            let record = held.join("warm-resume/meta.json");
+            let meta = read_held_metadata(&record).unwrap();
+            let warm_uuid = meta.keep_warm.as_ref().expect("persisted before sending").uuid.clone();
+            if cut != "before-output" {
+                loop {
+                    let line = p.next_line().await.unwrap();
+                    let assistant = line["type"] == "assistant";
+                    if assistant && cut == "read-not-handled" {
+                        break;
+                    }
+                    assert!(!p.idle_line(line, &sink).await.unwrap());
+                    if assistant {
+                        break;
+                    }
+                }
+            }
+            let expected_offset = read_held_metadata(&record).unwrap().keep_warm.unwrap().offset;
+            drop(p);
+            assert!(nix::sys::signal::kill(pg, None).is_ok(), "worker loss must leave native work alone");
+            let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+            let obs = observer(dir.path(), tools).await;
+            let mut p = Process::attach(&held, "warm-resume", dir.path(), "opus", Arc::default(), None, Some(obs)).await.unwrap();
+            assert_eq!(p.pgid, Some(pg));
+            assert_eq!(p.keep_warm.as_ref().unwrap().uuid, warm_uuid);
+            assert_eq!(p.held.as_ref().unwrap().offset.load(std::sync::atomic::Ordering::SeqCst), expected_offset);
+            assert!(p.tasks_running(), "adoption restores the live native registry from the maintenance record");
+            assert!(p.send_keep_warm("never resend an ambiguous maintenance input", &sink).await.is_err());
+            while p.keep_warm_pending() {
+                let line = p.next_line().await.unwrap();
+                assert!(!p.idle_line(line, &sink).await.unwrap(), "maintenance replay must not open a normal turn: {cut}");
+            }
+            let events = recorded.0.lock().unwrap().clone();
+            assert_eq!(events[before..].iter().map(kind).collect::<Vec<_>>(), ["other", "usage"], "{cut}");
+            let Some(session_event::Kind::Usage(used)) = &events[before + 1].kind else { panic!() };
+            assert!(used.keep_warm);
+            assert_eq!((used.input_tokens, used.cache_read_tokens, used.output_tokens), (2, 50000, 1));
+            let delivered = read_held_metadata(&dir.path().join("delivered-meta.json")).unwrap();
+            assert_eq!(delivered.keep_warm.unwrap().uuid, warm_uuid, "the marker precedes stdin delivery");
+            assert!(read_held_metadata(&record).unwrap().keep_warm.is_none(), "success clears durable maintenance state");
+            assert_eq!(std::fs::read_to_string(dir.path().join("inputs.txt")).unwrap().lines().count(), 2);
+            assert_eq!(std::fs::read_to_string(dir.path().join("spawns.txt")).unwrap().lines().count(), 1);
+            assert!(p.tasks_running());
+            p.close().await;
+        }
+    }
+
+    struct FailAfterWarmUsage {
+        writer: Arc<crate::session::Writer>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl EventSink for FailAfterWarmUsage {
+        async fn append(&self, kind: session_event::Kind) -> anyhow::Result<u64> {
+            let crash = matches!(&kind, session_event::Kind::Usage(used) if used.keep_warm)
+                && self.fail.swap(false, std::sync::atomic::Ordering::SeqCst);
+            let seq = self.writer.append(kind).await?;
+            anyhow::ensure!(!crash, "injected crash after warm Usage committed");
+            Ok(seq)
+        }
+
+        fn ephemeral(&self, kind: ephemeral_event::Kind) {
+            self.writer.ephemeral(kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn keep_warm_usage_commit_before_metadata_ack_is_not_billed_twice_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = warming_claude(dir.path());
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let obs = observer(dir.path(), tools).await;
+        let started = SessionEvent { seq: 1, kind: Some(session_event::Kind::Started(obs.started.clone())), ..Default::default() };
+        obs.journal.create_session(&obs.session_id, &obs.spec, &started).await.unwrap();
+        let writer = Arc::new(crate::session::Writer::new(obs.session_id.clone(), obs.journal.clone(), obs.link.clone(), 2));
+        let sink: Arc<dyn EventSink> = Arc::new(FailAfterWarmUsage { writer, fail: true.into() });
+        let mut p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "warm-accounting".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            Some(obs.clone()),
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        c6_testkit::eventually("accounting fixture ownership", async || {
+            keeper_holds_fifo(keeper, pg, &held.join("warm-accounting")).then_some(())
+        })
+        .await;
+        p.send_keep_warm(c6_agent::KEEP_WARM_NOTE, &sink).await.unwrap();
+        let error = loop {
+            let line = p.next_line().await.unwrap();
+            match p.idle_line(line, &sink).await {
+                Ok(false) => {}
+                Ok(true) => panic!("quiet maintenance must not begin a turn"),
+                Err(error) => break error,
+            }
+        };
+        assert!(error.to_string().contains("injected crash after warm Usage committed"));
+        let record = held.join("warm-accounting/meta.json");
+        let warm = read_held_metadata(&record).unwrap().keep_warm.unwrap();
+        assert!(warm.accounting_start_seq.is_some());
+        assert_eq!(warm.usages_logged, 0, "crash precedes the metadata acknowledgement");
+        let before = obs.journal.events_after(&obs.session_id, 0, u32::MAX).await.unwrap();
+        assert_eq!(before.iter().filter(|e| matches!(&e.kind, Some(session_event::Kind::Usage(u)) if u.keep_warm)).count(), 1);
+        drop(p);
+        assert!(nix::sys::signal::kill(pg, None).is_ok());
+
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let recovered = observer(dir.path(), tools).await;
+        let mut p =
+            Process::attach(&held, "warm-accounting", dir.path(), "opus", Arc::default(), None, Some(recovered.clone())).await.unwrap();
+        assert_eq!(p.pgid, Some(pg));
+        assert_eq!(p.keep_warm.as_ref().unwrap().uuid, warm.uuid);
+        let sink: Arc<dyn EventSink> = Arc::new(crate::session::Writer::new(
+            recovered.session_id.clone(),
+            recovered.journal.clone(),
+            recovered.link.clone(),
+            before.last().unwrap().seq + 1,
+        ));
+        while p.keep_warm_pending() {
+            let line = p.next_line().await.unwrap();
+            assert!(!p.idle_line(line, &sink).await.unwrap());
+        }
+        let after = recovered.journal.events_after(&recovered.session_id, 0, u32::MAX).await.unwrap();
+        assert_eq!(after, before, "recovery must reconcile the committed receipt, not append another charge");
+        assert!(read_held_metadata(&record).unwrap().keep_warm.is_none());
+        assert_eq!(std::fs::read_to_string(dir.path().join("inputs.txt")).unwrap().lines().count(), 1);
+        assert_eq!(std::fs::read_to_string(dir.path().join("spawns.txt")).unwrap().lines().count(), 1);
+        p.close().await;
+    }
+
+    #[tokio::test]
+    async fn keep_warm_deadline_is_rechecked_after_tracking_before_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = warming_claude(dir.path());
+        let recorded = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = recorded.clone();
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let obs = observer(dir.path(), tools).await;
+        let mut p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "deadline".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            Some(obs),
+        )
+        .unwrap();
+        run(&mut p, 1, &[input("build", "start-build")], &sink).await;
+        let pg = p.pgid.unwrap();
+        assert!(p.send_keep_warm_until("expired", &sink, tokio::time::Instant::now()).await.is_err());
+        assert!(!p.keep_warm_pending());
+
+        // Hold tracking's SQLite write until the injected clock has expired.
+        // Polling the request once proves the initial deadline check passed.
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.path().join("journal.db").display())).await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await.unwrap();
+        tokio::time::pause();
+        {
+            // Expire maintenance without also expiring SQLite's 30s pool wait.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let request = p.send_keep_warm_until("expired while tracking", &sink, deadline);
+            tokio::pin!(request);
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(11)).await;
+            // SQLite runs on real threads: resume before awaiting its commit,
+            // otherwise auto-advance can fire the pool's acquisition timeout.
+            tokio::time::resume();
+            sqlx::query("COMMIT").execute(&mut *connection).await.unwrap();
+            let error = request.await.unwrap_err();
+            assert!(error.to_string().contains("deadline expired before stdin write"), "{error:#}");
+        }
+        assert!(!p.keep_warm_pending());
+        assert!(read_held_metadata(&held.join("deadline/meta.json")).unwrap().keep_warm.is_none());
+        assert_eq!(std::fs::read_to_string(dir.path().join("inputs.txt")).unwrap().lines().count(), 1);
+        assert_eq!(p.pgid, Some(pg));
+        assert!(p.tasks_running());
+        assert_eq!(std::fs::read_to_string(dir.path().join("spawns.txt")).unwrap().lines().count(), 1);
+        drop(connection);
+        pool.close().await;
+        p.close().await;
+    }
+
+    struct FailWarmAssistant {
+        recorded: Arc<VecSink>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl EventSink for FailWarmAssistant {
+        async fn append(&self, kind: session_event::Kind) -> anyhow::Result<u64> {
+            if matches!(&kind, session_event::Kind::Assistant(_)) && self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("injected failure before converted assistant append");
+            }
+            self.recorded.append(kind).await
+        }
+        fn ephemeral(&self, _: ephemeral_event::Kind) {}
+    }
+
+    #[tokio::test]
+    async fn keep_warm_converted_output_survives_restart_before_normal_handler_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = warming_claude(dir.path());
+        let recorded = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = recorded.clone();
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let obs = observer(dir.path(), tools).await;
+        let mut p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "converted".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            Some(obs),
+        )
+        .unwrap();
+        run(&mut p, 1, &[input("build", "start-build")], &sink).await;
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        c6_testkit::eventually("converted fixture ownership", async || {
+            keeper_holds_fifo(keeper, pg, &held.join("converted")).then_some(())
+        })
+        .await;
+        recorded.0.lock().unwrap().clear();
+        p.send_keep_warm("do-work", &sink).await.unwrap();
+        loop {
+            let line = p.next_line().await.unwrap();
+            if p.idle_line(line, &sink).await.unwrap() {
+                break;
+            }
+        }
+        let warm = read_held_metadata(&held.join("converted/meta.json")).unwrap().keep_warm.unwrap();
+        assert!(warm.converted);
+        assert!(warm.lines.iter().any(|v| v["event"]["content_block"]["type"] == "tool_use"));
+        let fault: Arc<dyn EventSink> = Arc::new(FailWarmAssistant { recorded: recorded.clone(), fail: true.into() });
+        let feed = || Joining { inputs: Vec::new(), now: Vec::new() };
+        let more = tokio::sync::Notify::new();
+        let cancel = CancellationToken::new();
+        let error = p.turn(2, Vec::new(), false, None, "opus", &fault, &feed, &more, &cancel).await.unwrap_err();
+        assert!(error.to_string().contains("injected failure"));
+        let warm = read_held_metadata(&held.join("converted/meta.json")).unwrap().keep_warm.unwrap();
+        assert!(warm.converted);
+        assert_eq!(warm.lines.front().unwrap()["type"], "assistant", "the failed normal handler must not acknowledge its frame");
+        drop(p);
+        assert!(nix::sys::signal::kill(pg, None).is_ok());
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let obs = observer(dir.path(), tools).await;
+        let mut p = Process::attach(&held, "converted", dir.path(), "opus", Arc::default(), None, Some(obs)).await.unwrap();
+        assert!(p.tasks_running());
+        let line = p.next_line().await.unwrap();
+        assert!(p.idle_line(line, &sink).await.unwrap());
+        assert_eq!(run(&mut p, 2, &[], &sink).await.reason, Some(TurnEndReason::Completed));
+        assert!(!p.keep_warm_pending());
+        let events = recorded.0.lock().unwrap().clone();
+        assert!(events.iter().any(|e| kind(e) == "assistant"));
+        assert!(events.iter().any(|e| kind(e) == "tool_result"));
+        assert!(events.iter().all(|e| kind(e) != "user"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("inputs.txt")).unwrap().lines().count(), 2);
+        assert_eq!(std::fs::read_to_string(dir.path().join("spawns.txt")).unwrap().lines().count(), 1);
+        p.close().await;
+    }
+
+    #[tokio::test]
+    async fn keep_warm_that_starts_tools_becomes_work_without_fabricating_a_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = warming_claude(dir.path());
+        let recorded = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = recorded.clone();
+        let mut p = spawn(&bin, dir.path(), "s", false, None);
+        p.send_keep_warm("do-work", &sink).await.unwrap();
+        loop {
+            let line = p.next_line().await.unwrap();
+            if p.idle_line(line, &sink).await.unwrap() {
+                break;
+            }
+        }
+        assert!(p.keep_warm_pending(), "converted output remains durable until normal handling acknowledges it");
+        assert_eq!(run(&mut p, 1, &[], &sink).await.reason, Some(TurnEndReason::Completed));
+        assert!(!p.keep_warm_pending());
+        assert_eq!(kinds(&recorded), ["other", "turn_started", "assistant", "tool_result", "assistant", "usage", "turn_ended"]);
+        let events = recorded.0.lock().unwrap().clone();
+        assert!(events.iter().all(|e| !matches!(&e.kind, Some(session_event::Kind::Usage(u)) if u.keep_warm)));
+        assert_eq!(std::fs::read_to_string(dir.path().join("spawns.txt")).unwrap().lines().count(), 1);
         p.close().await;
     }
 
@@ -8747,6 +9665,7 @@ while True:
             keeper: pgid,
             output_root: Some(output_root.clone()),
             token: None,
+            keep_warm: None,
         };
         std::fs::write(record.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
         assert!(!held_group_owned(&meta, &record));

@@ -194,6 +194,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::TIMELINE,
     },
     Prompt {
+        name: "session.keep_warm",
+        description: "The minimal cache-maintenance input while a session waits on running background work. Its reply is shown quietly, not as a user turn.",
+        default: c6_agent::KEEP_WARM_NOTE,
+    },
+    Prompt {
         name: "session.claude_code",
         description: "Told to Claude Code sessions about carbon6, at the start of what carbon6 adds to Claude Code's system prompt (its guidance for memory, task cards and the memex follows).",
         default: c6_agent::CLAUDE_CODE_NOTE,
@@ -533,6 +538,7 @@ pub async fn for_worker(st: &HeadState, realm: &str) -> String {
                 || k.starts_with("session.resume_after_")
                 || k == "session.task_cards"
                 || k == "session.claude_code"
+                || k == "session.keep_warm"
                 || k == "session.carbon6"
         })
         .collect();

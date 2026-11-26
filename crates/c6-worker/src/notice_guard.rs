@@ -502,7 +502,7 @@ pub(crate) fn evaluate(events: &[SessionEvent], now_ms: i64, limits: Limits, eli
                 active = None;
                 notice_started = false;
             }
-            Some(Kind::Usage(u)) if notice_started && event.ts_ms > cutoff && event.ts_ms <= now_ms => {
+            Some(Kind::Usage(u)) if !u.keep_warm && notice_started && event.ts_ms > cutoff && event.ts_ms <= now_ms => {
                 // Cache reads/writes are separate usage fields; add them as
                 // context_tokens_from_events does. Reasoning is part of output.
                 tokens = tokens
@@ -658,6 +658,22 @@ mod tests {
 
     const NOW: i64 = 10 * HOUR_MS;
     const TEST_LIMITS: Limits = Limits { evidence_observations: 1, failure_observations: 1, rounds: 0, max_seconds: 0, tokens_per_hour: 0 };
+
+    #[test]
+    fn keep_warm_does_not_spend_or_reset_an_incomplete_notice_turn() {
+        let mut log = Log::default();
+        log.notice("Build", "completed", "The build finished.");
+        log.start();
+        log.usage(3, 0, 0, 0);
+        let before = log.guard(Limits { tokens_per_hour: 10, ..TEST_LIMITS });
+        log.push(Kind::Usage(Usage { input_tokens: 100_000, cache_read_tokens: 1_000_000, keep_warm: true, ..Default::default() }));
+        for title in ["Cache maintenance attempted", "Kept cache warm"] {
+            log.push(Kind::Notice(Notice { title: title.into(), quiet: true, ..Default::default() }));
+        }
+        assert_eq!(log.guard(Limits { tokens_per_hour: 10, ..TEST_LIMITS }), before);
+        log.usage(10, 0, 0, 0);
+        assert!(log.reason(10).is_some_and(|reason| reason.contains("spending limit")));
+    }
 
     #[test]
     fn error_signatures_ignore_timestamps_and_process_ids_but_keep_exit_codes() {

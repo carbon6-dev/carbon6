@@ -121,7 +121,7 @@ pub struct ToolSpec {
     pub parameters: serde_json::Value,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelRequest {
     pub model: String,
     pub system: String,

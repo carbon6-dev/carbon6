@@ -71,6 +71,7 @@ pub fn scope(name: &str) -> Option<Scope> {
         "workers.list",
         "connections.list",
         "connections.models",
+        "connections.cache_lifetimes",
         "connections.quotas",
         "commands.list",
         "realms.list",
@@ -419,6 +420,7 @@ fn build() -> Vec<Op> {
         op!("connections.test", "connections", "POST" "/api/v1/connections/test", Read, Input::Body(schema::<TestConnection>), "Tests a connection (a saved one by id, or the details given) and lists its models."),
         op!("connections.delete", "connections", "DELETE" "/api/v1/connections/{id}", Destructive, Input::None, "Deletes a connection. Sessions using it can no longer call their model.", choices = &[("id", "connections.list")]),
         op!("connections.models", "connections", "GET" "/api/v1/connections/{id}/models", Read, Input::Query(schema::<crate::api::ModelQuery>), "The models a connection offers; fresh=true tests the provider without reading or populating the model-list cache.", choices = &[("id", "connections.list")]),
+        op!("connections.cache_lifetimes", "connections", "GET" "/api/v1/connections/{id}/cache_lifetimes", Read, Input::None, "Read-only cache lifetime evidence by actual account and model: learned or provider-default seconds, whether cache usage was observed, and cache-read/rewrite price ratio when priced. Aliases use their current target; pools have no fixed lifetime.", choices = &[("id", "connections.list")]),
         op!("connections.chatgpt.start", "connections", "POST" "/api/v1/connections/chatgpt/start", Write, Input::Body(schema::<api::StartChatGptSignIn>), "Starts signing in with ChatGPT (a ChatGPT plan): returns the address for you to open; then connections.chatgpt.complete with where the browser ended up (unless it was this machine)."),
         op!("connections.chatgpt.complete", "connections", "POST" "/api/v1/connections/chatgpt/complete", Write, Input::Body(schema::<api::CompleteChatGptSignIn>), "Finishes signing in with ChatGPT with the address the browser ended on."),
 

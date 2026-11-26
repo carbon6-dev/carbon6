@@ -591,6 +591,10 @@ pub fn quotas() -> LocalBoxFuture<'static, Result<Vec<c6_api::ConnectionQuota>, 
     get_json("/api/v1/connections/quotas")
 }
 
+pub fn cache_lifetimes(id: &str) -> LocalBoxFuture<'static, Result<Vec<c6_api::cache::ModelCacheLifetime>, String>> {
+    get_json(format!("/api/v1/connections/{id}/cache_lifetimes"))
+}
+
 pub async fn create_connection(req: CreateConnection) -> Result<Connection, String> {
     send_json(Request::post("/api/v1/connections"), &req).await
 }

@@ -3308,3 +3308,36 @@ new metadata. API and `convert` tests round-trip both additive API kinds and
 retain unknown provenance on an old `card-answer` event. No history backfill is
 run. Full UI builds, browser matrices and workspace checks should run on the
 combined change, not on a stale WASM artifact.
+
+## Cache lifetime learning and background keep-warm
+
+`cargo test -p c6-head --lib cache_lifetime` checks provider defaults, five-gap
+survival evidence, ambiguous misses, delayed usage timing, concrete-account and
+realm authorization, and bounded historical replay. Replay tests interleave a
+foreground writer, arrivals before the enumeration cursor, and a database
+reopen at a mid-call checkpoint; failed transactions cannot advance evidence.
+
+`cargo test -p c6-worker --lib keep_warm` checks the injected-clock policy,
+threshold, margin, minimum interval, original-wait cap, conservative economics,
+request snapshots, and Claude Code's separate durable maintenance exchange.
+`cargo test -p c6-worker --test native_keep_warm` exercises the real actor and
+provider request path. A FIFO holds background work while only the worker's
+Tokio clock advances; the provider has a separate clock. These tests check
+identical prefixes and one-token replies, repeated pings, user waits, expired
+deadlines, thresholds, cap, and worker-runtime restart without a duplicate ping.
+
+The head's `keep_warm` tests check flagged usage as a priced subset of totals,
+backfill/reopen, realm and label filtering, and maintenance not advancing task
+progress or consuming unattended notice guards. UI tests check ownership-fenced
+waiting evidence and the reported deadline, not a client-side duplicate task
+tracker. Release UI size must be measured from the combined change.
+
+The worker's clock tests cover expiry after machine sleep as well as injected
+monotonic time. The production `settings-lists.cjs` browser matrix saves the
+keep-warm policy and connection exclusions on desktop/phone, retaining the
+independent Claude Code trimming policy.
+The Claude Code accounting regression commits a warm Usage to the actual
+journal, faults before its metadata acknowledgement, then reattaches to the
+same held process and verifies that recovery appends neither a second charge
+nor another maintenance input. `status-row.cjs` checks waiting/warm deadlines
+and schedule status across desktop, narrow and phone layouts.

@@ -170,6 +170,10 @@ pub async fn report(st: &HeadState, days: u32, filter: &[String], by: &str, real
         }
         let add = |r: &mut api::ActivityRow| {
             r.calls += 1;
+            if c.keep_warm {
+                r.keep_warm_calls += 1;
+                r.keep_warm_cost += cost.unwrap_or(0.0);
+            }
             r.input += c.input;
             r.output += c.output;
             r.cache_read += c.cache_read;

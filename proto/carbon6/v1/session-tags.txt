@@ -438,3 +438,7 @@ carbon6.v1.CreateSession 51 optional:bool claude_code_trim_enabled
 carbon6.v1.CreateSession 52 uint64 claude_code_trim_at
 carbon6.v1.NoticeLimits 11 optional:bool claude_code_trim_enabled
 carbon6.v1.NoticeLimits 12 optional:uint64 claude_code_trim_at
+carbon6.v1.CreateSession 49 optional:string keep_warm_json
+carbon6.v1.CreateSession 50 optional:string keep_warm_snapshot_json
+carbon6.v1.NoticeLimits 10 optional:string keep_warm_json
+carbon6.v1.Usage 11 bool keep_warm

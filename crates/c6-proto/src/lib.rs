@@ -16,6 +16,22 @@ pub const SESSION_MOVE_CAPABILITY: &str = "session_move_v1";
 /// movers ignore these fields and must not receive a complete-target request.
 pub const SESSION_MOVE_TARGET_CAPABILITY: &str = "session_move_target_v1";
 
+/// Maintenance is accounted and replicated, but is not evidence of task
+/// progress. Quiet diagnostic titles are protocol markers, not agent prompts.
+pub fn is_keep_warm_event(event: &SessionEvent) -> bool {
+    match &event.kind {
+        Some(session_event::Kind::Usage(usage)) => usage.keep_warm,
+        Some(session_event::Kind::Notice(notice)) => {
+            notice.quiet
+                && matches!(
+                    notice.title.as_str(),
+                    "Cache maintenance attempted" | "Kept cache warm" | "Kept the cache warm" | "Cache maintenance failed"
+                )
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +114,7 @@ mod tests {
         // auto_turns_per_hour=20, claude_code_idle_minutes=15 (tags 31–32).
         let bytes = b"\xf8\x01\x14\x80\x02\x0f";
         let spec = CreateSession::decode(bytes.as_slice()).unwrap();
+        assert!(spec.keep_warm_json.is_none());
         assert_eq!(spec, CreateSession { auto_turns_per_hour: 20, claude_code_idle_minutes: 15, ..Default::default() });
         assert_eq!(spec.encode_to_vec(), bytes);
     }
@@ -118,8 +135,16 @@ mod tests {
                 max_running_subagents: Some(0),
                 claude_code_trim_enabled: Some(false),
                 claude_code_trim_at: Some(10_000_000_000),
+                keep_warm_json: Some(r#"{"enabled":false}"#.into()),
             }),
         };
         assert_eq!(ReleaseNotices::decode(release.encode_to_vec().as_slice()).unwrap(), release);
+    }
+
+    #[test]
+    fn keep_warm_settings_round_trip_and_accept_legacy_limits() {
+        assert!(NoticeLimits::decode(&[][..]).unwrap().keep_warm_json.is_none());
+        let spec = CreateSession { keep_warm_json: Some(r#"{"enabled":false}"#.into()), ..Default::default() };
+        assert_eq!(CreateSession::decode(spec.encode_to_vec().as_slice()).unwrap(), spec);
     }
 }

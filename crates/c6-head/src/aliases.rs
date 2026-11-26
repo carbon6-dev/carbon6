@@ -110,6 +110,36 @@ pub(crate) async fn record_grant(
     Ok(())
 }
 
+/// A saved prefix may outlive an alias switch. Retain only an account already
+/// granted to this worker/root, through an alias the same-realm tree still
+/// uses. Revoking either the alias's own availability or the concrete account
+/// revokes this permission; the alias's NEW target is deliberately irrelevant.
+pub(crate) async fn prior_target_allowed(
+    store: &Store,
+    session: &crate::store::SessionRow,
+    target: &ConnectionRow,
+) -> anyhow::Result<bool> {
+    if session.status == "failed" || !crate::realms::available(&target.realms, &session.realm) {
+        return Ok(false);
+    }
+    let aliases: Vec<String> = sqlx::query_scalar(
+        "SELECT a.realms FROM connection_alias_grants g \
+         JOIN connections a ON a.id = g.alias_id AND a.kind = 'alias' \
+         JOIN connection_aliases d ON d.alias_id = a.id AND d.target_kind = ? \
+         WHERE g.root_session_id = ? AND g.worker_id = ? AND g.target_id = ? \
+         AND EXISTS (SELECT 1 FROM sessions s WHERE (s.id = g.root_session_id OR s.root_id = g.root_session_id) \
+                     AND s.connection_id = a.id AND s.realm = ? AND s.status != 'failed')",
+    )
+    .bind(&target.kind)
+    .bind(session.root_id.as_deref().unwrap_or(&session.id))
+    .bind(&session.worker_id)
+    .bind(&target.id)
+    .bind(&session.realm)
+    .fetch_all(&store.pool)
+    .await?;
+    Ok(aliases.iter().any(|realms| crate::realms::available(realms, &session.realm)))
+}
+
 pub(crate) async fn verify_usage(db: &mut SqliteConnection, session_id: &str, usage: &mut c6_proto::Usage) -> anyhow::Result<()> {
     if !usage.resolved_connection_id.is_empty() {
         let names: Option<(String, String)> = sqlx::query_as(
@@ -119,12 +149,32 @@ pub(crate) async fn verify_usage(db: &mut SqliteConnection, session_id: &str, us
         )
         .bind(session_id)
         .bind(&usage.resolved_connection_id)
-        .fetch_optional(db)
+        .fetch_optional(&mut *db)
         .await?;
         if let Some((alias, target)) = names {
             usage.alias_connection_name = alias;
             usage.resolved_connection_name = target;
             return Ok(());
+        }
+        // Maintenance calls pin a direct connection too. Keep that actual
+        // account only when it is this session's selected concrete connection;
+        // never accept another session's grant or worker-supplied display name.
+        if usage.keep_warm {
+            let direct: Option<(String, String, String)> = sqlx::query_as(
+                "SELECT c.name, c.realms, s.realm FROM sessions s JOIN connections c ON c.id = s.connection_id \
+                 WHERE s.id = ? AND c.id = ? AND c.kind NOT IN ('alias', 'pool')",
+            )
+            .bind(session_id)
+            .bind(&usage.resolved_connection_id)
+            .fetch_optional(&mut *db)
+            .await?;
+            if let Some((name, realms, realm)) = direct
+                && crate::realms::available(&realms, &realm)
+            {
+                usage.resolved_connection_name = name;
+                usage.alias_connection_name.clear();
+                return Ok(());
+            }
         }
     }
     usage.resolved_connection_id.clear();

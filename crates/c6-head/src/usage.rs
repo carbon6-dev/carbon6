@@ -23,8 +23,8 @@ const BUDGET_STATE: &str = "budget_state";
 /// Records a model call (while its event is stored).
 pub async fn record(tx: &mut sqlx::SqliteConnection, session_id: &str, seq: u64, ts: i64, u: &c6_proto::Usage) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT OR IGNORE INTO usage (session_id, seq, ts, connection_id, model, input, output, cache_read, cache_write, realm) \
-         SELECT ?, ?, ?, COALESCE(NULLIF(?, ''), connection_id), CASE WHEN ? = '' THEN model ELSE ? END, ?, ?, ?, ?, realm FROM sessions WHERE id = ?",
+        "INSERT OR IGNORE INTO usage (session_id, seq, ts, connection_id, model, input, output, cache_read, cache_write, keep_warm, realm) \
+         SELECT ?, ?, ?, COALESCE(NULLIF(?, ''), connection_id), CASE WHEN ? = '' THEN model ELSE ? END, ?, ?, ?, ?, ?, realm FROM sessions WHERE id = ?",
     )
     .bind(session_id)
     .bind(seq as i64)
@@ -36,9 +36,11 @@ pub async fn record(tx: &mut sqlx::SqliteConnection, session_id: &str, seq: u64,
     .bind(u.output_tokens as i64)
     .bind(u.cache_read_tokens as i64)
     .bind(u.cache_write_tokens as i64)
+    .bind(u.keep_warm)
     .bind(session_id)
     .execute(&mut *tx)
     .await?;
+    crate::cache_lifetime::record(tx, session_id, seq).await?;
     Ok(())
 }
 
@@ -265,7 +267,7 @@ pub fn check_budgets(budgets: &[api::Budget]) -> anyhow::Result<()> {
 }
 
 /// The price for a model: an exact entry, else the longest matching prefix.
-fn price_for<'a>(prices: &'a [api::Price], model: &str) -> Option<&'a api::Price> {
+pub(crate) fn price_for<'a>(prices: &'a [api::Price], model: &str) -> Option<&'a api::Price> {
     prices.iter().find(|p| p.model == model).or_else(|| {
         prices
             .iter()
@@ -277,6 +279,7 @@ fn price_for<'a>(prices: &'a [api::Price], model: &str) -> Option<&'a api::Price
 
 /// A model call.
 pub(crate) struct Call {
+    pub(crate) keep_warm: bool,
     pub(crate) session_id: String,
     pub(crate) ts: i64,
     pub(crate) connection_id: String,
@@ -317,6 +320,7 @@ pub(crate) async fn calls_since(st: &HeadState, since_ms: i64) -> anyhow::Result
     Ok(rows
         .iter()
         .map(|r| Call {
+            keep_warm: r.get("keep_warm"),
             session_id: r.get("session_id"),
             ts: r.get("ts"),
             connection_id: r.get("connection_id"),
@@ -350,6 +354,7 @@ pub async fn as_points(
         .iter()
         .map(|r| {
             let c = Call {
+                keep_warm: r.get("keep_warm"),
                 session_id: r.get("session_id"),
                 ts: r.get("ts"),
                 connection_id: r.get("connection_id"),
@@ -513,7 +518,7 @@ pub(crate) fn unattended_calls(events: &[c6_proto::SessionEvent]) -> std::collec
                 turn = None;
                 unattended = false;
             }
-            Some(Kind::Usage(_)) if unattended => {
+            Some(Kind::Usage(u)) if unattended && !u.keep_warm => {
                 calls.insert(event.seq as i64);
             }
             _ => {}
@@ -595,6 +600,7 @@ pub async fn cost_of(st: &HeadState, session_ids: &[String]) -> anyhow::Result<(
     let mut cost = 0.0;
     for r in &rows {
         let c = Call {
+            keep_warm: r.get("keep_warm"),
             session_id: String::new(),
             ts: 0,
             connection_id: String::new(),
@@ -628,6 +634,7 @@ pub async fn report(st: &HeadState, days: u32, filter: &[String], realm: Option<
     let connections: HashMap<String, String> = st.store.connections().await?.into_iter().map(|c| (c.id, c.name)).collect();
     let mut sessions = Sessions::default();
     let mut total = api::UsageRow { key: "total".into(), ..Default::default() };
+    let mut keep_warm = api::UsageRow { key: "keep_warm".into(), name: "Keep-warm".into(), ..Default::default() };
     let (mut by_day, mut by_model, mut by_connection, mut by_label, mut by_session) =
         (BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
     let mut unpriced = std::collections::BTreeSet::new();
@@ -642,6 +649,9 @@ pub async fn report(st: &HeadState, days: u32, filter: &[String], realm: Option<
             unpriced.insert(c.model.clone());
         }
         add(&mut total, &c, cost);
+        if c.keep_warm {
+            add(&mut keep_warm, &c, cost);
+        }
         let day = Local.timestamp_millis_opt(c.ts).single().map(|t| t.format("%Y-%m-%d").to_string()).unwrap_or_default();
         let row = |m: &mut BTreeMap<String, api::UsageRow>, key: String, name: String| {
             add(m.entry(key.clone()).or_insert_with(|| api::UsageRow { key, name, ..Default::default() }), &c, cost);
@@ -690,6 +700,7 @@ pub async fn report(st: &HeadState, days: u32, filter: &[String], realm: Option<
     Ok(api::UsageReport {
         since_ms: since.timestamp_millis(),
         total,
+        keep_warm,
         by_day: by_day.into_values().collect(),
         by_model: by_cost(by_model, 50),
         by_connection: by_cost(by_connection, 50),
@@ -704,6 +715,77 @@ pub async fn report(st: &HeadState, days: u32, filter: &[String], realm: Option<
 mod tests {
     use super::*;
     use crate::store::Store;
+
+    #[tokio::test]
+    async fn keep_warm_usage_is_a_priced_subset_of_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        let worker = c6_core::WorkerId::new();
+        backfill_session(&st.store, worker, "priced", 0).await;
+        backfill_session(&st.store, worker, "unpriced", 0).await;
+        st.store.set_setting(PRICES, r#"[{"model":"model","input":2.0,"output":4.0,"cache_read":0.2,"cache_write":2.5}]"#).await.unwrap();
+        let now = Local::now().timestamp_millis();
+        let event = |seq, model: &str, keep_warm| c6_proto::SessionEvent {
+            seq,
+            ts_ms: now,
+            kind: Some(c6_proto::session_event::Kind::Usage(c6_proto::Usage {
+                model: model.into(),
+                keep_warm,
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_read_tokens: 200,
+                cache_write_tokens: 20,
+                ..Default::default()
+            })),
+        };
+        let events = [event(1, "model", false), event(2, "model", true)];
+        st.store.ingest(worker, "priced", &events).await.unwrap();
+        // Replay must not count the maintenance call twice.
+        st.store.ingest(worker, "priced", &events).await.unwrap();
+        st.store.ingest(worker, "unpriced", &[event(1, "unknown", true)]).await.unwrap();
+        let r = report(st, 1, &[], Some("home")).await.unwrap();
+        assert_eq!((r.total.calls, r.keep_warm.calls, r.keep_warm.unpriced_calls), (3, 2, 1));
+        assert_eq!((r.keep_warm.input, r.keep_warm.output, r.keep_warm.cache_read, r.keep_warm.cache_write), (200, 20, 400, 40));
+        assert!((r.keep_warm.cost - 0.00033).abs() < 1e-12);
+        assert!((r.total.cost - 2.0 * r.keep_warm.cost).abs() < 1e-12);
+        assert_eq!(r.by_day[0].calls, 3);
+        assert_eq!(r.by_model.iter().map(|r| r.calls).sum::<u64>(), 3);
+        assert_eq!(r.top_sessions.iter().map(|r| r.calls).sum::<u64>(), 3);
+        assert_eq!(r.unpriced_models, ["unknown"]);
+        let budget = api::Budget {
+            name: "All calls".into(),
+            applies_to: vec![],
+            period: "day".into(),
+            limit: 1.0,
+            action: "block".into(),
+            enabled: true,
+        };
+        assert_eq!(
+            spent(st, &budget, &Some("home".into()), &prices(st).await.unwrap(), &mut Sessions::default()).await.unwrap(),
+            r.total.cost
+        );
+        let (cost, calls) = cost_of(st, &["priced".into(), "unpriced".into()]).await.unwrap();
+        assert_eq!((cost, calls), (r.total.cost, 3));
+        assert_eq!(report(st, 1, &[], Some("elsewhere")).await.unwrap().keep_warm.calls, 0);
+        assert_eq!(report(st, 1, &["missing".into()], None).await.unwrap().keep_warm.calls, 0);
+        let a = crate::analytics::report(st, 1, &[], "repo", Some("home")).await.unwrap();
+        assert_eq!((a.total.calls, a.total.keep_warm_calls), (3, 2));
+        assert_eq!(a.total.keep_warm_cost, r.keep_warm.cost);
+        assert_eq!(a.by_day[0].keep_warm_calls, 2);
+        assert_eq!(a.by_model.iter().map(|r| r.keep_warm_calls).sum::<u64>(), 2);
+        assert_eq!(a.by_group.iter().map(|r| r.keep_warm_calls).sum::<u64>(), 2);
+        head.shutdown().await.unwrap();
+    }
 
     #[test]
     fn plan_awareness_identifies_notice_started_calls_from_the_journal() {
@@ -741,6 +823,24 @@ mod tests {
         .map(|(i, kind)| c6_proto::SessionEvent { seq: (i + 1) as u64, ts_ms: i as i64, kind: Some(kind) })
         .collect::<Vec<_>>();
         assert_eq!(unattended_calls(&events), [10].into());
+    }
+
+    #[test]
+    fn plan_awareness_excludes_keep_warm_calls_from_open_notice_turns() {
+        use c6_proto::session_event::Kind;
+        let kinds = [
+            Kind::NoticeQueued(c6_proto::NoticeQueued { command_id: "report".into(), ..Default::default() }),
+            Kind::User(c6_proto::UserMessage { command_id: "report".into(), ..Default::default() }),
+            Kind::TurnStarted(c6_proto::TurnStarted { turn: 1, ..Default::default() }),
+            Kind::Usage(c6_proto::Usage { keep_warm: true, ..Default::default() }),
+            Kind::Usage(c6_proto::Usage::default()),
+        ];
+        let events = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| c6_proto::SessionEvent { seq: (i + 1) as u64, kind: Some(kind), ..Default::default() })
+            .collect::<Vec<_>>();
+        assert_eq!(unattended_calls(&events), [5].into());
     }
 
     fn usage_event(seq: i64) -> c6_proto::SessionEvent {
@@ -782,6 +882,34 @@ mod tests {
 
     async fn derived_counts(store: &Store) -> (i64, i64) {
         sqlx::query_as("SELECT (SELECT COUNT(*) FROM usage), (SELECT COUNT(*) FROM activity)").fetch_one(&store.pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn keep_warm_flag_survives_backfill_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("head.db");
+        let store = Store::open(&path).await.unwrap();
+        backfill_session(&store, c6_core::WorkerId::new(), "history", 2).await;
+        let mut event = usage_event(2);
+        if let Some(c6_proto::session_event::Kind::Usage(u)) = &mut event.kind {
+            u.keep_warm = true;
+        }
+        sqlx::query("UPDATE events SET data = ? WHERE session_id = 'history' AND seq = 2")
+            .bind(event.encode_to_vec())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        // An old-style insertion omitting the additive column stays ordinary.
+        sqlx::query("INSERT INTO usage (session_id, seq, ts, connection_id, model, input, output, cache_read, cache_write) VALUES ('history', 1, 1, 'c', 'model', 5, 0, 0, 0)")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(backfill_batch(&store.pool, EventBackfill::Usage).await.unwrap(), Some(2));
+        store.pool.close().await;
+        drop(store);
+        let store = Store::open(&path).await.unwrap();
+        let flags: Vec<bool> = sqlx::query_scalar("SELECT keep_warm FROM usage ORDER BY seq").fetch_all(&store.pool).await.unwrap();
+        assert_eq!(flags, [false, true]);
     }
 
     #[tokio::test]
@@ -856,6 +984,7 @@ mod tests {
         assert_eq!(price_for(&prices, "claude-haiku-4-5").unwrap().input, 1.0);
         assert!(price_for(&prices, "qwen3.6:27b").is_none());
         let c = Call {
+            keep_warm: false,
             session_id: String::new(),
             ts: 0,
             connection_id: String::new(),

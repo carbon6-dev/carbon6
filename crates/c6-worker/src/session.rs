@@ -331,6 +331,10 @@ enum RecoveryAction {
 #[derive(Default)]
 struct RecoveryGate {
     epoch: u64,
+    /// A projection of the actor's timer, not independent work/liveness evidence.
+    keep_warm_next_ms: std::sync::atomic::AtomicI64,
+    has_turn: std::sync::atomic::AtomicBool,
+    waiting_schedule: std::sync::atomic::AtomicBool,
     active: std::sync::atomic::AtomicBool,
     adopting: std::sync::atomic::AtomicBool,
     activity: Arc<std::sync::atomic::AtomicI32>,
@@ -992,6 +996,23 @@ impl SessionManager {
                     running_background_tasks,
                     running_background_processes,
                     held_process: held_process.unwrap_or_default() as i32,
+                    waiting_on: if state != SessionActorState::Idle {
+                        ""
+                    } else if running_background_tasks > 0 {
+                        "background"
+                    } else if a.recovery.waiting_schedule.load(Ordering::Relaxed) {
+                        "schedule"
+                    } else if !a.recovery.has_turn.load(Ordering::Relaxed) {
+                        "nothing"
+                    } else {
+                        "user"
+                    }
+                    .into(),
+                    keep_warm_next_ms: if state == SessionActorState::Idle {
+                        a.recovery.keep_warm_next_ms.load(Ordering::Relaxed)
+                    } else {
+                        0
+                    },
                 }
             })
             .collect();
@@ -2121,6 +2142,7 @@ impl SessionManager {
         writer.ownership_epoch = epoch;
         writer.disk_probe = Some((self.disk.clone(), self.state_dir.clone()));
         let writer = Arc::new(writer);
+        writer.set_keep_warm_capture(&spec);
         // On an SSH target, what runs on the worker (hooks, MCP servers)
         // runs in a local folder of the session's.
         let remote = !started.ssh_target.is_empty();
@@ -2313,7 +2335,12 @@ impl SessionManager {
             stopping: false,
             stopped_until: None,
         };
-        let recovery = Arc::new(RecoveryGate { epoch, activity: actor.writer.activity.clone(), ..Default::default() });
+        let recovery = Arc::new(RecoveryGate {
+            epoch,
+            activity: actor.writer.activity.clone(),
+            has_turn: std::sync::atomic::AtomicBool::new(turns > 0),
+            ..Default::default()
+        });
         let handle = Handle {
             tx,
             recovery: recovery.clone(),
@@ -3523,6 +3550,109 @@ type ParentTools = (Arc<SessionTools>, bool);
 /// process if it is still up. `None`: the turn failed to record itself.
 type TurnTask = tokio::task::JoinHandle<Option<(Conversation, Option<crate::claude_code::Process>)>>;
 
+enum CacheWarmAction {
+    Due { expires_ms: u64 },
+    Recorded,
+    Ineligible,
+}
+
+/// A timer or a single native request. Dropping the actor (including recovery
+/// and moves) cancels it; no detached timer can ping a previous owner.
+struct CacheWarmJob(tokio::task::JoinHandle<anyhow::Result<CacheWarmAction>>);
+
+impl Drop for CacheWarmJob {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct CacheWarmKey {
+    call_ms: i64,
+    wait_ms: i64,
+    connection_id: String,
+    model: String,
+    settings: c6_api::KeepWarmSettings,
+}
+
+fn cache_warm_timer(
+    key: CacheWarmKey,
+    kind: String,
+    observation: CacheObservation,
+    writer: Arc<Writer>,
+    gate: Arc<RecoveryGate>,
+) -> CacheWarmJob {
+    CacheWarmJob(tokio::spawn(async move {
+        use crate::keep_warm::{CacheEconomics, KeepWarmInput, WaitingOn};
+        let Some((_, usage)) = observation.usage else { return Ok(CacheWarmAction::Ineligible) };
+        // The head owns learning; a temporary disconnect retains conservative
+        // provider defaults. Compatible/local endpoints have no such default.
+        let learned = writer
+            .link
+            .call(
+                "session.cache_lifetime",
+                serde_json::json!({
+                    "session_id": writer.session_id,
+                    "connection_id": key.connection_id,
+                    "model": key.model,
+                }),
+            )
+            .await
+            .ok();
+        let ttl = learned.as_ref().and_then(|v| v["lifetime_seconds"].as_u64()).or(match kind.as_str() {
+            "claude_code" => Some(3_600),
+            "anthropic" => Some(300),
+            "openai" | "chatgpt" => Some(600),
+            _ => None,
+        });
+        let observed = usage.cache_read_tokens > 0
+            || learned.as_ref().is_some_and(|v| v["cache_observed"].as_bool() == Some(true))
+            || matches!(kind.as_str(), "claude_code" | "anthropic" | "openai" | "chatgpt");
+        let ratio = learned.as_ref().and_then(|v| v["read_to_rewrite_ratio"].as_f64()).or(match kind.as_str() {
+            "claude_code" | "anthropic" | "chatgpt" => Some(0.1),
+            // An unknown OpenAI model may discount cache reads by only half.
+            "openai" => Some(0.5),
+            _ => None,
+        });
+        let economics = learned
+            .as_ref()
+            .and_then(|v| serde_json::from_value::<c6_api::Price>(v["price"].clone()).ok())
+            .and_then(|price| CacheEconomics::from_price(&price, observed))
+            .or_else(|| ratio.map(|read_to_rewrite_ratio| CacheEconomics { read_to_rewrite_ratio, cache_observed: observed }));
+        // Usage can be published long after a request began (especially by
+        // Claude Code). Never count generation time as fresh cache lifetime.
+        let last_call_ms = if usage.keep_warm || kind == "claude_code" {
+            observation.last_call_started_ms
+        } else {
+            writer.journal.keep_warm_call_ms(&writer.session_id).await?
+        };
+        let Some(last_call_ms) = last_call_ms else { return Ok(CacheWarmAction::Ineligible) };
+        let last_call_ms = last_call_ms.min(key.call_ms).max(0) as u64;
+        let input = KeepWarmInput {
+            connection_id: &key.connection_id,
+            waiting_on: WaitingOn::Background,
+            context_tokens: crate::keep_warm::context_tokens(&c6_llm::Usage {
+                input_tokens: usage.input_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                ..Default::default()
+            }),
+            lifetime_seconds: ttl,
+            last_call_ms,
+            wait_start_ms: key.wait_ms.max(0) as u64,
+            now_ms: writer.now_ms().max(0) as u64,
+            pings_sent: observation.pings_sent,
+            projected_remaining_seconds: None,
+            economics,
+        };
+        let Some(due_ms) = crate::keep_warm::schedule(&key.settings, &input) else { return Ok(CacheWarmAction::Ineligible) };
+        gate.keep_warm_next_ms.store(due_ms.min(i64::MAX as u64) as i64, Ordering::Relaxed);
+        let delay = due_ms.saturating_sub(writer.now_ms().max(0) as u64);
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        Ok(CacheWarmAction::Due { expires_ms: last_call_ms.saturating_add(ttl.unwrap_or(0).saturating_mul(1_000)) })
+    }))
+}
+
 struct PendingTaskEvent {
     record: BackgroundTask,
     notice: Option<String>,
@@ -3568,6 +3698,47 @@ fn recover_rewind_queue(
 }
 
 impl Actor {
+    fn cache_warm_candidate(&self) -> Option<(CacheWarmKey, String, CacheObservation)> {
+        let settings = self
+            .spec
+            .keep_warm_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<c6_api::KeepWarmSettings>(json).ok())
+            .unwrap_or_default();
+        let model = self.spec.model.as_ref()?;
+        if !settings.enabled || settings.disabled_connections.contains(&model.connection_id) {
+            return None;
+        }
+        let waiting = crate::keep_warm::waiting_on(
+            &self.session_tools.background.list(),
+            self.claude.as_ref().is_some_and(|process| process.tasks_running()),
+            self.running_flag.load(Ordering::Acquire),
+        );
+        if waiting != crate::keep_warm::WaitingOn::Background {
+            return None;
+        }
+        let observation = self.writer.cache_observation.lock().unwrap().clone();
+        let (call_ms, usage) = observation.usage.as_ref()?;
+        let context = usage.input_tokens.saturating_add(usage.cache_read_tokens).saturating_add(usage.cache_write_tokens);
+        if context == 0
+            || context < settings.threshold_tokens
+            || (usage.keep_warm && usage.cache_read_tokens < context.saturating_sub(context / 5))
+        {
+            // An eviction or a provider that stopped honoring caching can
+            // turn a ping into a rewrite. Do not budget subsequent pings as
+            // cheap reads after observing that expensive outcome.
+            return None;
+        }
+        let connection_id =
+            if usage.resolved_connection_id.is_empty() { model.connection_id.clone() } else { usage.resolved_connection_id.clone() };
+        if settings.disabled_connections.contains(&connection_id) {
+            return None;
+        }
+        let key =
+            CacheWarmKey { call_ms: *call_ms, wait_ms: observation.wait_started_ms?, connection_id, model: usage.model.clone(), settings };
+        Some((key, model.connection_kind.clone(), observation))
+    }
+
     /// Keep the mailbox and tool sinks alive while the journal is unavailable.
     /// In particular, background callbacks cannot be recovered by head input
     /// redelivery. The old turn must finish dropping before its cursor is reset.
@@ -3759,6 +3930,7 @@ impl Actor {
         }
         self.conv = Some(conversation_from_log(&mut spec, &events));
         self.spec = spec;
+        self.writer.set_keep_warm_capture(&self.spec);
         *self.launch_limits.lock().unwrap() = crate::subagent::LaunchLimits::of(&self.spec);
         if let Some(started) = events.iter().find_map(|e| match &e.kind {
             Some(session_event::Kind::Started(s)) => Some(s.clone()),
@@ -3829,7 +4001,17 @@ impl Actor {
         // its cursor, including when the runtime aborts this actor task.
         let _shell_contexts = CancelShellContexts(self.session_tools.clone());
         match self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await {
-            Ok(events) => self.withdrawn = withdrawn_sources(&events),
+            Ok(events) => {
+                if let Some(last) = events.last() {
+                    self.writer.advance_clock_to(last.ts_ms);
+                }
+                self.withdrawn = withdrawn_sources(&events);
+                let mut observation = CacheObservation::default();
+                for event in &events {
+                    observation.observe(event);
+                }
+                *self.writer.cache_observation.lock().unwrap() = observation;
+            }
             Err(e) => {
                 error!("loading withdrawn task sources: {e:#}");
                 return;
@@ -3888,6 +4070,8 @@ impl Actor {
         let mut launch_queued = false;
         let mut launch_admission = None::<(String, crate::resource_pressure::Admission)>;
         let mut maintenance_running = false;
+        let mut cache_warm_job: Option<CacheWarmJob> = None;
+        let mut cache_warm_key: Option<CacheWarmKey> = None;
         self.rewinds = recover_rewind_queue(self.runs_claude_code(), std::mem::take(&mut self.rewinds), reset);
         loop {
             while running.is_none()
@@ -4017,7 +4201,9 @@ impl Actor {
                 *running = Some(self.start_turn());
                 self.running_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            let idle_until = self.claude.as_ref().filter(|_| running.is_none()).and_then(|p| p.idle_until(self.claude_idle()));
+            let held_background = background_liveness_counts(&self.session_tools.background.list()).0 > 0;
+            let idle_until =
+                self.claude.as_ref().filter(|_| running.is_none() && !held_background).and_then(|p| p.idle_until(self.claude_idle()));
             // Claude Code's tasks that ended while it waited, if it doesn't
             // start a turn for them by itself.
             let wake_at =
@@ -4028,6 +4214,33 @@ impl Actor {
             // Maintenance blocks runtime replacement, not idle notice guards:
             // there is no model turn for a callback to join while it runs.
             let turn_running = running.is_some() && !maintenance_running;
+            let candidate = if rewind_blocked
+                || adoption_blocked
+                || running.is_some()
+                || !self.inbox.lock().unwrap().queue.is_empty()
+                || !self.link.is_connected()
+            {
+                None
+            } else {
+                self.cache_warm_candidate()
+            };
+            gate.has_turn.store(self.turns > 0, Ordering::Relaxed);
+            gate.waiting_schedule.store(retry_at.is_some() || wake_at.is_some(), Ordering::Relaxed);
+            if candidate.as_ref().map(|(key, _, _)| key) != cache_warm_key.as_ref() {
+                cache_warm_job = None;
+                gate.keep_warm_next_ms.store(0, Ordering::Relaxed);
+                cache_warm_key = candidate.as_ref().map(|(key, _, _)| key.clone());
+                if let Some((key, kind, observation)) = candidate
+                    && observation.last_attempt_call_ms != Some(key.call_ms)
+                {
+                    // Wait-boundary trimming integration hook (context-economy
+                    // §3.1): trim carbon6-held work here before arming the timer.
+                    // A Claude Code process with native tasks must NEVER be
+                    // restarted to trim; keep this prefix warm untrimmed and
+                    // defer that agent's quiet-turn trim until its tasks finish.
+                    cache_warm_job = Some(cache_warm_timer(key, kind, observation, self.writer.clone(), gate.clone()));
+                }
+            }
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => return,
@@ -4245,6 +4458,7 @@ impl Actor {
                     Some(ActorMsg::NoticeLimits(limits)) => {
                         let previous = crate::subagent::LaunchLimits::of(&self.spec);
                         crate::subagent::LaunchLimits::apply_notice_limits(&mut self.spec, &limits);
+                        self.writer.set_keep_warm_capture(&self.spec);
                         if previous == crate::subagent::LaunchLimits::of(&self.spec) {
                             continue;
                         }
@@ -4265,6 +4479,7 @@ impl Actor {
                                     "max_running_subagents": limits.max_running_subagents,
                                     "claude_code_trim_enabled": self.spec.claude_code_trim_enabled.unwrap_or(true),
                                     "claude_code_trim_at": self.spec.claude_code_trim_at,
+                                    "keep_warm_json": limits.keep_warm_json,
                                 }).to_string(),
                                 priority: "low".into(),
                                 quiet: true,
@@ -4597,6 +4812,79 @@ impl Actor {
                     }
                 },
                 _ = tokio::time::sleep_until(launch_retry.unwrap_or_else(tokio::time::Instant::now)), if launch_retry.is_some() => {}
+                result = async { (&mut cache_warm_job.as_mut().expect("checked").0).await }, if cache_warm_job.is_some() => {
+                    cache_warm_job = None;
+                    gate.keep_warm_next_ms.store(0, Ordering::Relaxed);
+                    match result {
+                        Ok(Ok(CacheWarmAction::Due { expires_ms })) => {
+                            // Completion callbacks and real inputs win over a
+                            // ready timer, including an event queued this tick.
+                            if !rx.is_empty()
+                                || self.writer.now_ms().max(0) as u64 >= expires_ms
+                                || self.cache_warm_candidate().as_ref().map(|(key, _, _)| key) != cache_warm_key.as_ref()
+                            {
+                                cache_warm_key = None;
+                                continue;
+                            }
+                            // A journaled claim travels with moves and survives
+                            // crashes before a reply. Ambiguous in-flight calls
+                            // are never sent a second time after adoption.
+                            let Some(key) = cache_warm_key.as_ref() else { continue };
+                            if let Err(e) = self.writer.append(session_event::Kind::Notice(c6_proto::Notice {
+                                title: "Cache maintenance attempted".into(), message: key.call_ms.to_string(),
+                                priority: "low".into(), quiet: true,
+                            })).await {
+                                error!(session = %self.writer.session_id, "claiming keep-warm request: {e:#}");
+                                return;
+                            }
+                            let text = spec_prompt(&self.spec, "session.keep_warm", c6_agent::KEEP_WARM_NOTE);
+                            let deadline = tokio::time::Instant::now()
+                                + Duration::from_millis(expires_ms.saturating_sub(self.writer.now_ms().max(0) as u64));
+                            if self.runs_claude_code() {
+                                if let Some(process) = self.claude.as_mut()
+                                    && let Err(e) = process.send_keep_warm_until(&text, &(self.writer.clone() as Arc<dyn EventSink>), deadline).await
+                                {
+                                    warn!(session = %self.writer.session_id, "Claude Code keep-warm skipped: {e:#}");
+                                }
+                            } else {
+                                let journal = self.journal.clone();
+                                let link = self.link.clone();
+                                let session_id = self.writer.session_id.clone();
+                                let on_behalf_of = self.on_behalf_of.clone();
+                                let epoch = self.writer.ownership_epoch;
+                                let writer = self.writer.clone();
+                                cache_warm_job = Some(CacheWarmJob(tokio::spawn(async move {
+                                    journal.check_ownership(&session_id, epoch).await?;
+                                    let Some(snapshot) = journal.load_keep_warm_snapshot(&session_id).await? else {
+                                        return Ok(CacheWarmAction::Ineligible);
+                                    };
+                                    if writer.now_ms().max(0) as u64 >= expires_ms {
+                                        return Ok(CacheWarmAction::Ineligible);
+                                    }
+                                    let usage = match link.keep_warm_until(&on_behalf_of, &snapshot, &text, deadline).await {
+                                        Ok(usage) => usage,
+                                        Err(error) => {
+                                            journal.clear_keep_warm_snapshot(&session_id, epoch).await?;
+                                            return Err(error);
+                                        }
+                                    };
+                                    // Persist before returning task completion:
+                                    // a simultaneously-ready real input may
+                                    // drop this job without selecting its result.
+                                    writer.append(session_event::Kind::Usage(usage)).await?;
+                                    writer.append(session_event::Kind::Notice(c6_proto::Notice {
+                                        title: "Kept the cache warm".into(), message: String::new(), priority: "low".into(), quiet: true,
+                                    })).await?;
+                                    Ok(CacheWarmAction::Recorded)
+                                })));
+                            }
+                        }
+                        Ok(Ok(CacheWarmAction::Recorded)) => {}
+                        Ok(Ok(CacheWarmAction::Ineligible)) => {}
+                        Ok(Err(e)) => warn!(session = %self.writer.session_id, "keep-warm skipped: {e:#}"),
+                        Err(e) => warn!(session = %self.writer.session_id, "keep-warm task stopped: {e}"),
+                    }
+                }
                 _ = tokio::time::sleep_until(self.local_report_retry_at.unwrap_or_else(tokio::time::Instant::now)), if self.local_report_retry_at.is_some() => {
                     if let Err(e) = self.settle_delegations().await {
                         warn!(session = %self.writer.session_id, "retrying a subagent's report: {e:#}");
@@ -6172,6 +6460,7 @@ impl Actor {
         // An effort change keeps the model, and with it the reasoning.
         let same_model = (&current.connection_id, &current.model) == (&model.connection_id, &model.model);
         self.spec.model = Some(model);
+        self.writer.set_keep_warm_capture(&self.spec);
         if !same_model && let Some(conv) = &mut self.conv {
             conv.history = c6_agent::portable_messages(std::mem::take(&mut conv.history));
         }
@@ -6320,6 +6609,7 @@ impl Actor {
             .await?;
         info!(session = %sid, model = %model.model, runtime = %handoff.tool_profile, "handed over");
         self.spec.model = Some(model);
+        self.writer.set_keep_warm_capture(&self.spec);
         apply_handoff(&mut self.started, &handoff);
         self.tools = tools;
         self.claude_code.store(into_claude_code, std::sync::atomic::Ordering::SeqCst);
@@ -7761,7 +8051,7 @@ pub(crate) struct Writer {
     pub journal: Arc<Journal>,
     pub link: Arc<HeadLink>,
     pub next_seq: tokio::sync::Mutex<u64>,
-    ownership_epoch: u64,
+    pub(crate) ownership_epoch: u64,
     /// `next_seq` as of the last append, read without waiting on one: what
     /// streamed text is stamped with.
     logged: std::sync::atomic::AtomicU64,
@@ -7770,6 +8060,76 @@ pub(crate) struct Writer {
     outstanding_tools: Mutex<HashMap<String, bool>>,
     disk_probe: Option<(Arc<crate::disk::Monitor>, PathBuf)>,
     resource_failure: std::sync::atomic::AtomicBool,
+    cache_observation: Mutex<CacheObservation>,
+    cache_capture: Mutex<(bool, u64)>,
+    cache_clock: (std::sync::atomic::AtomicI64, tokio::time::Instant),
+}
+
+/// Rebuilt from the same usage/turn journal that drives accounting. Background
+/// liveness is deliberately not stored here: the existing registry owns it.
+#[derive(Clone, Default)]
+struct CacheObservation {
+    usage: Option<(i64, c6_proto::Usage)>,
+    // Conservative lower bounds for opaque CLI request starts. Tool results
+    // and input precede a call; its completed assistant/usage do not.
+    call_boundary_ms: Option<i64>,
+    call_started_ms: Option<i64>,
+    last_call_started_ms: Option<i64>,
+    last_attempt_at_ms: Option<i64>,
+    wait_started_ms: Option<i64>,
+    pings_sent: u64,
+    last_attempt_call_ms: Option<i64>,
+}
+
+impl CacheObservation {
+    fn observe(&mut self, event: &SessionEvent) {
+        match &event.kind {
+            Some(session_event::Kind::Usage(usage)) => {
+                if usage.keep_warm {
+                    self.pings_sent = self.pings_sent.saturating_add(1);
+                    self.last_call_started_ms = self.last_attempt_at_ms;
+                } else {
+                    self.last_call_started_ms = self.call_started_ms.take().or(self.call_boundary_ms);
+                    self.call_boundary_ms = Some(event.ts_ms);
+                }
+                self.usage = Some((event.ts_ms, usage.clone()));
+            }
+            Some(session_event::Kind::Assistant(_)) => {
+                if self.call_started_ms.is_none() {
+                    self.call_started_ms = self.call_boundary_ms;
+                }
+            }
+            Some(session_event::Kind::ToolResult(_)) => self.call_boundary_ms = Some(event.ts_ms),
+            Some(session_event::Kind::TurnEnded(end)) => {
+                self.wait_started_ms = (end.reason == TurnEndReason::Completed as i32).then_some(event.ts_ms);
+                self.pings_sent = 0;
+            }
+            Some(session_event::Kind::User(_) | session_event::Kind::TurnStarted(_) | session_event::Kind::Rewound(_)) => {
+                self.wait_started_ms = None;
+                self.pings_sent = 0;
+                self.call_boundary_ms = Some(event.ts_ms);
+                self.call_started_ms = None;
+            }
+            Some(session_event::Kind::Notice(notice)) if notice.quiet && notice.title == "Cache maintenance attempted" => {
+                self.last_attempt_call_ms = notice.message.parse().ok();
+                self.last_attempt_at_ms = Some(event.ts_ms);
+            }
+            Some(session_event::Kind::Notice(notice)) if notice.quiet && notice.title == "Cache maintenance failed" => {
+                self.wait_started_ms = None;
+            }
+            Some(session_event::Kind::ModelSwitched(_) | session_event::Kind::PlaceChanged(_) | session_event::Kind::Compaction(_)) => {
+                // A new account, runtime or rewritten prompt must earn its
+                // own completed-call evidence before maintenance can start.
+                *self = Self::default();
+            }
+            Some(session_event::Kind::Notice(notice))
+                if notice.quiet && notice.title.starts_with("Trimmed ") && notice.title.ends_with("from Claude Code's context") =>
+            {
+                *self = Self::default();
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Writer {
@@ -7786,7 +8146,35 @@ impl Writer {
             outstanding_tools: Default::default(),
             disk_probe: None,
             resource_failure: Default::default(),
+            cache_observation: Default::default(),
+            cache_capture: Mutex::new((true, 50_000)),
+            cache_clock: (std::sync::atomic::AtomicI64::new(c6_core::now_ms()), tokio::time::Instant::now()),
         }
+    }
+
+    /// Wall-time journal timestamps advanced by Tokio's monotonic clock. This
+    /// makes cache timers injectable without changing the process wall clock.
+    pub(crate) fn now_ms(&self) -> i64 {
+        // Monotonic clocks may pause during machine sleep. Re-anchor forward
+        // so resuming an old timer cannot dispatch a now-cold request.
+        self.advance_clock_to(c6_core::now_ms());
+        self.cache_clock.0.load(Ordering::Relaxed).saturating_add(self.cache_clock.1.elapsed().as_millis().min(i64::MAX as u128) as i64)
+    }
+
+    fn advance_clock_to(&self, observed_ms: i64) {
+        let elapsed = self.cache_clock.1.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        self.cache_clock.0.fetch_max(observed_ms.saturating_sub(elapsed), Ordering::Relaxed);
+    }
+
+    fn set_keep_warm_capture(&self, spec: &CreateSession) {
+        let settings =
+            spec.keep_warm_json.as_deref().and_then(|json| serde_json::from_str::<c6_api::KeepWarmSettings>(json).ok()).unwrap_or_default();
+        let excluded = spec.model.as_ref().is_some_and(|model| settings.disabled_connections.contains(&model.connection_id));
+        *self.cache_capture.lock().unwrap() = (settings.enabled && !excluded, settings.threshold_tokens);
+    }
+
+    pub(crate) fn keep_warm_capture(&self) -> (bool, u64) {
+        *self.cache_capture.lock().unwrap()
     }
 
     pub(crate) fn set_activity(&self, kind: c6_proto::SessionActivityKind) {
@@ -7840,7 +8228,7 @@ impl EventSink for Writer {
         let mut next = self.next_seq.lock().await;
         // Streamed text first: it must not arrive after what it streamed.
         self.link.flush_ephemeral();
-        let ev = SessionEvent { seq: *next, ts_ms: c6_core::now_ms(), kind: Some(kind) };
+        let ev = SessionEvent { seq: *next, ts_ms: self.now_ms(), kind: Some(kind) };
         self.journal_result(self.journal.check_ownership(&self.session_id, self.ownership_epoch).await).await?;
         let count = if matches!(&ev.kind, Some(session_event::Kind::Rewound(_))) {
             self.journal_result(self.journal.append_rewind_owned(&self.session_id, &ev, self.ownership_epoch).await).await?
@@ -7849,6 +8237,7 @@ impl EventSink for Writer {
             1
         };
         *next += count;
+        self.cache_observation.lock().unwrap().observe(&ev);
         self.logged.store(*next, std::sync::atomic::Ordering::SeqCst);
         Ok(ev.seq)
     }
@@ -7863,9 +8252,12 @@ impl EventSink for Writer {
             .chain(std::iter::once(session_event::Kind::TurnStarted(TurnStarted { turn, ..Default::default() })));
         let events: Vec<_> = kinds
             .enumerate()
-            .map(|(offset, kind)| SessionEvent { seq: *next + offset as u64, ts_ms: c6_core::now_ms(), kind: Some(kind) })
+            .map(|(offset, kind)| SessionEvent { seq: *next + offset as u64, ts_ms: self.now_ms(), kind: Some(kind) })
             .collect();
         self.journal_result(self.journal.append_turn_owned(&self.session_id, &events, self.ownership_epoch).await).await?;
+        for event in &events {
+            self.cache_observation.lock().unwrap().observe(event);
+        }
         *next += events.len() as u64;
         self.logged.store(*next, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -10854,7 +11246,7 @@ mod notice_tests {
             max_running_subagents: Some(0),
             ..Default::default()
         };
-        tx.send(ActorMsg::NoticeLimits(limits)).unwrap();
+        tx.send(ActorMsg::NoticeLimits(limits.clone())).unwrap();
         barrier(&manager, "limits-refreshed").await;
         let (events, request) = completed_batch_in_real_time_after(&manager, &mock, initial).await;
         assert!(request.contains("report #1."), "raising the threshold should deliver the held failure without Continue");
@@ -13155,6 +13547,101 @@ mod writer_tests {
     use sqlx::Connection;
 
     use super::*;
+
+    #[tokio::test]
+    async fn keep_warm_clock_reanchors_after_sleep_and_remains_injectable() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        tokio::time::pause();
+        let writer = Writer::new("s".into(), journal, Arc::new(HeadLink::default()), 1);
+        // Model a monotonic clock that did not count the suspended interval.
+        writer.cache_clock.0.store(1, Ordering::Relaxed);
+        let wall = c6_core::now_ms();
+        let before = writer.now_ms();
+        assert!(before >= wall, "wall time must expire a timer after machine sleep");
+        tokio::time::advance(Duration::from_secs(3601)).await;
+        assert!(writer.now_ms() >= before + 3_601_000, "paused-clock tests still advance freshness");
+    }
+
+    #[test]
+    fn keep_warm_journal_rebuild_preserves_wait_cap_and_attempt_claim() {
+        let event = |ts_ms, kind| SessionEvent { ts_ms, kind: Some(kind), ..Default::default() };
+        let events = [
+            event(1_000, session_event::Kind::Usage(c6_proto::Usage::default())),
+            event(2_000, session_event::Kind::TurnEnded(TurnEnded { reason: TurnEndReason::Completed as i32, ..Default::default() })),
+            event(
+                3_000,
+                session_event::Kind::Notice(c6_proto::Notice {
+                    title: "Cache maintenance attempted".into(),
+                    message: "1000".into(),
+                    quiet: true,
+                    ..Default::default()
+                }),
+            ),
+            event(3_301_000, session_event::Kind::Usage(c6_proto::Usage { keep_warm: true, ..Default::default() })),
+        ];
+        let mut rebuilt = CacheObservation::default();
+        for event in &events {
+            rebuilt.observe(event);
+        }
+        assert_eq!(rebuilt.wait_started_ms, Some(2_000));
+        assert_eq!(rebuilt.last_attempt_call_ms, Some(1_000));
+        assert_eq!(rebuilt.pings_sent, 1);
+        assert_eq!(rebuilt.usage.as_ref().unwrap().0, 3_301_000);
+        assert_eq!(rebuilt.last_call_started_ms, Some(3_000), "generation time does not extend the cache lifetime");
+        rebuilt.observe(&event(3_302_000, session_event::Kind::User(Default::default())));
+        assert_eq!(rebuilt.wait_started_ms, None);
+        assert_eq!(rebuilt.pings_sent, 0);
+        rebuilt.observe(&event(
+            3_303_000,
+            session_event::Kind::TurnEnded(TurnEnded { reason: TurnEndReason::Completed as i32, ..Default::default() }),
+        ));
+        rebuilt.observe(&event(
+            3_304_000,
+            session_event::Kind::Notice(c6_proto::Notice { title: "Cache maintenance failed".into(), quiet: true, ..Default::default() }),
+        ));
+        assert_eq!(rebuilt.wait_started_ms, None, "a failed CLI ping cannot resume the warm loop");
+    }
+
+    #[test]
+    fn keep_warm_opaque_calls_use_a_pre_generation_bound() {
+        let mut observation = CacheObservation::default();
+        let mut observe = |ts_ms, kind| observation.observe(&SessionEvent { ts_ms, kind: Some(kind), ..Default::default() });
+        observe(1_000, session_event::Kind::TurnStarted(Default::default()));
+        observe(3_601_000, session_event::Kind::Assistant(Default::default()));
+        observe(3_602_000, session_event::Kind::Usage(Default::default()));
+        assert_eq!(observation.last_call_started_ms, Some(1_000), "a long answer cannot move a ping past cache expiry");
+        observation.observe(&SessionEvent {
+            ts_ms: 3_603_000,
+            kind: Some(session_event::Kind::ToolResult(Default::default())),
+            ..Default::default()
+        });
+        observation.observe(&SessionEvent {
+            ts_ms: 3_604_000,
+            kind: Some(session_event::Kind::Assistant(Default::default())),
+            ..Default::default()
+        });
+        observation.observe(&SessionEvent {
+            ts_ms: 3_605_000,
+            kind: Some(session_event::Kind::Usage(Default::default())),
+            ..Default::default()
+        });
+        assert_eq!(observation.last_call_started_ms, Some(3_603_000));
+        for kind in [
+            session_event::Kind::ModelSwitched(Default::default()),
+            session_event::Kind::PlaceChanged(Default::default()),
+            session_event::Kind::Compaction(Default::default()),
+            session_event::Kind::Notice(c6_proto::Notice {
+                title: "Trimmed 2 old tool outputs from Claude Code's context".into(),
+                quiet: true,
+                ..Default::default()
+            }),
+        ] {
+            let mut invalidated = observation.clone();
+            invalidated.observe(&SessionEvent { kind: Some(kind), ..Default::default() });
+            assert!(invalidated.usage.is_none(), "rewritten or switched prefixes cannot reuse previous cache evidence");
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn mailbox_probe_times_out_without_queuing_a_duplicate_and_recovers_on_ack() {

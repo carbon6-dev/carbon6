@@ -45,6 +45,22 @@ pub struct Journal {
     pub appended: Notify,
 }
 
+/// The last request after account-specific replay preparation. Contains no
+/// credential grant: pings must obtain a fresh grant for this exact target.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct KeepWarmSnapshot {
+    pub request: c6_llm::ModelRequest,
+    /// Complete provider output, kept separately so the cached input remains
+    /// byte-for-byte reproducible. Older/incomplete snapshots cannot be pinged.
+    #[serde(default)]
+    pub response: Option<c6_llm::Message>,
+    pub connection_id: String,
+    pub kind: String,
+    pub base_url: String,
+    pub last_call_ms: i64,
+    pub usage: c6_llm::Usage,
+}
+
 struct ShellOwner {
     journal: Arc<Journal>,
     session_id: String,
@@ -118,6 +134,150 @@ pub struct Cursor {
 }
 
 impl Journal {
+    /// Called before credential resolution / request dispatch, so a failed
+    /// foreground call cannot leave an older prefix eligible for a warm ping.
+    pub async fn clear_keep_warm_snapshot(&self, session_id: &str, epoch: u64) -> anyhow::Result<()> {
+        let mut tx = self.begin_write().await?;
+        check_ownership_in(&mut tx, session_id, epoch).await?;
+        sqlx::query("DELETE FROM keep_warm_snapshots WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn save_keep_warm_snapshot(&self, session_id: &str, snapshot: &KeepWarmSnapshot, epoch: u64) -> anyhow::Result<()> {
+        let data = serde_json::to_string(snapshot)?;
+        let generation = uuid::Uuid::now_v7().to_string();
+        let mut tx = self.begin_write().await?;
+        check_ownership_in(&mut tx, session_id, epoch).await?;
+        sqlx::query(
+            "INSERT INTO keep_warm_snapshots (session_id, call_ms, connection_id, generation, ready, data) VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(session_id) DO UPDATE SET call_ms = excluded.call_ms, connection_id = excluded.connection_id,
+                 generation = excluded.generation, ready = excluded.ready, data = excluded.data",
+        )
+        .bind(session_id)
+        .bind(snapshot.last_call_ms)
+        .bind(&snapshot.connection_id)
+        .bind(generation)
+        .bind(snapshot.response.is_some())
+        .bind(data)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn load_keep_warm_snapshot(&self, session_id: &str) -> anyhow::Result<Option<KeepWarmSnapshot>> {
+        let data: Option<String> = sqlx::query_scalar("SELECT data FROM keep_warm_snapshots WHERE session_id = ? AND data IS NOT NULL")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        data.map(|data| serde_json::from_str(&data).map_err(Into::into)).transpose()
+    }
+
+    /// Conservative cache age without loading or parsing a large request.
+    /// Unfinished, too-small and legacy response-less prefixes are excluded.
+    pub async fn keep_warm_call_ms(&self, session_id: &str) -> anyhow::Result<Option<i64>> {
+        Ok(sqlx::query_scalar("SELECT call_ms FROM keep_warm_snapshots WHERE session_id = ? AND ready = 1 AND data IS NOT NULL")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    /// Usage and completed output belong only to the request that generated
+    /// them, never to a newer foreground request replacing this snapshot.
+    pub async fn update_keep_warm_usage(&self, session_id: &str, snapshot: &KeepWarmSnapshot, epoch: u64) -> anyhow::Result<()> {
+        let data = serde_json::to_string(snapshot)?;
+        let mut tx = self.begin_write().await?;
+        check_ownership_in(&mut tx, session_id, epoch).await?;
+        sqlx::query("UPDATE keep_warm_snapshots SET data = ?, ready = ? WHERE session_id = ? AND call_ms = ? AND connection_id = ? AND data IS NOT NULL")
+            .bind(data)
+            .bind(snapshot.response.is_some())
+            .bind(session_id)
+            .bind(snapshot.last_call_ms)
+            .bind(&snapshot.connection_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn invalidate_keep_warm_request(&self, session_id: &str, snapshot: &KeepWarmSnapshot, epoch: u64) -> anyhow::Result<()> {
+        let mut tx = self.begin_write().await?;
+        check_ownership_in(&mut tx, session_id, epoch).await?;
+        sqlx::query("DELETE FROM keep_warm_snapshots WHERE session_id = ? AND call_ms = ? AND connection_id = ?")
+            .bind(session_id)
+            .bind(snapshot.last_call_ms)
+            .bind(&snapshot.connection_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// A small reservation fences superseded streams even when they share an
+    /// injected timestamp. No request JSON is serialized or written here.
+    pub async fn reserve_keep_warm_snapshot(
+        &self,
+        session_id: &str,
+        connection_id: &str,
+        call_ms: i64,
+        epoch: u64,
+    ) -> anyhow::Result<String> {
+        let generation = uuid::Uuid::now_v7().to_string();
+        let mut tx = self.begin_write().await?;
+        check_ownership_in(&mut tx, session_id, epoch).await?;
+        sqlx::query(
+            "INSERT INTO keep_warm_snapshots (session_id, call_ms, connection_id, generation, data) VALUES (?, ?, ?, ?, NULL)
+            ON CONFLICT(session_id) DO UPDATE SET call_ms = excluded.call_ms, connection_id = excluded.connection_id,
+                generation = excluded.generation, ready = 0, data = NULL",
+        )
+        .bind(session_id)
+        .bind(call_ms)
+        .bind(connection_id)
+        .bind(&generation)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(generation)
+    }
+
+    /// Commit a measured, complete response only if this stream still owns
+    /// the reservation. Serialize the large request before the write lock.
+    pub async fn complete_keep_warm_snapshot(
+        &self,
+        session_id: &str,
+        generation: &str,
+        snapshot: &KeepWarmSnapshot,
+        epoch: u64,
+    ) -> anyhow::Result<bool> {
+        let data = serde_json::to_string(snapshot)?;
+        let mut tx = self.begin_write().await?;
+        check_ownership_in(&mut tx, session_id, epoch).await?;
+        let updated = sqlx::query("UPDATE keep_warm_snapshots SET data = ?, ready = ? WHERE session_id = ? AND generation = ?")
+            .bind(data)
+            .bind(snapshot.response.is_some())
+            .bind(session_id)
+            .bind(generation)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            == 1;
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    pub async fn invalidate_keep_warm_generation(&self, session_id: &str, generation: &str, epoch: u64) -> anyhow::Result<()> {
+        let mut tx = self.begin_write().await?;
+        check_ownership_in(&mut tx, session_id, epoch).await?;
+        sqlx::query("DELETE FROM keep_warm_snapshots WHERE session_id = ? AND generation = ?")
+            .bind(session_id)
+            .bind(generation)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub fn shell_owner(self: &Arc<Self>, session_id: &str, root_session_id: &str) -> Arc<dyn c6_tools::ShellOwner> {
         Arc::new(ShellOwner { journal: self.clone(), session_id: session_id.into(), root_session_id: root_session_id.into() })
     }
@@ -899,9 +1059,10 @@ impl Journal {
     /// Imports a session from the head's log (see `Restore`). Everything is
     /// already acknowledged.
     pub async fn import(&self, session_id: &str, spec: &CreateSession, events: &[SessionEvent]) -> anyhow::Result<()> {
+        let warm = spec.keep_warm_snapshot_json.as_deref().map(serde_json::from_str::<KeepWarmSnapshot>).transpose()?;
         let mut tx = self.begin_write().await?;
         check_ownership_in(&mut tx, session_id, 0).await?;
-        import_in(&mut tx, session_id, spec, events).await?;
+        import_in(&mut tx, session_id, spec, events, warm.as_ref()).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -917,6 +1078,7 @@ impl Journal {
         move_id: &str,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(!move_id.is_empty(), "missing move ID for session {session_id}");
+        let warm = spec.keep_warm_snapshot_json.as_deref().map(serde_json::from_str::<KeepWarmSnapshot>).transpose()?;
         let mut tx = self.begin_write().await?;
         anyhow::ensure!(
             !move_aborted_in(&mut tx, session_id, epoch, move_id).await?,
@@ -939,7 +1101,7 @@ impl Journal {
         // never discard them just because the journal is replaced.
         sqlx::query("DELETE FROM claude_turns WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM claude_rewinds WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?;
-        import_in(&mut tx, session_id, spec, events).await?;
+        import_in(&mut tx, session_id, spec, events, warm.as_ref()).await?;
         block_in(&mut tx, session_id, epoch, move_id).await?;
         tx.commit().await?;
         Ok(())
@@ -964,6 +1126,7 @@ impl Journal {
             }
             sqlx::query("DELETE FROM events WHERE session_id = ?").bind(&id).execute(&mut *tx).await?;
             sqlx::query("DELETE FROM applied_commands WHERE session_id = ?").bind(&id).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM keep_warm_snapshots WHERE session_id = ?").bind(&id).execute(&mut *tx).await?;
             sqlx::query("DELETE FROM sessions WHERE id = ?").bind(&id).execute(&mut *tx).await?;
             n += 1;
         }
@@ -979,6 +1142,7 @@ impl Journal {
         let events =
             sqlx::query("DELETE FROM events WHERE session_id NOT IN (SELECT id FROM sessions)").execute(&mut *tx).await?.rows_affected();
         sqlx::query("DELETE FROM applied_commands WHERE session_id NOT IN (SELECT id FROM sessions)").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM keep_warm_snapshots WHERE session_id NOT IN (SELECT id FROM sessions)").execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(events)
     }
@@ -1118,6 +1282,10 @@ async fn load_session_in(tx: &mut sqlx::SqliteConnection, session_id: &str) -> a
         return Ok(None);
     };
     let mut spec = CreateSession::decode(row.get::<Vec<u8>, _>("spec").as_slice())?;
+    spec.keep_warm_snapshot_json = sqlx::query_scalar("SELECT data FROM keep_warm_snapshots WHERE session_id = ? AND data IS NOT NULL")
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?;
     let imported_through = row.get::<i64, _>("imported_through") as u64;
     let events = events_after_in(tx, session_id, 0, u32::MAX).await?;
     // A restored spec already reflects the head's current settings. Only
@@ -1138,12 +1306,16 @@ pub(crate) fn apply_notice_settings_snapshot(spec: &mut CreateSession, event: &S
         max_running_subagents: Option<u32>,
         claude_code_trim_enabled: Option<bool>,
         claude_code_trim_at: Option<u64>,
+        keep_warm_json: Option<String>,
     }
     let Some(session_event::Kind::Notice(notice)) = &event.kind else { return };
     if !notice.quiet || (notice.title != crate::notice_guard::CONTINUED_TITLE && notice.title != "Notice settings refreshed") {
         return;
     }
     let Ok(snapshot) = serde_json::from_str::<Snapshot>(&notice.message) else { return };
+    if let Some(settings) = snapshot.keep_warm_json {
+        spec.keep_warm_json = Some(settings);
+    }
     let limits = snapshot.notice;
     if let Some(depth) = snapshot.max_subagent_depth {
         spec.max_subagent_depth = depth;
@@ -1168,11 +1340,33 @@ pub(crate) fn apply_notice_settings_snapshot(spec: &mut CreateSession, event: &S
     spec.notice_loop_backoff_max_seconds = limits.notice_loop_backoff_max_seconds;
 }
 
-async fn import_in(tx: &mut sqlx::SqliteConnection, session_id: &str, spec: &CreateSession, events: &[SessionEvent]) -> anyhow::Result<()> {
+async fn import_in(
+    tx: &mut sqlx::SqliteConnection,
+    session_id: &str,
+    spec: &CreateSession,
+    events: &[SessionEvent],
+    warm: Option<&KeepWarmSnapshot>,
+) -> anyhow::Result<()> {
     // Leftovers of a session whose row was lost (rows written by an
     // earlier build that trimmed live sessions) would collide.
     sqlx::query("DELETE FROM events WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM applied_commands WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM keep_warm_snapshots WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?;
+    if let Some(snapshot) = warm {
+        // Validated before taking the write lock. Reuse its serialized transfer
+        // copy rather than reserializing the full request inside the transaction.
+        sqlx::query(
+            "INSERT INTO keep_warm_snapshots (session_id, call_ms, connection_id, generation, ready, data) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind(snapshot.last_call_ms)
+        .bind(&snapshot.connection_id)
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(snapshot.response.is_some())
+        .bind(spec.keep_warm_snapshot_json.as_deref())
+        .execute(&mut *tx)
+        .await?;
+    }
     let now = c6_core::now_ms();
     sqlx::query("INSERT INTO sessions (id, spec, created_at, last_activity) VALUES (?, ?, ?, ?)")
         .bind(session_id)
@@ -1362,6 +1556,84 @@ impl Journal {
 
 #[cfg(test)]
 mod ownership_tests {
+    #[tokio::test]
+    async fn keep_warm_snapshots_fence_usage_failures_and_move_ownership() {
+        use super::{Journal, KeepWarmSnapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        journal.import("s", &c6_proto::CreateSession::default(), &[]).await.unwrap();
+        let mut snapshot = KeepWarmSnapshot {
+            response: None,
+            request: c6_llm::ModelRequest {
+                model: "m".into(),
+                system: "prefix".into(),
+                messages: vec![c6_llm::Message::user_text("hello")],
+                tools: vec![],
+                max_output_tokens: None,
+                cache_key: Some("s:a".into()),
+                effort: None,
+                web_search: false,
+                json: false,
+            },
+            connection_id: "a".into(),
+            kind: "chatgpt".into(),
+            base_url: "http://localhost".into(),
+            last_call_ms: 100,
+            usage: c6_llm::Usage::default(),
+        };
+        journal.save_keep_warm_snapshot("s", &snapshot, 0).await.unwrap();
+        assert!(journal.keep_warm_call_ms("s").await.unwrap().is_none(), "legacy/incomplete snapshots have no eligible call clock");
+        let old = snapshot.clone();
+        snapshot.last_call_ms = 200;
+        journal.save_keep_warm_snapshot("s", &snapshot, 0).await.unwrap();
+        let mut late_usage = old.clone();
+        late_usage.usage.input_tokens = 99_999;
+        journal.update_keep_warm_usage("s", &late_usage, 0).await.unwrap();
+        journal.invalidate_keep_warm_request("s", &old, 0).await.unwrap();
+        let current = journal.load_keep_warm_snapshot("s").await.unwrap().unwrap();
+        assert_eq!(current.last_call_ms, 200);
+        assert_eq!(current.usage.input_tokens, 0);
+        journal.clear_keep_warm_snapshot("s", 0).await.unwrap();
+        journal.update_keep_warm_usage("s", &snapshot, 0).await.unwrap();
+        assert!(journal.load_keep_warm_snapshot("s").await.unwrap().is_none());
+        let generation_a = journal.reserve_keep_warm_snapshot("s", &snapshot.connection_id, snapshot.last_call_ms, 0).await.unwrap();
+        let generation_b = journal.reserve_keep_warm_snapshot("s", &snapshot.connection_id, snapshot.last_call_ms, 0).await.unwrap();
+        assert_ne!(generation_a, generation_b, "same-clock streams still have distinct reservations");
+        let data: Option<String> =
+            sqlx::query_scalar("SELECT data FROM keep_warm_snapshots WHERE session_id = 's'").fetch_one(&journal.pool).await.unwrap();
+        assert!(data.is_none(), "reserving a request never writes its full JSON");
+        assert!(journal.load_keep_warm_snapshot("s").await.unwrap().is_none());
+        assert!(journal.keep_warm_call_ms("s").await.unwrap().is_none());
+        assert!(!journal.complete_keep_warm_snapshot("s", &generation_a, &snapshot, 0).await.unwrap());
+        journal.invalidate_keep_warm_generation("s", &generation_a, 0).await.unwrap();
+        snapshot.response = Some(c6_llm::Message { role: c6_llm::Role::Assistant, blocks: vec![c6_llm::Block::Text("done".into())] });
+        assert!(journal.complete_keep_warm_snapshot("s", &generation_b, &snapshot, 0).await.unwrap());
+        assert_eq!(journal.keep_warm_call_ms("s").await.unwrap(), Some(snapshot.last_call_ms));
+        journal.clear_keep_warm_snapshot("s", 0).await.unwrap();
+        assert!(journal.keep_warm_call_ms("s").await.unwrap().is_none());
+        assert!(
+            !journal.complete_keep_warm_snapshot("s", &generation_b, &snapshot, 0).await.unwrap(),
+            "cleared reservations cannot be resurrected"
+        );
+        journal.save_keep_warm_snapshot("s", &snapshot, 0).await.unwrap();
+        journal.block_ownership("s", 0, "move").await.unwrap();
+        assert!(journal.save_keep_warm_snapshot("s", &snapshot, 0).await.is_err());
+        assert!(journal.clear_keep_warm_snapshot("s", 0).await.is_err());
+        let (spec, _) = journal.load_session("s").await.unwrap().unwrap();
+        journal.import_owned("s", &spec, &[], 2, "move").await.unwrap();
+        journal.activate_ownership("s", 2, "move").await.unwrap();
+        assert_eq!(
+            journal.keep_warm_call_ms("s").await.unwrap(),
+            Some(snapshot.last_call_ms),
+            "move imports retain the conservative request clock"
+        );
+        assert!(journal.update_keep_warm_usage("s", &snapshot, 0).await.is_err());
+        assert!(journal.clear_keep_warm_snapshot("s", 0).await.is_err());
+        journal.clear_keep_warm_snapshot("s", 2).await.unwrap();
+        // Loading a spec must not resurrect its older embedded transfer copy.
+        assert!(journal.load_session("s").await.unwrap().unwrap().0.keep_warm_snapshot_json.is_none());
+    }
+
     #[tokio::test]
     async fn machine_roots_include_shells_and_retained_claude_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -1687,6 +1959,39 @@ mod ownership_tests {
             })),
         );
         assert_eq!((spec.claude_code_trim_enabled, spec.claude_code_trim_at), (Some(true), 0));
+    }
+
+    #[tokio::test]
+    async fn keep_warm_settings_refresh_survives_restore_and_legacy_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+        let journal = Journal::open(&path).await.unwrap();
+        let original = r#"{"enabled":true}"#;
+        let changed = r#"{"enabled":false,"disabled_connections":["local"]}"#;
+        let spec = CreateSession { keep_warm_json: Some(original.into()), ..Default::default() };
+        journal.create_session("s", &spec, &event(1)).await.unwrap();
+        let snapshot = |seq, settings: Option<&str>| SessionEvent {
+            seq,
+            ts_ms: seq as i64,
+            kind: Some(session_event::Kind::Notice(c6_proto::Notice {
+                title: "Notice settings refreshed".into(),
+                message: serde_json::json!({"keep_warm_json": settings}).to_string(),
+                quiet: true,
+                ..Default::default()
+            })),
+        };
+        journal.append("s", &snapshot(2, Some(changed))).await.unwrap();
+        // Older heads' notices must not reset a policy selected by a newer head.
+        journal.append("s", &snapshot(3, None)).await.unwrap();
+        drop(journal);
+        let journal = Journal::open(&path).await.unwrap();
+        let (mut loaded, _) = journal.load_session("s").await.unwrap().unwrap();
+        assert_eq!(loaded.keep_warm_json.as_deref(), Some(changed));
+        let mut legacy = snapshot(4, None);
+        let Some(session_event::Kind::Notice(notice)) = &mut legacy.kind else { unreachable!() };
+        notice.message = "{}".into();
+        apply_notice_settings_snapshot(&mut loaded, &legacy);
+        assert_eq!(loaded.keep_warm_json.as_deref(), Some(changed));
     }
 
     #[tokio::test]

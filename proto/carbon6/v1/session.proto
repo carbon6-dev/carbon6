@@ -480,6 +480,8 @@ message Usage {
   string resolved_connection_id = 8;
   string resolved_connection_name = 9;
   string alias_connection_name = 10;
+  // A cache-maintenance call, included in total usage and spending.
+  bool keep_warm = 11;
 }
 
 enum TurnEndReason {
@@ -667,6 +669,8 @@ message NoticeLimits {
   // Absent from older heads: preserve the session's current trim settings.
   optional bool claude_code_trim_enabled = 11;
   optional uint64 claude_code_trim_at = 12;
+  // JSON c6_api::KeepWarmSettings. Absent from older heads: preserve the current policy.
+  optional string keep_warm_json = 10;
 }
 
 // Sets the session's default for its subagents (unset `model`: the
@@ -827,6 +831,11 @@ message CreateSession {
   // Unset: enabled. Zero threshold: min(200,000, half the context window).
   optional bool claude_code_trim_enabled = 51;
   uint64 claude_code_trim_at = 52;
+  // Realm keep-warm policy (JSON c6_api::KeepWarmSettings).
+  optional string keep_warm_json = 49;
+  // Worker-local provider-ready prefix, transferred only with a move. No
+  // credentials or headers. Ordinary restored history need not have one.
+  optional string keep_warm_snapshot_json = 50;
 }
 
 // How a new git worktree is made: the branch ({{id}} is the session's

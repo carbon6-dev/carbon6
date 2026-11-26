@@ -109,6 +109,11 @@ fn Report(r: AnalyticsReport, by: RwSignal<String>, keys: Memo<Vec<String>>) -> 
         vec![("Model calls", "var(--series-1)", r.by_day.iter().map(|d| d.calls as f64).collect())]
     };
     let per_message = t.agent_ms.checked_div(t.messages).map_or_else(|| "–".into(), dur);
+    let cost_note = if t.keep_warm_calls > 0 {
+        format!("{} model calls, including {} keep-warm ({})", t.calls, t.keep_warm_calls, usd(t.keep_warm_cost))
+    } else {
+        format!("{} model calls", t.calls)
+    };
     view! {
         <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <Stat label="Agent time" value=dur(t.agent_ms) note=format!("{} turns, {} failed", t.turns, pct(t.turns_failed, t.turns)) />
@@ -116,11 +121,14 @@ fn Report(r: AnalyticsReport, by: RwSignal<String>, keys: Memo<Vec<String>>) -> 
             <Stat label="Agents at once (peak)" value=t.peak_agents.to_string() note=format!("{} sessions", t.sessions) />
             <Stat label="Work waiting on you (median)" value=if r.waits.replies == 0 { "–".into() } else { dur(r.waits.reply_median_ms) }
                 note=format!("90% within {}", dur(r.waits.reply_p90_ms)) />
-            <Stat label="Cost" value=usd(t.cost) note=format!("{} model calls", t.calls) />
+            <Stat label="Cost" value=usd(t.cost) note=cost_note />
             <Stat label="Tokens" value=format!("{} in · {} out", tokens(t.input + t.cache_read), tokens(t.output)) note=format!("{} of input cached", pct(t.cache_read, t.input + t.cache_read)) />
             <Stat label="Model time" value=dur(t.model_ms) note=format!("{} of agent time", pct(t.model_ms, t.agent_ms)) />
             <Stat label="Tool time" value=dur(t.tool_ms) note=format!("{} of agent time", pct(t.tool_ms, t.agent_ms)) />
         </div>
+        {(t.keep_warm_calls > 0).then(|| view! {
+            <p class="text-xs text-muted">"Keep-warm costs are included above. Rewrite savings are unverified: repeated pings may protect a single resume."</p>
+        })}
         {(!r.unpriced_models.is_empty()).then(|| view! {
             <p class="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
                 "No price for " {r.unpriced_models.join(", ")} ": those calls count as $0. Add prices in "

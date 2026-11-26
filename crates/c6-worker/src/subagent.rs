@@ -47,6 +47,7 @@ impl LaunchLimits {
                 max_running_subagents: Some(spec.max_running_subagents),
                 claude_code_trim_enabled: spec.claude_code_trim_enabled,
                 claude_code_trim_at: Some(spec.claude_code_trim_at),
+                keep_warm_json: spec.keep_warm_json.clone(),
             },
         }
     }
@@ -67,6 +68,9 @@ impl LaunchLimits {
         spec.notice_tokens_per_hour = limits.notice_tokens_per_hour;
         spec.notice_loop_backoff_rounds = limits.notice_loop_backoff_rounds;
         spec.notice_loop_backoff_max_seconds = limits.notice_loop_backoff_max_seconds;
+        if let Some(settings) = &limits.keep_warm_json {
+            spec.keep_warm_json = Some(settings.clone());
+        }
         if let Some(depth) = limits.max_subagent_depth {
             spec.max_subagent_depth = depth;
         }
@@ -1319,6 +1323,20 @@ impl c6_tools::Hooks for SubagentHooks {
 mod tests {
     use super::*;
 
+    #[test]
+    fn keep_warm_live_settings_reach_children_and_legacy_updates_preserve_them() {
+        let mut spec = CreateSession { keep_warm_json: Some(r#"{"enabled":true}"#.into()), ..Default::default() };
+        LaunchLimits::apply_notice_limits(&mut spec, &c6_proto::NoticeLimits::default());
+        assert_eq!(spec.keep_warm_json.as_deref(), Some(r#"{"enabled":true}"#));
+        let limits = c6_proto::NoticeLimits { keep_warm_json: Some(r#"{"enabled":false}"#.into()), ..Default::default() };
+        let before = LaunchLimits::of(&spec);
+        LaunchLimits::apply_notice_limits(&mut spec, &limits);
+        assert!(before != LaunchLimits::of(&spec), "a keep-warm-only edit must trigger settings persistence");
+        let mut child = CreateSession::default();
+        LaunchLimits::of(&spec).inherit(&mut child);
+        assert_eq!(child.keep_warm_json, limits.keep_warm_json);
+    }
+
     #[tokio::test]
     async fn head_loss_settles_local_wait_while_the_child_cannot_reply() {
         let (child, outcome) = tokio::sync::oneshot::channel();
@@ -1628,6 +1646,7 @@ mod tests {
             max_running_subagents: Some(0),
             claude_code_trim_enabled: Some(false),
             claude_code_trim_at: Some(123_456),
+            keep_warm_json: Some(r#"{"enabled":false}"#.into()),
         };
         LaunchLimits::apply_notice_limits(&mut edited, &update);
         *limits.lock().unwrap() = LaunchLimits::of(&edited);
