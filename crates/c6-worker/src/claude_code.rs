@@ -2183,6 +2183,19 @@ async fn wait_group_absence_until(deadline: tokio::time::Instant, mut probe: imp
     deadline
 }
 
+/// A successful owned stop sent signals, not proof of synchronous kernel exit.
+/// Spend only the caller's existing confirmation budget observing that exit,
+/// then require a fresh proof. This is not used for replacement admission.
+#[cfg(any(target_os = "macos", test))]
+async fn darwin_confirm_signaled_group_stopped(
+    pgid: i32,
+    deadline: tokio::time::Instant,
+    mut probe: impl FnMut() -> DarwinGroupObservation,
+) -> anyhow::Result<()> {
+    wait_group_absence_until(deadline, || probe().result).await;
+    darwin_confirm_group_stopped(pgid, deadline, probe).await
+}
+
 /// Replacement gets only the remainder of kill's original absence phase.
 /// Early cleanup failure supplies no grace, but still requires a fresh proof.
 #[cfg(any(target_os = "macos", test))]
@@ -2346,10 +2359,19 @@ async fn stop_session_held(
                 return Err(error);
             }
         }
-        stopped.push((dir, meta.output_root));
+        stopped.push((dir, meta.output_root, pg));
     }
-    confirm_stopped_reaping(journal, session, Duration::from_secs(3), reap).await?;
-    for (dir, output_root) in stopped {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    #[cfg(target_os = "macos")]
+    for (_, _, pg) in &stopped {
+        darwin_confirm_signaled_group_stopped(pg.as_raw(), deadline, || {
+            reap();
+            darwin_group_observation(*pg)
+        })
+        .await?;
+    }
+    confirm_stopped_reaping(journal, session, deadline.saturating_duration_since(tokio::time::Instant::now()), reap).await?;
+    for (dir, output_root, _) in stopped {
         let _ = std::fs::remove_dir_all(dir);
         if let Some(root) = output_root {
             let _ = std::fs::remove_dir_all(root);
@@ -8740,6 +8762,30 @@ done
             assert_eq!(deadline, start + Duration::from_secs(3));
             assert_eq!(tokio::time::Instant::now(), deadline);
             assert_ne!(result, Err(Errno::ESRCH));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_signaled_group_waits_for_exit_without_extending_confirmation_budget() {
+        use nix::errno::Errno;
+        for exits in [true, false] {
+            let start = tokio::time::Instant::now();
+            let deadline = start + Duration::from_secs(3);
+            let mut observations = 0;
+            let result = darwin_confirm_signaled_group_stopped(41, deadline, || {
+                observations += 1;
+                let absent = exits && tokio::time::Instant::now() >= start + Duration::from_millis(25);
+                darwin_group_observe(if absent { Err(Errno::ESRCH) } else { Ok(()) }, || panic!("raw live/ESRCH must not enumerate"))
+            })
+            .await;
+            assert!(observations > 1, "a sent signal is not synchronous absence");
+            if exits {
+                result.unwrap();
+                assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(30));
+            } else {
+                assert!(result.unwrap_err().downcast_ref::<StopUnconfirmed>().is_some());
+                assert_eq!(tokio::time::Instant::now(), deadline, "no fresh confirmation budget");
+            }
         }
     }
 
