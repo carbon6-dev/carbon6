@@ -573,7 +573,7 @@ fn CacheSettings(machine_id: String, config: Value, refresh: Callback<()>) -> im
             <fieldset class="space-y-3" disabled=move || busy.get() || !crate::place::is_console()>
                 <div class="flex flex-wrap gap-4">
                     {[("Enable shared compile cache", enabled), ("Rust", rust), ("C / C++", c_cpp)].into_iter().map(|(label, flag)| view! {
-                        <label class="flex items-center gap-2"><input type="checkbox" prop:checked=move || flag.get() on:change=move |e| flag.set(event_target_checked(&e)) />{label}</label>
+                        <label class="flex items-center gap-2"><input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || flag.get() on:change=move |e| flag.set(event_target_checked(&e)) />{label}</label>
                     }).collect_view()}
                 </div>
                 <div class="grid gap-3 sm:grid-cols-2">
