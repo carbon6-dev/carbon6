@@ -359,8 +359,9 @@ async function check(browser, origin, engine, view, theme) {
     return { label, passed: true, evidence };
   } catch (error) {
     await progress?.page.screenshot({ path: path.join(shots, `${label}-failure.png`) }).catch(() => {});
+    const transcript = await progress?.page.locator('#parent-e70').ariaSnapshot().catch(() => undefined);
     const result = { label, passed: false, phase: progress?.phase, error: error.stack, errors: progress?.errors,
-      requests: progress?.requests, console: progress?.consoleMessages, evidence };
+      requests: progress?.requests, console: progress?.consoleMessages, transcript, evidence };
     fs.writeFileSync(path.join(shots, `${label}-failure.json`), JSON.stringify(result, null, 2));
     console.error(`FAIL ${label}: ${error.stack}`);
     return result;

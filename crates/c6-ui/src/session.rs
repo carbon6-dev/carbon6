@@ -5556,8 +5556,9 @@ fn TranscriptImage(src: String, name: String, info: String) -> impl IntoView {
 /// A file sent in the transcript (pictures use `TranscriptImage`).
 fn transcript_file(src: String, name: String, info: String) -> AnyView {
     let hover = format!("{name} · {info}");
+    let (label, description) = (name.clone(), info.clone());
     view! {
-        <a href=src target="_blank" title=hover
+        <a href=src target="_blank" title=hover aria-label=label aria-description=description
             class="flex min-w-0 items-center gap-1.5 rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-600 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100">
             <span class="shrink-0">{icon(Icon::File, Size::S14)}</span>
             <span class="min-w-0">
@@ -9375,6 +9376,8 @@ mod tests {
             for expected in ["/attachments/42/0", name, mime, "1234 bytes"] {
                 assert!(html.contains(expected), "missing {expected}: {html}");
             }
+            assert!(html.contains(&format!("aria-label=\"{name}\"")), "filename names the link: {html}");
+            assert!(html.contains(&format!("aria-description=\"{mime} · 1234 bytes\"")), "metadata describes the link: {html}");
             assert!(!html.contains("<img"), "unsupported preview should use a file chip: {html}");
             assert_eq!(crate::components::copied_text(&html, "Copy attachment link"), "/api/v1/sessions/session/attachments/42/0");
         }

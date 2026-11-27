@@ -75,8 +75,8 @@ async function main() {
     await check(tool.getByRole('button', { name: 'Copy tool input', exact: true }), '{ "command": "printf fixture" }');
     await check(tool.getByRole('button', { name: 'Copy tool output', exact: true }), output);
     await check(page.locator('#parent-e74').getByRole('button', { name: 'Copy output content', exact: true }), published);
-    await check(page.locator('#parent-e76').getByRole('button', { name: 'Copy output link', exact: true }), `${origin}/api/v1/sessions/parent/outputs/76`);
-    await check(page.locator('#parent-e77').getByRole('button', { name: 'Copy attachment link', exact: true }), `${origin}/api/v1/sessions/parent/attachments/77/0`);
+    await check(page.locator('#parent-e76').getByRole('button', { name: 'Copy output link', exact: true }), `${origin}/api/v1/sessions/parent/outputs/76?c6_realm=home`);
+    await check(page.locator('#parent-e77').getByRole('button', { name: 'Copy attachment link', exact: true }), `${origin}/api/v1/sessions/parent/attachments/77/0?c6_realm=home`);
     await check(page.locator('#parent-e75').getByRole('button', { name: 'Copy error', exact: true }), error);
     assert.deepEqual(f.errors, []);
     await f.context.close();

@@ -159,7 +159,7 @@ bridge/vendor, not exercised against a live shell. No live head/workers touched.
 
 ## Integration verification
 
-The final Linux Docker release build measures **11,646,584 raw / 2,907,978 Brotli
+The final Linux Docker release build measures **11,646,920 raw / 2,908,644 Brotli
 bytes**, within both existing size allowances; no budget increase is needed.
 Native and WASM Clippy and `make check` pass after correcting the slide-copy
 view expression and using a consistent `&str` for JSON source encoding.
@@ -269,3 +269,13 @@ appended suffix and waits for the exact rendered snapshot. A deterministic unit
 test checks the wire deltas and rejects non-append snapshots. All existing
 native-input, >=22px layout-growth, end-following, full-visibility and hit-test
 assertions remain unchanged; neither payload snapshots nor viewport shrank.
+
+The subsequent full run exposed two exact link checks. Both reproduced twice
+alone. Binary Copy expectations now require the complete absolute URL including
+`c6_realm=home`, not an unrouted URL. The historical message-origin check also
+failed twice on the pre-copy baseline: file metadata was concatenated into the
+link's accessible name. File chips now explicitly use the filename as their
+accessible name and retain media type/size as an accessible description as well
+as visible text and a tooltip. A native rendering regression checks both
+attributes; the historical browser assertions remain unchanged. Failure evidence
+now includes the first transcript row's accessibility snapshot.
