@@ -265,6 +265,24 @@ test('asynchronous evidence-stream failure cancels and drains its worker instead
   } finally { fs.rmSync(directory, { recursive: true }); }
 });
 
+test('press fixture sends append-only wire deltas, not duplicated reply snapshots', async () => {
+  const { text } = require('./transcript-press.cjs');
+  const deltas = [], rendered = [];
+  const f = { stream: message => deltas.push(message.text), page: {
+    evaluate: async () => {},
+    waitForFunction: async (_predicate, expected) => {
+      assert.equal(deltas.join(''), expected, 'the rendered reply is exactly the requested snapshot');
+      rendered.push(expected);
+    },
+  } };
+  await text(f, 'The agent is writing');
+  await text(f, 'The agent is writing. More text.');
+  await text(f, 'The agent is writing. More text. And more.');
+  assert.deepEqual(deltas, ['The agent is writing', '. More text.', ' And more.']);
+  assert.equal(rendered.length, 3, 'each snapshot waits for its exact rendered content');
+  await assert.rejects(text(f, 'A replacement'), /snapshots only append/);
+});
+
 test('importing transcript-press neither loads a browser driver nor starts a suite or writes evidence', () => {
   const result = spawnSync(process.execPath, ['-e', `
     const assert = require('node:assert/strict');

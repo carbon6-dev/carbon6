@@ -83,8 +83,17 @@ async function nativeTouch(f, engine) {
   // Do not detach the Chromium CDP session: that resets phone touch emulation.
 }
 
+const streamedText = new WeakMap();
 async function text(f, value) {
-  f.stream({ type: 'text', turn: 100, seq: 9999, text: value });
+  // Callers describe the cumulative reply; StreamMsg::Text carries deltas.
+  // Sending each snapshot as a delta duplicated prefixes and inflated layout,
+  // eventually scrolling the recovery control out of even a correctly followed view.
+  const previous = streamedText.get(f) || '';
+  assert(value.startsWith(previous), 'fixture reply snapshots only append');
+  f.stream({ type: 'text', turn: 100, seq: 9999, text: value.slice(previous.length) });
+  streamedText.set(f, value);
+  await f.page.waitForFunction(expected => [...document.querySelectorAll('[data-follow-content] .md')]
+    .some(el => el.textContent.trim() === expected), value);
   await frame(f.page); await frame(f.page);
 }
 
@@ -539,5 +548,5 @@ async function main(env = process.env) {
   assert(combined?.results.length, 'PRESS_CASE selected no applicable cases');
 }
 
-module.exports = { runSuite, casesFor, nativeTouch };
+module.exports = { runSuite, casesFor, nativeTouch, text };
 if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1; });

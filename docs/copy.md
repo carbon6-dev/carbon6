@@ -163,7 +163,7 @@ The final Linux Docker release build measures **11,646,584 raw / 2,907,978 Brotl
 bytes**, within both existing size allowances; no budget increase is needed.
 Native and WASM Clippy and `make check` pass after correcting the slide-copy
 view expression and using a consistent `&str` for JSON source encoding.
-All 94 JavaScript unit tests and 14 motion VM checks pass. Production-WASM
+All 95 JavaScript unit tests and 14 motion VM checks pass. Production-WASM
 clipboard reads pass in fresh 1440px desktop and 390px touch contexts for every
 payload listed above. Both screenshots were inspected: desktop controls reveal
 on hover/focus, phone controls remain visible, and neither layout overflows or
@@ -260,3 +260,12 @@ still prohibits disclosure elements and unimplemented full-text actions, while
 requiring the exact complete set of Copy buttons and their original per-item
 Markdown payloads (including the long wrapping summary), rather than merely
 allowing arbitrary new buttons.
+
+Native press cancellation/multitouch then reproduced twice on each tree. The
+fixture described cumulative reply snapshots but sent them verbatim as
+`StreamMsg::Text` deltas; repeated prefixes inflated the stream enough to scroll
+the original recovery control above the viewport. Its helper now emits only the
+appended suffix and waits for the exact rendered snapshot. A deterministic unit
+test checks the wire deltas and rejects non-append snapshots. All existing
+native-input, >=22px layout-growth, end-following, full-visibility and hit-test
+assertions remain unchanged; neither payload snapshots nor viewport shrank.
