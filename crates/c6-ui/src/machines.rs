@@ -376,10 +376,15 @@ fn MachineInfo(machine: Machine) -> impl IntoView {
         <div class="space-y-2 text-sm"><div class="flex flex-wrap items-center gap-2"><strong class="break-all">{machine.name}</strong><span class="text-muted">{machine.role}" · "{if machine.online { "online" } else { "offline" }}</span>
             {(!head).then(|| view! { <Go to=View::Worker { id: machine.id.clone() } class="text-sky-700 hover:underline dark:text-sky-400">"Files & terminals "{icon(Icon::ArrowRight, Size::S14)}</Go> })}
         </div>
+        <div class="flex flex-wrap items-center gap-2 text-xs">
+            <span class="font-mono">{machine.hostname.clone()}</span><crate::components::CopyButton text=machine.hostname.clone() label="Copy hostname" />
+            <span class="font-mono">{machine.id.clone()}</span><crate::components::CopyButton text=machine.id.clone() label="Copy machine ID" />
+            <crate::components::CopyButton text=machine.version.clone().unwrap_or_default() label="Copy version" />
+        </div>
         {machine.head.map(|h| view! { <dl class="grid min-w-0 gap-x-6 gap-y-1 text-xs sm:grid-cols-2">
             <div><dt class="text-muted">"Version / update"</dt><dd class="break-all">{machine.version.unwrap_or_else(|| "unknown".into())}" · "{update_summary(&h.update)}</dd></div>
             <div><dt class="text-muted">"Uptime / connected workers"</dt><dd>{crate::tasks::elapsed(h.uptime_secs.saturating_mul(1000).min(i64::MAX as u64) as i64)}" / "{h.connected_workers}</dd></div>
-            <div class="min-w-0"><dt class="text-muted">"Data directory"</dt><dd class="break-all font-mono">{h.data_dir}</dd></div>
+            <div class="min-w-0"><dt class="text-muted">"Data directory"</dt><dd class="break-all font-mono"><crate::components::CopyButton text=h.data_dir.clone() label="Copy data directory" />{h.data_dir}</dd></div>
             <div class="min-w-0"><dt class="text-muted">"Data directory filesystem"</dt><dd class="break-all">{h.data_disk.map(|d| format!("{} ({}) · {} / {} used · {} available · {}", d.mount, d.filesystem, bytes(d.used), bytes(d.total), bytes(d.available), if d.total > 0 { format!("{:.1}% used", percent(d.used, d.total)) } else { "capacity unknown".into() })).unwrap_or_else(|| "unknown".into())}</dd></div>
             <div class="min-w-0"><dt class="text-muted">"Databases"</dt><dd class="break-all">{h.databases.into_iter().map(|d| format!("{}: {}", d.name, bytes(d.bytes))).collect::<Vec<_>>().join(" · ")}</dd></div>
         </dl> })}

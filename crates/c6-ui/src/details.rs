@@ -37,18 +37,8 @@ pub fn CopySession(session: String, #[prop(optional)] link: bool, #[prop(optiona
     let text = if inline { short_id(&session) } else { label.into() };
     let value =
         if link { format!("{}{}", window().location().origin().unwrap_or_default(), View::session(session).href()) } else { session };
-    let value = StoredValue::new(value);
-    let status = RwSignal::new("");
     view! {
-        <button class=if inline { "inline-flex items-center gap-2 rounded font-mono hover:underline" } else { crate::session::MENU_ITEM }
-            title=title aria-label=label on:click=move |_| {
-                spawn_local(async move {
-                    let result = wasm_bindgen_futures::JsFuture::from(window().navigator().clipboard().write_text(&value.get_value())).await;
-                    let _ = status.try_set(if result.is_ok() { "Copied" } else { "Couldn't copy" });
-                });
-            }>
-            {text}<span class="font-sans text-xs text-muted" role="status">{move || status.get()}</span>
-        </button>
+        <crate::components::CopyButton text=value label=label caption=text title=title />
     }
 }
 
@@ -164,8 +154,9 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
             .into_any()
         };
         let wid = s.worker_id.to_string();
+        let copy_id = wid.clone();
         let act = (!s.on_head).then(|| Callback::new(move |ev: web_sys::MouseEvent| open(View::Worker { id: wid.clone() }, &ev)));
-        Some(line("Runs on", body, act))
+        Some(view! { <div class="flex items-center">{line("Runs on", body, act)}<crate::components::CopyButton text=copy_id label="Copy worker ID" /></div> }.into_any())
     };
 
     // Its worktree and the repository it's of, or its folder.
@@ -187,13 +178,17 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
             }
             .into_any()
         };
-        Some(line(if worktree { "Worktree" } else { "Folder" }, body, act))
+        Some(view! { <div class="flex items-center">{line(if worktree { "Worktree" } else { "Folder" }, body, act)}<crate::components::CopyButton text=cwd label="Copy folder path" /></div> }.into_any())
     };
 
     let branch = move || {
         let current = git.get().flatten().map(|g| g.1).filter(|b| !b.is_empty());
         let b = current.or_else(|| started.get().map(|s| s.branch).filter(|b| !b.is_empty()))?;
-        Some(line("Branch", view! { <span class="font-mono" title=b.clone()>{b.clone()}</span> }, None))
+        Some(line(
+            "Branch",
+            view! { <span class="font-mono" title=b.clone()>{b.clone()}</span><crate::components::CopyButton text=b label="Copy branch" /> },
+            None,
+        ))
     };
 
     let changes = move || {

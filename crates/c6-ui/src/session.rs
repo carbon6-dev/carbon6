@@ -5352,6 +5352,7 @@ fn SessionMessage(
         let from = from.clone();
         move |_| crate::marks::of_id(&from)
     });
+    let source = text.clone();
     let (subject, rest) = if command == "card-answer" { (text, None) } else { subject_of(&text) };
     let subject = message_text(subject, &command);
     let open = RwSignal::new(false);
@@ -5381,6 +5382,7 @@ fn SessionMessage(
                 })}
                 {attachments}
                 <p class="font-medium text-zinc-900 dark:text-zinc-100">{subject}</p>
+                <crate::components::CopyButton text=source label="Copy message" />
                 {rest.map(|rest| view! {
                     {move || open.get().then(|| view! { <div class="whitespace-pre-wrap text-zinc-800 dark:text-zinc-200">{rest.clone()}</div> })}
                     <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| open.update(|o| *o = !*o)>
@@ -5393,6 +5395,7 @@ fn SessionMessage(
                 {(!prompt.is_empty()).then(|| view! {
                     <details class="text-xs text-muted">
                         <summary class="cursor-pointer select-none">"What the agent received"</summary>
+                        <crate::components::CopyButton text=prompt.clone() label="Copy expanded prompt" />
                         <pre class="mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{prompt}</pre>
                     </details>
                 })}
@@ -5537,6 +5540,7 @@ fn notice_line(title: &str, message: &str, priority: &str) -> AnyView {
     };
     view! {
         <div class=format!("rounded-md border px-3 py-2 text-sm {tone}")>
+            <crate::components::CopyButton text=format!("{title}\n{message}") label="Copy notice" />
             <p class="flex items-center gap-2 font-medium"><span>{crate::icons::bell()}</span><span>{title.to_owned()}</span></p>
             {(!message.is_empty()).then(|| view! { <p class="mt-1 whitespace-pre-wrap text-xs text-zinc-600 dark:text-zinc-400">{message.to_owned()}</p> })}
         </div>
@@ -5632,6 +5636,7 @@ fn task_notice(text: &str, notice: Option<&c6_api::TaskNotice>) -> AnyView {
             }}
             <details class="mt-2">
                 <summary class="cursor-pointer select-none">"Raw text the agent received"</summary>
+                <crate::components::CopyButton text=text.to_owned() label="Copy raw notice" />
                 <pre class="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded-md bg-zinc-100 p-2 font-mono text-[11px] dark:bg-zinc-900">{text.to_owned()}</pre>
             </details>
         </details>
@@ -5649,11 +5654,17 @@ fn user_attachments(session: &str, seq: u64, attachments: &[c6_api::AttachmentIn
             let url = crate::api::url(&format!("/api/v1/sessions/{session}/attachments/{seq}/{i}"));
             let mime = if a.mime.is_empty() { "application/octet-stream" } else { &a.mime };
             let info = format!("{mime} · {} bytes", a.size);
-            if attachment_preview_mime(mime).is_some() {
+            let copy = if mime.starts_with("text/") || matches!(mime, "application/json" | "application/xml") {
+                view! { <crate::components::CopyButton text=String::new() url=url.clone() label="Copy attachment content" /> }.into_any()
+            } else {
+                view! { <crate::components::CopyButton text=format!("{}{}", window().location().origin().unwrap_or_default(), url) label="Copy attachment link" /> }.into_any()
+            };
+            let preview = if attachment_preview_mime(mime).is_some() {
                 view! { <TranscriptImage src=url name=a.name.clone() info=info /> }.into_any()
             } else {
                 transcript_file(url, a.name.clone(), info)
-            }
+            };
+            view! { <div>{preview}{copy}</div> }.into_any()
         })
         .collect_view()
         .into_any()
@@ -5686,6 +5697,7 @@ fn user_message(session: &str, e: &Event) -> AnyView {
     };
     let delegated = !delegated_by.is_empty();
     let has_text = !text.is_empty();
+    let source = text.clone();
     let text = message_text(text.clone(), command);
     let shown = user_attachments(session, e.seq, attachments);
     view! {
@@ -5693,7 +5705,7 @@ fn user_message(session: &str, e: &Event) -> AnyView {
             {from.map(|(icon, text)| view! { <p class="text-[11px] text-violet-700 dark:text-violet-400">{icon}" "{text}</p> })}
             {(!attachments.is_empty()).then(|| view! { <div class="flex max-w-[85%] flex-wrap justify-end gap-1.5">{shown}</div> })}
             {has_text.then(|| view! {
-                <div class=format!("max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800 {}", if blocked.is_empty() { "" } else { "line-through opacity-60" })>{text}</div>
+                <div class=format!("max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800 {}", if blocked.is_empty() { "" } else { "line-through opacity-60" })>{text}<crate::components::CopyButton text=source label="Copy message" /></div>
             })}
             {(!blocked.is_empty()).then(|| view! {
                 <p class="max-w-[85%] text-right text-xs text-red-600 dark:text-red-400">{format!("Not sent: a UserPromptSubmit hook blocked it. {blocked}")}</p>
@@ -5701,6 +5713,7 @@ fn user_message(session: &str, e: &Event) -> AnyView {
             {(!prompt.is_empty()).then(|| view! {
                 <details class="max-w-[85%] text-xs text-muted">
                     <summary class="cursor-pointer select-none text-right">{if delegated { "sent with the subagent note".to_owned() } else if command.is_empty() { "sent with hook context".to_owned() } else { format!("/{command} expanded to") }}</summary>
+                    <crate::components::CopyButton text=prompt.clone() label="Copy expanded prompt" />
                     <pre class="mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{prompt.clone()}</pre>
                 </details>
             })}
@@ -5725,6 +5738,13 @@ fn sender_message(session: &str, e: &Event) -> AnyView {
     .into_any()
 }
 
+/// Keep source copying separate from Markdown rendering/citation cleanup.
+fn reply_text(text: &str, citations: &[c6_api::citations::UrlCitation], paths: Option<&markdown::Paths>) -> AnyView {
+    let (col, ws) = (use_column(), use_context::<crate::workspace::Workspace>());
+    view! { <div><crate::components::CopyButton text=text.to_owned() label="Copy as Markdown" /><div class="md" on:click=move |ev| if let Some(ws) = ws { crate::mentions::follow_link(&ev, col, ws); } inner_html=markdown::session_html(text, citations, paths)></div></div> }
+        .into_any()
+}
+
 fn render_event(
     session: &str,
     e: &Event,
@@ -5738,6 +5758,7 @@ fn render_event(
         EventKind::Started { system_prompt, tools, .. } => view! {
             <details class="text-xs text-muted">
                 <summary class="cursor-pointer select-none">{format!("Session started · {} tools", tools.len())}</summary>
+                <crate::components::CopyButton text=system_prompt.clone() label="Copy system prompt" />
                 <pre class="mt-2 max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{system_prompt.clone()}</pre>
             </details>
         }
@@ -5803,7 +5824,7 @@ fn render_event(
             let message = format!("Moved from {} to {}{branch}; {} files copied, {uncommitted_files} uncommitted files carried", location(from), location(to), copied_paths.len());
             view! { <div>
                 {notice_line("Place changed", &message, "low")}
-                {(!setup_log.is_empty()).then(|| view! { <details class="ml-5 text-xs text-muted"><summary>"Worktree setup"</summary><pre class="whitespace-pre-wrap">{setup_log.clone()}</pre></details> })}
+                {(!setup_log.is_empty()).then(|| view! { <details class="ml-5 text-xs text-muted"><summary>"Worktree setup"</summary><crate::components::CopyButton text=setup_log.clone() label="Copy setup log" /><pre class="whitespace-pre-wrap">{setup_log.clone()}</pre></details> })}
                 {(!copied_paths.is_empty()).then(|| view! { <details class="ml-5 text-xs text-muted"><summary>"Copied files"</summary><ul class="list-inside list-disc">{copied_paths.iter().map(|p| view! { <li>{p.clone()}</li> }).collect_view()}</ul></details> })}
             </div> }.into_any()
         },
@@ -5827,7 +5848,7 @@ fn render_event(
                         ContentBlock::ServerTool { label } => view! {
                             <p class="flex items-center gap-2 text-xs text-muted"><span>{crate::icons::search()}</span><span class="font-mono">{label.clone()}</span></p>
                         }.into_any(),
-                        ContentBlock::Text { text, citations } => view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=markdown::session_html(text, citations, paths.get_untracked().as_ref())></div> }.into_any(),
+                        ContentBlock::Text { text, citations } => reply_text(text, citations, paths.get_untracked().as_ref()),
                         ContentBlock::Thinking { text } => view! { <Thinking text=text.clone() show=crate::settings::show_thinking() /> }.into_any(),
                         ContentBlock::Narration { text } => view! { <SummarizedUpdate text=text.clone() /> }.into_any(),
                         ContentBlock::ToolUse { id, name, input_json } => {
@@ -5864,6 +5885,7 @@ fn render_event(
                     {shown.map(|(prompt, tools)| view! {
                         <details>
                             <summary class="cursor-pointer select-none text-muted">"Its system prompt and tools"</summary>
+                            <crate::components::CopyButton text=prompt.clone() label="Copy system prompt" />
                             <p class="mt-1">{tools}</p>
                             <pre class="mt-1 max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{prompt}</pre>
                         </details>
@@ -5877,6 +5899,7 @@ fn render_event(
                 <summary class="cursor-pointer select-none">
                     {format!("Context compacted ({} tokens summarized); the model continues from this summary", tokens(*tokens_before))}
                 </summary>
+                <crate::components::CopyButton text=summary.clone() label="Copy compaction summary as Markdown" />
                 <div class="md mt-2 text-zinc-700 dark:text-zinc-300" on:click=crate::mentions::link_clicks() inner_html=markdown::to_html(summary)></div>
             </details>
         }
@@ -5916,6 +5939,7 @@ fn SummarizedUpdate(text: String) -> impl IntoView {
     let (col, ws) = (crate::workspace::use_column(), use_context::<crate::workspace::Workspace>());
     view! {
         <div data-summarized-update class="summarized-update flex items-start gap-2 text-xs text-muted">
+            <crate::components::CopyButton text=text.clone() label="Copy summarized update" />
             <span class="shrink-0 font-medium">"Summarized update"</span>
             <div class="md min-w-0 flex-1" on:click=move |ev| if let Some(ws) = ws { crate::mentions::follow_link(&ev, col, ws); } inner_html=markdown::to_html(&text)></div>
         </div>
@@ -5937,6 +5961,7 @@ fn thinking_view(text: Signal<String>, show: Signal<bool>, open: RwSignal<bool>)
                 on:toggle=move |ev| open.set(event_target::<web_sys::HtmlDetailsElement>(&ev).open())>
                 <summary class="cursor-pointer select-none text-xs">"Thinking"</summary>
                 <Show when=move || open.get()>
+                    <crate::components::CopyButton text label="Copy thinking as Markdown" />
                     <div class="md mt-1 text-xs" on:click=move |ev| if let Some(ws) = ws { crate::mentions::follow_link(&ev, col, ws); } inner_html=move || text.with(|t| markdown::to_html(t))></div>
                 </Show>
             </details>
@@ -6623,6 +6648,7 @@ fn ToolOutput(result: Signal<Option<ToolResultView>>, live_output: Signal<Option
     view! {
         <div node_ref=live_box class="h-48 overflow-auto rounded bg-zinc-100 p-2 dark:bg-zinc-900"
             on:scroll=move |_| if let Some(el) = live_box.get_untracked() { live_tail.set_value(el.scroll_height() - el.scroll_top() - el.client_height() < 24) }>
+            <crate::components::CopyButton label="Copy tool output" text=Signal::derive(move || result.get().map(|r| r.output).or_else(|| live_output.get()).unwrap_or_default()) />
             <pre class=move || format!("whitespace-pre-wrap font-mono text-xs {}", if result.with(|r| r.as_ref().is_some_and(|r| r.is_error)) { "text-red-700 dark:text-red-300" } else { "" })>
                 {move || result.get().map(|r| r.output).or_else(|| live_output.get()).unwrap_or_else(|| "Waiting for output…".into())}
             </pre>
@@ -6809,7 +6835,7 @@ fn ToolCard(
                     </div>
                 })}
             </summary>
-            <ToolBody open plan kind input result live_output />
+            <ToolBody open plan kind input raw_input=input_json result live_output />
         </details>
         {doc_card.map(|doc| view! {
             <div class="mx-3 mb-2 h-8 min-w-0">
@@ -6846,15 +6872,21 @@ fn ToolBody(
     plan: Option<Vec<(String, String)>>,
     kind: String,
     input: serde_json::Value,
+    #[prop(optional)] raw_input: String,
     result: Signal<Option<ToolResultView>>,
     live_output: Signal<Option<String>>,
 ) -> impl IntoView {
     let plan = StoredValue::new(plan);
     let input = StoredValue::new(input);
     let kind = StoredValue::new(kind);
+    let raw_input = StoredValue::new(raw_input);
     view! {
         <Show when=move || open.get()>
             <div class="space-y-2 border-t border-zinc-200 px-3 py-2 dark:border-zinc-800">
+                <crate::components::CopyButton label="Copy tool input" text=Signal::derive(move || {
+                    let raw = raw_input.get_value();
+                    if raw.is_empty() { input.with_value(|v| serde_json::to_string_pretty(v).unwrap_or_default()) } else { raw }
+                }) />
                 {plan.get_value().map(|items| view! {
                     <ul class="space-y-1 text-sm">
                         {items.into_iter().map(|(text, status)| {
@@ -6887,6 +6919,7 @@ fn Queued(q: QueuedInput, session_id: String, take_back: Callback<QueuedInput>) 
         <div class="flex flex-col items-end gap-1" data-queued-command=command_id.get_value()>
             <div class="max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800">
                 {text.get_value()}
+                <crate::components::CopyButton text=text.get_value() label="Copy queued message" />
             </div>
             <div class="flex items-center justify-end gap-2 text-xs text-muted" data-queue-actions="true">
             <button class="relative flex h-7 w-7 items-center justify-center rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-800 [@media(pointer:coarse)]:after:absolute [@media(pointer:coarse)]:after:-inset-2"
@@ -7706,6 +7739,7 @@ fn ApprovalCard(
                 {what.map(|w| format!(": {w}"))}
                 {server.map(|s| view! { <span class="text-xs text-muted">{format!(" · {s}")}</span> })}
             </div>
+            <crate::components::CopyButton text=shown.clone() label="Copy approval input" />
             <pre class="max-h-48 overflow-auto whitespace-pre-wrap rounded-md bg-white p-2 font-mono text-xs dark:bg-zinc-900">{shown}</pre>
             {move || match sent.get() {
                 Some(Ok(true)) => view! { <p class="text-xs text-emerald-700">"Approved."</p> }.into_any(),
@@ -7823,8 +7857,6 @@ fn QuestionCard(session: String, call_id: String, title: String, fields: Vec<c6_
 /// A secret an operation returned, for you: copy it now.
 #[component]
 fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoView {
-    let copied = RwSignal::new(false);
-    let value = StoredValue::new(card.value.clone());
     let id = card.call_id.clone();
     view! {
         <div class="space-y-2 rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-sm dark:border-emerald-900 dark:bg-emerald-950/40">
@@ -7837,10 +7869,7 @@ fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoVi
             </div>
             <pre class="select-all overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-white p-2 font-mono text-xs dark:bg-zinc-900">{card.value.clone()}</pre>
             <div class="flex items-center gap-2">
-                <button class=BUTTON on:click=move |_| {
-                    let _ = window().navigator().clipboard().write_text(&value.get_value());
-                    copied.set(true);
-                }>{move || if copied.get() { "Copied" } else { "Copy" }}</button>
+                <crate::components::CopyButton text=card.value.clone() label="Copy secret" />
                 <span class="text-xs text-zinc-600 dark:text-zinc-400">{card.note.clone()}</span>
             </div>
         </div>
@@ -7878,6 +7907,57 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn copy_actions_keep_message_sources_and_complete_tool_results() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let source = "Ask session:other about **literal Markdown**\n\nSecond line & <tag>.\r\n";
+            let event: Event = serde_json::from_value(serde_json::json!({
+                "seq": 1, "ts": 1, "type": "user", "command_id": "copy-user",
+                "text": source, "prompt": "Hook expansion is not the original message"
+            }))
+            .unwrap();
+            let html = user_message("parent", &event).to_html();
+            assert_eq!(crate::components::copied_text(&html, "Copy message"), source);
+            assert_eq!(crate::components::copied_text(&html, "Copy expanded prompt"), "Hook expansion is not the original message");
+
+            let markdown = "# Original reply\n\n**Bold** and [a link](https://example.com).\n";
+            let html = reply_text(markdown, &[], None).to_html();
+            assert!(html.contains("<strong>Bold</strong>"));
+            assert_eq!(crate::components::copied_text(&html, "Copy as Markdown"), markdown);
+
+            let full = format!("{}\nlast line, not the tool's name", "full output\n".repeat(20_000));
+            let event: Event = serde_json::from_value(serde_json::json!({
+                "seq": 2, "ts": 2, "type": "tool_result", "call_id": "copy-tool", "tool": "Bash",
+                "output": full, "is_error": false, "truncated": false, "duration_ms": 1
+            }))
+            .unwrap();
+            let result = tool_results("parent", &[event]).remove("copy-tool");
+            let html =
+                view! { <ToolOutput result=Signal::stored(result) live_output=Signal::stored(Some("stale preview".into())) /> }.to_html();
+            assert_eq!(crate::components::copied_text(&html, "Copy tool output"), full);
+
+            let error = "Full failure\nCaused by:\n  permission denied at /tmp/雪\n";
+            let html = view! { <ErrorBox message=error.to_owned() /> }.to_html();
+            assert_eq!(crate::components::copied_text(&html, "Copy error"), error);
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn tool_input_copy_preserves_the_original_json() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let raw = "{ \"command\": \"printf '雪\\n'\", \"timeout\": 123 }";
+            let html = view! { <ToolBody open=RwSignal::new(true) plan=None kind="bash".into()
+            input=serde_json::from_str(raw).unwrap() raw_input=raw.to_owned()
+            result=Signal::stored(None) live_output=Signal::stored(None) /> }
+            .to_html();
+            assert_eq!(crate::components::copied_text(&html, "Copy tool input"), raw);
+        });
+    }
 
     #[test]
     fn only_matching_durable_user_placements_remove_waiting_inputs() {

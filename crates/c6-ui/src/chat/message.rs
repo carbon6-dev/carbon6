@@ -318,6 +318,7 @@ pub(crate) fn Message(
         let p = chat.place(&chat.shown_workspace().unwrap_or_default(), &channel);
         chat.open(p, None);
     });
+    let source_text = text.clone();
     let shown_text = text.clone();
     let btn = "rounded px-1.5 py-0.5 hover:bg-zinc-200 dark:hover:bg-zinc-700";
     let where_ = with_place.then(|| {
@@ -343,12 +344,12 @@ pub(crate) fn Message(
             let (p1, p2, ts1, ts2, tt, id1, id2, url1, url2) =
                 (place.clone(), place.clone(), ts.clone(), ts.clone(), thread_ts.clone(), id.clone(), id.clone(), url.clone(), url.clone());
             view! {
-                <div class="absolute -top-3 right-3 z-20 hidden items-center gap-0.5 rounded-md border border-zinc-200 bg-white px-1 py-0.5 text-xs shadow-sm group-hover:flex dark:border-zinc-700 dark:bg-zinc-900">
+                <div class="absolute -top-3 right-3 z-20 hidden items-center gap-0.5 rounded-md border border-zinc-200 bg-white px-1 py-0.5 text-xs shadow-sm group-hover:flex group-focus-within:flex pointer-coarse:flex dark:border-zinc-700 dark:bg-zinc-900">
                     {QUICK.iter().map(|n| { let react = react.clone(); view! { <button class=btn title=format!(":{n}:") on:click=move |_| react(n.to_string(), false)>{text::face(n)}</button> } }).collect_view()}
                     <button class=btn title="Add a reaction" data-pop=pop.get_value() on:click=move |_| picker.update(|p| *p = !*p)>{crate::icons::reaction()}</button>
                     {(!in_thread).then(|| view! { <button class=btn title="Reply in a thread" on:click=move |_| open_thread()>{crate::icons::message()}</button> })}
                     <button class=btn title="Save for later" on:click=move |_| chat.act("memex.chat.save", json!({"id": id1}))>{crate::icons::bookmark()}</button>
-                    <button class=btn title="Copy link" on:click=move |_| { let _ = window().navigator().clipboard().write_text(&url1); }>{crate::icons::link()}</button>
+                    <crate::components::CopyButton text=url1 label="Copy link" />
                     {(!in_thread && ctl.is_some()).then(|| view! {
                         <button class=btn title="Mark unread from here" on:click=move |_| {
                             if let Some(c) = ctl { c.auto_read.set(false); }
@@ -400,6 +401,7 @@ pub(crate) fn Message(
                     view! {
                         <div class="leading-relaxed">
                             {(!files_only).then(|| text::render(&shown_text, &known, opener))}
+                            <crate::components::CopyButton text=source_text.clone() label="Copy message" />
                             {(meta["edited"] == true).then(|| view! { <span class="ml-1 text-[11px] text-muted">"(edited)"</span> })}
                         </div>
                     }.into_any()

@@ -2,18 +2,19 @@
 (() => {
   const states = new WeakMap();
   function input(root) {
+    const source = root.querySelector(":scope > .fv-source");
     if (!states.has(root)) states.set(root, {
       path: root.dataset.path || "", url: root.dataset.url || "", mode: root.dataset.mode || "full",
-      line: Number(root.dataset.line || 0), text: root.querySelector(":scope > .fv-source")?.textContent || "",
+      line: Number(root.dataset.line || 0), text: source?.dataset?.encoding === "json" ? JSON.parse(source.textContent) : source?.textContent || "",
       language: root.dataset.language || "", limit: 0,
       mime: root.dataset.mime || "",
     });
     return states.get(root);
   }
-  async function complete(root) {
+  async function complete(root, forCopy = false) {
     const state = input(root);
     if (root.dataset.sourceTruncated === "true" && state.url && !state.complete) {
-      try { state.text = await window.c6Viewers.text(state.url, root); state.complete = true; }
+      try { state.text = await window.c6Viewers.text(state.url, root, forCopy ? Infinity : undefined); state.complete = true; }
       catch (_) {
         if (!root.isConnected) return null;
         const error = document.createElement("p"); error.setAttribute("role", "alert");
@@ -54,25 +55,44 @@
     else if (next.querySelector(".fv-code")) next.querySelector(".fv-code").scrollTop = scroll;
   }
   document.addEventListener("click", async (ev) => {
-    const target = ev.target.closest?.("[data-fv-copy],[data-fv-copy-json],[data-fv-sort],[data-fv-action]");
-    const root = target?.closest(".fv");
-    if (!root) return;
-    if (target.hasAttribute("data-fv-copy") || target.hasAttribute("data-fv-copy-json")) {
+    const copy = ev.target.closest?.(".c6-copy");
+    if (copy) {
       ev.preventDefault(); ev.stopPropagation();
-      let message;
+      const status = copy.querySelector('[role="status"]');
+      if (status) status.textContent = "Copying…";
       try {
-        await navigator.clipboard.writeText(target.hasAttribute("data-fv-copy-json") ? JSON.parse(target.dataset.fvCopyJson) : target.dataset.fvCopy);
-        message = "Copied"; target.dataset.copied = "true";
-      } catch (_) { message = "Copy unavailable"; }
-      target.title = message;
-      let status = root.querySelector(".fv-copy-status");
-      if (!status) {
-        status = document.createElement("span"); status.className = "fv-copy-status";
-        status.setAttribute("role", "status"); root.append(status);
+        let text;
+        if (copy.hasAttribute("data-copy-viewer")) {
+          const state = await complete(copy.closest(".fv"), true);
+          if (!state) throw new Error("Could not load complete content");
+          text = state.text;
+        } else if (copy.dataset.copyUrl) {
+          const response = await fetch(copy.dataset.copyUrl, { credentials: "same-origin" });
+          if (!response.ok) throw new Error("Could not load content");
+          text = await response.text();
+        } else if (copy.dataset.copySelector) {
+          const element = copy.parentElement.querySelector(copy.dataset.copySelector);
+          if (!element) throw new Error("Content unavailable");
+          text = element.matches("table")
+            ? [...element.rows].map(row => [...row.cells].map(cell => cell.innerText).join("\t")).join("\n")
+            : element.innerText;
+        } else {
+          text = JSON.parse(copy.dataset.copyJson);
+        }
+        await navigator.clipboard.writeText(text);
+        copy.dataset.copied = "true";
+        copy.title = copy.getAttribute?.("aria-label") || "Copy";
+        if (status) status.textContent = "Copied";
+      } catch (_) {
+        delete copy.dataset.copied;
+        copy.title = "Copy unavailable; select the text and copy manually";
+        if (status) status.textContent = "Couldn't copy";
       }
-      status.textContent = message;
       return;
     }
+    const target = ev.target.closest?.("[data-fv-sort],[data-fv-action]");
+    const root = target?.closest(".fv");
+    if (!root) return;
     if (target.hasAttribute("data-fv-sort")) {
       const state = await complete(root), sort = Number(target.dataset.fvSort);
       if (!state) return;
@@ -106,7 +126,7 @@
       state.limit = (state.limit || step) + step;
       redraw(root, state);
     }
-  });
+  }, true); // Copy must not also select a doc block, navigate, or open a message.
   document.addEventListener("change", async (ev) => {
     if (!ev.target.matches?.("[data-fv-filter]")) return;
     const root = ev.target.closest(".fv"), state = await complete(root);

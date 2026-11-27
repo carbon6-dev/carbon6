@@ -246,6 +246,7 @@ fn detail(v: Value, about: RwSignal<Option<(String, String)>>) -> impl IntoView 
                         }
                     }).collect_view()}
                 </div>
+                <crate::components::CopyButton text=item["text"].as_str().unwrap_or_default().to_owned() label="Copy photo text" />
                 <pre class="max-h-80 overflow-auto whitespace-pre-wrap rounded bg-zinc-50 p-2 text-xs dark:bg-zinc-900">{item["text"].as_str().unwrap_or_default().to_owned()}</pre>
                 {v["error"].as_str().map(|e| view! { <p class="text-xs text-amber-700">{e.to_owned()}</p> })}
                 <p class="text-xs text-muted">"Unnamed faces are named under Memex → Review."</p>

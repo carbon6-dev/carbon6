@@ -393,10 +393,12 @@ fn DecisionCard(
                 </div>
             })}
             {(!cleanup && !d.document.is_empty()).then(|| view! { <div class="md text-sm text-zinc-700 dark:text-zinc-300" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&d.document)></div> })}
+            {(!d.document.is_empty()).then(|| view! { <crate::components::CopyButton text=d.document.clone() label="Copy decision as Markdown" /> })}
             // A task card: exactly what the new session would be told.
             {(d.kind == "task").then(|| d.context["prompt"].as_str().map(str::to_owned)).flatten().map(|p| view! {
                 <details class="text-xs">
                     <summary class="cursor-pointer select-none text-muted">"What the new session is told"</summary>
+                    <crate::components::CopyButton text=p.clone() label="Copy task prompt" />
                     <pre class="mt-1 max-h-64 overflow-auto whitespace-pre-wrap rounded bg-zinc-50 p-2 font-mono text-[11px] dark:bg-zinc-900">{p}</pre>
                 </details>
             })}
@@ -576,6 +578,7 @@ fn discussion_messages(messages: Vec<c6_api::DecisionDiscussionMessage>, now: i6
                 <div class="space-y-1">
                     <p class="text-xs text-muted">{if m.role == "user" { "You" } else { "Assistant" }}" · "{ago(now - m.created_at)}</p>
                     <div class="md text-sm" inner_html=crate::markdown::to_html(&m.text)></div>
+                    <crate::components::CopyButton text=m.text.clone() label="Copy discussion message" />
                 </div>
             }).collect_view()}
         </div>

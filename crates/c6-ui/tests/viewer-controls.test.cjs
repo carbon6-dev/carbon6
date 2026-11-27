@@ -27,7 +27,7 @@ async function loadMore(dataset, codeClass) {
       createElement() { return {}; },
     },
   }, { filename: script });
-  await click({ target: { closest: () => target } });
+  await click({ target: { closest: selector => selector === '.c6-copy' ? null : target } });
   return input;
 }
 
@@ -52,14 +52,11 @@ test('numbered fences keep the declared renderer language and grow from 2000 to 
 });
 
 test('copy feedback preserves the small icon and announces the result', async () => {
-  let click, copied, status;
-  const root = {
-    querySelector: () => status,
-    append(value) { status = value; },
-  };
+  let click, copied;
+  const status = { textContent: '' };
   const target = {
-    dataset: { fvCopyJson: JSON.stringify('/a\r\u0000') }, innerHTML: '<svg></svg>',
-    closest: () => root, hasAttribute: name => name === 'data-fv-copy-json',
+    dataset: { copyJson: JSON.stringify('/a\r\u0000') }, innerHTML: '<svg></svg>',
+    querySelector: () => status, hasAttribute: () => false,
   };
   runInNewContext(source, {
     navigator: { clipboard: { async writeText(value) { copied = value; } } },
@@ -72,9 +69,69 @@ test('copy feedback preserves the small icon and announces the result', async ()
   assert.equal(copied, '/a\r\u0000');
   assert.equal(target.innerHTML, '<svg></svg>');
   assert.equal(target.textContent, undefined);
-  assert.equal(target.title, 'Copied');
-  assert.equal(status.className, 'fv-copy-status');
+  assert.equal(target.dataset.copied, 'true');
   assert.equal(status.textContent, 'Copied');
+});
+
+test('copy errors do not claim success or replace the icon', async () => {
+  let click;
+  const status = { textContent: '' };
+  const target = { dataset: { copyJson: '"source"' }, innerHTML: '<svg></svg>',
+    querySelector: () => status, hasAttribute: () => false };
+  runInNewContext(source, {
+    navigator: { clipboard: { async writeText() { throw new Error('denied'); } } },
+    document: { addEventListener(event, callback) { if (event === 'click') click = callback; } },
+  });
+  await click({ target: { closest: () => target }, preventDefault() {}, stopPropagation() {} });
+  assert.equal(target.dataset.copied, undefined);
+  assert.equal(status.textContent, "Couldn't copy");
+  assert.equal(target.innerHTML, '<svg></svg>');
+});
+
+test('viewer Copy content reads complete source, not path or the rendered preview', async () => {
+  let click, copied;
+  const full = 'full source\n'.repeat(2000) + '\r\nEND';
+  const status = { textContent: '' };
+  const root = { dataset: { path: 'name.txt', url: '/download', sourceTruncated: 'true' },
+    querySelector: () => ({ textContent: 'truncated display' }) };
+  const target = { dataset: {}, hasAttribute: name => name === 'data-copy-viewer',
+    closest: () => root, querySelector: () => status };
+  runInNewContext(source, {
+    window: { c6Viewers: { async text(url, owner, max) { assert.equal(url, '/download'); assert.equal(max, Infinity); return full; } } },
+    navigator: { clipboard: { async writeText(value) { copied = value; } } },
+    document: { addEventListener(event, callback) { if (event === 'click') click = callback; } },
+  });
+  await click({ target: { closest: () => target }, preventDefault() {}, stopPropagation() {} });
+  assert.equal(copied, full);
+  assert.equal(status.textContent, 'Copied');
+});
+
+test('code Copy preserves CR, NUL and leading newlines through JSON-encoded viewer source', async () => {
+  let click, copied;
+  const full = '\n雪\r\n\u0000 & <tag>\n';
+  const status = { textContent: '' };
+  const root = { dataset: { path: '' }, querySelector: () => ({ dataset: { encoding: 'json' }, textContent: JSON.stringify(full) }) };
+  const target = { dataset: {}, hasAttribute: name => name === 'data-copy-viewer', closest: () => root, querySelector: () => status };
+  runInNewContext(source, {
+    navigator: { clipboard: { async writeText(value) { copied = value; } } },
+    document: { addEventListener(event, callback) { if (event === 'click') click = callback; } },
+  });
+  await click({ target: { closest: () => target }, preventDefault() {}, stopPropagation() {} });
+  assert.equal(copied, full);
+});
+
+test('output content fetches the version URL rather than copying its name', async () => {
+  let click, copied;
+  const status = { textContent: '' };
+  const target = { dataset: { copyUrl: '/outputs/27?c6_realm=home', copyJson: '"name.md"' },
+    hasAttribute: () => false, querySelector: () => status };
+  runInNewContext(source, {
+    async fetch(url) { assert.equal(url, target.dataset.copyUrl); return { ok: true, async text() { return '# Actual content\n'; } }; },
+    navigator: { clipboard: { async writeText(value) { copied = value; } } },
+    document: { addEventListener(event, callback) { if (event === 'click') click = callback; } },
+  });
+  await click({ target: { closest: () => target }, preventDefault() {}, stopPropagation() {} });
+  assert.equal(copied, '# Actual content\n');
 });
 
 test('Pretty and Raw are explicit segmented choices, not two toggle buttons', () => {

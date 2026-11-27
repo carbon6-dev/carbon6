@@ -983,6 +983,7 @@ pub fn OpenIn(link: c6_api::Link) -> impl IntoView {
 pub fn ErrorBox(message: String) -> impl IntoView {
     view! {
         <div class="rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
+            <crate::components::CopyButton text=message.clone() label="Copy error" />
             {message}
         </div>
     }

@@ -79,10 +79,7 @@ pub fn SlackSettings() -> impl IntoView {
                             })}
                             <div class="relative">
                                 <pre class="max-h-56 overflow-auto rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{manifest}</pre>
-                                <button class=format!("{BUTTON_QUIET} absolute right-2 top-2 text-xs") on:click=move |_| {
-                                    let _ = window().navigator().clipboard().write_text(&copy);
-                                    note.set(Some("Manifest copied.".into()));
-                                }>"Copy"</button>
+                                <crate::components::CopyButton text=copy label="Copy manifest" />
                             </div>
                             <div class="grid gap-2 sm:grid-cols-2">
                                 <input class=INPUT placeholder=if s.client_id.is_empty() { "Client ID".to_owned() } else { s.client_id.clone() }

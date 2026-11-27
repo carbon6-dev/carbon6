@@ -241,6 +241,7 @@ fn DayChart(
         </div>
         <details class="text-xs text-muted">
             <summary class="cursor-pointer">"Table"</summary>
+            <crate::components::CopyButton text=String::new() selector="table" label="Copy analytics table (TSV)" />
             <table class="mt-1 w-full tabular-nums">
                 <thead><tr>
                     <th class="text-left font-normal">"Day"</th>
@@ -275,6 +276,7 @@ fn Waits(w: c6_api::Waits) -> impl IntoView {
     card(
         "Waiting on you",
         view! {
+            <crate::components::CopyButton text=String::new() selector="table" label="Copy analytics table (TSV)" />
             <table class="w-full text-sm">
                 <thead class="text-xs text-muted"><tr>
                     <th class="text-left font-normal"></th><th class="pl-3 text-right font-normal">"Times"</th>
@@ -310,6 +312,7 @@ fn Models(rows: Vec<ActivityRow>) -> impl IntoView {
         "Models",
         view! {
             <div class="overflow-x-auto">
+                <crate::components::CopyButton text=String::new() selector="table" label="Copy analytics table (TSV)" />
                 <table class="w-full min-w-[36rem] text-sm">
                     <thead class="text-xs text-muted"><tr>
                         <th class="py-1 text-left font-normal">"Model"</th><th class="w-32"></th><th class=TH>"Time"</th>
@@ -344,6 +347,7 @@ fn Tools(rows: Vec<ToolRow>) -> impl IntoView {
         "Tools",
         view! {
             <div class="overflow-x-auto">
+                <crate::components::CopyButton text=String::new() selector="table" label="Copy analytics table (TSV)" />
                 <table class="w-full min-w-[30rem] text-sm">
                     <thead class="text-xs text-muted"><tr>
                         <th class="py-1 text-left font-normal">"Tool"</th><th class="w-32"></th><th class=TH>"Time"</th>
@@ -380,6 +384,7 @@ fn Groups(rows: Vec<ActivityRow>, by: RwSignal<String>, keys: Memo<Vec<String>>)
                 </select>
             </div>
             <div class="overflow-x-auto">
+                <crate::components::CopyButton text=String::new() selector="table" label="Copy analytics table (TSV)" />
                 <table class="w-full min-w-[36rem] text-sm">
                     <thead class="text-xs text-muted"><tr>
                         <th class="py-1 text-left font-normal">{key.clone()}</th><th class="w-32"></th><th class=TH>"Agent time"</th>

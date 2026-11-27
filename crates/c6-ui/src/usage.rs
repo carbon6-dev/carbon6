@@ -206,7 +206,7 @@ fn Table(title: &'static str, rows: Vec<UsageRow>, link: bool) -> impl IntoView 
                 view! { <p class="text-xs text-muted">"Nothing yet."</p> }.into_any()
             } else {
                 view! {
-                    <div class="overflow-x-auto"><table class="w-full text-xs">
+                    <div class="overflow-x-auto"><crate::components::CopyButton text=String::new() selector="table" label="Copy usage table (TSV)" /><table class="w-full text-xs">
                         <thead class="text-muted"><tr>
                             <th class="pb-1 text-left font-normal"></th>
                             <th class="pb-1 text-right font-normal">"Calls"</th>

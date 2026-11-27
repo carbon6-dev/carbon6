@@ -8,6 +8,59 @@ use leptos::prelude::*;
 pub const CHECKBOX: &str = "size-4 shrink-0 accent-sky-600 focus-visible:outline-2 focus-visible:outline-sky-500/60";
 pub const SECTION_LABEL: &str = "text-[11px] font-medium uppercase tracking-wide text-muted";
 
+/// One clipboard control for views and trusted generated markup. The delegated
+/// handler in viewer-controls.js owns success/failure feedback and keeps the icon.
+#[component]
+pub fn CopyButton(
+    #[prop(into)] text: Signal<String>,
+    #[prop(default = "Copy".into(), into)] label: String,
+    #[prop(optional, into)] url: String,
+    #[prop(optional, into)] selector: String,
+    #[prop(optional, into)] caption: String,
+    #[prop(optional, into)] title: String,
+) -> impl IntoView {
+    let title = if title.is_empty() { label.clone() } else { title };
+    let class = if caption.is_empty() { "c6-copy" } else { "c6-copy c6-copy-labeled" };
+    view! {
+        <button type="button" class=class aria-label=label title=title
+            data-copy-json=move || serde_json::to_string(&text.get()).unwrap_or_default()
+            data-copy-url=url data-copy-selector=selector>
+            {icon(Icon::Copy, Size::S14)}
+            {caption}
+            <span class="c6-copy-status" role="status"></span>
+        </button>
+    }
+}
+
+/// The same control in sanitized Markdown/file-viewer HTML. JSON encoding
+/// preserves CR, NUL and newlines through HTML attribute normalization.
+pub fn copy_button_html(text: &str, label: &str) -> String {
+    format!(
+        "<button type=\"button\" class=\"c6-copy\" data-copy-json=\"{}\" aria-label=\"{}\" title=\"{}\">{}<span class=\"c6-copy-status\" role=\"status\"></span></button>",
+        crate::file_viewers::esc(&serde_json::to_string(text).unwrap_or_default()),
+        crate::file_viewers::esc(label),
+        crate::file_viewers::esc(label),
+        crate::icons::icon_html(Icon::Copy, Size::S14),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn copied_text(html: &str, label: &str) -> String {
+    let button = html
+        .split("<button")
+        .find(|s| s.split('>').next().unwrap_or_default().contains(&format!("aria-label=\"{label}\"")))
+        .expect("copy button");
+    let value = button.split("data-copy-json=\"").nth(1).expect("copy source").split('"').next().unwrap();
+    let value = value
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    serde_json::from_str(&value).expect("lossless JSON clipboard payload")
+}
+
 // `.btn` owns default sizing in the components layer, so BTN_SM's utilities
 // override it without depending on class-string order. Touch still wins.
 pub const BTN_PRIMARY: &str = "btn bg-zinc-900 text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300";
@@ -192,6 +245,15 @@ pub fn Gallery() -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_markup_preserves_control_characters_and_cannot_inject_html() {
+        let source = "\"quoted\"\r\n\0雪 & <script>not HTML</script>";
+        let html = copy_button_html(source, "Copy code");
+        assert_eq!(copied_text(&html, "Copy code"), source);
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("<svg") && html.contains("role=\"status\""));
+    }
 
     #[test]
     fn foundations_have_accessible_names_and_trailing_switches() {

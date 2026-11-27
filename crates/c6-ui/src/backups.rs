@@ -134,6 +134,7 @@ pub fn BackupsSetting() -> impl IntoView {
             {move || private.get().map(|k| view! {
                 <div class="space-y-1 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-800 dark:bg-amber-950">
                     <p class="font-medium">"Your backup key: keep it somewhere safe, away from this machine. It is shown only now, and nothing restores without it."</p>
+                    <crate::components::CopyButton text=k.clone() label="Copy backup key" />
                     <pre class="select-all overflow-auto font-mono text-xs">{k}</pre>
                     <button class=BUTTON_QUIET on:click=move |_| private.set(None)>"I've kept it"</button>
                 </div>

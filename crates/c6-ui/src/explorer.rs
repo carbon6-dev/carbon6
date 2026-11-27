@@ -622,7 +622,7 @@ fn ObjectPane(realm: String, section: String, kind: String, id: String) -> impl 
                         </div>
                         {(!o.fields.is_empty()).then(|| view! {
                             <dl class="grid grid-cols-1 gap-x-3 gap-y-0.5 text-sm [overflow-wrap:anywhere] @sm/view:grid-cols-[auto_minmax(0,1fr)]">
-                                {o.fields.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| view! { <dt class="text-muted">{k.clone()}</dt><dd class="whitespace-pre-wrap break-words">{v.clone()}</dd> }).collect_view()}
+                                {o.fields.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| view! { <dt class="text-muted">{k.clone()}</dt><dd class="whitespace-pre-wrap break-words">{v.clone()}<crate::components::CopyButton text=v.clone() label=format!("Copy {k}") /></dd> }).collect_view()}
                             </dl>
                         })}
                         {chart.map(|v| view! { <crate::views::ViewBody view=v all=Vec::new() /> })}

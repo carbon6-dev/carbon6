@@ -586,6 +586,7 @@ fn TaskInspector(session: String, task: Memo<Option<Task>>) -> impl IntoView {
                                 <p>{format!("{} · elapsed {} · exit {}", if s.running { "running" } else { "not running" }, elapsed(s.elapsed_ms.min(i64::MAX as u64) as i64), s.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "unavailable".into()))}</p>
                                 <div>
                                     <h3 class="font-medium">"Command"</h3>
+                                    <crate::components::CopyButton text=s.command.clone() label="Copy command" />
                                     <pre class="whitespace-pre-wrap break-all font-mono text-xs">{s.command}</pre>
                                 </div>
                                 <TaskStream label="stdin (read-only)" stream=s.stdin />
@@ -605,6 +606,7 @@ fn TaskStream(label: &'static str, stream: c6_api::TaskStream) -> impl IntoView 
     view! {
         <section class="min-w-0 space-y-1">
             <h3 class="font-medium">{label}</h3>
+            <crate::components::CopyButton text=stream.text.clone() label="Copy captured stream" />
             {(!stream.note.is_empty()).then(|| view! { <p class="break-words text-xs text-amber-700 dark:text-amber-400">{stream.note}</p> })}
             {(stream.dropped_bytes > 0).then(|| view! { <p class="text-xs text-amber-700 dark:text-amber-400">{format!("Truncated: {} earlier bytes dropped.", stream.dropped_bytes)}</p> })}
             <pre class="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded border border-zinc-200 bg-zinc-50 p-2 font-mono text-xs dark:border-zinc-700 dark:bg-zinc-950">{if stream.text.is_empty() { "(no captured data)".into() } else { stream.text }}</pre>

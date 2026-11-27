@@ -2868,6 +2868,8 @@ fn ArchivedDeck(doc: Doc, width: Signal<f64>) -> impl IntoView {
                 let notes = slide.attrs["notes"].as_str().unwrap_or("").to_owned();
                 view! {
                     <section data-block=slide.id>
+                        <crate::components::CopyButton text=slide.children.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n\n") label="Copy slide as Markdown" />
+                        <crate::components::CopyButton text=notes.clone() label="Copy slide notes" />
                         <crate::deck::SlideBox html width />
                         {(slide.attrs["hidden"] == true).then(|| view! { <p class="text-xs text-muted">"Hidden slide"</p> })}
                         {(!notes.is_empty()).then(|| view! { <p class="mt-1 whitespace-pre-wrap text-xs text-muted">{format!("Notes: {notes}")}</p> })}
@@ -2907,7 +2909,7 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
                         if c.kind == "embed" {
                             view! { <Embed v=c.attrs.clone() /> }.into_any()
                         } else {
-                            view! { <div class="md" inner_html=move || chips_html(&c.text, &c.attrs, &refs.map(|r| r.get()).unwrap_or_default(), archived.get())></div> }.into_any()
+                            view! { <div><crate::components::CopyButton text=c.text.clone() label="Copy block as Markdown" /><div class="md" inner_html=move || chips_html(&c.text, &c.attrs, &refs.map(|r| r.get()).unwrap_or_default(), archived.get())></div></div> }.into_any()
                         }
                     }).collect_view()}
                     {(!notes.is_empty()).then(|| view! { <p class="mt-2 border-t border-zinc-100 pt-1 text-xs text-muted dark:border-zinc-900">{format!("Notes: {notes}")}</p> })}
@@ -2919,7 +2921,7 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
         _ => {
             let _ = kind;
             let refs = use_context::<ChipCtx>().map(|c| c.refs);
-            view! { <div class="md" inner_html=move || chips_html(&b.text, &b.attrs, &refs.map(|r| r.get()).unwrap_or_default(), archived.get())></div> }
+            view! { <div><crate::components::CopyButton text=b.text.clone() label="Copy block as Markdown" /><div class="md" inner_html=move || chips_html(&b.text, &b.attrs, &refs.map(|r| r.get()).unwrap_or_default(), archived.get())></div></div> }
                 .into_any()
         }
     }
@@ -3292,6 +3294,7 @@ fn AgentName(id: String) -> impl IntoView {
 fn agent_text(text: &str) -> impl IntoView {
     let (col, ws) = (crate::workspace::use_column(), use_context::<crate::workspace::Workspace>());
     view! {
+        <crate::components::CopyButton text=text.to_owned() label="Copy comment as Markdown" />
         <div class="md max-w-[85%] break-words rounded-xl bg-zinc-100 px-3 py-1.5 dark:bg-zinc-800"
             on:click=move |ev| if let Some(ws) = ws { crate::mentions::follow_link(&ev, col, ws); }
             inner_html=crate::markdown::to_html(text)></div>
@@ -3308,7 +3311,7 @@ fn said(c: &c6_api::docs::DocComment, under: Option<AnyView>) -> AnyView {
         return view! {
             <div class="flex flex-col items-end">
                 <div class="mb-0.5 text-xs text-muted">{format!("You · {when}")}</div>
-                <p class="max-w-[85%] whitespace-pre-wrap break-words rounded-xl bg-sky-50 px-3 py-1.5 text-zinc-900 dark:bg-sky-950/60 dark:text-zinc-100">{text}</p>
+                <p class="max-w-[85%] whitespace-pre-wrap break-words rounded-xl bg-sky-50 px-3 py-1.5 text-zinc-900 dark:bg-sky-950/60 dark:text-zinc-100"><crate::components::CopyButton text=text.clone() label="Copy comment" />{text}</p>
                 {under}
             </div>
         }
@@ -3671,6 +3674,7 @@ fn Thread(id: String, about: bool) -> impl IntoView {
                     <div data-failed-reply="" class="space-y-1 rounded-md border border-zinc-300 p-2 dark:border-zinc-700">
                         <p class="text-xs text-muted">"Not sent. Kept here while you write your next reply."</p>
                         <pre class="max-h-24 overflow-y-auto whitespace-pre-wrap break-words font-sans text-sm">{c.with_value(|c| c.text.clone())}</pre>
+                        <crate::components::CopyButton text=c.with_value(|c| c.text.clone()) label="Copy unsent comment" />
                         <button class="text-xs text-sky-700 hover:underline disabled:opacity-50 dark:text-sky-400"
                             disabled=move || !reply.get().is_empty() title="Restore into an empty reply box"
                             on:click=move |_| {

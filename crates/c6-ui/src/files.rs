@@ -295,7 +295,7 @@ fn StatusSummary(s: Value) -> impl IntoView {
     view! {
         <div class="text-sm">
             <div class="flex flex-wrap items-center gap-2">
-                <span class="rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-xs dark:bg-zinc-800">{branch}</span>
+                <span class="rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-xs dark:bg-zinc-800"><crate::components::CopyButton text=branch.clone() label="Copy branch" />{branch}</span>
                 {s["upstream"].as_str().map(|u| view! { <span class="text-xs text-muted">{crate::icons::arrow_right()}" "{format!("Upstream {u} · {ahead} ahead, {behind} behind")}</span> })}
                 <span class="text-xs text-muted">{format!("{} changed file{}", files.len(), if files.len() == 1 { "" } else { "s" })}</span>
             </div>
@@ -303,7 +303,7 @@ fn StatusSummary(s: Value) -> impl IntoView {
                 {files.into_iter().map(|f| {
                     let code = format!("{}{}", f["index"].as_str().unwrap_or(" "), f["worktree"].as_str().unwrap_or(" "));
                     let cls = match code.as_str() { "??" => "text-emerald-600", c if c.contains('D') => "text-red-600", _ => "text-amber-600" };
-                    view! { <li class="truncate"><span class=format!("mr-2 {cls}")>{code}</span>{f["path"].as_str().unwrap_or("").to_owned()}</li> }
+                    view! { <li class="truncate"><span class=format!("mr-2 {cls}")>{code}</span><crate::components::CopyButton text=f["path"].as_str().unwrap_or("").to_owned() label="Copy path" />{f["path"].as_str().unwrap_or("").to_owned()}</li> }
                 }).collect_view()}
             </ul>
         </div>
@@ -328,6 +328,7 @@ pub fn DiffView(diff: String, truncated: bool) -> impl IntoView {
     view! {
         <div class="space-y-2">
             {truncated.then(|| view! { <p class="text-xs text-amber-600">"The diff is large; showing the first 4 MB."</p> })}
+            <crate::components::CopyButton text=diff label=if truncated { "Copy available diff (truncated at 4 MB)" } else { "Copy diff" } />
             {files.into_iter().map(|(name, lines)| {
                 let adds = lines.iter().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
                 let dels = lines.iter().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();

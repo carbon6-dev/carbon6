@@ -234,7 +234,7 @@ fn Detail(e: CalendarEvent, open: RwSignal<Option<CalendarEvent>>, refresh: RwSi
             </div>
             {move || error.get().map(|x| view! { <ErrorBox message=x /> })}
             {(!e.conference.is_empty()).then(|| view! { <a class="text-sm text-sky-700 hover:underline dark:text-sky-400" href=crate::markdown::safe_href(&e.conference) target="_blank" rel="noopener">"Join the call "{icon(Icon::ExternalLink, Size::S14)}</a> })}
-            {(!e.description.is_empty()).then(|| view! { <pre class="max-h-48 overflow-auto whitespace-pre-wrap font-sans text-sm">{e.description.clone()}</pre> })}
+            {(!e.description.is_empty()).then(|| view! { <div><crate::components::CopyButton text=e.description.clone() label="Copy event description" /><pre class="max-h-48 overflow-auto whitespace-pre-wrap font-sans text-sm">{e.description.clone()}</pre></div> })}
             {(!e.attendees.is_empty()).then(|| view! {
                 <ul class="text-sm">
                     {e.attendees.iter().map(|a| view! {

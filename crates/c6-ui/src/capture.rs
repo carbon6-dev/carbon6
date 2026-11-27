@@ -152,7 +152,7 @@ pub fn UpNext(session: String, running: Signal<bool>) -> impl IntoView {
                                                     _ => {}
                                                 } />
                                         }.into_any(),
-                                        None => view! { <p class="whitespace-pre-wrap break-words">{text.clone()}</p> }.into_any(),
+                                        None => view! { <p class="whitespace-pre-wrap break-words">{text.clone()}<crate::components::CopyButton text=text.clone() label="Copy follow-up" /></p> }.into_any(),
                                     }}
                                     {f.quote.clone().map(|q| view! { <QuoteLine quote=q /> })}
                                     <div class="flex flex-wrap gap-1 pt-0.5">

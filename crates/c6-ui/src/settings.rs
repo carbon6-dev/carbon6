@@ -1360,6 +1360,7 @@ fn Prompts() -> impl IntoView {
                                 <span class="ml-2 text-muted">{p.description.clone()}</span>
                             </summary>
                             <div class="mt-2 space-y-2">
+                                <crate::components::CopyButton text=Signal::derive(move || body.get()) label="Copy prompt" />
                                 <textarea class=format!("{INPUT} h-48 font-mono text-xs") prop:value=move || body.get() on:input=move |ev| body.set(event_target_value(&ev))></textarea>
                                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                                 <div class="flex gap-2">
@@ -2363,6 +2364,7 @@ fn ConnectionRow(
                 {move || check.get().map(|r| connection_test_result(r, false))}
                 <div class="truncate font-mono text-xs text-muted">
                     {kind_label(&c.kind)} {(!matches!(c.kind.as_str(), "alias" | "claude_code" | "pool")).then(|| format!(" · {}", c.base_url))}
+                    <crate::components::CopyButton text=c.base_url.clone() label="Copy connection URL" />
                     {pool.then_some(move || format!(" · {}", members_text()))}
                     {c.default_model.clone().map(|m| format!(" · {m}"))}
                     {c.subagent_model.clone().map(|m| format!(" · subagents: {m}"))}
@@ -4893,6 +4895,7 @@ fn AutomationsSetting() -> impl IntoView {
                 <div class="space-y-1 rounded-md bg-amber-50 p-3 text-sm dark:bg-amber-950">
                     <p class="font-medium">"The webhook's URL (shown once; make a new one if it leaks):"</p>
                     <div class="select-all break-all font-mono text-xs">{u.clone()}</div>
+                    <crate::components::CopyButton text=u.clone() label="Copy webhook URL" />
                     <div class="select-all break-all font-mono text-xs text-muted">{format!("curl -X POST --data '{{\"alert\":\"…\"}}' {u}")}</div>
                 </div>
             })}

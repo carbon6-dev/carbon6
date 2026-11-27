@@ -407,8 +407,10 @@ fn ApiTokens() -> impl IntoView {
                 view! {
                     <div class="mt-2 space-y-1 rounded-md bg-zinc-100 p-3 dark:bg-zinc-900">
                         <div class="select-all break-all font-mono text-xs">{t.clone()}</div>
+                        <crate::components::CopyButton text=t.clone() label="Copy API token" />
                         <p class="text-xs text-muted">"Copy it now; it is not shown again. To set up the CLI:"</p>
-                        <div class="select-all break-all font-mono text-xs">{login}</div>
+                        <div class="select-all break-all font-mono text-xs">{login.clone()}</div>
+                        <crate::components::CopyButton text=login label="Copy login command" />
                     </div>
                 }
             })}

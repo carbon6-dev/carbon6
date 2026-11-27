@@ -1,5 +1,20 @@
 @import "tailwindcss";
 
+/* Shared clipboard affordance: icon remains painted after success. Native
+   buttons retain Enter/Space and focus; touch never depends on hover. */
+.c6-copy { display: inline-flex; align-items: center; gap: .25rem; vertical-align: middle; flex-shrink: 0; border-radius: .25rem; padding: .25rem; color: var(--color-zinc-500); font: 11px/1.4 sans-serif; white-space: normal; }
+.c6-copy svg { width: .875rem; height: .875rem; flex: none; }
+.c6-copy:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
+.c6-copy:focus-visible { outline: 2px solid var(--color-sky-500); outline-offset: 2px; }
+.c6-copy-status:empty { display: none; }
+@media (pointer: fine) {
+  .c6-copy { opacity: 0; }
+  :hover > .c6-copy, :focus-within > .c6-copy, .c6-copy:focus-visible { opacity: 1; }
+  .fv:hover > .fv-header .c6-copy, .fv:focus-within > .fv-header .c6-copy { opacity: 1; }
+  .c6-copy-labeled { opacity: 1; }
+}
+@media (pointer: coarse) { .c6-copy { min-width: 2rem; min-height: 2rem; opacity: 1; } }
+
 /* Fit before the first visible frame. Removed navigation stays measurable:
    display:none would make resizing depend on its own previous decisions. */
 .c6-header:not([data-header-ready]) { visibility: hidden; }
@@ -578,7 +593,6 @@ html.dark {
 @layer components {
   .fv :is(button, input[data-fv-filter], .fv-diff-file > summary), .fv-actions a { min-height: var(--fv-control-height); }
   .fv :is(.fv-tree summary, .fv-json-row) { min-height: var(--fv-row-height); }
-  .fv .fv-json-row .fv-copy-icon { min-height: var(--fv-row-height); }
   .fv-collapsed > summary { min-height: 1.5rem; }
   /* The outer fence summary is not a descendant of the renderer root. */
   @media (pointer: coarse) { .fv-collapsed > summary { min-height: 2.75rem; } }
@@ -603,20 +617,11 @@ html.dark {
 .fv .fv-segment { padding-inline: .45rem; }
 .fv button[aria-pressed="true"] { background: var(--fv-selected-control); color: inherit; }
 .fv .fv-segment[aria-pressed="true"] { font-weight: 600; }
-.fv button.fv-copy-icon {
-  display: inline-flex; align-items: center; justify-content: center; vertical-align: middle;
-  flex: none; width: var(--fv-control-height); height: var(--fv-control-height); padding: 0;
-}
-.fv .fv-json-row .fv-copy-icon { width: var(--fv-row-height); height: var(--fv-row-height); }
-.fv .fv-copy-icon svg { width: .875rem; height: .875rem; flex: none; }
-.fv .fv-copy-status { display: block; color: var(--fv-quiet); font-size: 11px; line-height: 1.5; }
 .fv .fv-more { margin-block-start: .15rem; }
 @media (hover: hover) and (pointer: fine) {
   .fv :is(button:enabled:not([aria-pressed="true"]), .fv-actions a, .fv-tree summary, .fv-diff-file > summary):hover {
     background: var(--fv-hover); color: inherit;
   }
-  .fv .fv-json-row .fv-copy-icon { opacity: 0; }
-  .fv .fv-json-row:is(:hover, :focus-within) .fv-copy-icon { opacity: 1; }
 }
 .fv-code { overflow: auto; max-height: 70vh; font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.65; tab-size: 4; }
 .fv-line { display: flex; min-width: max-content; }

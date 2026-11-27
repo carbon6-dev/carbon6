@@ -299,6 +299,7 @@ fn CollectionView(name: String) -> impl IntoView {
                             Ok(p) if p.records.is_empty() => view! { <p class="text-sm text-muted">"No records."</p> }.into_any(),
                             Ok(p) => view! {
                                 <div class="overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-800">
+                                    <crate::components::CopyButton text=String::new() selector="table" label="Copy records table (TSV)" />
                                     <table class="w-full text-left text-sm">
                                         <thead class="bg-zinc-50 text-xs text-muted dark:bg-zinc-900">
                                             <tr>
@@ -728,6 +729,7 @@ fn RecordForm(collection: Collection, record: Option<Record>, done: Callback<()>
                     {h.into_iter().rev().map(|c| view! {
                         <li class="rounded bg-zinc-50 p-2 dark:bg-zinc-900">
                             <div class="text-muted">{format!("v{} · {} · {} · {}", c.version, c.op, c.changed_by, ago(now_ms() - c.changed_at))}</div>
+                            <crate::components::CopyButton text=serde_json::to_string(&c.fields).unwrap_or_default() label="Copy record JSON" />
                             <pre class="whitespace-pre-wrap font-mono">{serde_json::to_string(&c.fields).unwrap_or_default()}</pre>
                         </li>
                     }).collect_view()}

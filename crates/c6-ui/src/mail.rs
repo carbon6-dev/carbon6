@@ -602,9 +602,11 @@ fn Message(m: MailMessage) -> impl IntoView {
                 <span class="flex-1"></span>
                 <span class="text-xs text-muted">{crate::when::full(m.date)}</span>
             </div>
+            <crate::components::CopyButton text=m.text.clone() label="Copy email text" />
             {match html {
                 Some(h) => view! {
                     <div class="space-y-1">
+                        <crate::components::CopyButton text=h.clone() label="Copy email HTML" />
                         // Sandboxed: no scripts, an opaque origin; remote
                         // images only when you allow them.
                         <iframe class="h-96 w-full rounded border border-zinc-100 bg-white dark:border-zinc-800" sandbox="allow-popups allow-popups-to-escape-sandbox"
@@ -645,7 +647,13 @@ fn Message(m: MailMessage) -> impl IntoView {
 #[component]
 pub(crate) fn FileChip(name: String, mime: String, size: u64, href: String) -> impl IntoView {
     let (icon, kind) = file_kind(&mime, &name);
+    let copy = if href.starts_with("/api/") && (mime.starts_with("text/") || mime == "application/json") {
+        view! { <crate::components::CopyButton text=String::new() url=href.clone() label="Copy attachment content" /> }.into_any()
+    } else {
+        view! { <crate::components::CopyButton text=href.clone() label="Copy attachment link" /> }.into_any()
+    };
     view! {
+        <div class="flex items-center gap-1">
         <a href=href target="_blank" rel="noopener"
             class="flex max-w-xs items-center gap-2 rounded-md border border-zinc-200 px-2 py-1 hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-800">
             <span class="text-lg">{icon}</span>
@@ -654,6 +662,8 @@ pub(crate) fn FileChip(name: String, mime: String, size: u64, href: String) -> i
                 <span class="block text-[10px] text-muted">{format!("{kind} · {}", self::size(size))}</span>
             </span>
         </a>
+        {copy}
+        </div>
     }
 }
 
@@ -853,6 +863,7 @@ pub fn GoogleSettings() -> impl IntoView {
             })}
             {move || client.get().and_then(Result::ok).map(|c| view! {
                 <p class="text-xs text-muted">"Redirect URI: " <code class="select-all font-mono">{c.redirect_uri.clone()}</code></p>
+                <crate::components::CopyButton text=c.redirect_uri.clone() label="Copy redirect URI" />
                 {(c.from_root && !c.client_id.is_empty()).then(|| view! {
                     <p class="text-xs text-muted">"Using root's client (set in the console). Saving one here gives this realm its own."</p>
                 })}
@@ -936,7 +947,7 @@ mod tests {
                 assert_eq!(file_kind(mime, name).1, kind);
                 assert_eq!(file_kind(mime, name).0.to_html(), icon(expected, Size::S16).to_html(), "{mime}/{name}");
                 let html = view! { <FileChip name=name.into() mime=mime.into() size=42 href="/file".into() /> }.to_html();
-                assert_eq!(html.matches("<svg").count(), 1, "keep the type icon: {html}");
+                assert_eq!(html.matches("<svg").count(), 2, "keep the type icon and shared copy icon: {html}");
                 assert!(html.contains(kind), "{html}");
                 crate::icons::tests::assert_no_icon_glyphs(&html);
             }

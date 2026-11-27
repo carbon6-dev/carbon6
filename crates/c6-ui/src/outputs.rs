@@ -110,6 +110,7 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, synced: RwSignal<b
                             })}
                             <a class=format!("{BUTTON_QUIET} text-xs") href=u.clone() target="_blank" rel="noopener">"Open "{icon(Icon::ExternalLink, Size::S14)}</a>
                             <a class=format!("{BUTTON_QUIET} text-xs") href=format!("{u}?download=1")>"Download"</a>
+                            <OutputCopy url=u.clone() mime=v.mime.clone() />
                         </div>
                         <Preview url=u mime=v.mime.clone() />
                     </div>
@@ -149,6 +150,16 @@ pub fn Recent(events: RwSignal<Vec<Event>>, #[prop(into)] on_pick: Callback<Opti
                 <button class="min-h-7 px-1.5 text-[11px] text-muted hover:text-zinc-900 hover:underline pointer-coarse:min-h-11 dark:hover:text-zinc-100" on:click=move |_| on_pick.run(None)>"Show all"</button>
             })}
         }
+    }
+}
+
+/// An output shown by its type.
+#[component]
+fn OutputCopy(url: String, mime: String) -> impl IntoView {
+    if mime.starts_with("text/") || matches!(mime.as_str(), "application/json" | "application/xml" | "image/svg+xml") {
+        view! { <crate::components::CopyButton text=String::new() url=url label="Copy output content" /> }.into_any()
+    } else {
+        view! { <crate::components::CopyButton text=format!("{}{}", window().location().origin().unwrap_or_default(), url) label="Copy output link" /> }.into_any()
     }
 }
 
@@ -195,6 +206,7 @@ pub fn published_line(session: &str, seq: u64, name: &str, title: &str, mime: &s
                 <span class="font-mono">{format!("{name} · {}", size(size_bytes))}</span>
                 <a class="underline" href=u.clone() target="_blank" rel="noopener">"open "{icon(Icon::ExternalLink, Size::S14)}</a>
                 <span>"· see Outputs ("{crate::icons::ellipsis()}")"</span>
+                <OutputCopy url=u.clone() mime=mime.to_owned() />
             </p>
             {image.then(|| view! {
                 <a href=u.clone() target="_blank" rel="noopener" title="Open full size">

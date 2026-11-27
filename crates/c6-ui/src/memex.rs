@@ -400,6 +400,7 @@ fn item_view(it: Value, open: RwSignal<Option<String>>, error: RwSignal<Option<S
         </div>
         <div class="flex flex-wrap gap-1">{chips(about, open)}</div>
         <AddToTrail target=trail_target />
+        <crate::components::CopyButton text=s("text") label="Copy item text" />
         <pre class="max-h-[32rem] overflow-auto whitespace-pre-wrap rounded-md bg-zinc-50 p-3 text-sm dark:bg-zinc-900">{s("text")}</pre>
     }
 }

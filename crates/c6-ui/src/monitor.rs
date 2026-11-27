@@ -272,6 +272,7 @@ fn CallDetail(id: u64, live: bool) -> impl IntoView {
         view! {
             <details class="rounded border border-zinc-200 dark:border-zinc-800" class:hidden=move || shown().is_empty() open=title != "Prompt">
                 <summary class="cursor-pointer px-2 py-1 text-xs text-muted">{move || format!("{title} ({} characters)", size().chars().count())}</summary>
+                <crate::components::CopyButton text=Signal::derive(field(k)) label=format!("Copy {title}") />
                 <pre class="max-h-96 overflow-auto whitespace-pre-wrap break-words px-2 py-1 font-mono text-[11px]">{text}</pre>
             </details>
         }

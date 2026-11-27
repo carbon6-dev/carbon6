@@ -5,7 +5,6 @@ use std::time::Duration;
 use c6_api::{Enrollment, Worker, WorkerStatus};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use wasm_bindgen::JsCast;
 
 use crate::api;
 use crate::when::ago;
@@ -315,12 +314,13 @@ fn WorkerRow(w: Worker, now: RwSignal<i64>, error: RwSignal<Option<String>>) -> 
                     <span class=format!("h-2 w-2 shrink-0 rounded-full {dot}") title=label></span>
                     {(w.role != "memex").then(|| view! { <crate::marks::MarkButton key=format!("worker:{}", w.id) shape=crate::marks::Shape::Square /> })}
                     <crate::workspace::Go to=crate::workspace::View::Worker { id: w.id.to_string() } class="font-medium hover:underline">{w.name.clone()}</crate::workspace::Go>
+                    <crate::components::CopyButton text=w.id.to_string() label="Copy worker ID" />
                     {(w.role == "memex").then(|| view! {
                         <crate::workspace::Go to=crate::workspace::View::Memex class="rounded bg-violet-100 px-1.5 text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300">"memex"</crate::workspace::Go>
                     })}
                 </div>
             </td>
-            <td class="px-3 py-2 text-zinc-600 dark:text-zinc-400">{w.hostname}</td>
+            <td class="px-3 py-2 text-zinc-600 dark:text-zinc-400"><crate::components::CopyButton text=w.hostname.clone() label="Copy hostname" />{w.hostname}</td>
             <td class="px-3 py-2 text-zinc-600 dark:text-zinc-400">{format!("{}/{}", w.os, w.arch)}</td>
             <td class="px-3 py-2 font-mono text-xs text-zinc-600 dark:text-zinc-400">{w.version.unwrap_or_default()}</td>
             <td class="px-3 py-2">
@@ -435,25 +435,7 @@ fn AddWorker() -> impl IntoView {
 fn TokenView(enrollment: Enrollment, on_done: impl Fn(leptos::ev::MouseEvent) + 'static) -> impl IntoView {
     let command = format!("c6w enroll {}", enrollment.token);
     let minutes = ((enrollment.expires_at - now_ms()) / 60_000).max(0);
-    let copied = RwSignal::new(false);
     let input_ref = NodeRef::<leptos::html::Input>::new();
-
-    let copy = {
-        let command = command.clone();
-        move |_| {
-            let w = window();
-            // The Clipboard API only exists in secure contexts; the head is
-            // usually plain HTTP on a private address, so fall back to
-            // selecting the text for a manual copy.
-            if w.is_secure_context() {
-                let _ = w.navigator().clipboard().write_text(&command);
-                copied.set(true);
-            } else if let Some(input) = input_ref.get() {
-                let input: web_sys::HtmlInputElement = input.unchecked_into();
-                input.select();
-            }
-        }
-    };
 
     view! {
         <div class="space-y-3 text-sm">
@@ -472,9 +454,7 @@ fn TokenView(enrollment: Enrollment, on_done: impl Fn(leptos::ev::MouseEvent) + 
                         input.select();
                     }
                 />
-                <button class="shrink-0 rounded-md border border-zinc-300 px-3 py-1.5 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800" on:click=copy>
-                    {move || if copied.get() { "Copied" } else { "Copy" }}
-                </button>
+                <crate::components::CopyButton text=command.clone() label="Copy enrollment command" />
             </div>
             <p class="text-muted">"Then start it with " <code class="font-mono">"c6w run"</code> ". It will appear here once attached."</p>
             <div class="flex justify-end">

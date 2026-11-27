@@ -721,6 +721,7 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                 let (t, d) = (w1.fields.title.clone(), w1.fields.done_when.clone());
                                 let (t2, d2) = (t.clone(), d.clone());
                                 view! {
+                                    <crate::components::CopyButton text=format!("{t}\n\nDone when: {d}") label="Copy work item" />
                                     <div class="flex items-start gap-2">
                                         <span class="mt-2"><crate::marks::MarkButton key=format!("work:{}", w1.id) shape=crate::marks::Shape::Diamond size=14 /></span>
                                         <h1 class="min-w-0 flex-1 text-xl font-semibold [overflow-wrap:anywhere]">{t}</h1>
@@ -856,9 +857,10 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                                 spawn_local(async move { apply(api::work_todo_patch(id.get_value(), todo, p).await) });
                                             } />
                                         <span class="min-w-0 flex-1">
-                                            <span class=if done { "block truncate text-muted line-through" } else { "block truncate" } title=what>{t.text.clone()}</span>
+                                            <span class=if done { "block truncate text-muted line-through" } else { "block truncate" } title=what.clone()>{t.text.clone()}</span>
                                             {t.quote.clone().map(|q| view! { <crate::capture::QuoteLine quote=q /> })}
                                         </span>
+                                        <crate::components::CopyButton text=what label="Copy to-do prompt" />
                                         {t.from.starts_with("decision:").then(|| view! { <span class="shrink-0 text-[11px] text-muted" title="An agent proposed it as a task card">"task card"</span> })}
                                         {t.by.strip_prefix("session:").filter(|_| !t.from.starts_with("decision:")).map(|s| view! {
                                             <Go to=View::session(s.to_owned()) class="shrink-0 text-[11px] text-muted hover:underline" title="An agent added it; this opens its session">"by an agent"</Go>

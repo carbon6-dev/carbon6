@@ -184,6 +184,7 @@ fn TableView(view: ViewDef) -> impl IntoView {
                 let fields = fields_of(&view, &col.schema);
                 view! {
                     <div class="overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-800">
+                        <crate::components::CopyButton text=String::new() selector="table" label="Copy view table (TSV)" />
                         <table class="w-full text-sm">
                             <thead class="bg-zinc-50 text-left text-xs text-muted dark:bg-zinc-900">
                                 <tr>{fields.iter().map(|f| view! { <th class="px-2 py-1.5 font-medium">{f.clone()}</th> }).collect_view()}<th></th></tr>

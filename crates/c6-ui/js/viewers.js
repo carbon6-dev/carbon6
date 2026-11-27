@@ -20,9 +20,11 @@
       document.querySelectorAll(".c6-file-link[data-fv-path][data-fv-url]").forEach(scanNode);
     },
     render(input) { return renderer ? renderer(JSON.stringify(input)) : ""; },
-    async text(url, owner) {
+    // Explicit user-requested copy may opt out of the preview read ceiling;
+    // read() still enforces same-origin worker downloads and cancellation.
+    async text(url, owner, max = limit) {
       if (owner && !owner.isConnected) throw new DOMException("Viewer disconnected", "AbortError");
-      return asText(await read(url, limit, owner && stateFor(owner).abort.signal));
+      return asText(await read(url, max, owner && stateFor(owner).abort.signal));
     },
   };
 
@@ -350,7 +352,8 @@
   }
 
   async function renderDiagram(root, state) {
-    const source = trustedDiagram(own(root, ".fv-source")?.textContent || "");
+    const encoded = own(root, ".fv-source");
+    const source = trustedDiagram(encoded?.dataset?.encoding === "json" ? JSON.parse(encoded.textContent) : encoded?.textContent || "");
     const task = diagramQueue.then(async () => {
       if (state.abort.signal.aborted || !root.isConnected) return;
       const box = own(root, ".fv-rendered");

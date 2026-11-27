@@ -6,8 +6,6 @@ use leptos::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::icons::{Icon, Size, icon_html};
-
 pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
@@ -242,13 +240,7 @@ fn tree(value: &Value, path: &str, label: &str, budget: &mut usize, depth: usize
         return "<span>… node limit; use Raw or Download</span>".into();
     }
     *budget -= 1;
-    let copy = format!(
-        "<button type=\"button\" class=\"fv-copy-icon {}\" data-fv-copy-json=\"{}\" aria-label=\"Copy JSON Pointer for {}\" title=\"Copy JSON Pointer\">{}</button>",
-        crate::components::BAR_BUTTON,
-        esc(&serde_json::to_string(path).unwrap_or_default()),
-        esc(&clipped(label)),
-        icon_html(Icon::Copy, Size::S14)
-    );
+    let copy = crate::components::copy_button_html(path, &format!("Copy JSON Pointer for {}", clipped(label)));
     let label = esc(&clipped(label));
     match value {
         Value::Object(map) => {
@@ -399,6 +391,7 @@ pub(crate) fn render(input: &Input) -> String {
     } else {
         ""
     };
+    let binary = matches!(kind, Renderer::Image | Renderer::Pdf | Renderer::Other);
     let kind = format!("{kind:?}").to_lowercase();
     let cap_note = if input.text.len() > 2 * 1024 * 1024 {
         "<p class=\"fv-cap-note\">Source preview capped at 2 MiB; Download has the complete file.</p>"
@@ -410,31 +403,31 @@ pub(crate) fn render(input: &Input) -> String {
     } else {
         format!("<a class=\"fv-download\" href=\"{}\" download>Download</a>", esc(&input.url))
     };
-    let copy = if input.path.is_empty() {
-        String::new()
+    let path_copy = if input.path.is_empty() { String::new() } else { crate::components::copy_button_html(&input.path, "Copy path") };
+    // A path is useful, but is not the file's contents. Always offer both,
+    // including for fences without a filename. Read uncapped source on demand.
+    let content_copy = if binary {
+        if input.url.is_empty() { String::new() } else { crate::components::copy_button_html(&input.url, "Copy file link") }
     } else {
-        format!(
-            "<button type=\"button\" class=\"fv-copy-icon {}\" data-fv-copy=\"{}\" aria-label=\"Copy path\" title=\"Copy path\">{}</button>",
-            crate::components::BAR_BUTTON,
-            esc(&input.path),
-            icon_html(Icon::Copy, Size::S14)
-        )
+        crate::components::copy_button_html("", "Copy content").replacen("data-copy-json=", "data-copy-viewer data-copy-json=", 1)
     };
+    let copy = format!("{content_copy}{path_copy}");
     let header = if toolbar.is_empty() && open.is_empty() && copy.is_empty() {
         String::new()
     } else {
         format!("<div class=\"fv-header\">{toolbar}<div class=\"fv-actions\">{open}{copy}</div></div>")
     };
     format!(
-        "<section class=\"fv pointer-coarse:[&_button]:min-h-11 pointer-coarse:[&_button]:min-w-11 pointer-coarse:[&_a]:min-h-11 pointer-coarse:[&_a]:min-w-11 pointer-coarse:[&_input]:min-h-11 pointer-coarse:[&_summary]:min-h-11\" data-kind=\"{kind}\" data-path=\"{}\" data-url=\"{}\" data-mode=\"{}\" data-language=\"{}\" data-mime=\"{}\" data-line=\"{}\" data-source-truncated=\"{}\"><pre class=\"fv-source\" hidden>{}</pre>{header}{cap_note}{body}</section>",
+        "<section class=\"fv pointer-coarse:[&_button]:min-h-11 pointer-coarse:[&_button]:min-w-11 pointer-coarse:[&_a]:min-h-11 pointer-coarse:[&_a]:min-w-11 pointer-coarse:[&_input]:min-h-11 pointer-coarse:[&_summary]:min-h-11\" data-kind=\"{kind}\" data-path=\"{}\" data-url=\"{}\" data-mode=\"{}\" data-language=\"{}\" data-mime=\"{}\" data-line=\"{}\" data-source-truncated=\"{}\"><pre class=\"fv-source\" data-encoding=\"json\" hidden>{}</pre>{header}{cap_note}{body}</section>",
         esc(&input.path),
         esc(&input.url),
         esc(&input.mode),
         esc(&input.language),
         esc(&input.mime),
         input.line,
-        input.text.len() > 2 * 1024 * 1024,
-        esc(prefix(&input.text, 2 * 1024 * 1024))
+        !input.url.is_empty() && input.text.len() > 2 * 1024 * 1024,
+        esc(&serde_json::to_string(if input.url.is_empty() { &input.text } else { prefix(&input.text, 2 * 1024 * 1024) })
+            .unwrap_or_default())
     )
 }
 
@@ -572,7 +565,7 @@ mod tests {
         assert!(lines[0].1.is_ok());
         assert!(lines[1].1.is_err());
         let html = render(&Input { language: "json".into(), text: "{\"a\\r\\u0000\":1}".into(), ..Default::default() });
-        assert!(html.contains("data-fv-copy-json=\"&quot;/a\\r\\u0000&quot;\""));
+        assert!(html.contains("data-copy-json=\"&quot;/a\\r\\u0000&quot;\""));
     }
 
     #[test]
@@ -593,6 +586,28 @@ mod tests {
         assert!(html.contains("data-fv-view=\"raw\" aria-pressed=\"false\""));
         assert!(html.find("class=\"fv-actions\"").unwrap() < html.find("class=\"fv-rendered fv-tree\"").unwrap());
         assert!(html.contains("pointer-coarse:[&_button]:min-h-11"));
+    }
+
+    #[test]
+    fn fences_and_files_copy_source_separately_from_names() {
+        let text = "printf '雪 & <tag>'\n\n";
+        let html = fence(text, "bash");
+        assert!(html.contains("aria-label=\"Copy content\"") && html.contains("data-copy-viewer"));
+        assert!(html.contains(&format!(
+            "<pre class=\"fv-source\" data-encoding=\"json\" hidden>{}</pre>",
+            esc(&serde_json::to_string(text).unwrap())
+        )));
+        let html = render(&Input { path: "name.txt".into(), text: text.into(), ..Default::default() });
+        assert_eq!(crate::components::copied_text(&html, "Copy path"), "name.txt");
+        assert!(html.contains(&format!(
+            "<pre class=\"fv-source\" data-encoding=\"json\" hidden>{}</pre>",
+            esc(&serde_json::to_string(text).unwrap())
+        )));
+        let full = format!("{}END", "x".repeat(2 * 1024 * 1024 + 1));
+        let html = fence(&full, "text");
+        assert!(html.contains("END&quot;</pre>"), "a capped fence's copy source is not its capped display");
+        let html = render(&Input { path: "large.txt".into(), url: "/download".into(), text: full, ..Default::default() });
+        assert!(html.contains("data-source-truncated=\"true\""), "large downloadable files fetch full source before copying");
     }
 
     #[test]
@@ -637,7 +652,7 @@ mod tests {
             ..Default::default()
         });
         assert!(html.contains("<img alt="));
-        assert_eq!(html.matches("<svg ").count(), 1, "only the trusted Copy icon enters markup");
+        assert_eq!(html.matches("<svg ").count(), 2, "only the trusted content/path Copy icons enter markup");
         assert!(!html.contains("<svg onload="));
         assert!(html.contains("&lt;svg onload="));
         assert!(!html.contains("<script"));
