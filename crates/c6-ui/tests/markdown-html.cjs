@@ -124,7 +124,11 @@ async function checkSummarizedUpdates(browser, origin, engine, theme, width, sho
     assert.equal(await items.count(), 2, 'each narration block retains its own item');
     assert.equal(await items.getByText('Summarized update', { exact: true }).count(), 2);
     assert.equal(await items.first().locator('strong').textContent(), 'First summary', 'keep summary Markdown');
-    assert.equal(await items.locator('details, summary, button').count(), 0, 'visible summaries, not a Thinking disclosure or unbuilt action');
+    assert.equal(await items.locator('details, summary').count(), 0, 'visible summaries, not a Thinking disclosure');
+    assert.deepEqual(await items.locator('button').evaluateAll(buttons => buttons.map(button => ({
+      label: button.getAttribute('aria-label'), text: JSON.parse(button.getAttribute('data-copy-json')),
+    }))), events[1].blocks.map(block => ({ label: 'Copy summarized update', text: block.text })),
+    'only source-exact Copy actions, not an unbuilt full-text action');
     const ordinary = page.locator('#parent-e70 .md');
     const historical = page.locator('#parent-e75');
     assert.equal(await historical.locator('[data-summarized-update]').count(), 0, 'do not reclassify old Text');

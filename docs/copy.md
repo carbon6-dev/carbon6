@@ -253,3 +253,10 @@ adding another fixed header. Desktop location controls stay in the tile bar.
 The unchanged phone-bar suite still requires actual content within 44px of the
 top; the session-sheet suite additionally requires the phone location summary
 and model control to be reachable in Details, with no strip in the tile.
+
+The narration browser assertion predates shared Copy and prohibited every
+button inside a summarized update. Its two failures reproduced alone. It now
+still prohibits disclosure elements and unimplemented full-text actions, while
+requiring the exact complete set of Copy buttons and their original per-item
+Markdown payloads (including the long wrapping summary), rather than merely
+allowing arbitrary new buttons.
