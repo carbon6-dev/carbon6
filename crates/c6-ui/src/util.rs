@@ -6,6 +6,16 @@ use leptos::prelude::*;
 mod drafts;
 pub use drafts::attachments as draft_attachments;
 
+/// API links copied by browser views need their origin. Native rendering keeps
+/// the relative address, without calling browser-only window bindings.
+pub fn absolute_api_link(url: &str) -> String {
+    #[cfg(target_arch = "wasm32")]
+    let origin = window().location().origin().unwrap_or_default();
+    #[cfg(not(target_arch = "wasm32"))]
+    let origin = "";
+    format!("{origin}{url}")
+}
+
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = c6Motion, js_name = reduced)]

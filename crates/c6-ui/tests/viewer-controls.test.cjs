@@ -134,6 +134,29 @@ test('output content fetches the version URL rather than copying its name', asyn
   assert.equal(copied, '# Actual content\n');
 });
 
+test('table copy uses the currently displayed cells and stops row navigation', async () => {
+  let click, copied, prevented = false, stopped = false;
+  const status = { textContent: '' };
+  const table = { matches: selector => selector === 'table', rows: [
+    { cells: [{ innerText: 'Name' }, { innerText: 'Cost' }] },
+    { cells: [{ innerText: 'Visible record' }, { innerText: '$1.23' }] },
+  ] };
+  const target = { dataset: { copySelector: 'table', copyJson: '"not the table"' },
+    hasAttribute: () => false, querySelector: () => status,
+    parentElement: { querySelector(selector) { assert.equal(selector, 'table'); return table; } } };
+  runInNewContext(source, {
+    navigator: { clipboard: { async writeText(value) { copied = value; } } },
+    document: { addEventListener(event, callback, capture) {
+      if (event === 'click') { click = callback; assert.equal(capture, true); }
+    } },
+  });
+  await click({ target: { closest: () => target },
+    preventDefault() { prevented = true; }, stopPropagation() { stopped = true; } });
+  assert.equal(copied, 'Name\tCost\nVisible record\t$1.23');
+  assert(prevented && stopped, 'Copy must not also navigate or select its enclosing row');
+  assert.equal(status.textContent, 'Copied');
+});
+
 test('Pretty and Raw are explicit segmented choices, not two toggle buttons', () => {
   let click;
   const source = { hidden: true, closest: () => root };

@@ -27,15 +27,20 @@ test('correctness and perf invocations cannot overlap or steal each other\'s loc
 test('full selection retains both engines and independent acceptance suites', () => {
   const config = configuration({});
   assert.deepEqual(config.engines, ['chromium', 'webkit']);
-  for (const suite of ['message-edit', 'message-origin', 'comments-design', 'session-sheet', 'transcript-press', 'transcript-times', 'navigation-errors', 'stale-transcript'])
+  for (const suite of ['message-edit', 'message-origin', 'comments-design', 'session-sheet', 'transcript-press', 'transcript-times', 'navigation-errors', 'stale-transcript', 'copy-actions'])
     assert(config.selected.includes(suite), suite);
   const tasks = plan(config, {});
   for (const suite of config.selected) for (const engine of config.engines)
-    assert.equal(tasks.some(task => task.suite === suite && task.engine === engine), suite !== 'ring-render' || engine === 'chromium');
+    assert.equal(tasks.some(task => task.suite === suite && task.engine === engine), !['ring-render', 'copy-actions'].includes(suite) || engine === 'chromium');
   assert.equal(shards('workspace-open', {}).length, 4, 'both widths and real platform modifiers');
   assert.equal(shards('motion', { BROWSER_MATRIX: 'all' }).length, 4, 'exhaustive Cartesian mode remains available');
   assert.equal(shards('phone-picker', {}).length, 8);
   assert.equal(shards('phone-bar', { BROWSER_MATRIX: 'all' }).length, 14);
+  assert.deepEqual(shards('message-edit', {}), [{ CASE: '/desktop/' }, { CASE: '/phone/' }]);
+  const sheets = shards('session-sheet', {});
+  assert.equal(sheets.filter(task => task.EXTRAS === '0').length, 10, 'all theme/viewport cases remain');
+  assert.deepEqual(sheets.filter(task => task.EXTRAS === 'only'), [{ EXTRAS: 'only' }], 'all isolation/restriction cases remain');
+  assert.deepEqual(shards('theme', {}).map(task => task.THEME_CASE), ['paint', 'tile', 'phone', 'radios', 'choices']);
 });
 
 test('representative matrices retain the named responsive, policy and theme branches', () => {
@@ -57,6 +62,9 @@ test('diagnostic selectors do not multiply or override caller-selected cases', (
   for (const suite of ['motion', 'phone-picker', 'phone-bar', 'workspace-open'])
     assert.deepEqual(shards(suite, { VIEWPORT: 'narrow' }), [{}]);
   assert.deepEqual(shards('stale-transcript', {}), [{}], 'new suites use the generic isolated worker');
+  for (const [suite, selectors] of [['message-edit', { CASE_EXACT: 'webkit/phone/queued-ready' }],
+    ['session-sheet', { VIEWS: 'narrow' }], ['theme', { THEME_CASE: 'paint' }]])
+    assert.deepEqual(shards(suite, selectors), [{}], `${suite} retains explicit selectors`);
 });
 
 test('each tier records harness dependencies without a provenance unit gate', async () => {

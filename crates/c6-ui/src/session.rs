@@ -1112,6 +1112,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let background = Memo::new(move |_| jobs.with(|list| crate::tasks::background_count(list)));
     let chrome = SessionChrome {
         token: SessionChrome::next_token(),
+        owner: StoredValue::new(Owner::current().expect("session owner").downgrade()),
         id: id_stored,
         detail,
         find_open,
@@ -1287,7 +1288,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         // the glance beside it, the two centred together; the glance stays
         // in sight as the transcript scrolls.
         <div class=format!("relative {READING_ROW} items-start overflow-clip")>
-        <div class=format!("relative {READING} px-4 pb-8 pt-4") data-follow-content="true">
+        // Native scrollbars must also clear the coarse-pointer target's 8px halo.
+        <div class=format!("relative {READING} px-4 pr-8 md:pr-6 pb-8 pt-4") data-follow-content="true">
             <Show when=move || feed.stream_failed.get()>
                 <p class="mb-3 text-sm text-muted" role="status">"Session stream disconnected. Reconnecting…"</p>
             </Show>
@@ -1514,6 +1516,7 @@ struct ChipDisclosure {
 pub struct SessionChrome {
     /// Which pane registered it (a pane's view can be replaced in place).
     pub(crate) token: u64,
+    owner: StoredValue<WeakOwner>,
     pub(crate) id: StoredValue<String>,
     pub(crate) detail: LocalResource<Result<c6_api::SessionDetail, String>>,
     find_open: RwSignal<bool>,
@@ -1572,6 +1575,16 @@ pub struct SessionChrome {
 }
 
 impl SessionChrome {
+    /// The bar is outside the transcript's owner. Stop its borrowed render
+    /// effects synchronously when the transcript goes, before its arena is
+    /// disposed; the keyed bar removes their DOM on its next reactive turn.
+    pub(crate) fn borrow<T: IntoView>(self, view: impl FnOnce() -> T) -> impl IntoView {
+        let transcript = self.owner.get_value().upgrade().expect("registered session owner");
+        let owner = borrowed_chrome_owner(&transcript);
+        let view = owner.with(view);
+        leptos::tachys::reactive_graph::OwnedView::new_with_owner(view.into_view(), owner)
+    }
+
     fn next_token() -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1720,6 +1733,19 @@ impl SessionChrome {
             self.navigation,
         );
     }
+}
+
+fn borrowed_chrome_owner(transcript: &Owner) -> Owner {
+    let owner = Owner::new();
+    let borrowed = owner.downgrade();
+    transcript.with(|| {
+        on_cleanup(move || {
+            if let Some(owner) = borrowed.upgrade() {
+                owner.pause();
+            }
+        })
+    });
+    owner
 }
 
 /// A text box to give a session a new name: Enter saves, Escape (or the
@@ -5657,7 +5683,8 @@ fn user_attachments(session: &str, seq: u64, attachments: &[c6_api::AttachmentIn
             let copy = if mime.starts_with("text/") || matches!(mime, "application/json" | "application/xml") {
                 view! { <crate::components::CopyButton text=String::new() url=url.clone() label="Copy attachment content" /> }.into_any()
             } else {
-                view! { <crate::components::CopyButton text=format!("{}{}", window().location().origin().unwrap_or_default(), url) label="Copy attachment link" /> }.into_any()
+                view! { <crate::components::CopyButton text=crate::util::absolute_api_link(&url) label="Copy attachment link" /> }
+                    .into_any()
             };
             let preview = if attachment_preview_mime(mime).is_some() {
                 view! { <TranscriptImage src=url name=a.name.clone() info=info /> }.into_any()
@@ -7908,6 +7935,35 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn borrowed_bar_effects_pause_before_transcript_signals_are_disposed() {
+        let bar = Owner::new();
+        let transcript = bar.with(Owner::new);
+        let model = transcript.with(|| RwSignal::new("model"));
+        let surface = bar.with(|| borrowed_chrome_owner(&transcript));
+        let effect = surface.with(Owner::new);
+        let nested_effect = effect.with(Owner::new);
+        assert!(!effect.paused());
+        transcript.with(|| {
+            on_cleanup({
+                let effect = effect.clone();
+                let nested_effect = nested_effect.clone();
+                move || {
+                    assert!(effect.paused(), "queued bar effects must stop before arena disposal");
+                    assert!(nested_effect.paused(), "nested model controls share the borrowed lifetime");
+                    assert_eq!(model.get_untracked(), "model", "cleanup precedes signal disposal");
+                }
+            })
+        });
+        transcript.cleanup();
+        assert_eq!(model.try_get_untracked(), None);
+        assert!(surface.paused());
+        assert!(!bar.paused(), "navigation must leave the persistent bar running");
+        let weak = surface.downgrade();
+        drop(surface);
+        assert!(weak.upgrade().is_none(), "the transcript must not retain an unmounted bar surface");
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn copy_actions_keep_message_sources_and_complete_tool_results() {
@@ -8845,10 +8901,12 @@ mod tests {
             assert!(shown.contains("Reasoning, not a status update"), "{shown}");
             assert!(shown.contains(">Thinking</summary>"), "{shown}");
             let bold = view! { <Thinking text="**Preparing process flag extract**".to_owned() show=Signal::stored(true) /> }.to_html();
+            let body = bold.split("<div class=\"md").nth(1).unwrap();
             assert!(
-                bold.contains("<strong>Preparing process flag extract</strong>") && !bold.contains("**"),
+                body.contains("<strong>Preparing process flag extract</strong>") && !body.contains("**"),
                 "thinking renders its Markdown: {bold}"
             );
+            assert_eq!(crate::components::copied_text(&bold, "Copy thinking as Markdown"), "**Preparing process flag extract**");
             let details = shown.split('>').find(|s| s.contains("<details")).unwrap();
             assert!(details.contains(" open"), "thinking starts expanded: {shown}");
         });
@@ -9307,6 +9365,7 @@ mod tests {
                 assert!(html.contains(expected), "missing {expected}: {html}");
             }
             assert!(!html.contains("<img"), "unsupported preview should use a file chip: {html}");
+            assert_eq!(crate::components::copied_text(&html, "Copy attachment link"), "/api/v1/sessions/session/attachments/42/0");
         }
     }
 

@@ -159,7 +159,7 @@ fn OutputCopy(url: String, mime: String) -> impl IntoView {
     if mime.starts_with("text/") || matches!(mime.as_str(), "application/json" | "application/xml" | "image/svg+xml") {
         view! { <crate::components::CopyButton text=String::new() url=url label="Copy output content" /> }.into_any()
     } else {
-        view! { <crate::components::CopyButton text=format!("{}{}", window().location().origin().unwrap_or_default(), url) label="Copy output link" /> }.into_any()
+        view! { <crate::components::CopyButton text=crate::util::absolute_api_link(&url) label="Copy output link" /> }.into_any()
     }
 }
 
@@ -253,7 +253,14 @@ mod tests {
             assert!(link.contains(&arrow), "the link keeps its 14px external arrow: {html}");
             assert!(html.contains(&crate::icons::package().to_html()), "keep the published icon: {html}");
             assert!(html.contains(&crate::icons::ellipsis().to_html()), "keep the Outputs menu icon: {html}");
-            assert_eq!(html.matches("<svg").count(), 3, "{html}");
+            assert!(
+                html.contains("aria-label=\"Copy output content\"") && html.contains("data-copy-url=\"/api/v1/sessions/s1/outputs/1\""),
+                "{html}"
+            );
+            assert_eq!(html.matches("<svg").count(), 4, "the three existing icons plus Copy: {html}");
+            let binary =
+                view! { <OutputCopy url="/api/v1/sessions/s1/outputs/2".to_owned() mime="application/pdf".to_owned() /> }.to_html();
+            assert_eq!(crate::components::copied_text(&binary, "Copy output link"), "/api/v1/sessions/s1/outputs/2");
         });
     }
 }

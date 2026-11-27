@@ -63,7 +63,7 @@ function acquireLock(env) {
 
 const suites = ['workspace-open', 'motion', 'comment-sheet', 'phone-picker', 'phone-bar', 'theme',
   'settings-lists', 'resource-lifecycle', 'machines-scroll', 'markdown-html', 'status-row', 'stale-transcript', 'ring-render',
-  'transcript-press', 'transcript-times', 'selection-capture', 'message-edit', 'message-origin', 'comments-design', 'session-sheet', 'navigation-errors'];
+  'transcript-press', 'transcript-times', 'selection-capture', 'message-edit', 'message-origin', 'comments-design', 'session-sheet', 'navigation-errors', 'copy-actions'];
 const quick = ['workspace-open', 'motion', 'settings-lists', 'markdown-html', 'transcript-press', 'transcript-times', 'stale-transcript'];
 const words = value => value.trim().split(/[\s,]+/).filter(Boolean);
 const positive = (name, value) => {
@@ -101,6 +101,16 @@ function configuration(env) {
 // inclusion); no second shell allowlist or mandatory sharder is needed.
 function shards(suite, env) {
   const explicit = keys => keys.some(key => env[key] !== undefined);
+  if (suite === 'message-edit' && !explicit(['CASE', 'CASE_EXACT'])) {
+    return ['desktop', 'phone'].map(view => ({ CASE: `/${view}/` }));
+  }
+  if (suite === 'session-sheet' && !explicit(['THEMES', 'VIEWS', 'EXTRAS'])) {
+    return [...['light', 'dark'].flatMap(THEMES => ['wide', 'narrow', 'phone-320', 'phone-390', 'phone-430']
+      .map(VIEWS => ({ THEMES, VIEWS, EXTRAS: '0' }))), { EXTRAS: 'only' }];
+  }
+  if (suite === 'theme' && !explicit(['THEME_CASE', 'LAYOUTS', 'THEMES', 'WIDTHS'])) {
+    return ['paint', 'tile', 'phone', 'radios', 'choices'].map(THEME_CASE => ({ THEME_CASE }));
+  }
   if (suite === 'workspace-open' && !explicit(['VIEWPORT', 'PLATFORM', 'ONLY'])) {
     return ['desktop', 'narrow'].flatMap(VIEWPORT => ['Linux x86_64', 'MacIntel'].map(PLATFORM => ({ VIEWPORT, PLATFORM })));
   }
@@ -136,10 +146,10 @@ function shards(suite, env) {
 function plan(config, env) {
   const tasks = [];
   for (const engine of config.engines) for (const suite of config.selected) {
-    if (suite === 'ring-render' && engine !== 'chromium') continue;
+    if (['ring-render', 'copy-actions'].includes(suite) && engine !== 'chromium') continue;
     for (const [index, filters] of shards(suite, { ...env, BROWSER_MATRIX: config.matrix }).entries()) tasks.push({ engine, suite, shard: index + 1, filters });
   }
-  assert(tasks.length, 'No applicable suite/engine pairs selected (ring-render is Chromium-only)');
+  assert(tasks.length, 'No applicable suite/engine pairs selected (ring-render and copy-actions are Chromium-only)');
   // Start long jobs first so the end of the run isn't one unsharded tail.
   const weight = { 'message-edit': 100, motion: 80, 'session-sheet': 60, theme: 50, 'phone-picker': 40 };
   return tasks.sort((a, b) => (weight[b.suite] || 20) - (weight[a.suite] || 20));
@@ -368,6 +378,7 @@ async function run(env, dependencies = {}) {
   process.on('SIGTERM', interrupt);
   try {
     const units = [
+      ...(config.selected.includes('copy-actions') ? ['viewer-controls.test'] : []),
       ...(config.selected.includes('transcript-press') ? ['follow-press-unit'] : []),
       ...(config.selected.some(suite => ['motion', 'navigation-errors'].includes(suite)) ? ['browser-navigation.test'] : []),
       ...(config.selected.includes('session-sheet') ? ['browser-lifecycle.test'] : []),

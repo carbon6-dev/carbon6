@@ -2868,7 +2868,7 @@ fn ArchivedDeck(doc: Doc, width: Signal<f64>) -> impl IntoView {
                 let notes = slide.attrs["notes"].as_str().unwrap_or("").to_owned();
                 view! {
                     <section data-block=slide.id>
-                        <crate::components::CopyButton text=slide.children.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n\n") label="Copy slide as Markdown" />
+                        <crate::components::CopyButton text={slide.children.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n\n")} label="Copy slide as Markdown" />
                         <crate::components::CopyButton text=notes.clone() label="Copy slide notes" />
                         <crate::deck::SlideBox html width />
                         {(slide.attrs["hidden"] == true).then(|| view! { <p class="text-xs text-muted">"Hidden slide"</p> })}
@@ -4457,7 +4457,9 @@ mod tests {
         let owner = Owner::new();
         owner.with(|| {
             let html = agent_text("1. **Work the target back.** Then *check*.").to_html();
-            assert!(html.contains("<strong>Work the target back.</strong>") && !html.contains("**"), "{html}");
+            let body = html.split("<div class=\"md").nth(1).unwrap();
+            assert!(body.contains("<strong>Work the target back.</strong>") && !body.contains("**"), "{html}");
+            assert_eq!(crate::components::copied_text(&html, "Copy comment as Markdown"), "1. **Work the target back.** Then *check*.");
             assert!(html.contains("<ol>") || html.contains("<ol "), "{html}");
         });
     }

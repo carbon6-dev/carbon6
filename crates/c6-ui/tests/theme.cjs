@@ -663,6 +663,19 @@ async function browserTests() {
   let browser;
   try {
     browser = await launchBrowser(playwright, process.env.ENGINE || 'chromium');
+    const selected = process.env.THEME_CASE;
+    assert(!selected || ['paint', 'tile', 'phone', 'radios', 'choices'].includes(selected), 'unknown THEME_CASE');
+    if (selected) {
+      await within(`theme ${selected}`, async () => {
+        if (selected === 'paint') {
+          for (const choice of ['system', 'light', 'dark', 'soft', 'dim']) for (const os of ['light', 'dark'])
+            await firstPaint(browser, origin, choice, os);
+        } else if (selected === 'radios') await workspaceRadios(browser, origin, fixture, settle);
+        else if (selected === 'choices') await workspaceChoices(browser, origin, fixture, settle);
+        else await switching(browser, origin, selected, fixture, settle);
+      });
+      return;
+    }
     if (process.argv.includes('--workspace-choices')) {
       await within('retained workspace Choices and aspects', () => workspaceChoices(browser, origin, fixture, settle));
       return;

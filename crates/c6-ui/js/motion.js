@@ -216,11 +216,12 @@ window.c6Modal = (element, close) => {
     const items = [...element.querySelectorAll('button, input, select, textarea, a[href], [tabindex]')]
       .filter(el => !el.disabled && el.tabIndex >= 0 && !el.closest('[inert]') && el.getClientRects().length);
     const index = items.indexOf(document.activeElement);
-    if (event.shiftKey ? index <= 0 : index < 0 || index === items.length - 1) {
-      event.preventDefault();
-      (event.shiftKey ? items.at(-1) : items[0])?.focus();
-    }
-    if (!items.length) event.preventDefault();
+    // Safari can omit buttons from native Tab navigation. Owning only the
+    // boundary wrap lets Tab leave from an interior input in that mode.
+    event.preventDefault();
+    const next = index < 0 ? (event.shiftKey ? items.length - 1 : 0) :
+      (index + (event.shiftKey ? -1 : 1) + items.length) % items.length;
+    items[next]?.focus();
   };
   element.addEventListener('keydown', keys);
   return () => {

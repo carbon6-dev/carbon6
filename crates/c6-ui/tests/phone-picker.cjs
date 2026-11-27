@@ -134,7 +134,13 @@ async function modalFocus(page, dialog, opener, label = 'Sessions') {
   for (const key of ['Tab', 'Shift+Tab']) {
     for (let n = 0; n < count + 2; n++) {
       await page.keyboard.press(key);
-      assert(await dialog.evaluate(el => el.contains(document.activeElement)), `${key} remains inside ${label} at step ${n}`);
+      const focus = await dialog.evaluate(el => ({ inside: el.contains(document.activeElement),
+        active: document.activeElement?.outerHTML.slice(0, 600),
+        items: [...el.querySelectorAll('button, input, select, textarea, a[href], [tabindex]')]
+          .map(node => ({ tag: node.tagName, text: node.getAttribute('aria-label') || node.textContent.slice(0, 80),
+            tab: node.tabIndex, disabled: node.disabled, rects: node.getClientRects().length, inert: !!node.closest('[inert]') })),
+      }));
+      assert(focus.inside, `${key} remains inside ${label} at step ${n}: ${JSON.stringify(focus)}`);
     }
   }
 }

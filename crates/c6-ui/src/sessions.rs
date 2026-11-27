@@ -1482,7 +1482,16 @@ fn StartSettingsChip(
             class="inline-flex min-h-8 min-w-0 max-w-full items-center gap-1 rounded-md border border-zinc-200 px-2 text-xs text-soft hover:bg-zinc-100 pointer-coarse:min-h-11 dark:border-zinc-700 dark:hover:bg-zinc-800"
             aria-label=move || value.map_or_else(|| kind.label().to_owned(), |v| format!("{}: {}", kind.label(), v.get()))
             aria-expanded=move || (open.get() == Some(kind)).to_string()
-            on:click=move |_| open.update(|open| kind.toggle(open))>
+            on:click=move |ev| {
+                // Safari does not focus clicked buttons. Mark the actual
+                // opener before escapable captures it, rather than Worker
+                // winning because all three chips share the panel's mark.
+                use wasm_bindgen::JsCast;
+                if let Some(button) = ev.current_target().and_then(|target| target.dyn_into::<web_sys::HtmlElement>().ok()) {
+                    let _ = button.focus();
+                }
+                open.update(|open| kind.toggle(open));
+            }>
             {kind.label()}{value.map(|v| view! { <span class="min-w-0 truncate font-medium" title=move || v.get()>{move || v.get()}</span> })}
             <span class="shrink-0 text-muted" aria-hidden="true">{icons::chevron_down()}</span>
         </button>

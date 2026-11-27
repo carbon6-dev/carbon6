@@ -147,8 +147,93 @@ Written tests:
 * `tests/copy-actions.cjs`: actual production WASM in Chromium, private loopback
   fixtures with clipboard-read/write permissions; keyboard-click prompt/reply,
   code, tool input/full output, publication and error Copy, then read clipboard.
+  The full browser runner includes this Chromium-only suite and the
+  `viewer-controls.test.cjs` unit checks. It runs fresh desktop and 390px touch
+  contexts, asserts hover/focus/touch visibility and viewport fit, and retains
+  `copy-1440.png` / `copy-390.png` screenshots in its evidence directory.
 
-Remaining verification: Rust type checking/clippy, all unit/browser suites,
+At the implementation handoff, remaining verification was Rust type checking/clippy, all unit/browser suites,
 clipboard policies on non-Chromium/insecure origins, touch/visual placement, and
 compressed UI budget. Native terminal selection behavior was inspected in the
 bridge/vendor, not exercised against a live shell. No live head/workers touched.
+
+## Integration verification
+
+The final Linux Docker release build measures **11,645,527 raw / 2,908,133 Brotli
+bytes**, within both existing size allowances; no budget increase is needed.
+Native and WASM Clippy and `make check` pass after correcting the slide-copy
+view expression and using a consistent `&str` for JSON source encoding.
+All 94 JavaScript unit tests and 14 motion VM checks pass. Production-WASM
+clipboard reads pass in fresh 1440px desktop and 390px touch contexts for every
+payload listed above. Both screenshots were inspected: desktop controls reveal
+on hover/focus, phone controls remain visible, and neither layout overflows or
+adds a competing action cluster. The motion tile fixture now uses the real
+platform modifier (`ControlOrMeta`), since native macOS Control-click opens a
+context menu rather than dispatching the production new-tile click.
+
+The first full browser cohort exposed pre-existing failures, retained with its
+evidence rather than discarded. Each representative failure reproduced twice
+against the exact `e6bcb026` release assets as well as the copy branch:
+
+* Transcript-flow assertions must skip `hidden` recovery notices, just as layout
+  does; they still require the preceding visible reply and the exact flex gap.
+* Ask uses the platform Ctrl/Cmd modifier; macOS textarea end-of-document uses
+  Cmd+Down. Native typing now exercises those real gestures, not Linux shortcuts.
+* New-session tests follow the current Worker/Model/More chips, with effort under
+  More, retaining model-input identity, shared model caching, nested Escape,
+  settings persistence and passive-versus-pinned preview checks.
+* Native WebKit's scrollbar intercepts the last pixel of a right-aligned
+  queue action at the old 16px gutter. An isolated 24px-gutter experiment passes
+  the unchanged desktop four-edge hit tests; touch needs a 32px gutter so the
+  additional transparent 8px target halo also clears the native scrollbar.
+  Waiting for scrollbar fade
+  did not resolve it and was not retained. No forced clicks, retries, fixed
+  delays or relaxed edge assertions were added.
+
+The first full Rust run retained five failures (2,092 passed); each also failed
+twice in isolation before correction. Markdown tests now distinguish the
+rendered body from the deliberately raw JSON copy attribute and assert both
+independently. Icon tests enumerate the new Copy control explicitly, including
+the path-only binary viewer without a download URL. Binary attachment/output
+links use a shared origin helper that does not call browser bindings in native
+rendering; native tests assert those payloads and the real browser clipboard
+suite covers their absolute addresses.
+
+The full native cohort also exposed two literal Ctrl tile-switch shortcuts in
+session-sheet isolation; these now use the same real platform modifier as the
+app. The app already maps either Meta or Control to `How::NewTile`, and the
+workspace-open Mac cases exercise actual Meta-clicks, not only dispatched
+events. Theme, message-edit and session-sheet now shard existing independent
+case groups instead of racing whole accumulated suites against one worker/case
+deadline. The scheduler tests retain all groups and explicit selector behavior;
+no deadline was enlarged. Final full native and Linux runs use four browser
+workers, with no compilation or Rust-test run competing for the machine.
+
+The next native cohort passed 128/130 shards and exposed a real modal bug in
+WebKit, reproduced twice with both fresh-process and connected browsers. Safari
+can skip native button Tab stops; a boundary-only trap then lets Tab escape
+from an interior search input to the body. `c6Modal` now owns the complete
+Tab/Shift-Tab cycle, retaining its disabled/hidden/inert filtering and opener
+restoration. The new deterministic VM regression fails on the old handler and
+passes on the corrected one; phone-picker retains its original containment
+assertion and now includes active-element/eligible-control diagnostics.
+
+The preserved settings-opener focus assertion then exposed Safari's separate
+button-click behavior: clicking Model does not natively focus it, so the shared
+panel's fallback opener was Worker. This reproduced twice in isolation. Start
+settings chips now focus the actual clicked button before opening, allowing
+Escape to restore the correct opener without changing the assertion.
+
+Session-target navigation then exposed a disposed-reactive-value panic in all
+four Chromium workspace cases. It reproduced twice on this branch and twice on
+the exact pre-copy baseline. An exact-byte reproduction of the production
+optimized WASM with its symbol map located the queued render effect in
+`SessionLocation`'s model chip: the persistent tile bar borrowed signals from a
+transcript that navigation had already disposed. Keying the bar alone cannot
+order two separately queued render effects. Borrowed controls, location and
+menu now have explicit reactive owners which are synchronously paused (including
+nested render effects) by transcript cleanup, before its signals are removed.
+The keyed bar still owns DOM removal; no transcript or bar owner is retained by
+the other. A deterministic lifecycle regression checks recursive pausing before
+signal disposal, an unaffected persistent bar and weak ownership after unmount.
+The browser's original no-panic and navigation-history assertions are unchanged.

@@ -816,12 +816,12 @@ async function isolation(browser, origin, engine, theme, view) {
     await sheet.getByRole('button', { name: 'Show all', exact: true }).click();
     const outputs = parentTile.locator('[data-pane-motion]').filter({ has: page.locator('iframe') });
     await page.frameLocator('iframe').getByRole('heading', { name: 'Focus return output', exact: true }).waitFor();
-    await page.keyboard.press('Control+2');
+    await page.keyboard.press('ControlOrMeta+2');
     await page.waitForFunction(() => JSON.parse(localStorage.getItem('c6.home.workspace.v2')).focus === 1);
     await settle(page);
     assert(await page.locator('[data-tile-motion="5"]').isVisible());
     assert.equal(await page.locator('[data-session-sheet]:visible').count(), 0, 'hidden origin must not reopen its global sheet/popover over another tile');
-    await page.keyboard.press('Control+1');
+    await page.keyboard.press('ControlOrMeta+1');
     await outputs.waitFor();
     assert.equal(await page.locator('[data-session-sheet]:visible').count(), 0, 'returning to Outputs does not prematurely consume the deferred return token');
     if (view.startsWith('phone')) {

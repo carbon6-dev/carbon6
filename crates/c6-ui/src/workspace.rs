@@ -3040,7 +3040,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> AnyView {
                 // Chrome borrows its transcript's arena. A new registration
                 // needs fresh controls, not attribute rebuilds on the old one.
                 <For each=chrome key=|c| c.token let:c>
-                    <crate::session::SessionControls chrome=c />
+                    {c.borrow(move || view! { <crate::session::SessionControls chrome=c /> })}
                 </For>
                 <Show when=move || shown.get().is_some()>
                     <button class=format!("{btn} hidden md:@min-[30rem]/tile:flex")
@@ -3062,7 +3062,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> AnyView {
                 <crate::activity::SessionsPicker />
             </div>
             <For each=chrome key=|c| c.token let:c>
-                <crate::session::SessionLocation chrome=c />
+                {c.borrow(move || view! { <crate::session::SessionLocation chrome=c /> })}
             </For>
             {move || shown.get().map(|(_, id)| view! { <crate::session::ArchivedSession id /> })}
             <Popover at=palette_at class="w-auto">
@@ -3077,7 +3077,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> AnyView {
             </Popover>
             <Popover at=menu_at class="w-60">
                 <For each=menu_chrome key=|c| c.token let:c>
-                    <crate::session::SessionMenu chrome=c on_rename=move |()| rename_under_title() on_done=move |()| menu_at.set(None) />
+                    {c.borrow(move || view! { <crate::session::SessionMenu chrome=c on_rename=move |()| rename_under_title() on_done=move |()| menu_at.set(None) /> })}
                 </For>
                 <For each=view_actions key=|(token, _)| *token let:actions>
                     <div on:click=move |_| menu_at.set(None)>{(actions.1)()}</div>

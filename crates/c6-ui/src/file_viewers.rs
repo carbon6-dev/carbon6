@@ -426,7 +426,7 @@ pub(crate) fn render(input: &Input) -> String {
         esc(&input.mime),
         input.line,
         !input.url.is_empty() && input.text.len() > 2 * 1024 * 1024,
-        esc(&serde_json::to_string(if input.url.is_empty() { &input.text } else { prefix(&input.text, 2 * 1024 * 1024) })
+        esc(&serde_json::to_string(if input.url.is_empty() { input.text.as_str() } else { prefix(&input.text, 2 * 1024 * 1024) })
             .unwrap_or_default())
     )
 }
@@ -652,7 +652,9 @@ mod tests {
             ..Default::default()
         });
         assert!(html.contains("<img alt="));
-        assert_eq!(html.matches("<svg ").count(), 2, "only the trusted content/path Copy icons enter markup");
+        assert_eq!(html.matches("<svg ").count(), 1, "only the trusted path Copy icon enters markup without a download URL");
+        assert_eq!(crate::components::copied_text(&html, "Copy path"), "/tmp/a.svg");
+        assert!(!html.contains("Copy file link"), "no binary link without a URL");
         assert!(!html.contains("<svg onload="));
         assert!(html.contains("&lt;svg onload="));
         assert!(!html.contains("<script"));

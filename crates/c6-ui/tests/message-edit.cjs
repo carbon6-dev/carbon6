@@ -69,7 +69,8 @@ async function checkWaitingPlacement(browser, origin, phone, empty) {
     await settle(page);
     await waitingInFlow(waiting);
     assert(await waiting.evaluate((el, empty) => {
-      const previous = el.previousElementSibling;
+      let previous = el.previousElementSibling;
+      while (previous && !previous.getClientRects().length) previous = previous.previousElementSibling;
       const content = el.closest('[data-follow-content]').getBoundingClientRect();
       const row = el.getBoundingClientRect();
       const gap = parseFloat(getComputedStyle(el.parentElement).rowGap);
@@ -84,7 +85,8 @@ async function checkWaitingPlacement(browser, origin, phone, empty) {
       await page.locator('.md').filter({ hasText: `Stream batch ${i}.` }).waitFor();
       await waitingAtEnd(page);
       assert(await waiting.evaluate(el => {
-        const previous = el.previousElementSibling;
+        let previous = el.previousElementSibling;
+        while (previous && !previous.getClientRects().length) previous = previous.previousElementSibling;
         const gap = parseFloat(getComputedStyle(el.parentElement).rowGap);
         return previous?.textContent.includes('Growing streamed reply.') &&
           Math.abs(el.getBoundingClientRect().top - previous.getBoundingClientRect().bottom - gap) <= 1;
@@ -118,9 +120,24 @@ async function checkWaitingPlacement(browser, origin, phone, empty) {
       blocks: [{ type: 'text', text: 'The completed streamed reply.' }], stop_reason: 'end_turn' } }));
     await page.locator('.c6-transcript-row').filter({ hasText: 'The completed streamed reply.' }).waitFor();
     await settle(page);
-    assert(await waiting.evaluate(el => el.previousElementSibling?.textContent.includes('The completed streamed reply.')),
+    assert(await waiting.evaluate(el => {
+      let previous = el.previousElementSibling;
+      while (previous && !previous.getClientRects().length) previous = previous.previousElementSibling;
+      return previous?.textContent.includes('The completed streamed reply.');
+    }),
       'the completed reply replaces its stream before waiting input, keeping transcript order');
     assert.deepEqual(f.errors, []);
+  } catch (error) {
+    console.error('WAITING FLOW DIAGNOSTIC', await f.page.locator('[data-waiting-messages]').evaluate(el => ({
+      top: el.getBoundingClientRect().top,
+      contentTop: el.closest('[data-follow-content]').getBoundingClientRect().top,
+      previous: el.previousElementSibling?.outerHTML.slice(0, 2500),
+      siblings: [...el.parentElement.children].map(node => ({
+        id: node.id, class: node.className, top: node.getBoundingClientRect().top,
+        height: node.getBoundingClientRect().height, text: node.textContent.slice(0, 120),
+      })),
+    })));
+    throw error;
   } finally { await f.context.close(); }
 }
 
@@ -153,6 +170,12 @@ async function actionTarget(button, phone, icon = true) {
       if (css.visibility === 'hidden' || Number(css.opacity) === 0) visible = false;
     }
     return { width: r.width, height: r.height, expanded, insets, visible,
+      rect: { left: r.left, top: r.top, right: r.right, bottom: r.bottom },
+      edgeHits: edges.map(([x, y]) => ({ x, y, hit: document.elementFromPoint(x, y)?.outerHTML.slice(0, 500) })),
+      ancestors: [...function* () { for (let n = el.parentElement; n; n = n.parentElement) yield n; }()].map(n => ({
+        class: n.className, rect: n.getBoundingClientRect().toJSON(), clientWidth: n.clientWidth,
+        overflow: getComputedStyle(n).overflow, clip: getComputedStyle(n).clipPath,
+      })),
       targetWidth: target.right - target.left, targetHeight: target.bottom - target.top,
       edgesHit: edges.every(([x, y]) => x >= 0 && x < innerWidth && y >= 0 && y < innerHeight &&
         el.contains(document.elementFromPoint(x, y))) };
@@ -165,7 +188,7 @@ async function actionTarget(button, phone, icon = true) {
     assert(geometry.insets.every((n, i) => Math.abs(n - expected[i]) <= .5), 'icon expands all edges; Send now expands vertically only');
     assert(Math.abs(geometry.targetHeight - 44) <= 1 && Math.abs(geometry.targetWidth - (icon ? 44 : geometry.width)) <= 1);
   } else assert.equal(geometry.expanded, false, 'desktop does not acquire coarse-pointer hit expansion');
-  assert(geometry.edgesHit, 'all four target edges are on-screen and hit the actual button, including outside its visible bounds on touch');
+  assert(geometry.edgesHit, `all four target edges are on-screen and hit the actual button, including outside its visible bounds on touch: ${JSON.stringify(geometry)}`);
 }
 
 async function readActions(row, phone) {
@@ -684,7 +707,7 @@ async function checkQueued(browser, origin, phone, outcome) {
             return url.pathname === '/api/v1/assistant/mentionables' && url.searchParams.get('q') === 'updated';
           });
           await composer.focus();
-          await composer.press('ControlOrMeta+End');
+          await composer.press(process.platform === 'darwin' ? 'Meta+ArrowDown' : 'Control+End');
           await composer.pressSequentially(' @updated');
           assert.equal((await found).status(), 200);
           await sameComposer(composer, node, `${combined} @updated`);
@@ -732,6 +755,7 @@ async function checkQueued(browser, origin, phone, outcome) {
     assert.deepEqual(f.errors, []);
   } catch (error) {
     console.error('RETURN TO BOX DIAGNOSTIC', JSON.stringify({ phase: f.phase, calls, mutations, feedReads, errors: f.errors,
+      composer: await f.page.locator('textarea').evaluateAll(els => els.map(el => ({ value: el.value, start: el.selectionStart, end: el.selectionEnd }))),
       console: f.consoleMessages, requests: f.requests.slice(-12) }));
     throw error;
   } finally { release.resolve(); recoveryRelease.resolve(); secondRelease.resolve(); await f.context.close(); }

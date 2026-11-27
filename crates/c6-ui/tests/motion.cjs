@@ -985,7 +985,7 @@ async function modelForms(f) {
       });
       await f.navigate(new URL(`/r/home${pathname}`, page.url()).href, { waitUntil: 'domcontentloaded' });
     } else if (pathname === '/ask') {
-      await page.keyboard.press('Control+j');
+      await page.keyboard.press('ControlOrMeta+j');
       await page.getByRole('dialog', { name: 'Ask carbon6', exact: true }).getByRole('button', { name: /^Your conversations/ }).click();
     } else {
       if (phoneViewport(f.viewport)) await page.getByRole('button', { name: /^Menu,/ }).first().click();
@@ -995,10 +995,99 @@ async function modelForms(f) {
     // fields to their page so a still-open Ask form cannot stand in for Sessions.
     const formPage = page.locator('main').filter({ has: page.locator('h1').filter({ hasText: name === 'ask' ? /^Ask$/ : /^Sessions$/ }) }).last();
     const input = formPage.getByPlaceholder('model id', { exact: true });
-    const fields = name === 'new-session' ? formPage.getByTitle(phoneViewport(f.viewport) ? 'Where and how it runs' :
-      'Change where and how it runs', { exact: true }) : null;
+    if (name === 'new-session') {
+      // Start settings are now inline Worker/Model/More panels on every size;
+      // effort lives under More, not the model panel or a phone sheet.
+      const model = formPage.getByRole('button', { name: /^Model:/ });
+      const more = formPage.getByRole('button', { name: 'More', exact: true });
+      await model.click();
+      await input.waitFor(); await settle(page);
+      assert.equal(await page.getByRole('dialog', { name: 'Model', exact: true }).count(), 0, `${route}: settings remain inline`);
+      const prefetched = f.requests.filter(r => r.endsWith('/connections/test/models')).length;
+      const panel = input.locator('..').locator('..').locator('..').locator('..');
+      await panel.locator('select').filter({ has: page.locator('option[value="test"]') }).selectOption('test');
+      await settle(page);
+      await input.evaluate(el => { window.__formModelInput = el; });
+      await input.fill('custom-form-model');
+      await settle(page);
+      assert.equal(await input.inputValue(), 'custom-form-model');
+      assert(await input.evaluate(el => el === window.__formModelInput && el === document.activeElement), `${route}: retains its model input and focus`);
+      const offered = formPage.getByRole('button', { name: 'fixture-model-32', exact: true });
+      if (phoneViewport(f.viewport)) {
+        await page.evaluate(() => __keyboard(Math.min(innerHeight, 300), 12));
+        await settle(page);
+        await input.evaluate(el => el.scrollIntoView({ block: 'center' })); await visibleBounds(input);
+      }
+      await offered.evaluate(el => el.scrollIntoView({ block: 'center' })); await visibleBounds(offered);
+      await offered.click();
+      if (!cold) assert.equal(f.requests.filter(r => r.endsWith('/connections/test/models')).length, prefetched, `${route}: shares the prefetched models`);
+      assert.equal(await input.inputValue(), 'fixture-model-32');
+      assert.equal(await model.getAttribute('aria-expanded'), 'true', `${route}: selecting a model keeps its panel open`);
+      await more.click();
+      await input.waitFor({ state: 'hidden' });
+      const effort = formPage.getByRole('combobox', { name: 'Reasoning effort', exact: true });
+      await effort.evaluate(el => el.scrollIntoView({ block: 'center' })); await visibleBounds(effort);
+      await effort.selectOption('high');
+      assert.equal(await effort.inputValue(), 'high');
+      await model.click();
+      await input.waitFor();
+      assert.equal(await input.inputValue(), 'fixture-model-32');
+      assert(await input.evaluate(el => el === window.__formModelInput), `${route}: switching panels retains the input`);
+      if (!phoneViewport(f.viewport)) {
+        await formPage.getByTitle('Open beside this list (⌘/Ctrl-click: new tile if not already open)', { exact: true }).first().hover();
+        await settle(page);
+        assert.equal(await model.getAttribute('aria-expanded'), 'true', `${route}: passive hover keeps the panel open`);
+        assert.equal(await page.locator('[data-session-preview]').count(), 0, `${route}: hover cannot cover the active form`);
+      }
+      const asked = f.requests.filter(r => r.endsWith('/connections/test/models')).length;
+      await input.focus();
+      await input.press('ArrowDown');
+      await offered.waitFor();
+      assert.equal(f.requests.filter(r => r.endsWith('/connections/test/models')).length, asked, `${route}: reopening reuses models`);
+      await input.press('Escape');
+      await offered.waitFor({ state: 'hidden' });
+      assert.equal(await model.getAttribute('aria-expanded'), 'true', `${route}: first Escape closes only the list`);
+      await input.press('Escape');
+      await input.waitFor({ state: 'hidden' });
+      assert.equal(await model.getAttribute('aria-expanded'), 'false', `${route}: second Escape closes the panel`);
+      const returnedFocus = await model.evaluate(el => ({ correct: el === document.activeElement,
+        active: document.activeElement?.outerHTML.slice(0, 600) }));
+      assert(returnedFocus.correct, `${route}: Escape restores the settings opener: ${JSON.stringify(returnedFocus)}`);
+      await more.click();
+      assert.equal(await effort.inputValue(), 'high', `${route}: More retains effort`);
+      await more.click();
+      if (!phoneViewport(f.viewport)) {
+        const row = formPage.getByTitle('Open beside this list (⌘/Ctrl-click: new tile if not already open)', { exact: true }).first();
+        const rail = page.locator('aside.c6-sidebar').getByRole('button', { name: 'Session details', exact: true }).first();
+        const preview = page.locator('[data-session-preview]');
+        await row.hover(); await preview.waitFor();
+        const listPop = await preview.getAttribute('data-pop');
+        await preview.getByRole('button', { name: 'Close session details', exact: true }).focus();
+        await rail.hover();
+        await page.waitForFunction(pop => {
+          const els = document.querySelectorAll('[data-session-preview]');
+          return els.length === 1 && els[0].getAttribute('data-pop') !== pop;
+        }, listPop);
+        await preview.getByRole('button', { name: 'Close session details', exact: true }).focus();
+        await row.hover();
+        await page.waitForFunction(pop => {
+          const els = document.querySelectorAll('[data-session-preview]');
+          return els.length === 1 && els[0].getAttribute('data-pop') === pop;
+        }, listPop);
+        await page.getByRole('button', { name: 'Close session details', exact: true }).click();
+        await model.click(); await input.waitFor();
+        await formPage.getByRole('button', { name: 'Session details', exact: true }).first().click();
+        await preview.waitFor(); await input.waitFor({ state: 'hidden' });
+        assert.equal(await model.getAttribute('aria-expanded'), 'false', `${route}: explicit details displaces settings`);
+        await rail.hover(); await settle(page);
+        assert.equal(await preview.getAttribute('data-pop'), listPop, `${route}: passive hover cannot displace pinned details`);
+        await page.getByRole('button', { name: 'Close session details', exact: true }).click();
+      }
+      await page.screenshot({ path: path.join(SHOTS, `${f.label}-${route}-models.png`) });
+      await page.evaluate(() => __keyboard(innerHeight));
+      continue;
+    }
     step(`${route} fields`);
-    if (fields) await fields.click();
     await input.waitFor(); await settle(page);
     assert.equal(await page.getByRole('dialog', { name: 'Model', exact: true }).count(), 0, 'form fields remain inline, not nested sheets');
     const controls = input.locator('..').locator('..').locator('..').locator('..');
@@ -1022,11 +1111,6 @@ async function modelForms(f) {
     step(`${route} model`);
     await offered.evaluate(el => el.scrollIntoView({ block: 'center' })); await visibleBounds(offered);
     await offered.click();
-    if (fields) {
-      await settle(page);
-      assert.equal(await fields.getAttribute('aria-expanded'), 'true',
-        `${route}: choosing a model must keep the fields open so effort remains usable`);
-    }
     if (!cold) assert.equal(f.requests.filter(r => r.endsWith('/connections/test/models')).length, prefetched, `${route} shares the composer's prefetched list`);
     assert.equal(await input.inputValue(), 'fixture-model-32', `${name} still selects offered models`);
     const effort = controls.getByRole('combobox', { name: 'Reasoning effort', exact: true });
@@ -1036,20 +1120,6 @@ async function modelForms(f) {
     step(`${route} effort selection`);
     await effort.selectOption('high');
     assert.equal(await effort.inputValue(), 'high');
-    if (fields) {
-      await settle(page);
-      assert.equal(await fields.getAttribute('aria-expanded'), 'true',
-        `${route}: choosing effort must keep the fields open so the model list remains usable`);
-      if (!phoneViewport(f.viewport)) {
-        // Selecting a model removes the list and can expose this row under
-        // a stationary pointer. Exercise that hover regardless of geometry:
-        // a passive preview must not displace an explicitly opened panel.
-        await formPage.getByTitle('Open beside this list (⌘/Ctrl-click: new tile if not already open)', { exact: true }).first().hover();
-        await settle(page);
-        assert.equal(await fields.getAttribute('aria-expanded'), 'true', `${route}: row hover keeps the fields open`);
-        assert.equal(await page.locator('[data-session-preview]').count(), 0, `${route}: hover cannot cover the active form`);
-      }
-    }
     const asked = f.requests.filter(r => r.endsWith('/connections/test/models')).length;
     step(`${route} reopen model list`);
     await controls.getByTitle('Every model the connection offers', { exact: true }).click();
@@ -1059,66 +1129,6 @@ async function modelForms(f) {
     step(`${route} Escape model list`);
     await page.keyboard.press('Escape');
     await offered.waitFor({ state: 'hidden' });
-    if (fields) {
-      assert.equal(await fields.getAttribute('aria-expanded'), 'true', `${route}: first Escape closes only the model list`);
-      step(`${route} Escape fields`);
-      await page.keyboard.press('Escape');
-      await input.waitFor({ state: 'hidden' });
-      assert.equal(await fields.getAttribute('aria-expanded'), 'false', `${route}: second Escape closes the fields`);
-      assert(await fields.evaluate(el => el === document.activeElement), `${route}: Escape restores the fields opener`);
-      step(`${route} reopen fields`);
-      await fields.click();
-      await input.waitFor();
-      assert(await input.evaluate(el => el === window.__formModelInput), `${route}: reopening retains the model input`);
-      assert.equal(await input.inputValue(), 'fixture-model-32', `${route}: reopening retains the model`);
-      assert.equal(await effort.inputValue(), 'high', `${route}: reopening retains effort`);
-      if (phoneViewport(f.viewport)) {
-        step(`${route} outside tap`);
-        await formPage.locator('.fixed.inset-0.bg-black\\/30').click({ position: { x: 2, y: 2 } });
-        await input.waitFor({ state: 'hidden' });
-        assert.equal(await fields.getAttribute('aria-expanded'), 'false', `${route}: outside tap dismisses the sheet`);
-      } else {
-        step(`${route} inline fields dismissal`);
-        // Desktop's fields are inline, not an outside-click popover.
-        await formPage.getByRole('searchbox').click();
-        assert.equal(await fields.getAttribute('aria-expanded'), 'true', `${route}: outside click preserves inline fields`);
-        await fields.click();
-        await input.waitFor({ state: 'hidden' });
-        const row = formPage.getByTitle('Open beside this list (⌘/Ctrl-click: new tile if not already open)', { exact: true }).first();
-        const rail = page.locator('aside.c6-sidebar').getByRole('button', { name: 'Session details', exact: true }).first();
-        const preview = page.locator('[data-session-preview]');
-        step(`${route} passive preview handoff`);
-        await row.hover();
-        await preview.waitFor();
-        const listPop = await preview.getAttribute('data-pop');
-        // Focus keeps an unpinned preview alive across actionability/scroll
-        // delays: its hide timer cannot turn a blocked handoff into a pass.
-        await preview.getByRole('button', { name: 'Close session details', exact: true }).focus();
-        await rail.hover();
-        await page.waitForFunction(listPop => {
-          const els = document.querySelectorAll('[data-session-preview]');
-          return els.length === 1 && els[0].getAttribute('data-pop') !== listPop;
-        }, listPop);
-        await preview.getByRole('button', { name: 'Close session details', exact: true }).focus();
-        await row.hover();
-        await page.waitForFunction(listPop => {
-          const els = document.querySelectorAll('[data-session-preview]');
-          return els.length === 1 && els[0].getAttribute('data-pop') === listPop;
-        }, listPop);
-        await page.getByRole('button', { name: 'Close session details', exact: true }).click();
-        step(`${route} explicit preview`);
-        await fields.click();
-        await input.waitFor();
-        await formPage.getByRole('button', { name: 'Session details', exact: true }).first().click();
-        await page.locator('[data-session-preview]').waitFor();
-        await input.waitFor({ state: 'hidden' });
-        assert.equal(await fields.getAttribute('aria-expanded'), 'false', `${route}: explicit details still displaces the fields`);
-        await rail.hover();
-        await settle(page);
-        assert.equal(await preview.getAttribute('data-pop'), listPop, `${route}: passive hover cannot displace pinned details`);
-        await page.getByRole('button', { name: 'Close session details', exact: true }).click();
-      }
-    }
     await page.screenshot({ path: path.join(SHOTS, `${f.label}-${route}-models.png`) });
     await page.evaluate(() => __keyboard(innerHeight));
   }
@@ -1437,7 +1447,9 @@ async function tiles(f) {
   // Actual production modifier-click creates the second tile. Never mutate
   // saved workspace JSON to pretend an opening/reorder was animated.
   await tileAction(page, async () => {
-    await page.getByRole('button', { name: 'Changes', exact: true }).first().click({ modifiers: ['Control'] });
+    // Native macOS Control-click opens a context menu instead of dispatching
+    // the click. Use the platform's real new-tile gesture in both engines.
+    await page.getByRole('button', { name: 'Changes', exact: true }).first().click({ modifiers: ['ControlOrMeta'] });
     await page.waitForFunction(() => document.querySelectorAll('button[aria-label="Close this tile"]').length === 2);
   });
   assert.equal(await page.locator('[data-tile-motion]').count(), 2, 'tiles opt into production FLIP roots');
@@ -1762,6 +1774,38 @@ function unitTests() {
     assert.equal(f.canceled(), 0);
     f.api.set('reduced'); assert.equal(f.canceled(), 1); assert.equal(f.cssCanceled(), 0); assert.equal(f.transitionCanceled(), 1);
     f.api.set('off'); assert.equal(f.canceled(), 2); assert.equal(f.cssCanceled(), 0); assert.equal(f.transitionCanceled(), 2);
+  });
+  test('production modal owns the complete Tab cycle when native navigation skips buttons', () => {
+    const f = load(), listeners = new Map(), doc = f.window.document;
+    f.window.matchMedia = () => ({ addEventListener() {}, removeEventListener() {} });
+    const item = (extra = {}) => ({ disabled: false, tabIndex: 0, closest: () => null,
+      getClientRects: () => [1], focus() { doc.activeElement = this; }, ...extra });
+    const opener = item({ isConnected: true }), first = item(), input = item(), last = item();
+    const disabled = item({ disabled: true }), hidden = item({ getClientRects: () => [] });
+    const inert = item({ closest: () => ({ inert: true }) });
+    const items = [first, disabled, input, hidden, inert, last];
+    const element = { parentElement: null, querySelectorAll: () => items,
+      contains: node => node === element || items.includes(node), focus() { doc.activeElement = this; },
+      addEventListener: (name, fn) => listeners.set(name, fn), removeEventListener: name => listeners.delete(name) };
+    doc.activeElement = opener;
+    const dispose = f.window.c6Modal(element, () => {});
+    const tab = (shiftKey, expected) => {
+      let prevented = false;
+      listeners.get('keydown')({ key: 'Tab', shiftKey, preventDefault() { prevented = true; } });
+      assert(prevented, 'every Tab must be contained even when Safari omits native button stops');
+      assert.equal(doc.activeElement, expected);
+    };
+    tab(false, first); tab(false, input); tab(false, last); tab(false, first);
+    tab(true, last); tab(true, input); tab(true, first); tab(true, last);
+    doc.activeElement = element; tab(true, last);
+    doc.activeElement = element;
+    items.length = 0;
+    let prevented = false;
+    listeners.get('keydown')({ key: 'Tab', preventDefault() { prevented = true; } });
+    assert(prevented, 'an empty modal also retains focus');
+    dispose();
+    assert.equal(doc.activeElement, opener, 'closing restores the original opener');
+    assert.equal(listeners.size, 0);
   });
   test('production drawer swipe claims only clear outward touch drags and releases through shared CSS', () => {
     const setup = (choice = 'full', side = 'left', translate = '0px', width = 288) => {
