@@ -120,6 +120,24 @@ test('browser control matrix is exactly the four requested controls on either en
   for (const engine of ['webkit', 'chromium']) assert.deepEqual(cellsFor(engine), CELLS);
 });
 
+test('negative navigation controls finish the scheduled attention refresh before unloading', async () => {
+  const { settleAttentionStartup } = require('./navigation-errors.cjs');
+  const order = [], requests = [];
+  let finish;
+  const response = new Promise(resolve => { finish = resolve; });
+  const page = { clock: { async runFor(ms) {
+    assert.equal(ms, 300);
+    order.push('refresh dispatched');
+    requests.push({ async response() { return { finished: () => response }; } });
+  } } };
+  const settled = settleAttentionStartup(page, requests).then(() => order.push('ready to unload'));
+  await Promise.resolve();
+  assert.deepEqual(order, ['refresh dispatched']);
+  finish(null);
+  await settled;
+  assert.deepEqual(order, ['refresh dispatched', 'ready to unload']);
+});
+
 test('within retains caller-owned evidence, timing schema, results and rejection', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'navigation-within-'));
   try {

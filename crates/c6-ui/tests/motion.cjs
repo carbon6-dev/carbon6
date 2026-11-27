@@ -306,6 +306,7 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
   await Promise.race([settle(page), crash]);
   const send = message => { for (const socket of streams) socket.send(JSON.stringify(message)); };
   return Object.assign(progress, {
+    pingAttention: () => { for (const socket of lives) socket.send(JSON.stringify({ type: 'attention' })); },
     setMarks: given => { marks = given; for (const live of lives) live.send(JSON.stringify({ type: 'marks', marks })); },
     setSuggestion: text => { suggestion = text === null ? null : { text, for_seq: 65 }; },
     deferViewWrite: () => {

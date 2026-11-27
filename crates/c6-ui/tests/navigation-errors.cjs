@@ -17,6 +17,18 @@ const CELLS = ['same-message-outside-window', 'different-message-inside-window',
   'different-url-inside-window', 'cold-reload-attention-in-flight'];
 const cellsFor = () => CELLS;
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+async function settleAttentionStartup(page, requests) {
+  // NeedsYou coalesces live-feed pings for 300ms. Advance its injected clock,
+  // not wall time, and finish every dispatched response before the negative
+  // controls unload the app. Otherwise an unrelated, correctly classified
+  // native refusal can contaminate their exact zero-classification assertion.
+  await page.clock.runFor(300);
+  await Promise.all(requests.map(async request => {
+    const response = await request.response();
+    assert(response, 'startup attention request receives a response');
+    assert.equal(await response.finished(), null, 'startup attention response finishes');
+  }));
+}
 async function bounded(promise, label) {
   let timer;
   try { return await Promise.race([promise, new Promise((_, reject) => {
@@ -57,16 +69,31 @@ async function serve() {
 async function cell(browser, engine, name) {
   const host = await serve(), { origin } = host;
   const result = { engine, name, pass: false, origin, rawLog: [] };
+  const positive = name === 'cold-reload-attention-in-flight', startupAttention = [];
   let f, navigation, holdAttention = false;
   try {
     f = await fixture(browser, origin, { width: 1440, height: 1000 }, 'dark',
       { choice: 'off', effective: 'off', os: 'no-preference' }, progress => { f = progress; }, {}, {
         instrumentation: false,
         log: { log: (...args) => result.rawLog.push(args.join(' ')), error: (...args) => result.rawLog.push(args.join(' ')) },
-        setup: async ({ page }) => page.route(origin + '/api/v1/attention', route =>
-          holdAttention ? route.continue() : route.fallback()),
+        setup: async ({ page }) => {
+          if (!positive) {
+            await page.clock.install();
+            page.on('request', request => {
+              if (request.url() === origin + '/api/v1/attention') startupAttention.push(request);
+            });
+          }
+          await page.route(origin + '/api/v1/attention', route =>
+            holdAttention ? route.continue() : route.fallback());
+        },
       });
-    const positive = name === 'cold-reload-attention-in-flight';
+    if (!positive) {
+      // Exercise the pending application refresh deliberately, rather than
+      // depending on whether bootstrap happened to finish before reload.
+      f.pingAttention();
+      await settleAttentionStartup(f.page, startupAttention);
+      await f.navigation.drain();
+    }
     if (positive) {
       holdAttention = true;
       await f.page.evaluate(url => {
@@ -141,5 +168,5 @@ async function main() {
   assert(results.every(row => row.pass), 'all four controls must pass; no retries or discarded cells');
 }
 
-module.exports = { CELLS, cellsFor };
+module.exports = { CELLS, cellsFor, settleAttentionStartup };
 if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1; });

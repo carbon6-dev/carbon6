@@ -163,7 +163,7 @@ The final Linux Docker release build measures **11,646,920 raw / 2,908,644 Brotl
 bytes**, within both existing size allowances; no budget increase is needed.
 Native and WASM Clippy and `make check` pass after correcting the slide-copy
 view expression and using a consistent `&str` for JSON source encoding.
-All 95 JavaScript unit tests and 14 motion VM checks pass. Production-WASM
+All 96 JavaScript unit tests and 14 motion VM checks pass. Production-WASM
 clipboard reads pass in fresh 1440px desktop and 390px touch contexts for every
 payload listed above. Both screenshots were inspected: desktop controls reveal
 on hover/focus, phone controls remain visible, and neither layout overflows or
@@ -279,3 +279,15 @@ accessible name and retain media type/size as an accessible description as well
 as visible text and a tooltip. A native rendering regression checks both
 attributes; the historical browser assertions remain unchanged. Failure evidence
 now includes the first transcript row's accessibility snapshot.
+
+The first Linux full cohort completed all 130 shards but exposed a WebKit
+navigation-control race. A deliberately queued real live-feed attention ping
+reproduced the exact failure twice alone: its debounced application fetch ran
+while the negative control held the replacement document, adding a separate,
+correctly classified native diagnostic to a cell that requires exactly zero.
+Negative controls now deliberately queue that refresh and advance its injected
+300ms debounce clock, awaiting complete attention response bodies before
+unloading. There is no wall-clock sleep, retry, broader error tolerance or
+changed assertion; the positive in-flight cold-reload control retains real
+timing. A deterministic unit test checks dispatch and response completion
+ordering before the readiness gate resolves.
