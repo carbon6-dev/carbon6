@@ -570,6 +570,13 @@ async function check(browser, origin, engine, theme, view) {
     // Details: no invented empty outputs/work/labels summaries, but their
     // editors stay reachable. All requests still go only to the mock head.
     if (view !== 'wide') await sheet.getByRole('button', { name: /^(Session details|Details)\b/ }).click();
+    if (view.startsWith('phone')) {
+      const location = sheet.getByRole('group', { name: 'Session location', exact: true });
+      await location.getByText('Folder', { exact: true }).waitFor();
+      await location.getByRole('button', { name: /^Model/ }).waitFor();
+      assert.equal(await page.locator('[data-tile-surface] [aria-label="Session location"]').count(), 0,
+        'phone placement/model controls live in Session details, not a second navigation bar');
+    }
     await sheet.getByText('Runs on', { exact: true }).waitFor();
     assert.equal(await sheet.getByText('Newest outputs', { exact: true }).count(), 0);
     assert.equal(await sheet.getByRole('button', { name: 'Show all', exact: true }).count(), 0);

@@ -3061,7 +3061,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> AnyView {
                 <button class=format!("{btn} hidden md:@min-[14rem]/tile:flex") title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
                 <crate::activity::SessionsPicker />
             </div>
-            <For each=chrome key=|c| c.token let:c>
+            <For each=move || if phone.get() { None } else { chrome() } key=|c| c.token let:c>
                 {c.borrow(move || view! { <crate::session::SessionLocation chrome=c /> })}
             </For>
             {move || shown.get().map(|(_, id)| view! { <crate::session::ArchivedSession id /> })}

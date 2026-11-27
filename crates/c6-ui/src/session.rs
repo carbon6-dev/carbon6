@@ -1404,7 +1404,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         </SessionPopover>
         <Show when=move || sheet_present.get() || output_return_sheet.get()>
             <leptos::portal::Portal>
-                <BottomSheet open=sheet label="Session" close_icon=false panel=sheet_panel><SessionOverview chrome on_done=move |()| sheet.set(false) /></BottomSheet>
+                <BottomSheet open=sheet label="Session" close_icon=false panel=sheet_panel><SessionOverview chrome phone=true on_done=move |()| sheet.set(false) /></BottomSheet>
             </leptos::portal::Portal>
         </Show>
         <SessionPopover at=catch_at class="w-[min(24rem,calc(100vw-1rem))] p-3">
@@ -2695,8 +2695,13 @@ fn PlacementFrame(open: RwSignal<bool>, pop: StoredValue<String>, children: Chil
 
 /// The context ring's one destination: panes, what runs, and the unchanged glance.
 #[component]
-fn SessionOverview(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>, #[prop(default = false)] wide: bool) -> impl IntoView {
-    view! { <BackgroundWork chrome on_done wide /> }
+fn SessionOverview(
+    chrome: SessionChrome,
+    #[prop(into)] on_done: Callback<()>,
+    #[prop(default = false)] wide: bool,
+    #[prop(default = false)] phone: bool,
+) -> impl IntoView {
+    view! { <BackgroundWork chrome on_done wide phone /> }
 }
 
 /// A desktop session's own strip, when its tile's bar speaks for another view
@@ -2778,7 +2783,12 @@ pub(crate) fn ArchivedSession(id: String, #[prop(optional)] show_title: bool) ->
 /// The shared sheet and wide overview: live identities, a retained history
 /// drill-in, and conditional session metadata. Each job owns its own actions.
 #[component]
-fn BackgroundWork(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>, #[prop(default = false)] wide: bool) -> impl IntoView {
+fn BackgroundWork(
+    chrome: SessionChrome,
+    #[prop(into)] on_done: Callback<()>,
+    #[prop(default = false)] wide: bool,
+    #[prop(default = false)] phone: bool,
+) -> impl IntoView {
     use crate::tasks::Page;
     let page = RwSignal::new(Page::Landing);
     let section = NodeRef::<leptos::html::Section>::new();
@@ -2905,6 +2915,7 @@ fn BackgroundWork(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>, #[
                 </div>
             </div>
             <Show when=move || page.get() == Page::Details>
+                {phone.then(|| view! { <SessionLocation chrome /> })}
                 <crate::details::Glance chrome on_done />
                 <RecoveryBanner recovery=chrome.recovery session_id=chrome.id.get_value() />
                 {move || chrome.loss.get().map(|cause| view! { <ErrorBox message=format!("Work lost: {cause}. Send a message to resume this session.") /> })}

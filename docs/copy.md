@@ -159,7 +159,7 @@ bridge/vendor, not exercised against a live shell. No live head/workers touched.
 
 ## Integration verification
 
-The final Linux Docker release build measures **11,645,527 raw / 2,908,133 Brotli
+The final Linux Docker release build measures **11,646,584 raw / 2,907,978 Brotli
 bytes**, within both existing size allowances; no budget increase is needed.
 Native and WASM Clippy and `make check` pass after correcting the slide-copy
 view expression and using a consistent `&str` for JSON source encoding.
@@ -237,3 +237,19 @@ The keyed bar still owns DOM removal; no transcript or bar owner is retained by
 the other. A deterministic lifecycle regression checks recursive pausing before
 signal disposal, an unaffected persistent bar and weak ownership after unmount.
 The browser's original no-panic and navigation-history assertions are unchanged.
+
+The next full cohort reached later workspace phases and exposed physical
+Ctrl-clicks in its Linux-platform emulation on a macOS host. Both failures
+reproduced twice alone. `navigator.platform` does not change the host's native
+context-menu gesture: native Mac cases retain real Meta-clicks, native Linux
+cases retain real Ctrl-clicks, and only Linux-on-Mac emulation dispatches an
+explicit Ctrl-click event. Every destination, deduplication, draft and history
+assertion remains intact, as does the separate Mac context-menu check.
+
+That cohort also exposed the baseline's location strip adding 67px below the
+single phone bar; this reproduced twice on each tree. On phones, Worker,
+Folder/Worktree and Model now live in the ring's Session details page instead of
+adding another fixed header. Desktop location controls stay in the tile bar.
+The unchanged phone-bar suite still requires actual content within 44px of the
+top; the session-sheet suite additionally requires the phone location summary
+and model control to be reachable in Details, with no strip in the tile.

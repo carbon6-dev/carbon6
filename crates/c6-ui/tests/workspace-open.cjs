@@ -155,6 +155,13 @@ async function check(browser, origin, viewport, label, platform) {
     const { page, context } = f, lives = new Set(), liveWaiters = new Set();
     const command = platform.startsWith('Mac') ? 'Meta' : 'Control';
     const press = key => page.keyboard.press(`${command}+${key}`);
+    // Emulating navigator.platform does not change the host's mouse gestures:
+    // physical Ctrl-click on macOS is a context menu, not a Linux click. Keep
+    // real Meta-clicks on Mac and real Ctrl-clicks on Linux; only the emulated
+    // Linux-on-Mac case needs an explicit Ctrl event.
+    const modifierClick = locator => process.platform === 'darwin' && command === 'Control'
+      ? locator.dispatchEvent('click', { button: 0, ctrlKey: true })
+      : locator.click({ modifiers: [command] });
     // Subsequent seed navigations install this before WASM starts, so the
     // real platform check, not just synthetic modifier flags, is covered.
     await context.addInitScript(platform => Object.defineProperty(navigator, 'platform', { get: () => platform }), platform);
@@ -435,7 +442,7 @@ async function check(browser, origin, viewport, label, platform) {
     phase('modifier reveals existing document without key or history churn');
     await links();
     const beforeModifier = await snapshot(page);
-    await parent().locator('a[href$="#block.2"]').last().click({ modifiers: [command] });
+    await modifierClick(parent().locator('a[href$="#block.2"]').last());
     await waitView(page, 'docs', 'block.2', 2);
     const afterModifier = await snapshot(page);
     assert.deepEqual(afterModifier.tiles.map(t => t.columns.map(c => c.key)), beforeModifier.tiles.map(t => t.columns.map(c => c.key)));
@@ -457,25 +464,25 @@ async function check(browser, origin, viewport, label, platform) {
     phase('modifier opens not-yet-open document in new tile, then reuses it');
     await links();
     const sourceBeforeNew = (await snapshot(page)).tiles[0];
-    await parent().locator(`a[href$="/docs/${OTHER_DOC}"]`).last().click({ modifiers: [command] });
+    await modifierClick(parent().locator(`a[href$="/docs/${OTHER_DOC}"]`).last());
     await waitView(page, 'docs', undefined, 3);
     const newDoc = await snapshot(page), newDocTile = newDoc.tiles[newDoc.focus];
     assert.equal(newDocTile.columns[0].view.id, OTHER_DOC);
     assert.deepEqual(newDoc.tiles[0].columns, sourceBeforeNew.columns, 'new destination does not replace source panes');
     assert.deepEqual(newDoc.tiles[0].back, sourceBeforeNew.back);
     await links();
-    await parent().locator(`a[href$="/docs/${OTHER_DOC}"]`).last().click({ modifiers: [command] });
+    await modifierClick(parent().locator(`a[href$="/docs/${OTHER_DOC}"]`).last());
     await waitView(page, 'docs', undefined, 3);
     const newDocAgain = await snapshot(page);
     assert.equal(newDocAgain.tiles[newDocAgain.focus].key, newDocTile.key);
 
     phase('modifier opens a new single-copy page, then reuses it');
     await links();
-    await parent().locator('a[href$="/workers"]').last().click({ modifiers: [command] });
+    await modifierClick(parent().locator('a[href$="/workers"]').last());
     await waitView(page, 'workers', undefined, 4);
     const workers = await snapshot(page), workersTile = workers.tiles[workers.focus];
     await links();
-    await parent().locator('a[href$="/workers"]').last().click({ modifiers: [command] });
+    await modifierClick(parent().locator('a[href$="/workers"]').last());
     await waitView(page, 'workers', undefined, 4);
     const workersAgain = await snapshot(page);
     assert.equal(workersAgain.tiles[workersAgain.focus].key, workersTile.key);
@@ -489,7 +496,7 @@ async function check(browser, origin, viewport, label, platform) {
     const secondaryDraft = 'A different draft belongs only to the second session.';
     await parent().locator('textarea').fill(parentDraft);
     const beforeSession = await snapshot(page);
-    await parent().locator('a[href$="#e20"]').last().click({ modifiers: [command] });
+    await modifierClick(parent().locator('a[href$="#e20"]').last());
     const turnTarget = { q: '', anchor: 'e20', open: [], at: null };
     await waitView(page, 'session', turnTarget, 2);
     await parent().locator('[id="parent-e20"]').waitFor({ state: 'attached' });
@@ -504,7 +511,7 @@ async function check(browser, origin, viewport, label, platform) {
     for (const selector of ['a[href$="#e20"]', 'a[data-ref="session:parent"]']) {
       const sameSockets = await streamState(), sameRequests = f.requests.length;
       await parent().locator('textarea').evaluate(el => { window.__sessionComposer = el; });
-      await parent().locator(selector).last().click({ modifiers: [command] });
+      await modifierClick(parent().locator(selector).last());
       const untargeted = selector.includes('data-ref');
       await waitView(page, 'session', untargeted ? null : turnTarget, 2);
       const expected = structuredClone(sameSession);
@@ -548,7 +555,7 @@ async function check(browser, origin, viewport, label, platform) {
     await links();
     const sourceSession = (await snapshot(page)).tiles[0];
     phase('unopened secondary: modifier-click transcript link');
-    await parent().locator('a[href$="/sessions/secondary"]').last().click({ modifiers: [command] });
+    await modifierClick(parent().locator('a[href$="/sessions/secondary"]').last());
     phase('unopened secondary: wait for focused session in three tiles');
     await waitView(page, 'session', undefined, 3);
     const newSession = await snapshot(page), secondaryTile = newSession.tiles[newSession.focus];
@@ -568,7 +575,7 @@ async function check(browser, origin, viewport, label, platform) {
     phase('Sessions list: reinject parent transcript links');
     await links();
     phase('Sessions list: modifier-click root link');
-    await parent().locator('a[href$="/"]').last().click({ modifiers: [command] });
+    await modifierClick(parent().locator('a[href$="/"]').last());
     phase('Sessions list: wait for focused Sessions in four tiles');
     await waitView(page, 'sessions', undefined, 4);
     const withList = await snapshot(page), listTile = withList.tiles[withList.focus], listKey = listTile.columns[0].key;
@@ -582,7 +589,7 @@ async function check(browser, origin, viewport, label, platform) {
       const previewClose = page.getByRole('button', { name: 'Close session details', exact: true });
       if (await previewClose.isVisible()) await previewClose.click();
       await press('4');
-      await page.locator(`#col-${listKey} a[href$="/sessions/${id}"]`).first().click({ modifiers: [command] });
+      await modifierClick(page.locator(`#col-${listKey} a[href$="/sessions/${id}"]`).first());
       phase(`Sessions list reuse ${id}: wait for existing session in four tiles`);
       await waitView(page, 'session', null, 4);
       const after = await snapshot(page);
@@ -851,7 +858,7 @@ async function check(browser, origin, viewport, label, platform) {
       // Desktop has the Changes toolbar action already; opening the ring's
       // popover first would put its scrim over that same action.
       if (viewport.width < 768) await page.locator('[data-tile-motion="2"]').getByRole('button', { name: /Open session sheet/ }).click();
-      await page.getByRole('button', { name: 'Changes', exact: true }).last().click({ modifiers: [command] });
+      await modifierClick(page.getByRole('button', { name: 'Changes', exact: true }).last());
       await waitView(page, 'session_changes', undefined, count);
       const companions = await snapshot(page);
       assert.equal(liveColumns(companions).filter(c => c.view.view === 'session_changes' && c.view.id === 'parent').length, count - 2);
