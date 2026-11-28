@@ -59,7 +59,7 @@ async fn the_memex_sorts_through_a_pool_and_survives_a_member_going_away() {
     let post =
         async |path: &str, body: Value| -> reqwest::Response { http.post(format!("{api}/{path}")).json(&body).send().await.unwrap() };
     let mac: Connection = post("connections", json!({"name": "mac", "base_url": a.base_url()})).await.json().await.unwrap();
-    let mumuzz: Connection = post("connections", json!({"name": "mumuzz", "base_url": b.base_url()})).await.json().await.unwrap();
+    let worker_b: Connection = post("connections", json!({"name": "worker-b", "base_url": b.base_url()})).await.json().await.unwrap();
 
     // A pool's members are other API connections, each once, with 1 to 64 slots.
     let bad = [
@@ -79,14 +79,14 @@ async fn the_memex_sorts_through_a_pool_and_survives_a_member_going_away() {
     assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST, "a pool of pools");
     let pool: Connection = http
         .patch(format!("{api}/connections/{}", pool.id))
-        .json(&json!({"members": [{"connection_id": "mac", "slots": 1}, {"connection_id": "mumuzz", "slots": 1}]}))
+        .json(&json!({"members": [{"connection_id": "mac", "slots": 1}, {"connection_id": "worker-b", "slots": 1}]}))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(pool.members.iter().map(|m| m.connection_id.as_str()).collect::<Vec<_>>(), [mac.id.as_str(), mumuzz.id.as_str()]);
+    assert_eq!(pool.members.iter().map(|m| m.connection_id.as_str()).collect::<Vec<_>>(), [mac.id.as_str(), worker_b.id.as_str()]);
     let models: Vec<String> = http.get(format!("{api}/connections/{}/models", pool.id)).send().await.unwrap().json().await.unwrap();
     assert_eq!(models, ["mock-1", "mock-2"], "its members' models");
     // Sessions dial their connection from their worker: no pools there.
@@ -113,8 +113,8 @@ async fn the_memex_sorts_through_a_pool_and_survives_a_member_going_away() {
         let v: Value = post("memex/rpc", json!({"method": "memex.triage.list", "params": {"limit": 100}})).await.json().await.ok()?;
         serde_json::from_value::<Vec<Triage>>(v).ok()?.into_iter().find(|t| t.target == format!("thread:acct:{target}"))
     };
-    // The first call holds mac's one slot: the second goes to mumuzz.
-    eventually("one sorted on mumuzz while mac is busy", async || {
+    // The first call holds mac's one slot: the second goes to worker-b.
+    eventually("one sorted on worker-b while mac is busy", async || {
         (a.requests().len() == 1 && !b.requests().is_empty() && (sorted("one").await.is_some() || sorted("two").await.is_some()))
             .then_some(())
     })
@@ -125,7 +125,7 @@ async fn the_memex_sorts_through_a_pool_and_survives_a_member_going_away() {
         assert_eq!(s.by, "model", "{s:?}");
     }
 
-    // mac goes away; mail keeps coming. Its calls go to mumuzz, none misfiled.
+    // mac goes away; mail keeps coming. Its calls go to worker-b, none misfiled.
     a.stop();
     let before = b.requests().len();
     mail(&m, "three", "lee@fabrikam.com", "Our invoice is attached.").await;
@@ -142,7 +142,7 @@ async fn the_memex_sorts_through_a_pool_and_survives_a_member_going_away() {
     // The activity panel says which member took each call.
     let calls = c6_llm::activity::calls();
     let through = |member: &str, state: &str| calls.iter().any(|c| c.via == pool.id && c.connection == member && c.state == state);
-    assert!(through(&mac.id, "done") && through(&mumuzz.id, "done"), "both served");
+    assert!(through(&mac.id, "done") && through(&worker_b.id, "done"), "both served");
     assert!(through(&mac.id, "failed"), "mac's refused call is shown");
     head.shutdown().await.unwrap();
 }

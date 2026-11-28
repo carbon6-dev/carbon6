@@ -2157,13 +2157,13 @@ mod create_session_tests {
     fn explicit_placement_is_preserved() {
         let request: CreateSession = serde_json::from_value(json!({
             "worker_id": uuid::Uuid::nil(), "cwd": "/work/repo", "worktree": true,
-            "ssh": "dev", "labels": ["project:falcon"]
+            "ssh": "dev", "labels": ["project:acme"]
         }))
         .unwrap();
         assert_eq!(request.cwd, "/work/repo");
         assert!(request.worktree);
         assert_eq!(request.ssh.as_deref(), Some("dev"));
-        assert_eq!(request.labels, ["project:falcon"]);
+        assert_eq!(request.labels, ["project:acme"]);
     }
 }
 

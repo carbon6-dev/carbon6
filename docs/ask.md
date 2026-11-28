@@ -3,7 +3,7 @@
 Status: built (2026-11-02; §6 is what was built). Decided with you:
 - **No separate Chat feature.** Ask (docs/assistant.md) already runs in the head with no worker, can do everything the UI can, and reads workers' files and git. It becomes the place to just talk to a model, about anything or about your setup.
 - **Conversations you come back to:** a **Chat** list of your Ask conversations, newest first, to continue, rename or archive.
-- **Work on a machine waits for its answer:** "run the tests on rust-dev-02 and tell me what fails" starts a subagent there and waits for its report.
+- **Work on a machine waits for its answer:** "run the tests on build-02 and tell me what fails" starts a subagent there and waits for its report.
 - **Any model, per conversation:** an API or ChatGPT connection in Ask's own loop, or **Claude Code**, which the head then runs on its own machine whenever `claude` is on its PATH (§3).
 - **Your mail, chat and calendar stay out unless you bring them in:** a switch per conversation, or @-mentioning one thread, person, project or doc.
 

@@ -2314,7 +2314,7 @@ fn ConnectionRow(
             }
         });
     };
-    // "mac ×2, mumuzz ×1"
+    // "mac ×2, worker-b ×1"
     let shown = c.members.clone();
     let members_text = move || {
         let names = all.get();

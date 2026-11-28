@@ -2273,8 +2273,8 @@ mod tests {
     #[test]
     fn remote_equivalence_does_not_drop_nondefault_ports() {
         assert_eq!(remote_key("git@EXAMPLE.invalid:team/repo.git"), remote_key("https://example.invalid:443/team/repo"));
-        assert_eq!(remote_key("git@GitHub.com:Carbon6-Dev/Falcon.GIT/"), remote_key("https://github.com/carbon6-dev/falcon"));
-        assert_eq!(remote_key("HTTPS://GitHub.com:443/Carbon6-Dev/Falcon.GIT/"), remote_key("ssh://git@github.com/carbon6-dev/falcon.git"));
+        assert_eq!(remote_key("git@GitHub.com:Carbon6-Dev/Widget.GIT/"), remote_key("https://github.com/carbon6-dev/widget"));
+        assert_eq!(remote_key("HTTPS://GitHub.com:443/Carbon6-Dev/Widget.GIT/"), remote_key("ssh://git@github.com/carbon6-dev/widget.git"));
         assert_ne!(remote_key("https://example.invalid/Team/Repo.git"), remote_key("https://example.invalid/team/repo.git"));
         assert_ne!(remote_key("/tmp/Repo.git"), remote_key("/tmp/repo.git"));
         assert_ne!(remote_key("ssh://git@example.invalid:2222/team/repo"), remote_key("ssh://git@example.invalid/team/repo"));
@@ -2305,7 +2305,7 @@ mod tests {
         git_to(clone, MAX_JSON, &mut io::sink()).unwrap();
         for repo in [&source, &destination] {
             git(repo, &["remote", "remove", "origin"]).ok();
-            git(repo, &["remote", "add", "origin", "https://github.com/Carbon6-Dev/Falcon.git"]).unwrap();
+            git(repo, &["remote", "add", "origin", "https://github.com/Carbon6-Dev/Widget.git"]).unwrap();
             git(repo, &["config", "user.name", "Move Test"]).unwrap();
             git(repo, &["config", "user.email", "move@example.invalid"]).unwrap();
         }
@@ -2388,7 +2388,7 @@ mod tests {
         assert_eq!(clone_destination(&descriptor, &new).unwrap(), new);
         let parent = folder(t.path(), "parent");
         fs::write(parent.join("keep"), "keep").unwrap();
-        assert_eq!(clone_destination(&descriptor, &parent).unwrap(), parent.join("falcon"));
+        assert_eq!(clone_destination(&descriptor, &parent).unwrap(), parent.join("widget"));
     }
 
     fn dirty_source(source: &Path) {

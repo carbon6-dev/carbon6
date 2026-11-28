@@ -1792,7 +1792,7 @@ mod tests {
     fn resolves_where_a_subagent_runs() {
         let conns = vec![
             conn("c1", "work", "anthropic", "claude-sonnet-5-5"),
-            conn("c2", "blacktitan ChatGPT", "chatgpt", "gpt-6.1"),
+            conn("c2", "work ChatGPT", "chatgpt", "gpt-6.1"),
             conn("c3", "router", "openai_compat", ""),
         ];
         let parent = spec("c1", "anthropic", "claude-opus-5-5", "high");
@@ -1814,11 +1814,11 @@ mod tests {
         // The call wins: by connection name (any case) and model; the
         // effort carries over on the same connection, not to another.
         assert_eq!(
-            resolve_model(&parent, &picked, "haiku", &choice("BLACKTITAN chatgpt", "gpt-6.1-sol", ""), &conns).unwrap(),
+            resolve_model(&parent, &picked, "haiku", &choice("WORK chatgpt", "gpt-6.1-sol", ""), &conns).unwrap(),
             spec("c2", "chatgpt", "gpt-6.1-sol", "medium")
         );
         assert_eq!(
-            resolve_model(&parent, &none, "", &choice("blacktitan chatgpt", "gpt-6.1-sol", ""), &conns).unwrap(),
+            resolve_model(&parent, &none, "", &choice("work chatgpt", "gpt-6.1-sol", ""), &conns).unwrap(),
             spec("c2", "chatgpt", "gpt-6.1-sol", "")
         );
         assert_eq!(
@@ -1827,7 +1827,7 @@ mod tests {
             "by id, on its default model"
         );
         assert_eq!(
-            resolve_model(&parent, &none, "", &choice("", "blacktitan ChatGPT/gpt-6.1-sol", "xhigh"), &conns).unwrap(),
+            resolve_model(&parent, &none, "", &choice("", "work ChatGPT/gpt-6.1-sol", "xhigh"), &conns).unwrap(),
             spec("c2", "chatgpt", "gpt-6.1-sol", "xhigh")
         );
         assert_eq!(
@@ -1837,7 +1837,7 @@ mod tests {
         );
         // Refusals.
         let err = resolve_model(&parent, &none, "", &choice("nope", "", ""), &conns).unwrap_err();
-        assert!(err.contains("no connection \"nope\"") && err.contains("work, blacktitan ChatGPT, router"), "{err}");
+        assert!(err.contains("no connection \"nope\"") && err.contains("work, work ChatGPT, router"), "{err}");
         assert!(resolve_model(&parent, &none, "", &choice("router", "", ""), &conns).unwrap_err().contains("no default model"));
         assert!(resolve_model(&parent, &none, "", &choice("", "", "huge"), &conns).unwrap_err().contains("effort"));
         // A head-authorized default can be newer than this catalog, but it

@@ -332,7 +332,7 @@ A subagent may run on another connection and model than its parent: a cheap mode
 
 The connection, model and effort come from the first of these that says, most specific first:
 
-1. **The `Task` call:** `connection` (a name or id from the list in the tool's description), `model` (a model id, or `connection/model`) and `effort`. The model sets them when you ask ("use a subagent on my blacktitan ChatGPT connection with gpt-6.1-sol at high"). A connection without a model runs its default model.
+1. **The `Task` call:** `connection` (a name or id from the list in the tool's description), `model` (a model id, or `connection/model`) and `effort`. The model sets them when you ask ("use a subagent on my work ChatGPT connection with gpt-6.1-sol at high"). A connection without a model runs its default model.
 2. **A named agent's `model`:** an alias (`opus`, `sonnet`, `haiku`) on an Anthropic connection, or `connection/model` on any.
 3. **The session's default for subagents:** picked in the session (the **Subagents** row under the message box; `PUT /sessions/{id}/subagent-model`), else the routing rule's (**Subagent connection**, **Subagent model**, **Subagent effort**).
 4. **The connection's subagent model:** set on the session's connection (Settings → Connections → Edit → **Subagent model**), on that same connection. A smaller model there (`gpt-6-luna` under `gpt-6.1-sol`) makes searching and reading far cheaper; subagents were a third of the calls when a ChatGPT plan ran out in three days.
@@ -359,7 +359,7 @@ In carbon6's own loop, a subagent whose request would read more than 200k tokens
 - **What stays:** the latest 8 outputs, the first 5 after every message to the agent (what it read to learn each instruction), and outputs under 400 characters.
 - **What goes:** each other output becomes the editable prompt `session.trimmed_output` ("[Earlier output of ‹call› removed to save context. Run the tool again if you need it.]").
 - **Cache-friendly:** a trim happens only when it saves at least a fifth, and trimmed outputs stay trimmed, so the cached prefix changes about as often as with compaction, which still comes after if needed.
-- **Evidence:** in step replays of 30 points from long Falcon subagents, this policy read 52% less context with no loss beyond the judge's own noise (docs/replay-eval.md).
+- **Evidence:** in step replays of 30 points from subagents of a long-running private project, this policy read 52% less context with no loss beyond the judge's own noise (docs/replay-eval.md).
 - **Scope in carbon6's own loop:** only subagents are trimmed; your top-level sessions aren't.
 
 **Claude Code sessions, including top-level sessions and carbon6-managed

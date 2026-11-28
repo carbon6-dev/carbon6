@@ -224,14 +224,14 @@ async fn a_session_takes_what_you_mention_within_its_scope() {
 async fn ask_delegates_to_a_template_and_waits_for_the_report() {
     let env = Env::new().await;
     let state = tempfile::tempdir().unwrap();
-    let e = c6_head::api::new_enrollment(&env.head.state, Some("rust-dev")).await.unwrap();
+    let e = c6_head::api::new_enrollment(&env.head.state, Some("worker-a")).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
     let (_w, stop) = run_worker(state.path()).await;
     let repo = tempfile::tempdir().unwrap();
     let r = env
         .http
         .put(format!("{}/settings/templates", env.api))
-        .json(&json!([{"name": "tests-on-rust-dev", "description": "Run things in the repo", "workers": ["rust-dev"],
+        .json(&json!([{"name": "tests-on-worker-a", "description": "Run things in the repo", "workers": ["worker-a"],
                         "cwd": repo.path().canonicalize().unwrap().display().to_string(), "connection": "m", "model": "m", "agents": true}]))
         .send()
         .await
@@ -239,19 +239,19 @@ async fn ask_delegates_to_a_template_and_waits_for_the_report() {
     assert!(r.status().is_success(), "{}", r.text().await.unwrap());
     env.mock.push(Reply::ToolCalls(vec![(
         "c6_delegate".into(),
-        json!({"template": "tests-on-rust-dev", "prompt": "Run the tests and say what fails.", "description": "run the tests"}).to_string(),
+        json!({"template": "tests-on-worker-a", "prompt": "Run the tests and say what fails.", "description": "run the tests"}).to_string(),
     )]));
     env.mock.push(Reply::Text("2 tests fail: parse_dates and merge_ranges.".into()));
     env.mock.push(Reply::Text("Two tests fail: parse_dates and merge_ranges.".into()));
     let s: Session = serde_json::from_value(
-        env.post("/assistant", json!({"prompt": "run the tests on rust-dev", "connection": "m", "model": "m", "realm": "home"})).await,
+        env.post("/assistant", json!({"prompt": "run the tests on worker-a", "connection": "m", "model": "m", "realm": "home"})).await,
     )
     .unwrap();
     let events = env.turns(&s.id, 1).await;
 
     // It was offered with where it runs.
     let tools = env.mock.requests()[0]["tools"].to_string();
-    assert!(tools.contains("c6_delegate") && tools.contains("tests-on-rust-dev: Run things in the repo (on rust-dev:"), "{tools}");
+    assert!(tools.contains("c6_delegate") && tools.contains("tests-on-worker-a: Run things in the repo (on worker-a:"), "{tools}");
     // A child of the conversation, on the worker; the call got its report.
     let child = events
         .iter()
@@ -262,7 +262,7 @@ async fn ask_delegates_to_a_template_and_waits_for_the_report() {
         .unwrap_or_else(|| panic!("a subagent: {:?}", result_of(&events, "c6_delegate")));
     let row = env.head.state.store.session(&child).await.unwrap().unwrap();
     assert_eq!(row.parent_id.as_deref(), Some(s.id.as_str()));
-    assert_eq!(row.worker_name, "rust-dev");
+    assert_eq!(row.worker_name, "worker-a");
     let (out, is_error) = result_of(&events, "c6_delegate").expect("the delegation's result");
     assert!(!is_error && out.contains("2 tests fail: parse_dates and merge_ranges.") && out.contains("status=\"completed\""), "{out}");
     assert!(

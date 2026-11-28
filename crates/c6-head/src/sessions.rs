@@ -3792,7 +3792,7 @@ mod input_compatibility_tests {
     #[test]
     fn full_placement_target_round_trips_for_exact_consent() {
         let value = json!({"kind": "target", "expected_place_seq": 27,
-            "worker": "destination", "cwd": "/srv/workspaces/falcon", "clone": false,
+            "worker": "destination", "cwd": "/srv/workspaces/widget", "clone": false,
             "worktree": {"branch": "fix/dialog"}, "copy_scratch": false});
         let request: PlacementRequest = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(request).unwrap(), value);

@@ -1,5 +1,33 @@
 # Tests that fail only when something is wrong
 
+## Local private-term guard
+
+Maintainers with private projects keep a local term list; the hook refuses
+pushes containing them. The list stays outside the repository at
+`~/.config/c6/private-terms`, or the path in `C6_PRIVATE_TERMS`. It contains one
+case-insensitive extended regular expression per line; blank lines and comments
+starting with `#` (optionally indented) are ignored. Never commit the real list.
+
+Run `bash scripts/check-private-terms.sh --staged` before committing, or
+`bash scripts/check-private-terms.sh --range A..B` to check added content in
+every commit and its message. Deleted content is allowed so leaks can be
+removed. Lockfiles and `crates/c6-ui/vendor` are excluded. Reports contain only
+locations and "private term found", not the matched content. No local term file
+means a successful skip with a one-line note; this is not a shared CI policy.
+
+`make hooks` explicitly installs `scripts/hooks/pre-push` into Git's hooks
+directory, including in linked worktrees. It replaces an existing `pre-push`
+hook, so merge any custom hook first; a configured `core.hooksPath` must be
+handled separately. Nothing installs it automatically. Existing remote refs
+are checked from their previous tip; new refs check commits not reachable from
+that remote's local tracking refs (all history when none exist). A missing base
+object refuses the push; fetch the remote first. This prevents new leaks, but
+does not remove anything from previously published history.
+
+`bash scripts/test-check-private-terms.sh` exercises the guard and hook with
+synthetic patterns in a temporary repository, without any providers or builds.
+It also runs as part of `make check`.
+
 ## Claude Code context maintenance
 
 `claude_trim::tests` exercise native JSONL policy and atomic publication with

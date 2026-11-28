@@ -31,7 +31,7 @@ It runs where the transcript is, a worker, with the `claude` that wrote it:
 ## First run (2026-11-15)
 
 **What was run:**
-- **Points:** 10, five each from two Falcon backlog subagents (SQL, execution), with logged contexts of 200–950k tokens.
+- **Points:** 10, five each from two subagents from a long-running private project, with logged contexts of 200–950k tokens.
 - **Model:** Claude Opus, as logged.
 - **Judge:** Sonnet.
 
@@ -51,7 +51,7 @@ It runs where the transcript is, a worker, with the `claude` that wrote it:
 ## Second run (2026-11-15): 30 points, judged against the baseline
 
 **What was run:**
-- **Points:** 30, six each from five Falcon backlog subagents (SQL, execution, OS, planner, KQL), with logged contexts of 200–950k tokens.
+- **Points:** 30, six each from five subagents from a long-running private project, with logged contexts of 200–950k tokens.
 - **Arms:** baseline and `stub-old-keep-start`.
 - **Effort:** as logged (medium).
 - **Judge:** `--judge-against baseline`, pairwise and in random order.
@@ -65,8 +65,7 @@ It runs where the transcript is, a worker, with the `claude` that wrote it:
 
 **What it shows:**
 - **No measurable loss in step quality** at less than half the context.
-- **Six of the ten "worse" points** are the agent re-reading instruction files it was handed mid-run (`FIX_PROMPT.md`, `red1-*.md`, `WAVE2_PROMPT.md`). They came after the first five outputs, so they were stubbed. Keeping the first few outputs after every new message, not only at the start, should cover them.
-- **By area:** planner 0/6 worse, KQL 4/6.
+- **Six of the ten "worse" points** are the agent re-reading instruction files it was handed mid-run. They came after the first five outputs, so they were stubbed. Keeping the first few outputs after every new message, not only at the start, should cover them.
 - **The judge** sees only the task's opening instructions, so it can't tell when a later instruction made a read relevant.
 
 ## Third run (2026-11-15): keeping the start of every instruction

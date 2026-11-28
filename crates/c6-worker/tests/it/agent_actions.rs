@@ -64,7 +64,7 @@ async fn agents_make_and_change_things_by_your_rule() {
     let tool = |input: Value| Reply::ToolCalls(vec![("carbon6".into(), input.to_string())]);
 
     // Yours: a project and a work item with a to-do.
-    let p: Value = send(M::POST, "projects".into(), json!({"title": "Falcon Robustness", "plan": false})).await.json().await.unwrap();
+    let p: Value = send(M::POST, "projects".into(), json!({"title": "Acme Robustness", "plan": false})).await.json().await.unwrap();
     let pid = p["id"].as_str().unwrap().to_owned();
     let w: Value = send(M::POST, "work".into(), json!({"title": "Your work"})).await.json().await.unwrap();
     let wid = w["id"].as_str().unwrap().to_owned();
@@ -81,7 +81,7 @@ async fn agents_make_and_change_things_by_your_rule() {
         M::POST,
         "sessions".into(),
         json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": "", "connection_id": conn["id"], "model": "m",
-               "prompt": "create a new Work in the Falcon Robustness project", "work": "none"}),
+               "prompt": "create a new Work in the Acme Robustness project", "work": "none"}),
     )
     .await
     .json()
@@ -116,15 +116,15 @@ async fn agents_make_and_change_things_by_your_rule() {
     assert_eq!(m["title"], "Harden retries and timeouts");
 
     // 3. Renaming your project asks you once; nothing changes until you allow it.
-    let rename = json!({"op": "projects.edit", "input": {"id": pid, "body": {"title": "Falcon"}}});
+    let rename = json!({"op": "projects.edit", "input": {"id": pid, "body": {"title": "Acme"}}});
     mock.push(tool(rename.clone()));
     mock.push(Reply::Text("Asked.".into()));
-    send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "rename the project to Falcon"})).await;
+    send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "rename the project to Acme"})).await;
     let ev = turns(sid.clone(), 3).await;
     assert!(last_result(&ev).contains("Not yet"), "{}", last_result(&ev));
-    assert_eq!(get(format!("projects/{pid}")).await["title"], "Falcon Robustness");
+    assert_eq!(get(format!("projects/{pid}")).await["title"], "Acme Robustness");
     let ds = get("decisions".into()).await;
-    let d = ds.as_array().unwrap().iter().find(|d| d["title"].as_str().unwrap_or("").contains("Falcon Robustness")).unwrap().clone();
+    let d = ds.as_array().unwrap().iter().find(|d| d["title"].as_str().unwrap_or("").contains("Acme Robustness")).unwrap().clone();
     // Your answer reaches the session as a message (a turn), and it calls again.
     mock.push(tool(rename.clone()));
     mock.push(Reply::Text("Renamed.".into()));
@@ -135,7 +135,7 @@ async fn agents_make_and_change_things_by_your_rule() {
         ev.iter().any(|e| e["type"] == "user" && e["text"].as_str().unwrap_or("").contains("The user allowed decision")),
         "the session heard the answer"
     );
-    assert_eq!(get(format!("projects/{pid}")).await["title"], "Falcon");
+    assert_eq!(get(format!("projects/{pid}")).await["title"], "Acme");
 
     // 4. Removing your to-do asks each time, and Allow does it.
     mock.push(tool(json!({"op": "work.todos.remove", "input": {"id": wid, "todo": your_todo}})));
@@ -184,7 +184,7 @@ async fn agents_make_and_change_things_by_your_rule() {
 
     // 6. The work tool does the same: new work in a project named as you'd
     // say it, then a to-do on it by its id.
-    let create = json!({"action": "create", "title": "Chaos drills", "done_when": "a drill a week", "project": "falcon"});
+    let create = json!({"action": "create", "title": "Chaos drills", "done_when": "a drill a week", "project": "acme"});
     mock.push(Reply::ToolCalls(vec![("work".into(), create.to_string())]));
     mock.push(Reply::Text("Made.".into()));
     send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "new work for drills"})).await;

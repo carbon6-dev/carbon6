@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn a_failed_load_says_why() {
-        assert_eq!(load_error("no realm \"mach5\""), "Couldn't load what needs you: no realm \"mach5\"");
+        assert_eq!(load_error("no realm \"work\""), "Couldn't load what needs you: no realm \"work\"");
     }
 
     #[test]

@@ -2621,8 +2621,8 @@ mod ownership_tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
         let scratch = dir.path().join("scratch");
-        let checkout = dir.path().join("falcon");
-        let linked = dir.path().join("worktrees/falcon/topic/src");
+        let checkout = dir.path().join("widget");
+        let linked = dir.path().join("worktrees/widget/topic/src");
         let started = SessionEvent {
             kind: Some(session_event::Kind::Started(c6_proto::SessionStarted { cwd: scratch.display().to_string(), ..Default::default() })),
             ..event(1)

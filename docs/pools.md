@@ -25,7 +25,7 @@ Sessions and subagents don't use pools. Their worker dials the connection itself
 
 ## Setting one up
 
-1. Add each server as a connection of its own (**Settings → Connections**), for example `mac` (`http://mac.tailnet:11434/v1`) and `mumuzz` (`http://ollama.svc:11434/v1`). Each has an optional **Context window**, empty for automatic detection (docs/connections.md).
+1. Add each server as a connection of its own (**Settings → Connections**), for example `mac` (`http://mac.tailnet:11434/v1`) and `worker-b` (`http://ollama.svc:11434/v1`). Each has an optional **Context window**, empty for automatic detection (docs/connections.md).
 2. Add a connection of kind **Pool**: name it, and add its members with how many calls each takes at once (Ollama: its `OLLAMA_NUM_PARALLEL`).
 3. Choose the pool where you'd choose a connection, for example **Settings → Memex → Understanding**, and a model the members have.
 4. Set **Settings → Memex → calls at once** to about the total of the members' slots, up to 64 (default 1). For example, two 32-slot vLLM servers can use 64; a larger pool still shares 64 memex lanes. With more than one lane, one keeps new mail moving. Fewer lanes leave slots idle; more than the pool's slots queues calls.

@@ -34,7 +34,7 @@ COLD PITCHES 23 · NEWSLETTERS 90 · NOTIFICATIONS 60  (archived)
 
 - Each line says in a few words why it's there; people are the memex's people.
 - The message list (today's Mail and Chat pages) stays, one key away, for search and browsing.
-- A brief per realm: mach5's mail and Slack together; home's apart. A combined view across realms can come later.
+- A brief per realm: work's mail and Slack together; home's apart. A combined view across realms can come later.
 
 ### 2.2 Working a request
 
@@ -133,7 +133,7 @@ Nothing here is a fixed string in code (it's carbon6's rule): each is an editabl
 | `brief.times` | When briefs come |
 | sender marks | Your marks: pitch / known, by address or domain (kept in the realm's memex) |
 
-The memex reads prompts from home only today (prompts::for_memex); it will read the realm's own, so mach5 can sort and draft differently from home.
+The memex reads prompts from home only today (prompts::for_memex); it will read the realm's own, so work can sort and draft differently from home.
 
 ## 8. Building on what's there
 

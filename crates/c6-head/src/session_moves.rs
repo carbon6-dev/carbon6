@@ -654,9 +654,9 @@ mod tests {
 
     #[test]
     fn preflight_errors_name_the_destination_field_without_rpc_jargon() {
-        assert_eq!(preflight_reason("rust-dev-03", "Folder: choose /srv/falcon"), "Folder on rust-dev-03: choose /srv/falcon");
-        assert_eq!(preflight_reason("rust-dev-03", "Worktree: choose a new branch"), "Worktree on rust-dev-03: choose a new branch");
-        assert_eq!(preflight_reason("rust-dev-03", "Worker: install Claude CLI"), "Worker on rust-dev-03: install Claude CLI");
+        assert_eq!(preflight_reason("worker-a", "Folder: choose /srv/widget"), "Folder on worker-a: choose /srv/widget");
+        assert_eq!(preflight_reason("worker-a", "Worktree: choose a new branch"), "Worktree on worker-a: choose a new branch");
+        assert_eq!(preflight_reason("worker-a", "Worker: install Claude CLI"), "Worker on worker-a: install Claude CLI");
     }
 
     #[test]

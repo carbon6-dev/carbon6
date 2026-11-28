@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Installed explicitly with `make hooks`; never stores the local term list.
+set -euo pipefail
+root=$(git rev-parse --show-toplevel)
+remote=${1:?missing remote}
+if [ ! -f "${C6_PRIVATE_TERMS:-${HOME}/.config/c6/private-terms}" ]; then
+    echo 'private-terms: no local term file; skipping check.' >&2
+    exit 0
+fi
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+while read -r local_ref local_oid remote_ref remote_oid; do
+    # Deleting a remote ref introduces no commits.
+    [ -n "${local_oid//0/}" ] || continue
+    if [ -n "${remote_oid//0/}" ]; then
+        bash "$root/scripts/check-private-terms.sh" --range "$remote_oid..$local_oid"
+    else
+        # A new branch need not recheck already-published remote history. If
+        # there are no tracking refs, inspect its entire history (fail closed).
+        git rev-list "$local_oid" --not "--remotes=$remote/*" > "$tmp/commits"
+        while IFS= read -r commit; do
+            bash "$root/scripts/check-private-terms.sh" --range "$commit^!"
+        done < "$tmp/commits"
+    fi
+done

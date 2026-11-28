@@ -30,13 +30,13 @@ So the message you used to type becomes a template: branch `vinayakb/{{name}}`, 
 
 ## 3. Where: a pool, pick one
 
-A template's **workers** still work as before (empty: the online one; a list or `*`: one session on each). A template may instead **pick one**: from named workers or from **workers with a label** (labels you give workers on the Workers page), it takes the online one with the fewest running sessions. The form says which and why ("rust-dev-03, the least busy of dev-vm").
+A template's **workers** still work as before (empty: the online one; a list or `*`: one session on each). A template may instead **pick one**: from named workers or from **workers with a label** (labels you give workers on the Workers page), it takes the online one with the fewest running sessions. The form says which and why ("worker-a, the least busy of dev-vm").
 
 ## 4. Start with, and the work's place
 
 - **A project names its "start with" template,** and a work item may name its own (it wins). Every way of starting work in it uses that template: the project's + Work and quick sessions, a to-do's ▶ Start, Plan the next phase, Pick up, and a task card's **Start session** for a card raised in that work's sessions. The form opens filled from it; you can change anything.
 - **The first session started for a work item through such a template** records the work's **place** on the work item: the worker, the worktree's folder, its branch and the template's "when the work ends".
-- **Later starts for that work go back there:** the same worker, in that worktree, with no new worktree or branch. The form says so ("rust-dev-02, where this work's worktree is"). If that worker is offline, the form says so too: you may wait, or pick another worker, which makes a fresh worktree there (from the branch, if it was pushed).
+- **Later starts for that work go back there:** the same worker, in that worktree, with no new worktree or branch. The form says so ("build-02, where this work's worktree is"). If that worker is offline, the form says so too: you may wait, or pick another worker, which makes a fresh worktree there (from the branch, if it was pushed).
 
 ## 5. When the work ends
 

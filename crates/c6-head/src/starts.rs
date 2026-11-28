@@ -60,7 +60,7 @@ pub fn least_busy<'a>(candidates: &[&'a api::Worker], busy: &std::collections::H
         .copied()
 }
 
-/// What the pool is, in words: "dev-vm" or "rust-dev-01, rust-dev-02".
+/// What the pool is, in words: "dev-vm" or "build-01, build-02".
 fn pool_name(t: &api::Template) -> String {
     let mut v: Vec<String> = t.worker_labels.iter().map(|l| format!("label {l}")).collect();
     v.extend(t.workers.iter().cloned());

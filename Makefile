@@ -53,7 +53,7 @@ DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSI
 .PHONY: help docker-build docker-build-all docker-test docker-lint-image docker-check docker-fmt docker-images docker-head docker-head-stop docker-token docker-login-link \
         docker-deb docker-deb-all docker-deb-test deb deb-test deb-smoke brew-dist brew brew-install brew-test release release-notes \
         ui ui-browser-install ui-browser-test ui-browser-quick ui-browser-perf build print-version test test-under-load check dev-head dev-token dev-login-link dev-worker clean \
-        site site-serve site-check site-publish
+        site site-serve site-check site-publish hooks
 
 help: ## Show this help
 	@echo "Usage: make <target> [VAR=value]"
@@ -186,6 +186,10 @@ build: ui ## Build release binaries (c6h, c6w, c6) into target/release, knowing 
 print-version: ## Print the exact version the packages of HEAD get (what `build` stamps into the binaries)
 	@echo $(DEB_VERSION)
 
+hooks: ## Opt in to the local private-term pre-push guard (docs/testing.md)
+	@mkdir -p "$$(git rev-parse --git-path hooks)"
+	@install -m 755 scripts/hooks/pre-push "$$(git rev-parse --git-path hooks)/pre-push"
+
 test: ## Run the test suite: every test at once with cargo nextest when it's installed (brew install cargo-nextest), else cargo test
 	@export RUST_BACKTRACE=$${RUST_BACKTRACE:-1}; \
 	if cargo nextest --version >/dev/null 2>&1; then cargo nextest run --workspace --no-fail-fast; else cargo test; fi
@@ -195,6 +199,7 @@ test-under-load: ## Run the test suite with every CPU core kept busy (RUNS=1; NE
 
 check: ## Check formatting, clippy every target (including wasm), lint tests and ratchet built UI size (docs/testing.md)
 	@python3 scripts/check-session-tags.py --self-test
+	@bash scripts/test-check-private-terms.sh
 	@cargo fmt --all --check || { echo "check: unformatted code; run cargo fmt --all" >&2; exit 1; }
 	@for args in "--workspace --all-targets" "-p c6-ui --target wasm32-unknown-unknown"; do \
 		if cargo clippy --locked $$args --message-format short 2>&1 | tee /dev/stderr | grep -vE '^warning: spurious network' | grep -qE '^(warning|error)'; then \

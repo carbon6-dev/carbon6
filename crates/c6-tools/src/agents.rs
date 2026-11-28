@@ -647,12 +647,14 @@ mod tests {
         let t = |name: &str, targets: &[&str]| TemplateInfo {
             name: name.into(),
             description: "Infra changes".into(),
-            place: "mumuzz:~/src/infra (new worktree)".into(),
+            place: "worker-b:~/src/infra (new worktree)".into(),
             model: "work · sonnet".into(),
             targets: targets.iter().map(|s| s.to_string()).collect(),
         };
         let spec = Task::claude().with_templates("Templates:", vec![t("infra", &[])]).spec();
-        assert!(spec.description.contains("Templates:\n- infra (runs on mumuzz:~/src/infra (new worktree), work · sonnet): Infra changes"));
+        assert!(
+            spec.description.contains("Templates:\n- infra (runs on worker-b:~/src/infra (new worktree), work · sonnet): Infra changes")
+        );
         assert_eq!(spec.parameters["properties"]["template"]["enum"], json!(["infra"]));
         assert!(spec.parameters["properties"].get("on").is_none());
         let spec = Task::claude().with_templates("Templates:", vec![t("fleet", &["a", "b"])]).spec();

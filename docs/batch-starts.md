@@ -47,7 +47,7 @@ Where the link shows:
 
 ## 4. Rules that keep it simple
 
-- **Same place only.** Items batch only if they would run in the same realm, worker, folder and repo. The picker greys out the rest, with the reason on hover ("in falcon, the others in carbon6"). No splitting into several sessions behind your back.
+- **Same place only.** Items batch only if they would run in the same realm, worker, folder and repo. The picker greys out the rest, with the reason on hover ("in acme, the others in carbon6"). No splitting into several sessions behind your back.
 - **At most 10 per batch,** and the combined message stays within the to-do prompt limit (20,000 bytes × 10). The picker says when you've hit either.
 - **Once and only once:** each card's answer and each to-do's `session` go through the same paths as a single start. The batch is all or nothing: if the session can't be created, no card is answered.
 

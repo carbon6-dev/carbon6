@@ -86,7 +86,7 @@ async fn fresh_worktree_starts_beside_unpublished_held_session_and_shows_subagen
         .await
         .unwrap();
     let repo = tempfile::tempdir().unwrap();
-    let project = state.path().join("worktrees/falcon/fresh");
+    let project = state.path().join("worktrees/widget/fresh");
     for args in
         [vec!["init"], vec!["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]]
     {

@@ -93,12 +93,12 @@ async fn credentials_go_only_to_what_a_workers_session_uses() {
     let (head, _dir) = head().await;
     let (st, api) = (&head.state, Api::of(&head));
     use reqwest::Method as M;
-    api.ok(M::POST, "realms", json!({"id": "mach5-agents"})).await;
-    let (a, b) = (worker(st, "a", &[]).await, worker(st, "b", &["mach5-agents"]).await);
+    api.ok(M::POST, "realms", json!({"id": "work-agents"})).await;
+    let (a, b) = (worker(st, "a", &[]).await, worker(st, "b", &["work-agents"]).await);
     let home_only = connection(&api, "home-only", &["home"]).await;
     let shared = connection(&api, "shared", &[]).await;
     let mine = session(&api, a, &home_only, "home").await;
-    let agents = session(&api, a, &shared, "mach5-agents").await;
+    let agents = session(&api, a, &shared, "work-agents").await;
 
     // The normal path: a's session, on its connection.
     let g = ask(st, a, &mine, &home_only).await;
@@ -110,11 +110,11 @@ async fn credentials_go_only_to_what_a_workers_session_uses() {
     assert_eq!(ask(st, a, &mine, &shared).await.error, "");
     let (cc, cc2) = (claude_code(&api, "cc").await, claude_code(&api, "cc2").await);
     assert_eq!(ask(st, a, &mine, &cc).await.error, "");
-    // A mach5-agents session asking for a home-only connection: it can't
+    // A work-agents session asking for a home-only connection: it can't
     // switch to it, nor have it.
     let switch = json!({"text": "go", "connection_id": home_only, "model": "m"});
     let e = api.send(M::POST, &format!("sessions/{agents}/messages"), switch).await.unwrap_err();
-    assert!(e.contains("not available to realm mach5-agents"), "{e}");
+    assert!(e.contains("not available to realm work-agents"), "{e}");
     assert!(!ask(st, a, &agents, &home_only).await.error.is_empty());
     // A model switch the worker hasn't reported yet: the new connection
     // (Claude Code to Claude Code over SSH, whose subagents can't run on
@@ -127,7 +127,7 @@ async fn credentials_go_only_to_what_a_workers_session_uses() {
     // A connection kept from the session's realm after it started.
     assert_eq!(ask(st, a, &agents, &shared).await.error, "");
     api.ok(M::PUT, &format!("connections/{shared}/realms"), json!({"realms": ["home"]})).await;
-    assert!(ask(st, a, &agents, &shared).await.error.contains("not available to realm mach5-agents"));
+    assert!(ask(st, a, &agents, &shared).await.error.contains("not available to realm work-agents"));
 
     // Secrets: name@session only, from the session's realm.
     api.ok(M::PUT, "settings/secrets/DEPLOY_KEY", json!({"value": "dk-1"})).await;
@@ -141,7 +141,7 @@ async fn credentials_go_only_to_what_a_workers_session_uses() {
     assert_eq!(ask(st, a, "", &home_only).await.bearer, "key-home-only");
     assert!(!ask(st, b, "", &home_only).await.error.is_empty());
     let theirs = connection(&api, "theirs", &[]).await;
-    let on_b = session(&api, b, &theirs, "mach5-agents").await;
+    let on_b = session(&api, b, &theirs, "work-agents").await;
     assert_eq!(ask(st, b, &on_b, &theirs).await.error, "");
     assert!(ask(st, b, "", &theirs).await.error.contains("says which session asks"));
     // The head's own (the knowledge store, the assistant): as before.
@@ -161,24 +161,24 @@ async fn subagent_defaults_do_not_bypass_realm_authorization() {
     let (head, _dir) = head().await;
     let (st, api) = (&head.state, Api::of(&head));
     use reqwest::Method as M;
-    api.ok(M::POST, "realms", json!({"id": "mach5-agents"})).await;
+    api.ok(M::POST, "realms", json!({"id": "work-agents"})).await;
     let w = worker(st, "worker", &[]).await;
     let own = connection(&api, "own", &[]).await;
     let allowed = connection(&api, "allowed", &[]).await;
     let forbidden = connection(&api, "forbidden", &["home"]).await;
-    let s = session(&api, w, &own, "mach5-agents").await;
+    let s = session(&api, w, &own, "work-agents").await;
     let path = format!("sessions/{s}/subagent-model");
     api.ok(M::PUT, &path, json!({"connection_id": allowed, "model": "m"})).await;
     assert_eq!(ask(st, w, &s, &allowed).await.error, "");
 
     let error = api.send(M::PUT, &path, json!({"connection_id": forbidden, "model": "m"})).await.unwrap_err();
-    assert!(error.contains("not available to realm mach5-agents"), "{error}");
+    assert!(error.contains("not available to realm work-agents"), "{error}");
     assert_eq!(st.store.session(&s).await.unwrap().unwrap().subagent_connection_id, allowed);
-    assert!(ask(st, w, &s, &forbidden).await.error.contains("not available to realm mach5-agents"));
+    assert!(ask(st, w, &s, &forbidden).await.error.contains("not available to realm work-agents"));
 
     api.ok(M::PUT, &format!("connections/{allowed}/realms"), json!({"realms": ["home"]})).await;
     assert_eq!(st.store.session(&s).await.unwrap().unwrap().subagent_connection_id, allowed);
-    assert!(ask(st, w, &s, &allowed).await.error.contains("not available to realm mach5-agents"));
+    assert!(ask(st, w, &s, &allowed).await.error.contains("not available to realm work-agents"));
     head.shutdown().await.unwrap();
 }
 
@@ -228,7 +228,7 @@ async fn templates_from_a_session_run_on_its_worker() {
     let (head, _dir) = head().await;
     let (st, api) = (&head.state, Api::of(&head));
     use reqwest::Method as M;
-    api.ok(M::POST, "realms", json!({"id": "mach5-agents"})).await;
+    api.ok(M::POST, "realms", json!({"id": "work-agents"})).await;
     let (a, b) = (worker(st, "a", &[]).await, worker(st, "b", &[]).await);
     let (ga, _ra) = attach(st, a, 1, &[]).await;
     let (gb, _rb) = attach(st, b, 2, &[]).await;
@@ -265,7 +265,7 @@ async fn templates_from_a_session_run_on_its_worker() {
     assert_eq!(worker_of(st, &run["sessions"][0]).await, "b");
 
     // Any run: only workers that serve its realm.
-    api.ok(M::PUT, &format!("workers/{}/realms", b.0), json!({"realms": ["mach5-agents"]})).await;
+    api.ok(M::PUT, &format!("workers/{}/realms", b.0), json!({"realms": ["work-agents"]})).await;
     let run = c6_head::templates::run(st, "anywhere", "", &[], "home").await.unwrap();
     assert_eq!(run.sessions.len(), 1, "{:?}", run.errors);
     assert_eq!(run.sessions[0].worker_id, a.0);
@@ -319,8 +319,8 @@ async fn kit_jobs_run_only_where_their_realm_is_served() {
     let (head, _dir) = head().await;
     let st = &head.state;
     let api = Api::of(&head);
-    api.ok(reqwest::Method::POST, "realms", json!({"id": "mach5-agents"})).await;
-    let (vm, mac) = (worker(st, "vm", &["mach5-agents"]).await, worker(st, "mac", &[]).await);
+    api.ok(reqwest::Method::POST, "realms", json!({"id": "work-agents"})).await;
+    let (vm, mac) = (worker(st, "vm", &["work-agents"]).await, worker(st, "mac", &[]).await);
     // The VM connected first.
     let (gvm, mut rvm) = attach(st, vm, 1, &["kits"]).await;
     let (gmac, mut rmac) = attach(st, mac, 2, &["kits"]).await;
@@ -340,8 +340,8 @@ async fn kit_jobs_run_only_where_their_realm_is_served() {
     let r = run(job("home", None));
     assert_eq!(ran_on(&mut [("vm", &gvm, &mut rvm), ("mac", &gmac, &mut rmac)]).await, "mac");
     assert_eq!(r.await.unwrap(), Ok(Some(0)));
-    // mach5-agents's: the worker kept to it first.
-    let r = run(job("mach5-agents", None));
+    // work-agents's: the worker kept to it first.
+    let r = run(job("work-agents", None));
     assert_eq!(ran_on(&mut [("vm", &gvm, &mut rvm), ("mac", &gmac, &mut rmac)]).await, "vm");
     r.await.unwrap().unwrap();
     // Asked for by name, it must serve the realm too.

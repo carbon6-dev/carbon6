@@ -188,7 +188,7 @@ pub struct StartPlan {
     pub labels: Vec<String>,
     /// The first message's start, from the template.
     pub prompt: String,
-    /// Why this worker: "rust-dev-02, where this work's worktree is".
+    /// Why this worker: "build-02, where this work's worktree is".
     pub why: String,
     /// The worker the work's place is on is offline.
     pub offline: bool,

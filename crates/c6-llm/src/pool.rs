@@ -553,16 +553,16 @@ mod tests {
 
     #[tokio::test]
     async fn the_least_busy_member_with_a_free_slot() {
-        let p = pool(vec![member("mac", 2, &[]), member("mumuzz", 1, &[])], &[]);
+        let p = pool(vec![member("mac", 2, &[]), member("worker-b", 1, &[])], &[]);
         let a = p.acquire("m", "home").await.unwrap();
         let b = p.acquire("m", "home").await.unwrap();
         // 0/2 then 0/1 (the first listed on a tie); then 1/2 beats 1/1.
-        assert_eq!((a.member.as_str(), b.member.as_str()), ("mac", "mumuzz"));
+        assert_eq!((a.member.as_str(), b.member.as_str()), ("mac", "worker-b"));
         let c = p.acquire("m", "home").await.unwrap();
         assert_eq!(c.member, "mac");
-        assert_eq!(p.busy(), HashMap::from([("mac".into(), 2), ("mumuzz".into(), 1)]));
+        assert_eq!(p.busy(), HashMap::from([("mac".into(), 2), ("worker-b".into(), 1)]));
         drop((a, b, c));
-        assert_eq!(p.busy(), HashMap::from([("mac".into(), 0), ("mumuzz".into(), 0)]));
+        assert_eq!(p.busy(), HashMap::from([("mac".into(), 0), ("worker-b".into(), 0)]));
     }
 
     #[tokio::test]
@@ -653,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_member_rests_and_the_call_goes_to_another() {
-        let p = pool(vec![member("mac", 4, &[]), member("mumuzz", 1, &[])], &[]);
+        let p = pool(vec![member("mac", 4, &[]), member("worker-b", 1, &[])], &[]);
         let tried = Mutex::new(Vec::new());
         let r = p
             .run("m", "home", |e| {
@@ -662,10 +662,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(r, "fake://mumuzz");
-        assert_eq!(*tried.lock().unwrap(), vec!["fake://mac", "fake://mumuzz"]);
+        assert_eq!(r, "fake://worker-b");
+        assert_eq!(*tried.lock().unwrap(), vec!["fake://mac", "fake://worker-b"]);
         // Resting: the next call skips it though it is the least busy.
-        assert_eq!(p.acquire("m", "home").await.unwrap().member, "mumuzz");
+        assert_eq!(p.acquire("m", "home").await.unwrap().member, "worker-b");
         // A failure that isn't for now is the call's own: no other member.
         let r = p.run("m", "home", |_| async { Err::<(), _>(LlmError::Http { status: 400, body: "bad".into(), retry_after: None }) }).await;
         assert!(matches!(r, Err(LlmError::Http { status: 400, .. })));
@@ -677,19 +677,19 @@ mod tests {
     #[tokio::test]
     async fn members_without_the_model_or_the_realm_are_passed_over() {
         let p = pool(
-            vec![member("mac", 1, &["home"]), member("mumuzz", 1, &[]), member("lab", 1, &["mach5-agents"])],
-            &[("mac", &["qwen3.6:35b", "nomic-embed-text:latest"]), ("mumuzz", &["nomic-embed-text:latest"]), ("lab", &["qwen3.6:35b"])],
+            vec![member("mac", 1, &["home"]), member("worker-b", 1, &[]), member("lab", 1, &["work-agents"])],
+            &[("mac", &["qwen3.6:35b", "nomic-embed-text:latest"]), ("worker-b", &["nomic-embed-text:latest"]), ("lab", &["qwen3.6:35b"])],
         );
         assert_eq!(p.acquire("qwen3.6:35b", "home").await.unwrap().member, "mac");
-        assert_eq!(p.acquire("qwen3.6:35b", "mach5-agents").await.unwrap().member, "lab");
+        assert_eq!(p.acquire("qwen3.6:35b", "work-agents").await.unwrap().member, "lab");
         // `name` is `name:latest`.
         let (a, b) = (p.acquire("nomic-embed-text", "home").await.unwrap(), p.acquire("nomic-embed-text", "home").await.unwrap());
-        assert_eq!((a.member.as_str(), b.member.as_str()), ("mac", "mumuzz"));
+        assert_eq!((a.member.as_str(), b.member.as_str()), ("mac", "worker-b"));
         assert!(matches!(p.acquire("llama4", "home").await, Err(LlmError::Unavailable(m)) if m.contains("llama4")));
-        // mumuzz is for every realm, but hasn't it.
+        // worker-b is for every realm, but hasn't it.
         assert!(matches!(p.acquire("qwen3.6:35b", "other").await, Err(LlmError::Unavailable(m)) if m.contains("qwen3.6:35b")));
         let home_only = pool(vec![member("mac", 1, &["home"])], &[]);
-        assert!(matches!(home_only.acquire("m", "mach5-agents").await, Err(LlmError::Unavailable(m)) if m.contains("realm mach5-agents")));
+        assert!(matches!(home_only.acquire("m", "work-agents").await, Err(LlmError::Unavailable(m)) if m.contains("realm work-agents")));
     }
 
     #[tokio::test]
@@ -731,7 +731,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_members_keep_what_the_old_had() {
-        let p = pool(vec![member("mac", 1, &[]), member("mumuzz", 1, &[])], &[]);
+        let p = pool(vec![member("mac", 1, &[]), member("worker-b", 1, &[])], &[]);
         let held = p.acquire("m", "home").await.unwrap();
         p.set_members(vec![member("mac", 2, &[])]);
         assert_eq!(p.busy(), HashMap::from([("mac".into(), 1)]), "its call in flight is kept");

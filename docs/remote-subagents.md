@@ -37,7 +37,7 @@ New `Template` fields, editable in **Settings → Templates** and through `setti
 | `agents: bool` | **Agents may start it.** The template shows up in `Task`'s list for sessions in its realm (§6). Off: only `template_start`, runs, triggers and automations can use it. |
 | `title: String` | Optional title for its sessions; `{{input}}`-style fields allowed. Empty: the template's name, as today. |
 
-**Prompt.** The `Task` call's `prompt` fills `{{input}}`. If the template's prompt is empty, the call's prompt is the first message. A template prompt with no `{{input}}` gets the call's prompt after it, separated by a blank line. That way the template can carry standing instructions ("You work in the infra repo on mumuzz; run `make plan`, never `apply`") and each call adds the task.
+**Prompt.** The `Task` call's `prompt` fills `{{input}}`. If the template's prompt is empty, the call's prompt is the first message. A template prompt with no `{{input}}` gets the call's prompt after it, separated by a blank line. That way the template can carry standing instructions ("You work in the infra repo on worker-b; run `make plan`, never `apply`") and each call adds the task.
 
 **Targets.** A subagent template must resolve to **one** session. One worker, one SSH target or one host works as is. A template with several targets (`*`, a list, host labels) is allowed only if the call picks one with `on` (§6). Otherwise the call is refused with the list of choices.
 
@@ -90,7 +90,7 @@ The oneshot is fulfilled by a new head→worker `SessionCommand`, **`DelegationE
 
 With `template` set, `subagent_type`, `connection`, `model` and `effort` are refused, because the template fixes them. Why extend `Task` rather than add a tool? Starting a subagent is what `Task` means, `SendMessage` already continues it, and this way Claude Code sessions get it for free through `mcp__carbon6__Task`. The weaker-model argument from docs/subagents.md §6 is about a tool that can both start and resume. Adding a placement choice to "start" is a different case.
 
-**The list.** The head sends the realm's subagent templates in the spec (`CreateSession.subagent_templates_json`, like `subagent_connections_json`): name, description, where it runs (`mumuzz:~/src/infra`, worktree or not), connection·model, and the choices for `on`. The tool's description lists them. A session keeps its list, like its connections. A template that was edited or deleted since then is resolved fresh at call time, and the error lists the current ones.
+**The list.** The head sends the realm's subagent templates in the spec (`CreateSession.subagent_templates_json`, like `subagent_connections_json`): name, description, where it runs (`worker-b:~/src/infra`, worktree or not), connection·model, and the choices for `on`. The tool's description lists them. A session keeps its list, like its connections. A template that was edited or deleted since then is resolved fresh at call time, and the error lists the current ones.
 
 `template_start` stays as it is, for fire-and-forget and fleets.
 
@@ -114,8 +114,8 @@ With `template` set, `subagent_type`, `connection`, `model` and `effort` are ref
 | You or the parent stop the parent's turn | The runner calls `subagent_interrupt` for each foreground remote child, and the head interrupts it. The child's digest comes back as the call's result, as with a local child. Background children keep running. |
 | You stop the child (its thread's Stop) | Its turn ends `interrupted`, and the parent's call returns the digest. |
 | **The child's worker** restarts | The child's open turn closes `lost` (`recover()`), and the head relays the `lost` digest. Its log is kept, so Resume or `SendMessage` continues it once the worker is back. |
-| The child's worker is offline at start | `subagent_start` fails at once ("worker mumuzz is offline"), with any other targets the template has. No queueing in v1. |
-| **The parent's worker** restarts | On reload, a `SubagentSpawned { remote }` with no `ToolResult` gets one: "still running on mumuzz; its report will arrive as a notice", with the id. The link becomes `background`, and the report arrives later as a `task-notification` notice. The child keeps working, unlike a local child, which a restart kills. |
+| The child's worker is offline at start | `subagent_start` fails at once ("worker worker-b is offline"), with any other targets the template has. No queueing in v1. |
+| **The parent's worker** restarts | On reload, a `SubagentSpawned { remote }` with no `ToolResult` gets one: "still running on worker-b; its report will arrive as a notice", with the id. The link becomes `background`, and the report arrives later as a `task-notification` notice. The child keeps working, unlike a local child, which a restart kills. |
 | The parent's worker is offline when the child ends | The report waits in `pending_report` and is delivered at `Hello`. |
 | The parent rewinds past the call | As in docs/subagents.md §11: the child stays and only you can continue it. Its link is marked `owned`. |
 | The parent is archived | Archiving the tree archives the child, as `root_id` already does. A running child is interrupted first. |
@@ -124,7 +124,7 @@ With `template` set, `subagent_type`, `connection`, `model` and `effort` are ref
 
 Mostly unchanged, because the thread is driven by `SubagentSpawned` and child rows, and the head streams any session to the browser whatever worker it's on.
 
-- **Thread header:** a remote child shows its place in place of the agent name: `▣ template · mumuzz:~/src/infra (worktree c6/1a2b…) · sonnet-5.5`. ↗ opens it in its own tile.
+- **Thread header:** a remote child shows its place in place of the agent name: `▣ template · worker-b:~/src/infra (worktree c6/1a2b…) · sonnet-5.5`. ↗ opens it in its own tile.
 - **States:** besides the usual pills, "waiting on you" (a held approval in the child) and "report pending" (the child ended while the parent's worker was offline).
 - **◆ strip and breadcrumb:** remote children are listed with their worker.
 - **Templates page:** the **Agents may start it** checkbox, the `worktree` checkbox, and the template's subagent runs listed under its run history.
