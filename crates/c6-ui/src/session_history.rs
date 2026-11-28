@@ -334,7 +334,10 @@ pub(crate) fn Scrubber(history: History, open_sheet: RwSignal<bool>) -> impl Int
                 on:pointerenter=move |_| preview.set(true)
                 on:pointerleave=move |_| if !dragging.get() { preview.set(false); }
                 on:pointerdown=move |ev: web_sys::PointerEvent| {
-                    if crate::util::phone() { open_sheet.set(true); return; }
+                    // Open the phone sheet on click, after the touch ends.
+                    // Mounting its scrim on pointerdown retargets the same
+                    // tap's click to the scrim and immediately closes it.
+                    if crate::util::phone() { return; }
                     ev.prevent_default();
                     if let Some(el) = rail.get_untracked() { let _ = el.focus(); let _ = el.set_pointer_capture(ev.pointer_id()); }
                     dragging.set(true); preview.set(true); last_jump.set_value(None); pick(ev.client_y(), true);
