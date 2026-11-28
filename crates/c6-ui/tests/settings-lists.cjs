@@ -54,6 +54,9 @@ async function check(browser, origin, phone, theme, engine) {
           else saved[key] = value;
           return route.fulfill({ status: 204 });
         });
+        await context.route('**/api/v1/settings/task-shift/status**', route => route.fulfill({ json: {
+          embedding_configured: false, routing_configured: false,
+        } }));
       },
     });
   try {
@@ -183,18 +186,38 @@ async function check(browser, origin, phone, theme, engine) {
     assert.equal(await warmField('Maximum expiry margin (seconds)').inputValue(), '300');
     assert.equal(await warmField('Maximum keep-warm duration per wait (seconds)').inputValue(), '43200');
     assert.equal(await exclusions.inputValue(), 'local');
+    const idleCompact = limits.getByRole('checkbox', { name: 'Compact while idle on me (experimental, off by default)', exact: true });
+    const taskShift = limits.getByRole('checkbox', { name: 'Detect new tasks and offer a handover (experimental, off by default)', exact: true });
+    assert.equal(await idleCompact.isChecked(), false, 'idle compaction is opt-in for older settings');
+    assert.equal(await taskShift.isChecked(), false, 'task detection is opt-in for older settings');
+    await limits.getByText('Task detection inactive: choose a Memex embedding model; add a task:shift or task:suggest API routing rule.', { exact: true }).waitFor();
     await threshold.fill('65000');
     await warmField('Maximum expiry margin (seconds)').fill('120');
     await warmField('Maximum keep-warm duration per wait (seconds)').fill('7200');
     await exclusions.fill('local,  expensive, ,');
     await limits.getByRole('checkbox', { name: 'Keep large contexts warm during background work' }).uncheck();
     await limits.getByRole('button', { name: 'Save', exact: true }).click();
-    await limits.getByText('Saved. Running sessions take up the new agent limits and keep-warm settings.', { exact: true }).waitFor();
+    await limits.getByText('Saved. Running sessions take up the new agent limits and context-economy settings.', { exact: true }).waitFor();
     assert.equal(writes.at(-1).key, 'subagent-limits');
     assert.deepEqual(writes.at(-1).value.keep_warm, { enabled: false, threshold_tokens: 65000,
-      margin_seconds: 120, cap_seconds: 7200, disabled_connections: ['local', 'expensive'] });
+      margin_seconds: 120, cap_seconds: 7200, disabled_connections: ['local', 'expensive'],
+      idle_compact_enabled: false, task_shift_enabled: false });
     assert.equal(writes.at(-1).value.claude_code_trim_enabled, false, 'saving keep-warm preserves trim policy');
     assert.equal(writes.at(-1).value.claude_code_trim_at, 123456);
+    await idleCompact.check();
+    await taskShift.check();
+    const boundarySaved = page.waitForResponse(response => response.request().method() === 'PUT'
+      && new URL(response.url()).pathname === '/api/v1/settings/subagent-limits');
+    await limits.getByRole('button', { name: 'Save', exact: true }).click();
+    await (await boundarySaved).finished();
+    assert.deepEqual(writes.at(-1).value.keep_warm, { enabled: false, threshold_tokens: 65000,
+      margin_seconds: 120, cap_seconds: 7200, disabled_connections: ['local', 'expensive'],
+      idle_compact_enabled: true, task_shift_enabled: true }, 'boundary opt-ins preserve the other cache settings');
+    await navigateSection(page, 'commands', 'Slash commands');
+    await navigateSection(page, 'agents', 'Agents');
+    await page.waitForFunction(el => el.value === 'local, expensive', await exclusions.elementHandle());
+    assert.equal(await idleCompact.isChecked(), true, 'idle compaction opt-in survives a fresh owner');
+    assert.equal(await taskShift.isChecked(), true, 'task detection opt-in survives a fresh owner');
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'agent settings fit the viewport');
     if (process.env.SCREENSHOTS) {
       fs.mkdirSync(process.env.SCREENSHOTS, { recursive: true });
