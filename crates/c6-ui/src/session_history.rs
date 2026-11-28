@@ -252,7 +252,7 @@ pub(crate) fn PromptList(history: History, #[prop(into)] on_go: Callback<()>) ->
             <Show when=move || history.loaded.get().is_some() && history.error.with(Option::is_none) && filtered.with(Vec::is_empty)>
                 <p class="py-2 text-xs text-muted">"No prompts found."</p>
             </Show>
-            <Show when=move || filtered.with(Vec::len) > limit.get()>
+            <Show when=move || { filtered.with(Vec::len) > limit.get() }>
                 <button class="py-2 text-xs text-sky-700" on:click=move |_| limit.update(|n| *n += 100)>"Show more prompts"</button>
             </Show>
         </section>
@@ -369,7 +369,7 @@ pub(crate) fn Scrubber(history: History, open_sheet: RwSignal<bool>) -> impl Int
                 <Show when=move || preview.get()>
                     {move || current.get().map(|p| view! {
                         <div class="c6-history-preview" role="tooltip">
-                            <div class="font-medium">{p.first_line}</div>
+                            <div class="font-medium">{p.first_line.clone()}</div>
                             <div class="text-muted">{crate::when::full(p.ts)}" · "{duration(&p)}</div>
                         </div>
                     })}
