@@ -538,14 +538,24 @@ mod tests {
             Self { _dir: dir, head, llm, embeddings, embeddings_server, worker, http, api }
         }
 
-        fn configure_embeddings(&self) {
+        async fn configure_embeddings(&self) {
+            // Prompt edits reload the memex's configuration asynchronously. An
+            // in-memory override can be cleared by that reload (or its startup
+            // refresh), so use the same durable configuration as the application.
             self.head
                 .state
-                .memex
-                .get()
-                .unwrap()
-                .embed
-                .set(Some(c6_memex::embed::Config { connection_id: "test-embed".into(), model: "test-vector".into() }));
+                .store
+                .set_setting(
+                    crate::memex::SETTINGS,
+                    &json!({"embedding": {"connection": "test-embed", "model": "test-vector"}}).to_string(),
+                )
+                .await
+                .unwrap();
+            crate::memex::reload(&self.head.state).await;
+            eventually("the configured embedding model", async || {
+                self.head.state.memex.get().unwrap().embed.config().filter(|c| c.connection_id == "test-embed" && c.model == "test-vector")
+            })
+            .await;
         }
 
         async fn routes(&self, routes: &[(&str, &str)]) {
@@ -627,7 +637,7 @@ mod tests {
         assert!(!f.send(UNRELATED, json!([])).await.1.trim_context);
         assert!(f.offer().await.is_none());
 
-        f.configure_embeddings();
+        f.configure_embeddings().await;
         f.routes(&[]).await;
         assert!(!f.send(BORDERLINE, json!([])).await.1.trim_context);
         assert!(!f.send(UNRELATED, json!([])).await.1.trim_context);
@@ -656,7 +666,7 @@ mod tests {
     #[tokio::test]
     async fn keep_context_dismisses_the_offer_and_learns_once_for_this_session() {
         let f = Fixture::start().await;
-        f.configure_embeddings();
+        f.configure_embeddings().await;
         f.routes(&[("task:shift", "shift-small")]).await;
         let (id, input) = f.send(UNRELATED, json!([])).await;
         assert!(input.trim_context);
@@ -685,21 +695,36 @@ mod tests {
     #[tokio::test]
     async fn handover_uses_the_original_session_worker_and_does_not_create_a_session_or_change_its_place() {
         let f = Fixture::start().await;
-        f.configure_embeddings();
+        f.configure_embeddings().await;
         f.routes(&[("task:shift", "shift-small")]).await;
         crate::prompts::set(&f.head.state, "session.handover", "Edited handover instructions. Original: {{message}}").await.unwrap();
+        // Observe a completed prompt-driven refresh before classifying, rather
+        // than racing the reload notification against the browser send.
+        crate::prompts::set(&f.head.state, "memex.understand.system", "Edited understanding instructions.").await.unwrap();
+        eventually("the prompt-driven memex refresh", async || {
+            let memex = f.head.state.memex.get().unwrap();
+            (memex.prompt("memex.understand.system", "") == "Edited understanding instructions.").then_some(())
+        })
+        .await;
+        assert_eq!(f.head.state.memex.get().unwrap().embed.config().unwrap().connection_id, "test-embed");
         let (id, _) = f.send(UNRELATED, json!([{"name":"notes.txt", "mime":"text/plain", "data":"aGk="}])).await;
+        assert_eq!(f.offer().await.unwrap().command_id, id, "classification must produce the offer before requesting its handover");
         f.settle(&id, 4, UNRELATED, Some("Already drafted the first clause.")).await;
         let url = format!("{}/task-shift/{id}/handover", f.api);
-        let checking = {
+        let mut checking = {
             let http = f.http.clone();
             let url = url.clone();
             tokio::spawn(async move {
-                http.post(url).send().await.unwrap().error_for_status().unwrap().json::<c6_api::TaskShiftHandover>().await.unwrap()
+                let response = http.post(url).send().await.unwrap();
+                assert!(response.status().is_success(), "handover refused: {}", response.text().await.unwrap());
+                response.json::<c6_api::TaskShiftHandover>().await.unwrap()
             })
         };
         let draft_id = format!("task-handover:{id}");
-        let (session, worker, queued) = eventually("handover command in the original queue", async || f.command(&draft_id).await).await;
+        let (session, worker, queued) = tokio::select! {
+            result = &mut checking => panic!("handover returned before queuing its command: {result:?}"),
+            command = eventually("handover command in the original queue", async || f.command(&draft_id).await) => command,
+        };
         assert_eq!(session, "session");
         assert_eq!(worker, f.worker.to_string());
         assert!(queued.model.is_none(), "keep the old session's model");
