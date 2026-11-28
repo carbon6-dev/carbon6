@@ -420,9 +420,8 @@ async fn preflight_deferral_delivers_the_reminder_without_running_shell() {
     let events = Arc::new(VecSink { defer_shell: true, ..Default::default() });
     let sink: Arc<dyn EventSink> = events.clone();
     let mut conv = Conversation { history: vec![Message::user_text("Inspect the sample.")], context_tokens: 0 };
-    let reason = run_turn(1, &cfg(), &client, &default_tools(), &session, &sink, &mut conv, &mut Vec::new, &CancellationToken::new())
-        .await
-        .unwrap();
+    let reason =
+        run_turn(1, &cfg(), &client, &default_tools(), &session, &sink, &mut conv, &mut Vec::new, &CancellationToken::new()).await.unwrap();
     assert_eq!(reason, TurnEndReason::Completed);
     assert!(!dir.path().join("sample.txt").try_exists().unwrap());
     let requests = mock.requests();

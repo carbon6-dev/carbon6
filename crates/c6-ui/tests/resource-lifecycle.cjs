@@ -16,7 +16,7 @@ const choose = (name, values, fallback = values) => {
 };
 const engines = choose('ENGINE', ['chromium', 'webkit', 'both'], ['both']).flatMap(e => e === 'both' ? ['chromium', 'webkit'] : [e]);
 const themes = choose('THEME', ['light', 'dark']);
-const cases = choose('RESOURCE_CASE', ['chat', 'stale', 'work', 'projects']);
+const cases = choose('RESOURCE_CASE', ['chat', 'stale', 'work', 'projects', 'contract']);
 const layout = view => ({ tiles: [{ key: 2, columns: [{ key: 3, view }], cursor: 0,
   active: 3, used: 3, back: [], forward: [], stack: 0, minimized: false }], focus: 0, next: 4, full: false });
 const savedMessage = text => ({ id: 'saved-one', text, created_at: 1,
@@ -153,22 +153,89 @@ async function closed(f, state, kind) {
   assert.equal(state.closed, 2, 'fresh disabled owner does not fetch closed data');
 }
 
+async function contract(f, state) {
+  const { page } = f;
+  const heading = version => page.locator('summary').filter({ hasText: new RegExp(`^Project contract \\(v${version}\\)$`) });
+  await heading(1).click();
+  const editor = page.getByRole('textbox', { name: 'Project contract JSON', exact: true });
+  const save = page.getByRole('button', { name: 'Save contract', exact: true });
+  assert.equal(JSON.parse(await editor.inputValue()).architecture_rules[0].value, 'Keep widget checks local.');
+  await editor.fill('{');
+  await save.click();
+  await page.getByText(/^Invalid contract:/).waitFor();
+  assert.equal(state.contractWrites.length, 0, 'invalid JSON never reaches the server');
+
+  const content = { architecture_rules: [{ value: 'Validate widget changes before integration.' }] };
+  await editor.fill(JSON.stringify(content));
+  const response = () => page.waitForResponse(r => new URL(r.url()).pathname === '/api/v1/projects/widget/contract');
+  state.rejectContract = true;
+  let saved = response();
+  await save.click();
+  await (await saved).finished();
+  await page.getByText('Contract fixture refused the save.', { exact: true }).waitFor();
+  await heading(1).waitFor();
+  assert.equal(state.project.contract_history.length, 1, 'a failed save creates no local revision');
+
+  saved = response();
+  await save.click();
+  await (await saved).finished();
+  await heading(2).waitFor();
+  assert.equal(state.contractWrites.length, 2);
+  for (const change of state.contractWrites) {
+    assert.equal(change.expected_version, 1);
+    assert.equal(change.contract.architecture_rules[0].value, content.architecture_rules[0].value);
+  }
+  await page.getByText('Contract fixture refused the save.', { exact: true }).waitFor({ state: 'hidden' });
+  await page.locator('summary').filter({ hasText: /^Change history$/ }).click();
+  await page.locator('summary').filter({ hasText: /^v2 · you · 2$/ }).waitFor();
+  await page.locator('summary').filter({ hasText: /^v1 · you · 1$/ }).waitFor();
+
+  f.phase = 'contract revision cold reload';
+  await f.reload({ waitUntil: 'domcontentloaded' });
+  await heading(2).click();
+  assert.equal(JSON.parse(await editor.inputValue()).architecture_rules[0].value, content.architecture_rules[0].value);
+  assert.equal(state.contractWrites.length, 2, 'loading a revision does not save it again');
+}
+
 async function check(browser, origin, engine, theme, kind) {
   let f;
-  const state = { calls: [], saves: [], closed: 0, reject: false, hold: false, held: null, remount: false };
+  const state = { calls: [], saves: [], closed: 0, reject: false, hold: false, held: null, remount: false,
+    contractWrites: [], rejectContract: false,
+    project: { id: 'widget', realm: 'home', version: 1, title: 'Widget project', status: 'active', state: 'quiet',
+      labels: [], created_at: 1, updated_at: 1,
+      contract_history: [{ version: 1, provenance: { by: 'you', at: 1 },
+        content: { architecture_rules: [{ value: 'Keep widget checks local.', provenance: { by: 'you', at: 1 } }] } }] } };
   const label = `${engine}-${theme}-${kind}`;
   const directory = path.join(output, label);
   fs.mkdirSync(directory, { recursive: true });
   const isChat = kind === 'chat' || kind === 'stale';
+  const isContract = kind === 'contract';
   console.log(`START ${label}`);
   try {
     await within(label, async () => {
       f = await fixture(browser, origin, { width: 1440, height: 1000 }, theme,
         { choice: 'off', effective: 'off', os: 'no-preference' }, progress => { f = progress; }, {}, {
-          path: isChat ? '/chat' : `/${kind}`, instrumentation: false,
-          ready: isChat ? 'input[placeholder="Filter conversations"]' : '[role="switch"]',
-          layout: layout(isChat ? { view: 'chat' } : { view: kind, id: '' }),
+          path: isChat ? '/chat' : isContract ? '/projects/widget' : `/${kind}`, instrumentation: false,
+          ready: isChat ? 'input[placeholder="Filter conversations"]' : isContract ? 'details:has([aria-label="Project contract JSON"]) > summary' : '[role="switch"]',
+          layout: layout(isChat ? { view: 'chat' } : isContract ? { view: 'projects', id: 'widget' } : { view: kind, id: '' }),
           setup: async ({ context }) => {
+            if (isContract) await context.route('**/api/v1/projects/widget**', async route => {
+              const request = route.request(), url = new URL(request.url());
+              if (url.origin !== origin) return route.fallback();
+              if (url.pathname === '/api/v1/projects/widget' && request.method() === 'GET')
+                return route.fulfill({ json: state.project });
+              if (url.pathname !== '/api/v1/projects/widget/contract') return route.fallback();
+              assert.equal(request.method(), 'PUT');
+              const change = request.postDataJSON();
+              state.contractWrites.push(change);
+              if (state.rejectContract) {
+                state.rejectContract = false;
+                return route.fulfill({ status: 500, json: { error: 'Contract fixture refused the save.' } });
+              }
+              const revision = { version: 2, provenance: { by: 'you', at: 2 }, content: change.contract };
+              state.project.contract_history.push(revision);
+              return route.fulfill({ json: revision });
+            });
             await context.route('**/api/v1/memex/rpc**', async route => {
               const request = route.request();
               if (new URL(request.url()).origin !== origin) return route.fallback();
@@ -194,7 +261,7 @@ async function check(browser, origin, engine, theme, kind) {
               }
               await route.fulfill({ json });
             });
-            if (!isChat) await context.route(`**/api/v1/${kind}**`, async route => {
+            if (!isChat && !isContract) await context.route(`**/api/v1/${kind}**`, async route => {
               const request = route.request(), url = new URL(request.url());
               if (url.origin !== origin || url.pathname !== `/api/v1/${kind}`) return route.fallback();
               assert.equal(request.method(), 'GET');
@@ -205,6 +272,7 @@ async function check(browser, origin, engine, theme, kind) {
           },
         });
       if (isChat) await chat(f, state, kind === 'stale');
+      else if (isContract) await contract(f, state);
       else await closed(f, state, kind);
       assert.deepEqual(f.errors, [], 'no external traffic, UI crashes or runtime errors');
     });
@@ -216,7 +284,7 @@ async function check(browser, origin, engine, theme, kind) {
     return false;
   } finally {
     fs.writeFileSync(path.join(directory, 'evidence.json'), JSON.stringify({ calls: state.calls,
-      saves: state.saves, closed: state.closed, phase: f?.phase,
+      saves: state.saves, closed: state.closed, contractWrites: state.contractWrites, phase: f?.phase,
       errors: f?.errors, console: f?.consoleMessages, requests: f?.requests,
       navigation: f?.navigation?.ledger, rawPageErrors: f?.navigation?.rawPageErrors }, null, 2));
     await f?.context.close();

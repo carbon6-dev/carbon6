@@ -1268,6 +1268,57 @@ mod compact_tests {
         }));
     }
 
+    #[tokio::test]
+    async fn cold_resume_trim_savings_include_the_request_only_reminder() {
+        let cfg = TurnConfig { trim_at: 1_000, ..cfg() };
+        let model = Model::default();
+        let journal = Arc::new(Journal::default());
+        let sink: Arc<dyn EventSink> = journal.clone();
+        let mut history = vec![Message::user_text("Read the sample files")];
+        for n in 0..30 {
+            let id = format!("call-{n}");
+            history.push(assistant(Block::ToolUse { id: id.clone(), name: "Read".into(), input_json: "{}".into() }));
+            history.push(Message { role: Role::User, blocks: vec![tool_result(&id, &"x".repeat(500))] });
+        }
+        let original = history.clone();
+        let mut conv = Conversation { history, context_tokens: 4_500 };
+        let dir = tempfile::tempdir().unwrap();
+        let session_tools = Arc::new(SessionTools::new(dir.path().to_owned()));
+        let reminder = "Request-only policy reminder. ".repeat(4_000);
+        let render = |_: &[(&str, &str, &str)]| Some(reminder.clone());
+
+        run_turn_with_tool_reminders(
+            1,
+            &cfg,
+            &model,
+            &[],
+            &session_tools,
+            &sink,
+            &mut conv,
+            &mut Vec::new,
+            &CancellationToken::new(),
+            Some(&render),
+        )
+        .await
+        .unwrap();
+
+        let requests = model.0.lock().unwrap();
+        let [request] = requests.as_slice() else { panic!("a reminder needs no extra request") };
+        let mut expected = original.clone();
+        expected.last_mut().unwrap().blocks.push(Block::Text(reminder));
+        assert_eq!(request.messages, expected);
+        assert_eq!(&conv.history[..original.len()], original.as_slice(), "request-only context must not alter durable history");
+        assert!(
+            !journal
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| { matches!(event, session_event::Kind::Notice(notice) if notice.title == "Trimmed old tool output") }),
+            "the unchanged reminder makes the total saving smaller than a fifth"
+        );
+    }
+
     #[test]
     fn large_windows_compact_sooner_unless_set() {
         assert_eq!(compact_share(16_384, 0), COMPACT_AT);

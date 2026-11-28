@@ -450,3 +450,5 @@ carbon6.v1.SpecRefreshed 1 CreateSession spec
 carbon6.v1.SpecRefreshed 2 string system_prompt
 carbon6.v1.SpecRefreshed 3 repeated:string tools
 carbon6.v1.UserInput 19 bool trim_context
+carbon6.v1.CreateSession 54 optional:string project_contract_json
+carbon6.v1.CreateSession 55 optional:string project_contract_prompt

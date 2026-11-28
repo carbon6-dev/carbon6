@@ -4301,10 +4301,10 @@ fn refreshes_session_specs(method: &axum::http::Method, path: &str) -> bool {
             return true;
         }
     }
-    if let Some(tail) = path.strip_prefix("/api/v1/work/") {
-        if !tail.contains('/') && method == axum::http::Method::PATCH || tail.ends_with("/attach") || tail.ends_with("/detach") {
-            return true;
-        }
+    if let Some(tail) = path.strip_prefix("/api/v1/work/")
+        && (!tail.contains('/') && method == axum::http::Method::PATCH || tail.ends_with("/attach") || tail.ends_with("/detach"))
+    {
+        return true;
     }
     for prefix in ["/api/v1/connections", "/api/v1/memories", "/api/v1/installs", "/api/v1/realms", "/api/v1/grants"] {
         if path == prefix || path.strip_prefix(prefix).is_some_and(|tail| tail.starts_with('/')) {
@@ -5593,7 +5593,8 @@ async fn answer_decision(
     let is_contract: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM decisions WHERE id = ? AND ref LIKE 'contract:%')")
         .bind(id)
         .fetch_one(&st.store.pool)
-        .await?;
+        .await
+        .map_err(anyhow::Error::from)?;
     if is_contract && !caller.human_origin(st.auth.required) {
         return Err(crate::forbidden("only the user may accept a project contract proposal").into());
     }

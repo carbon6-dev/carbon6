@@ -1,4 +1,4 @@
--- Keep the accepted capability and result schema with each invocation.
+-- Snapshot the accepted capability and result schema with each invocation.
 CREATE TABLE project_capability_runs (
     id TEXT PRIMARY KEY,
     parent_id TEXT NOT NULL REFERENCES sessions(id),

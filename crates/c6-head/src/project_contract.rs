@@ -31,10 +31,8 @@ fn revision(change: &ContractSet, previous: Option<&ProjectContract>, suggestion
             CapabilityLocation::Template { name } if name.trim().is_empty() => {
                 return Err(bad_request("a capability needs a template name"));
             }
-            CapabilityLocation::Worker { worker, folder } => {
-                if worker.trim().is_empty() || worker == "*" || folder.trim().is_empty() {
-                    return Err(bad_request("a worker capability needs a worker and folder"));
-                }
+            CapabilityLocation::Worker { worker, folder } if worker.trim().is_empty() || worker == "*" || folder.trim().is_empty() => {
+                return Err(bad_request("a worker capability needs a worker and folder"));
             }
             _ => {}
         }
@@ -330,7 +328,8 @@ pub async fn capability(st: &HeadState, session: &crate::store::SessionRow, p: &
 }
 
 async fn capability_result(st: &HeadState, parent: &crate::store::SessionRow, run: &str) -> anyhow::Result<Value> {
-    let record: Option<(String, String, String, Option<String>, Option<i64>)> = sqlx::query_as(
+    type RunRow = (String, String, String, Option<String>, Option<i64>);
+    let record: Option<RunRow> = sqlx::query_as(
         "SELECT child_id, capability, contract, result, end_seq FROM project_capability_runs WHERE id = ? AND parent_id = ?",
     )
     .bind(run)
