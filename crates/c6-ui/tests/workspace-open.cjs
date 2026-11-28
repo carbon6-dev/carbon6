@@ -137,22 +137,47 @@ async function check(browser, origin, viewport, label, platform) {
   let f;
   // Establish HTTP routing before the first app request proves attention. Later
   // seed replacements must not rely on a grant from an older route revision.
-  const setup = async ({ context }) => context.route('**/api/**', async route => {
-    const p = new URL(route.request().url()).pathname;
-    if (p.endsWith('/sessions/secondary')) return route.fulfill({ json: {
-      session: secondary, worker_name: worker.name, worker_online: true, queued: [] } });
-    if (p.endsWith('/sessions/secondary/suggestion') || p.endsWith('/sessions/secondary/catchup')) return route.fulfill({ status: 204 });
-    if (p.endsWith('/sessions/secondary/view')) return route.fulfill({ json: {} });
-    if (p.endsWith(`/docs/${DOC}`)) return route.fulfill({ json: doc });
-    if (p.endsWith(`/docs/${OTHER_DOC}`)) return route.fulfill({ json: { ...doc, id: OTHER_DOC, title: 'Other workspace document' } });
-    if (p.endsWith('/docs')) return route.fulfill({ json: [{ ...doc, tabs: undefined }] });
-    if (p.endsWith('/search')) return route.fulfill({ json: { results: [], ignored: [], truncated: false } });
-    if (p.endsWith(`/docs/${DOC}/ops`)) return route.fulfill({ json: { id: DOC, rev: 1, ids: [], keys: {}, hashes: {} } });
-    return route.fallback();
-  });
+  const pendingApi = new Set();
+  const setup = async ({ context, page }) => {
+    await page.clock.install();
+    page.on('request', request => {
+      if (new URL(request.url()).pathname.startsWith('/api/')) pendingApi.add(request);
+    });
+    page.on('requestfinished', request => pendingApi.delete(request));
+    page.on('requestfailed', request => pendingApi.delete(request));
+    await context.route('**/api/**', async route => {
+      const p = new URL(route.request().url()).pathname;
+      if (p.endsWith('/sessions/secondary')) return route.fulfill({ json: {
+        session: secondary, worker_name: worker.name, worker_online: true, queued: [] } });
+      if (p.endsWith('/sessions/secondary/suggestion') || p.endsWith('/sessions/secondary/catchup')) return route.fulfill({ status: 204 });
+      if (p.endsWith('/sessions/secondary/view')) return route.fulfill({ json: {} });
+      if (p.endsWith(`/docs/${DOC}`)) return route.fulfill({ json: doc });
+      if (p.endsWith(`/docs/${OTHER_DOC}`)) return route.fulfill({ json: { ...doc, id: OTHER_DOC, title: 'Other workspace document' } });
+      if (p.endsWith('/docs')) return route.fulfill({ json: [{ ...doc, tabs: undefined }] });
+      if (p.endsWith('/search')) return route.fulfill({ json: { results: [], ignored: [], truncated: false } });
+      if (p.endsWith(`/docs/${DOC}/ops`)) return route.fulfill({ json: { id: DOC, rev: 1, ids: [], keys: {}, hashes: {} } });
+      return route.fallback();
+    });
+  };
   try {
     f = await fixture(browser, origin, viewport, 'light', { choice: 'off', os: 'no-preference', effective: 'off' }, value => { f = value; }, {}, { setup });
     const { page, context } = f, lives = new Set(), liveWaiters = new Set();
+    const finishBeforeUnload = async () => {
+      // Cold restoration is what this suite exercises, not cancellation of
+      // startup/seen writes. Flush NeedsYou's 300ms live-feed coalescer on the
+      // injected clock, then finish actual response bodies and their reactive
+      // follow-up work before destroying the document. WebKit can otherwise
+      // report fetch() calls from that departing work as access-control errors.
+      await page.clock.runFor(300);
+      do {
+        await Promise.all([...pendingApi].map(async request => {
+          const response = await request.response();
+          assert(response, `pre-navigation response: ${request.url()}`);
+          assert.equal(await response.finished(), null, `pre-navigation body: ${request.url()}`);
+        }));
+        await settle(page);
+      } while (pendingApi.size);
+    };
     const command = platform.startsWith('Mac') ? 'Meta' : 'Control';
     const press = key => page.keyboard.press(`${command}+${key}`);
     // Emulating navigator.platform does not change the host's mouse gestures:
@@ -166,6 +191,7 @@ async function check(browser, origin, viewport, label, platform) {
     // real platform check, not just synthetic modifier flags, is covered.
     await context.addInitScript(platform => Object.defineProperty(navigator, 'platform', { get: () => platform }), platform);
     await context.addInitScript(observeSockets);
+    await finishBeforeUnload();
     await f.reload({ waitUntil: 'domcontentloaded' });
     await page.locator('textarea').first().waitFor();
     await settle(page);
@@ -186,6 +212,7 @@ async function check(browser, origin, viewport, label, platform) {
       // A same-URL/hash goto can be same-document navigation: WASM would
       // never restore the seeded layout. Stop the old app before seeding,
       // also preventing its reactive storage writer from racing this write.
+      await finishBeforeUnload();
       await f.navigate(origin + '/__seed', { waitUntil: 'domcontentloaded' });
       await page.evaluate(({ key, saved, drafts }) => {
         localStorage.setItem(key, JSON.stringify(saved));
@@ -582,12 +609,16 @@ async function check(browser, origin, viewport, label, platform) {
     const listSource = structuredClone(listTile);
     for (const id of ['parent', 'secondary', 'parent', 'secondary']) {
       phase(`Sessions list reuse ${id}: focus list and modifier-click row`);
-      // The previous row's hover preview is a portal above the list and
-      // can cover the next row. Dismiss it as a user would, not with a
-      // forced click that would bypass the real pointer hit test.
+      // The previous row's hover preview can cover the next row. On a fine
+      // pointer, leaving it schedules a 250ms dismissal: finish that timer
+      // rather than racing a click against a disappearing close button.
+      // Touch previews are pinned, so dismiss those with their real button.
       await page.mouse.move(0, 0);
       const previewClose = page.getByRole('button', { name: 'Close session details', exact: true });
-      if (await previewClose.isVisible()) await previewClose.click();
+      if (viewport.width >= 768 && viewport.height >= 512) {
+        await page.clock.runFor(250);
+        await previewClose.waitFor({ state: 'hidden' });
+      } else if (await previewClose.isVisible()) await previewClose.click();
       await press('4');
       await modifierClick(page.locator(`#col-${listKey} a[href$="/sessions/${id}"]`).first());
       phase(`Sessions list reuse ${id}: wait for existing session in four tiles`);
