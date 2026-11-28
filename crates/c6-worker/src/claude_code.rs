@@ -2525,6 +2525,11 @@ impl Process {
         }
         if let Some(root) = &output_root {
             cmd.env("CLAUDE_CODE_TMPDIR", &root.0);
+            // A separate command hook uses only the documented hook JSON.
+            // This root survives held processes and is reclaimed with them.
+            if launch.settings.as_deref().is_some_and(|s| s.contains(" claude-capability ")) {
+                cmd.env(crate::claude_capability::STATE_ENV, root.0.join("capability-turn.json"));
+            }
         }
         cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]);
         cmd.args(["--replay-user-messages", "--dangerously-skip-permissions"]);
@@ -6326,6 +6331,46 @@ cat <<'EOF'
 EOF
 "#;
         script(dir, "claude", script_body)
+    }
+
+    #[tokio::test]
+    async fn native_capability_hooks_keep_other_guards_and_get_private_process_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script(
+            dir.path(),
+            "claude",
+            r#"#!/bin/sh
+read -r prompt
+printf '%s' "$C6_CAPABILITY_HOOK_STATE" > hook-state.txt
+while [ $# -gt 0 ]; do [ "$1" = "--settings" ] && printf '%s' "$2" > hook-settings.txt; shift; done
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}],"stop_reason":"end_turn"},"parent_tool_use_id":null}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":1,"output_tokens":1}}'
+"#,
+        );
+        let contract = serde_json::json!({"version":1,"provenance":{"by":"you","at":1},"content":{
+            "capabilities":[{"value":{"name":"inspect widget","description":"inspect","location":{"kind":"template","name":"inspect"},
+                "inputs":{},"result_schema":{},"trigger_phrases":["widget status"],"command_patterns":["widget-check"]}}]}});
+        let spec = c6_proto::CreateSession { project_contract_json: Some(contract.to_string()), ..Default::default() };
+        let hooks = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"lease-check"}]}]}}"#;
+        let launch = Launch {
+            conversation: "widget-native".into(),
+            native: Some(vec!["Bash".into(), "WebFetch".into()]),
+            settings: Some(crate::session::claude_code_settings(&spec, Some(hooks))),
+            ..Default::default()
+        };
+        let sink: Arc<dyn EventSink> = Arc::new(VecSink::default());
+        let mut process = Process::spawn(&bin, launch, false, dir.path(), "widget-model", Arc::default(), None, None).unwrap();
+        assert_eq!(run(&mut process, 1, &[input("widget-input", "widget status")], &sink).await.reason, Some(TurnEndReason::Completed));
+        let settings: Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("hook-settings.txt")).unwrap()).unwrap();
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 3, "native allowlist, lease entry, capability entry");
+        assert!(pre.iter().any(|group| group["hooks"][0]["command"] == "lease-check"));
+        assert!(pre.iter().any(|group| group["hooks"][0]["command"].as_str().is_some_and(|s| s.contains(" claude-capability "))));
+        assert_eq!(settings["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 1);
+        let path = PathBuf::from(std::fs::read_to_string(dir.path().join("hook-state.txt")).unwrap());
+        assert!(path.is_absolute());
+        assert_ne!(path.parent(), Some(dir.path()), "state must not go in the project folder");
+        assert!(path.parent().unwrap().is_dir());
     }
 
     /// A process kept to some of Claude Code's own tools gets the flags for

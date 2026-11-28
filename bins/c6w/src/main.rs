@@ -46,6 +46,9 @@ enum Command {
     /// the reason on stderr; docs/background.md §4).
     #[command(hide = true)]
     ClaudeGuard { allowed: Vec<String> },
+    /// Deterministic native project-capability reminder (command hook).
+    #[command(hide = true)]
+    ClaudeCapability { policy: String },
 }
 
 /// Set when the worker exits to be started again (an update, or a version
@@ -73,6 +76,9 @@ async fn run() -> anyhow::Result<()> {
     // Before logging starts: Claude Code reads the hook's output.
     if let Command::ClaudeGuard { allowed } = &cli.command {
         claude_guard(allowed);
+    }
+    if let Command::ClaudeCapability { policy } = &cli.command {
+        claude_capability(policy);
     }
     tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
     let state_dir = cli.state_dir.unwrap_or_else(identity::default_state_dir);
@@ -128,6 +134,7 @@ async fn run() -> anyhow::Result<()> {
             }
         }
         Command::ClaudeGuard { .. } => unreachable!("handled above"),
+        Command::ClaudeCapability { .. } => unreachable!("handled above"),
         Command::Status => {
             let id = Identity::load(&state_dir)?;
             println!("worker:  {} ({})", id.meta.worker_name, id.meta.worker_id);
@@ -165,6 +172,29 @@ fn claude_guard(allowed: &[String]) -> ! {
         Err(reason) => {
             eprintln!("{reason}");
             std::process::exit(2)
+        }
+    }
+}
+
+fn claude_capability(policy: &str) -> ! {
+    use std::io::Read;
+    let result = (|| -> anyhow::Result<Option<String>> {
+        let path = std::env::var_os(c6_worker::claude_capability::STATE_ENV)
+            .ok_or_else(|| anyhow::anyhow!("missing private capability hook state"))?;
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input)?;
+        c6_worker::claude_capability::command(policy, &PathBuf::from(path), &input)
+    })();
+    match result {
+        Ok(Some(output)) => {
+            println!("{output}");
+            std::process::exit(0);
+        }
+        Ok(None) => std::process::exit(0),
+        Err(_) => {
+            // Hook input and policy are user data; never echo either on error.
+            eprintln!("carbon6 could not check the project capability reminder; this action was not run. Retry after fixing the hook.");
+            std::process::exit(2);
         }
     }
 }

@@ -8534,6 +8534,7 @@ pub(crate) fn claude_code_settings(spec: &CreateSession, hooks: Option<&str>) ->
             obj.insert("hooks".into(), h);
         }
     }
+    crate::claude_capability::configure(&mut v, spec, spec_prompt(spec, "project.contract_reminder", c6_agent::PROJECT_CONTRACT_REMINDER));
     v.to_string()
 }
 
