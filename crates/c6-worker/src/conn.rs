@@ -311,6 +311,7 @@ async fn attach_once(worker: &Arc<Worker>, state: &watch::Sender<ConnState>, shu
                 Ok(Some(HeadMsg { msg: Some(m) })) => {
                     deadline = Instant::now() + READ_TIMEOUT;
                     match m {
+                        head_msg::Msg::RestartExpected(restart) => worker.link.expect_restart(restart.until_ms),
                         head_msg::Msg::Pong(p) => {
                             if let Some(sent) = in_flight.remove(&p.nonce) {
                                 last_rtt_us = sent.elapsed().as_micros().min(u32::MAX as u128) as u32;

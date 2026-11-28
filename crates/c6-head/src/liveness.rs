@@ -14,6 +14,18 @@ use crate::HeadState;
 use crate::registry::ConnectionStamp;
 use crate::store::SessionRow;
 
+pub(crate) const PLANNED_RESTART_MS: i64 = 5 * 60 * 1000;
+pub(crate) const HEAD_RESTART_UNTIL: &str = "liveness.head_restart_until";
+const STARTUP_RECONNECT_MS: i64 = 2 * 60 * 1000;
+
+struct Startup(i64);
+
+impl Default for Startup {
+    fn default() -> Self {
+        Self(now_ms())
+    }
+}
+
 #[derive(Clone)]
 struct Evidence {
     worker: WorkerId,
@@ -38,6 +50,7 @@ struct Progress {
 
 #[derive(Default)]
 pub(crate) struct Runtime {
+    started: Startup,
     evidence: Mutex<HashMap<String, Evidence>>,
     disconnected: Mutex<HashMap<WorkerId, (ConnectionStamp, i64)>>,
     /// Sweep is also a public test hook; serialize it with scheduled sweeps.
@@ -150,10 +163,27 @@ fn elapsed(now: i64, then: i64) -> i64 {
 /// A declaration never manufactures a sequence in the worker's journal.
 pub async fn sweep_at(st: &HeadState, now: i64) -> anyhow::Result<()> {
     let _sweep = st.liveness.sweep.lock().await;
+    if st.shutdown.is_cancelled() {
+        return Ok(());
+    }
     let sessions: Vec<SessionRow> =
         sqlx::query_as("SELECT * FROM sessions WHERE archived = 0 AND observed = 0").fetch_all(st.store.pool()).await?;
     let evidence = st.liveness.evidence.lock().unwrap().clone();
     let progress = st.liveness.progress.lock().unwrap().clone();
+    let head_restart_until = st.store.setting(HEAD_RESTART_UNTIL).await?.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    // The update protocol already persists installing/restarting before a
+    // worker's installer can stop it. Only the latest status qualifies: a
+    // failed/done update must not hide an unrelated subsequent disconnect.
+    let planned: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
+        "SELECT machine, updated_at FROM update_machines u WHERE state IN ('installing', 'restarting') \
+         AND updated_at > ? AND NOT EXISTS (SELECT 1 FROM update_machines n WHERE n.machine = u.machine \
+         AND (n.updated_at > u.updated_at OR (n.updated_at = u.updated_at AND n.rowid > u.rowid)))",
+    )
+    .bind(now.saturating_sub(PLANNED_RESTART_MS))
+    .fetch_all(st.store.pool())
+    .await?
+    .into_iter()
+    .collect();
     let pending: HashSet<String> = sqlx::query_scalar("SELECT DISTINCT child_id FROM remote_delegations WHERE state = 'waiting'")
         .fetch_all(st.store.pool())
         .await?
@@ -249,7 +279,16 @@ pub async fn sweep_at(st: &HeadState, now: i64) -> anyhow::Result<()> {
                 }
                 entry.1
             };
-            (elapsed(now, since) >= i64::from(l.liveness_worker_grace_seconds) * 1000)
+            // With no attachment since boot, absence is not evidence that the
+            // worker process died: its old stream died with this head. After a
+            // successful attach, ordinary disconnect grace applies again.
+            let startup_until = if stamp.last.is_none() {
+                (st.liveness.started.0 + STARTUP_RECONNECT_MS).max(head_restart_until.min(st.liveness.started.0 + PLANNED_RESTART_MS))
+            } else {
+                0
+            };
+            let planned_until = planned.get(&worker.to_string()).map_or(0, |at| at + PLANNED_RESTART_MS);
+            (now >= startup_until.max(planned_until) && elapsed(now, since) >= i64::from(l.liveness_worker_grace_seconds) * 1000)
                 .then(|| format!("worker disconnected for {} seconds", elapsed(now, since) / 1000))
         };
         if let Some(cause) = cause {
@@ -368,6 +407,23 @@ async fn record_loss(st: &HeadState, s: &SessionRow, fence: LossFence<'_>, cause
     // the registry's narrow commit lock; never hold it while waiting for a
     // SQLite writer or delivering a report.
     let mut tx = st.store.pool().begin_with("BEGIN IMMEDIATE").await?;
+    if fence.stamp.live.is_none() {
+        // Installing may have been acknowledged after the sweep's snapshot.
+        // Serialize the final check with that durable update before claiming
+        // the disconnected worker is lost.
+        let until: Option<i64> = sqlx::query_scalar(
+            "SELECT CASE WHEN state IN ('installing', 'restarting') THEN updated_at + ? ELSE 0 END \
+             FROM update_machines WHERE machine = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(PLANNED_RESTART_MS)
+        .bind(fence.worker.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if until.is_some_and(|until| now < until) {
+            tx.rollback().await?;
+            return Ok(());
+        }
+    }
     // A same-millisecond local registration may have committed after the
     // report but not yet published its runtime generation. Wait for new evidence.
     let result = sqlx::query(
@@ -421,7 +477,8 @@ async fn record_loss(st: &HeadState, s: &SessionRow, fence: LossFence<'_>, cause
         selected.fresh_after(fence.progress)
             && st.liveness.evidence.lock().unwrap().get(&s.id).is_some_and(|latest| latest.generation == selected.generation)
     });
-    if st.registry.connection_stamp(fence.worker) != fence.stamp
+    if st.shutdown.is_cancelled()
+        || st.registry.connection_stamp(fence.worker) != fence.stamp
         || !evidence_current
         || st.liveness.progress.lock().unwrap().get(&s.id).copied() != fence.progress
     {
@@ -609,6 +666,66 @@ mod tests {
         sweep_at(st, now_ms() + 7 * 86400 * 1000).await.unwrap();
         assert!(!is_lost(st, "session").await.unwrap());
         assert_eq!(st.store.session("session").await.unwrap().unwrap().status, "running");
+    }
+
+    #[tokio::test]
+    async fn head_startup_waits_for_old_workers_but_a_dead_worker_eventually_is_lost() {
+        for planned in [false, true] {
+            let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+            let st = &head.state;
+            let setup = st.liveness.sweep.lock().await;
+            let worker = WorkerId::new();
+            sqlx::query("UPDATE sessions SET worker_id = ?, status = 'running' WHERE id = 'session'")
+                .bind(worker.to_string())
+                .execute(st.store.pool())
+                .await
+                .unwrap();
+            let now = now_ms();
+            if planned {
+                st.store.set_setting(HEAD_RESTART_UNTIL, &(now + PLANNED_RESTART_MS).to_string()).await.unwrap();
+            }
+            drop(setup);
+            sweep_at(st, now).await.unwrap();
+            sweep_at(st, now + 31_000).await.unwrap();
+            assert!(!is_lost(st, "session").await.unwrap(), "old worker may still be reconnecting after head restart");
+            if planned {
+                sweep_at(st, now + STARTUP_RECONNECT_MS + 1).await.unwrap();
+                assert!(!is_lost(st, "session").await.unwrap(), "planned installer gets the persisted longer grace");
+            }
+            let budget = if planned { PLANNED_RESTART_MS } else { STARTUP_RECONNECT_MS };
+            sweep_at(st, now + budget + 1).await.unwrap();
+            assert!(is_lost(st, "session").await.unwrap(), "restart expectation is bounded, not proof of life");
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_worker_install_gets_bounded_grace_not_an_immediate_lost_report() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let setup = st.liveness.sweep.lock().await;
+        let worker = WorkerId::new();
+        sqlx::query("UPDATE sessions SET worker_id = ?, status = 'running' WHERE id = 'session'")
+            .bind(worker.to_string())
+            .execute(st.store.pool())
+            .await
+            .unwrap();
+        let now = now_ms();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let live = st.registry.attach(worker, now, tx, vec![], "worker").await;
+        drop(live);
+        sqlx::query("INSERT INTO update_machines (machine, version, state, started_at, updated_at) VALUES (?, 'test', 'installing', ?, ?)")
+            .bind(worker.to_string())
+            .bind(now)
+            .bind(now)
+            .execute(st.store.pool())
+            .await
+            .unwrap();
+        drop(setup);
+        sweep_at(st, now).await.unwrap();
+        sweep_at(st, now + 31_000).await.unwrap();
+        assert!(!is_lost(st, "session").await.unwrap());
+        sweep_at(st, now + PLANNED_RESTART_MS + 1).await.unwrap();
+        assert!(is_lost(st, "session").await.unwrap(), "an installer that never returns must not hide a dead worker");
     }
     use c6_proto::SessionLiveness;
     use prost::Message;
@@ -879,6 +996,12 @@ mod tests {
             sqlx::query("INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, parent_id, parent_call_id) \
                          VALUES (?, ?, ?, '', '', '', 'idle', 0, 0, ?, ?)")
                 .bind(id).bind(worker.to_string()).bind(id).bind(owner).bind(call).execute(st.store.pool()).await.unwrap();
+        }
+        // Both processes were observed on this head, then genuinely vanished;
+        // this is ordinary disconnect grace, not startup reattachment.
+        for worker in [parent, child] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            drop(st.registry.attach(worker, now_ms(), tx, vec![], "worker").await);
         }
         let now = now_ms();
         let notice = c6_proto::SessionEvent {

@@ -153,6 +153,15 @@ impl Registry {
         }
     }
 
+    pub(crate) fn expect_restart(&self, until_ms: i64) {
+        for live in self.conns.lock().unwrap().values() {
+            let msg = HeadMsg { msg: Some(head_msg::Msg::RestartExpected(c6_proto::RestartExpected { until_ms })) };
+            // Advisory, not a prerequisite for survival: workers use bounded
+            // reconnect recovery even when this queue is full or the head dies.
+            let _ = live.tx.try_send(Ok(msg));
+        }
+    }
+
     /// Calls a worker method and waits for its result.
     pub async fn call(
         &self,

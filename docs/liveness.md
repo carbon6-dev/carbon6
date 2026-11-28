@@ -15,6 +15,46 @@ does not lose work. Model silence and non-resource recovery have separate bounds
 tool is not model silence, however long the tool takes. Missing reports from
 older workers are unknown, never evidence that their actors died.
 
+### Head and update reconnects
+
+A head restart is not a worker restart. Active worker actors, model streams,
+tools and the journal keep running; no turn or completed tool is replayed.
+Before this head has seen a worker attach, liveness gives its old sessions a
+two-minute startup reconnect window in addition to the ordinary disconnect
+test. This covers an unannounced head restart and a roughly 30-second outage.
+After a successful attachment the normal configurable worker grace applies.
+
+A head update persists a five-minute restart expectation **before installing**
+(a package installer may restart the service itself), and sends an additive
+`RestartExpected` advisory to attached workers. The replacement head reads the
+persisted expectation. A worker update's acknowledged `installing`/`restarting`
+status is likewise a planned disconnect; its latest persisted update status
+gives it up to five minutes to reattach. `done`, `failed` and rollback supersede
+the expectation. Draining/downloading alone do not postpone loss detection.
+The windows are bounded: an expected reconnect is not proof that a disconnected
+process is still alive. A worker that never returns is still reported lost;
+affirmative stopped-actor evidence on a live connection is never hidden by an
+update marker. No parent failure report is manufactured during these windows.
+
+Model credential transport has its own reconnect-aware wait: two minutes
+normally, up to five when a head update was announced. Backoff grows from one
+to thirty seconds and a new attachment wakes it immediately. A 15-second
+unanswered request is retried, including on the same healthy stream, rather
+than failing the model turn. Each attempt has a fresh request id; cancellation,
+timeout and disconnect remove its old waiter. Explicit authorization refusals
+still fail promptly. Valid cached grants bridge an outage; reattachment still
+invalidates session model grants so current authorization is checked again.
+
+Credentials are control traffic, independent of ordered journal ingestion,
+initial spec refresh and command replay. A session committed just before
+shutdown can authorize from its durable row immediately after reconnect;
+there is no new-stream session-registration prerequisite. Local subagents ask
+as their root session, so credential logs under the root id do **not** mean the
+child's request was unanswered. Grant logs include the requested session,
+authorization root and request id for correlation.
+
+### Actor evidence
+
 The worker sends evidence on its 10-second heartbeat, independently of the
 actor mailbox and journal writes. The head fences it by worker connection and
 ownership epoch. Tool activity tracks outstanding tool-call ids, so the first
@@ -47,7 +87,8 @@ The realm's subagent settings expose these bounds (in seconds):
 
 Reports and worker-link changes also trigger sweeps. Thus disconnection and
 affirmative actor death normally become visible within a minute; model and
-recovery waits use their separate configured bounds. Older workers without
+recovery waits and the startup/planned-restart exceptions above use their
+separate bounds. Older workers without
 actor evidence still get worker-disconnection monitoring, but cannot prove
 actor death while connected. Upgrade those workers for actor-level coverage.
 

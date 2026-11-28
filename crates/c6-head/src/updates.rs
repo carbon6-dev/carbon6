@@ -579,6 +579,11 @@ async fn update_head(st: &HeadState, rel: &Rel) -> anyhow::Result<()> {
         },
     };
     machine(st, "head", v, "installing", method.name(), "").await?;
+    // Persist before an installer can restart this process. The replacement
+    // head and parents must not mistake the attachment gap for dead work.
+    let until = now_ms() + crate::liveness::PLANNED_RESTART_MS;
+    st.store.set_setting(crate::liveness::HEAD_RESTART_UNTIL, &until.to_string()).await?;
+    st.registry.expect_restart(until);
     // Before installing: a .deb's postinst restarts the head mid-install.
     let pending = dir(&st.data_dir);
     Pending {

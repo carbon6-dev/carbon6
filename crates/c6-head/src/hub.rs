@@ -207,14 +207,7 @@ impl WorkerHub for HubSvc {
                     tracing::warn!(worker = %worker_id, "refreshing session settings after reconnect: {e:#}");
                 }
             });
-            // Use the captured stream and its Hello. Do this before command
-            // replay, rather than racing delivery in a settings task.
-            if let Err(e) = refresh_attached_specs(&st, worker_id, &tx, &hello.capabilities, &hello.sessions).await {
-                warn!(worker = %worker_id, "refreshing session specs after reconnect: {e:#}");
-                let _ = tx.send(Err(attach_error(e))).await;
-                return;
-            }
-            let reason = serve_worker(&st, &guard, &mut inbound, &tx, &hello.capabilities).await;
+            let reason = serve_worker(&st, &guard, &mut inbound, &tx, &hello).await;
             st.store.touch_worker(worker_id, now_ms()).await.ok();
             info!(worker = %worker_id, %reason, "worker detached");
         });
@@ -228,14 +221,18 @@ async fn serve_worker(
     guard: &crate::registry::ConnGuard<'_>,
     inbound: &mut Streaming<WorkerMsg>,
     tx: &mpsc::Sender<Result<HeadMsg, Status>>,
-    capabilities: &[String],
+    hello: &Hello,
 ) -> String {
     let worker_id = guard.worker_id;
     let (work, pending) = mpsc::channel(WORK_CAPACITY);
     let stop = guard.cancel.child_token();
     let _stop = stop.clone().drop_guard();
-    let mut lane =
-        tokio::spawn(ordered_work(st.clone(), worker_id, tx.clone(), capabilities.to_vec(), guard.deliver.clone(), stop, pending));
+    let mut lane = tokio::spawn(ordered_work(st.clone(), worker_id, tx.clone(), hello.clone(), guard.deliver.clone(), stop, pending));
+    // Credentials authorize durable session rows, not uploaded events. Never
+    // put them behind reconnect's spec refresh/command replay or event effects
+    // (which can themselves wait for a worker RPC). Replies belong to this
+    // stream, not whichever connection the registry happens to hold later.
+    let mut credentials = tokio::task::JoinSet::new();
     let mut deadline = Instant::now() + IDLE_TIMEOUT;
     loop {
         let msg = tokio::select! {
@@ -246,6 +243,13 @@ async fn serve_worker(
             _ = tokio::time::sleep_until(deadline.into()) => return "idle timeout".into(),
             _ = tx.closed() => return "response stream closed".into(),
             r = &mut lane => return ordered_work_ended(tx, r),
+            r = credentials.join_next(), if !credentials.is_empty() => {
+                if let Some(Err(e)) = r {
+                    warn!(worker = %worker_id, "credential task failed: {e:#}");
+                    return "credential task failed; reconnect to retry".into();
+                }
+                continue;
+            }
             r = inbound.message() => r,
         };
         deadline = Instant::now() + IDLE_TIMEOUT;
@@ -266,6 +270,21 @@ async fn serve_worker(
                 let _ = tx.try_send(Ok(head(head_msg::Msg::Pong(Pong { nonce: p.nonce }))));
             }
             worker_msg::Msg::Hello(_) => warn!(worker = %worker_id, "duplicate Hello ignored"),
+            worker_msg::Msg::CredentialRequest(req) => {
+                tracing::debug!(worker = %worker_id, session = %req.session_id, request_id = req.request_id,
+                    connection = %req.connection_id, "credential request received on control lane");
+                // Bound independent tasks. Closing the stream makes every
+                // unanswered request retryable instead of silently dropping it.
+                if credentials.len() >= 64 {
+                    let _ = tx.try_send(Err(Status::unavailable("credential lane busy; reconnect to retry")));
+                    return "credential lane busy".into();
+                }
+                let (st, tx) = (st.clone(), tx.clone());
+                credentials.spawn(async move {
+                    let grant = sessions::credential(&st, worker_id, req).await;
+                    let _ = tx.send(Ok(head(head_msg::Msg::Credential(grant)))).await;
+                });
+            }
             worker_msg::Msg::RpcResponse(resp) => guard.rpc_response(resp),
             worker_msg::Msg::MachineSample(sample) => {
                 // Observations never enter the durable-event lane or wait for
@@ -329,11 +348,14 @@ async fn ordered_work(
     st: Arc<HeadState>,
     worker_id: WorkerId,
     tx: mpsc::Sender<Result<HeadMsg, Status>>,
-    capabilities: Vec<String>,
+    hello: Hello,
     deliver: Arc<tokio::sync::Notify>,
     stop: CancellationToken,
     mut pending: mpsc::Receiver<worker_msg::Msg>,
 ) -> Result<(), Status> {
+    let Hello { capabilities, sessions: cursors, .. } = hello;
+    // Still ordered before replay, but not before the control reader starts.
+    refresh_attached_specs(&st, worker_id, &tx, &capabilities, &cursors).await.map_err(attach_error)?;
     // Highest command seq sent on this connection; a new connection starts
     // over, and the worker ignores commands it already applied.
     let mut delivered = 0;
@@ -409,12 +431,6 @@ async fn ordered_work(
                 // replay the handler, which is not one atomic operation.
                 if let Err(e) = sessions::on_rejected(&st, worker_id, r).await {
                     warn!(worker = %worker_id, "recording rejection: {e:#}");
-                }
-            }
-            Some(worker_msg::Msg::CredentialRequest(req)) => {
-                let grant = sessions::credential(&st, worker_id, req).await;
-                if tx.send(Ok(head(head_msg::Msg::Credential(grant)))).await.is_err() {
-                    return Ok(());
                 }
             }
             Some(_) => unreachable!("control messages are handled by the stream reader"),
@@ -694,8 +710,30 @@ mod tests {
             .unwrap();
         }
         send(worker_msg::Msg::Ping(Ping { nonce: 42, ..Default::default() })).await.unwrap();
-        let pong = c6_testkit::within("pong while the database writer is held", inbound.message()).await.unwrap().unwrap();
-        assert!(matches!(pong.msg, Some(head_msg::Msg::Pong(Pong { nonce: 42 }))));
+        send(worker_msg::Msg::CredentialRequest(c6_proto::CredentialRequest {
+            request_id: 123,
+            session_id: "session".into(),
+            connection_id: "api".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let mut pong = false;
+        let mut credential = false;
+        c6_testkit::within("control replies while the ordered event writer is held", async {
+            while !pong || !credential {
+                match inbound.message().await.unwrap().unwrap().msg {
+                    Some(head_msg::Msg::Pong(Pong { nonce: 42 })) => pong = true,
+                    Some(head_msg::Msg::Credential(grant)) => {
+                        assert_eq!(grant.request_id, 123);
+                        assert!(grant.error.is_empty(), "{grant:?}");
+                        credential = true;
+                    }
+                    other => panic!("unexpected reply before writer release: {other:?}"),
+                }
+            }
+        })
+        .await;
         writer.rollback().await.unwrap();
 
         for expected in 1..=2 {

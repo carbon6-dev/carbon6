@@ -12,6 +12,45 @@ The goal: a worker can restart at any moment, and nothing that was running is lo
 
 ## 1. Where things stand
 
+### Head-only restarts and transient worker links
+
+Restarting the head does not restart worker processes or their actors. Worker
+model credential requests now wait through transient transport failures,
+resending with new request ids after a reconnect or an unanswered reply. The
+normal budget is two minutes, with adaptive backoff capped at thirty seconds;
+an announced update can extend the total wait to five minutes. Usable cached
+grants still avoid the head round trip while offline. A fresh attachment clears
+session model grants to recheck authorization; refusal is not treated as a
+retryable transport failure. A provider's 401 refresh uses the same transport
+recovery without ever reusing the refused token.
+
+The head answers credentials from a connection-scoped control lane, not behind
+ordered event upload, spec refresh or replayed commands. Authorization uses the
+durable session row (the root row for local children), not registration on a
+particular stream. This matters for sessions created immediately before an
+update. Grant logging identifies both the requested session and its root;
+historically all successful grants were logged only under the root.
+
+Before installation the head persists a bounded restart expectation and
+advises attached workers. On boot it allows old workers two minutes to attach,
+or up to five minutes for an announced installation. Worker updates already
+acknowledge `installing` before invoking an installer that might restart them;
+liveness now recognizes that persisted state as planned too. Parents do not
+receive a lost/failed report merely because these links are reconnecting. Once
+reattached, actors continue the same turn; only the pending credential fetch is
+retried, never completed tools. A genuinely absent worker still becomes lost
+after its applicable grace expires. See docs/liveness.md for bounds and the
+distinction between a reconnect expectation and affirmative process evidence.
+
+Deterministic regressions cover same-stream unanswered replies, stale request
+ids, cancellation, repeated 30-second credential outages (paused Tokio time),
+startup and planned-update grace (explicit sweep times), and a new remote
+subagent spanning a real head restart with MockLlm gates. The latter checks a
+successful parent report, finished background Task and exactly-once tool
+outputs; its 30-second liveness observation is injected, not a wall-clock sleep.
+
+### Worker process preservation
+
 Current session configuration is separate from restartable session state; see
 [Session state and current configuration](session-specs.md). Capable workers
 receive fresh derived specs before recovered turns can dispatch. Changed

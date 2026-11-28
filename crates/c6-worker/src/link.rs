@@ -12,6 +12,9 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 const CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(15);
+/// One accepted model call may bridge several reconnect attempts. Individual
+/// requests remain short so a lost reply is retried even on a healthy stream.
+const CREDENTIAL_RECOVERY: Duration = Duration::from_secs(5 * 60);
 /// Calls to the head (and through it, to the memex).
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Refresh credentials this long before they expire.
@@ -52,6 +55,8 @@ pub struct HeadLink {
     outbound: Mutex<Option<mpsc::Sender<WorkerMsg>>>,
     attached: tokio::sync::Notify,
     stopped: AtomicBool,
+    /// Advisory from a planned head update; bounded locally even if malformed.
+    restart_until_ms: AtomicU64,
     /// Deltas waiting for the next flush; `Some` while a flush is scheduled.
     ephemeral_buf: Arc<Mutex<Option<Vec<EphemeralEvent>>>>,
     waiters: Mutex<HashMap<u64, oneshot::Sender<CredentialGrant>>>,
@@ -79,6 +84,13 @@ impl Drop for CallRegistration<'_> {
 }
 
 impl HeadLink {
+    pub(crate) fn expect_restart(&self, until_ms: i64) {
+        let now = c6_core::now_ms();
+        let until = until_ms.clamp(now, now + CREDENTIAL_RECOVERY.as_millis() as i64);
+        self.restart_until_ms.store(until as u64, Ordering::Relaxed);
+        tracing::info!(until_ms = until, "head restart planned; active turns will wait for reconnect");
+    }
+
     /// A link to the head in this process.
     pub fn local(head: Arc<dyn LocalHead>) -> Self {
         let link = Self::default();
@@ -317,34 +329,48 @@ impl HeadLink {
         self.credential_with(session_id, connection_id, false).await
     }
 
-    /// For an accepted model turn with no usable grant, allow a brief
-    /// reconnect to the broker instead of borrowing another session's grant.
+    /// Transport failure is not a model failure. Retry the credential request,
+    /// never the turn (and therefore never already-completed tool calls).
     pub(crate) async fn model_credential(&self, session_id: &str, connection_id: &str) -> anyhow::Result<CredentialGrant> {
-        let result = self.session_credential(session_id, connection_id).await;
-        let Some(failure) = result.as_ref().err().and_then(|e| e.downcast_ref::<CredentialTransport>()) else { return result };
+        self.recover_credential(session_id, connection_id, false).await
+    }
+
+    async fn recover_credential(&self, session_id: &str, connection_id: &str, refresh: bool) -> anyhow::Result<CredentialGrant> {
         if !is_session_model(session_id, connection_id) {
-            return result;
+            return self.credential_with(session_id, connection_id, refresh).await;
         }
-        let replacement = async {
-            loop {
-                let attached = self.attached.notified();
-                tokio::pin!(attached);
-                attached.as_mut().enable();
-                if self.stopped.load(Ordering::Relaxed) {
-                    return false;
-                }
-                if self.outbound.lock().unwrap().as_ref().is_some_and(|tx| {
-                    !tx.is_closed() && !failure.0.as_ref().and_then(|old| old.upgrade()).is_some_and(|old| tx.same_channel(&old))
-                }) {
-                    return true;
-                }
-                attached.await;
+        // Normally two minutes; an announced update gets up to five. Backoff
+        // adapts to repeated failures, and a new attachment wakes it early.
+        let planned = self.restart_until_ms.load(Ordering::Relaxed) as i64 - c6_core::now_ms();
+        let budget = Duration::from_millis(planned.max(120_000) as u64).min(CREDENTIAL_RECOVERY);
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            if self.stopped.load(Ordering::Relaxed) {
+                bail!("head credential transport stopped");
             }
-        };
-        if matches!(tokio::time::timeout(CREDENTIAL_TIMEOUT, replacement).await, Ok(true)) {
-            self.session_credential(session_id, connection_id).await
-        } else {
-            result
+            // Register before inspecting the link: a reconnect between the
+            // failed request and this wait must not consume the whole budget.
+            let attached = self.attached.notified();
+            tokio::pin!(attached);
+            attached.as_mut().enable();
+            let result = tokio::time::timeout_at(deadline, self.credential_with(session_id, connection_id, refresh)).await;
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => bail!("timed out recovering credentials from the head after {} seconds", budget.as_secs()),
+            };
+            if self.stopped.load(Ordering::Relaxed)
+                || !result.as_ref().err().is_some_and(|e| e.is::<CredentialTransport>())
+                || tokio::time::Instant::now() >= deadline
+            {
+                return result;
+            }
+            tracing::debug!(session = session_id, connection = connection_id, ?backoff, "waiting to retry head credentials");
+            tokio::select! {
+                _ = attached.as_mut() => {},
+                _ = tokio::time::sleep_until((tokio::time::Instant::now() + backoff).min(deadline)) => {},
+            }
+            backoff = (backoff * 2).min(Duration::from_secs(30));
         }
     }
 
@@ -456,7 +482,7 @@ impl HeadLink {
             Ok(Some(grant)) => grant,
             Ok(None) => return self.credential_transport_failure(&key, generation, refresh, &tx),
             Err(_) if tx.is_closed() => return self.credential_transport_failure(&key, generation, refresh, &tx),
-            Err(_) => bail!("timed out waiting for credentials from the head"),
+            Err(_) => return self.credential_transport_failure(&key, generation, refresh, &tx),
         };
         let outbound = self.outbound.lock().unwrap();
         if self.stopped.load(Ordering::Relaxed) || outbound.as_ref().is_some_and(|current| !current.same_channel(&tx)) {
@@ -710,7 +736,8 @@ impl c6_llm::ModelClient for LinkedClient {
         match self.stream_with_grant(req, &g).await {
             Err(c6_llm::LlmError::Http { status: 401, body, .. }) => {
                 tracing::warn!(connection = %self.connection_id, "the provider refused the credentials; asking the head for new ones: {body}");
-                let g = self.link.fresh_credential(&self.session_id, &self.connection_id).await.map_err(unreachable)?;
+                self.link.forget_session_credential(&self.session_id, &self.connection_id);
+                let g = self.link.recover_credential(&self.session_id, &self.connection_id, true).await.map_err(unreachable)?;
                 let retried = self.stream_with_grant(req, &g).await;
                 if matches!(&retried, Err(c6_llm::LlmError::Http { status: 401, .. })) {
                     self.link.forget_session_credential(&self.session_id, &self.connection_id);
@@ -936,6 +963,85 @@ mod tests {
         assert!(futures::poll!(&mut second).is_pending());
         link.on_grant(CredentialGrant { request_id: req.request_id, bearer: "replacement".into(), ..Default::default() });
         assert_eq!(second.await.unwrap().bearer, "replacement");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_request_retries_on_the_same_stream_and_cleans_up_old_ids() {
+        let link = HeadLink::default();
+        let mut rx = attach(&link);
+        let grant = link.model_credential("just-created", "c");
+        tokio::pin!(grant);
+        assert!(futures::poll!(&mut grant).is_pending());
+        let old = take_request(&mut rx);
+        tokio::time::advance(CREDENTIAL_TIMEOUT).await;
+        assert!(futures::poll!(&mut grant).is_pending());
+        assert!(link.waiters.lock().unwrap().is_empty(), "timed-out ids must not accumulate");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(futures::poll!(&mut grant).is_pending());
+        let req = take_request(&mut rx);
+        assert_ne!(old.request_id, req.request_id);
+        assert_eq!(req.session_id, "just-created");
+        link.on_grant(CredentialGrant { request_id: old.request_id, bearer: "obsolete".into(), ..Default::default() });
+        assert!(futures::poll!(&mut grant).is_pending());
+        link.on_grant(CredentialGrant { request_id: req.request_id, bearer: "current".into(), ..Default::default() });
+        assert_eq!(grant.await.unwrap().bearer, "current");
+        assert!(link.waiters.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_model_request_survives_thirty_second_outage_and_repeated_reconnects() {
+        let link = HeadLink::default();
+        let mut rx = attach(&link);
+        let grant = link.model_credential("just-created", "c");
+        tokio::pin!(grant);
+        assert!(futures::poll!(&mut grant).is_pending());
+        for _ in 0..3 {
+            let old = take_request(&mut rx);
+            link.disconnected();
+            assert!(futures::poll!(&mut grant).is_pending());
+            tokio::time::advance(Duration::from_secs(30)).await;
+            assert!(futures::poll!(&mut grant).is_pending());
+            rx = attach(&link);
+            assert!(futures::poll!(&mut grant).is_pending());
+            link.on_grant(CredentialGrant { request_id: old.request_id, bearer: "obsolete".into(), ..Default::default() });
+            assert!(futures::poll!(&mut grant).is_pending());
+        }
+        let req = take_request(&mut rx);
+        link.on_grant(CredentialGrant { request_id: req.request_id, bearer: "reconnected".into(), ..Default::default() });
+        assert_eq!(grant.await.unwrap().bearer, "reconnected");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn credential_recovery_is_bounded_and_cancellation_removes_the_waiter() {
+        let link = HeadLink::default();
+        let mut rx = attach(&link);
+        {
+            let grant = link.model_credential("root", "c");
+            tokio::pin!(grant);
+            assert!(futures::poll!(&mut grant).is_pending());
+            take_request(&mut rx);
+            assert_eq!(link.waiters.lock().unwrap().len(), 1);
+        }
+        assert!(link.waiters.lock().unwrap().is_empty());
+        link.disconnected();
+        let grant = link.model_credential("root", "c");
+        tokio::pin!(grant);
+        assert!(futures::poll!(&mut grant).is_pending());
+        tokio::time::advance(CREDENTIAL_RECOVERY).await;
+        assert!(grant.await.is_err(), "a genuinely unavailable head must eventually fail visibly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn planned_head_install_extends_recovery_but_never_waits_forever() {
+        let link = HeadLink::default();
+        link.expect_restart(c6_core::now_ms() + 3_600_000); // Clamp an excessive advisory.
+        let grant = link.model_credential("root", "c");
+        tokio::pin!(grant);
+        assert!(futures::poll!(&mut grant).is_pending());
+        tokio::time::advance(Duration::from_secs(121)).await;
+        assert!(futures::poll!(&mut grant).is_pending(), "planned install gets more than the ordinary two minutes");
+        tokio::time::advance(CREDENTIAL_RECOVERY).await;
+        assert!(grant.await.is_err(), "even a malformed advisory cannot remove the cap");
     }
 
     #[tokio::test]

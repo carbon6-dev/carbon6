@@ -395,6 +395,100 @@ async fn worker_reconnect_in_grace_preserves_the_open_turn() {
 }
 
 #[tokio::test]
+async fn head_restart_preserves_a_new_subagent_and_never_replays_its_tools() {
+    let mut env = Env::new().await;
+    let parent_worker = Node::start(&env, "restart-parent").await;
+    let node = Node::start(&env, "restart-child").await;
+    let project = tempfile::tempdir().unwrap();
+    let prompt = "HEAD-RESTART: Run the two scoped steps and report success.";
+    let scope = user_prompt_scope(prompt);
+    let first =
+        env.mock.push_gated_about(&scope, Reply::ToolCalls(vec![("bash".into(), json!({"command": "echo before-reconnect"}).to_string())]));
+    let second =
+        env.mock.push_gated_about(&scope, Reply::ToolCalls(vec![("bash".into(), json!({"command": "echo after-reconnect"}).to_string())]));
+    env.mock.push_about(&scope, Reply::Text("Both steps finished, exactly once.".into()));
+    let (parent, child) = remote_task(&env, &parent_worker, "restart-child", project.path(), prompt, true).await;
+    model_requested(&env, &child, prompt).await;
+    env.mock.push_about(&user_prompt_scope(REMOTE_PARENT_PROMPT), Reply::Text("I received the successful report.".into()));
+
+    // The child was only just created. Its actor and first model stream stay
+    // alive while the head and all stream-local credential state disappear.
+    env.head.take().unwrap().shutdown().await.unwrap();
+    eventually("the old child stream to disconnect", async || (!node.worker.link.is_connected()).then_some(())).await;
+    first.notify_one();
+    eventually("the first tool to finish in the offline journal", async || {
+        let (_, events) = node.worker.journal.load_session(&child).await.unwrap()?;
+        events
+            .iter()
+            .any(|e| {
+                matches!(
+                    &e.kind, Some(c6_proto::session_event::Kind::ToolResult(r)) if r.output == "before-reconnect\n" && !r.is_error
+                )
+            })
+            .then_some(())
+    })
+    .await;
+    // Establish that the second request is already in flight before attaching
+    // again. Reconnect invalidates its cached authorization; the third request
+    // must get a fresh credential from the replacement head's durable row.
+    eventually("the next model request to reach its gate offline", async || {
+        env.mock
+            .requests()
+            .iter()
+            .any(|r| {
+                r["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|s| s.contains("before-reconnect")))
+                })
+            })
+            .then_some(())
+    })
+    .await;
+    env.head = Some(env.listeners.start(super::cfg(env.head_dir.path())).await);
+    // Inject the liveness observation 30 seconds after restart instead of
+    // sleeping. link.rs separately advances the credential clock through real
+    // 30-second outages; MockLlm's SSE clock stays live on this runtime.
+    let observed = c6_core::now_ms() + 30_000;
+    sweep(&env, observed).await;
+    assert_no_incident(&env, &child).await;
+    eventually("the surviving child worker to reattach", async || {
+        (head(&env).registry.get(node.worker.identity.meta.worker_id).is_some() && node.worker.link.is_connected()).then_some(())
+    })
+    .await;
+    second.notify_one();
+    assert_eq!(end_after(&env, &child, 0).await, TurnEndReason::Completed);
+    let notice = eventually("the parent's successful child report", async || {
+        env.events(&parent).await.into_iter().find_map(|e| match e.kind {
+            EventKind::User { task_notice: Some(n), .. } if n.session_id == child => Some(n),
+            _ => None,
+        })
+    })
+    .await;
+    assert_eq!(notice.status, "completed");
+    eventually("the background Task to finish", async || {
+        env.events(&parent)
+            .await
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::BackgroundTask { state, .. } if state == "finished"))
+            .then_some(())
+    })
+    .await;
+    let outputs: Vec<String> = env
+        .events(&child)
+        .await
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            EventKind::ToolResult { output, .. } => Some(output),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outputs, ["before-reconnect\n", "after-reconnect\n"]);
+    assert_no_incident(&env, &child).await;
+    assert!(!env.events(&parent).await.iter().any(|e| matches!(
+        &e.kind, EventKind::User { task_notice: Some(n), .. } if n.session_id == child && matches!(n.status.as_str(), "lost" | "failed")
+    )));
+}
+
+#[tokio::test]
 async fn orphan_running_needs_affirmative_actor_stop_evidence() {
     let env = Env::new().await;
     let parent_worker = Node::start(&env, "orphan-parent").await;

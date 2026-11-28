@@ -118,7 +118,14 @@ message HeadMsg {
     CredentialGrant credential = 5;
     RpcRequest rpc_request = 6;
     HeadCallReply head_call_reply = 7;
+    RestartExpected restart_expected = 8;
   }
+}
+
+// Advisory only: never interrupts actors or authorizes cached credentials.
+// Old workers ignore the additive message and still reconnect normally.
+message RestartExpected {
+  int64 until_ms = 1;
 }
 
 message Hello {

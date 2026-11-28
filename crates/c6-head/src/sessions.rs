@@ -3725,7 +3725,7 @@ async fn credential_in(
             let denied = CredentialGrant { request_id: req.request_id, connection_id: req.connection_id, ..Default::default() };
             return refused(denied, worker_name, &req.session_id, "credential unavailable");
         }
-        info!(worker = %worker_name, session = %root, connection = %conn.id, "credentials given");
+        info!(worker = %worker_name, session = %req.session_id, root = %root, request_id = req.request_id, connection = %conn.id, "credentials given");
     }
     grant
 }

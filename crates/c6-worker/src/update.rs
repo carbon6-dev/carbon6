@@ -260,7 +260,11 @@ async fn run(w: &Arc<Worker>) -> anyhow::Result<()> {
             Some((name, bytes))
         }
     };
-    say(w, v, "installing", "").await;
+    // Await the head's durable installing acknowledgement before the
+    // installer can disconnect us. Liveness treats this as a planned,
+    // bounded restart, not an unexplained disappearance. Older heads still
+    // understand the ordinary update status.
+    say(w, v, "installing", "planned restart; waiting for worker reattachment").await;
     // Before installing: a .deb's postinst restarts the worker mid-install.
     Pending {
         from: version(w),
