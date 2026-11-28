@@ -4439,7 +4439,12 @@ fn user_content(input: &PendingInput, preamble: Option<&str>) -> Value {
         matches!(essence.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp").then_some(essence)
     };
     let (images, files): (Vec<_>, Vec<_>) = input.attachments.iter().cloned().partition(|a| image_type(&a.mime).is_some());
-    let text = c6_agent::user_text(&input.attributed_text(), &files);
+    // A native slash command must begin with '/', not the automation-origin
+    // prefix. This internal maintenance input is still recorded as automation
+    // in carbon6; only its native control-command transport is unwrapped.
+    let idle_compact = input.is_compact() && input.command_id.starts_with("idle-compact:") && !input.human_origin;
+    let text =
+        if idle_compact { c6_agent::user_text(input.model_text(), &files) } else { c6_agent::user_text(&input.attributed_text(), &files) };
     let text = match preamble {
         Some(p) => format!("{p}\n\n{text}"),
         None => text,
@@ -5938,6 +5943,38 @@ printf '{"wrapper":"%s","directory":"%s","size":"%s"}\n' "$RUSTC_WRAPPER" "$SCCA
             assert!(p.trim_quiet(), "the unread-output gate clears only once that output is taken");
         }
         p.close().await;
+    }
+
+    #[tokio::test]
+    async fn idle_compact_is_delivered_as_a_native_command_without_restarting() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script(
+            dir.path(),
+            "compact-cli",
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in *'"control_request"'*) continue;; esac
+  printf '%s\n' "$line" >> compact-inputs.jsonl
+  printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}'
+done
+"#,
+        );
+        let mut process = spawn(&bin, dir.path(), "s", false, None);
+        let pgid = process.pgid;
+        assert!(process.trim_quiet());
+        let sink: Arc<dyn EventSink> = Arc::new(VecSink::default());
+        let input = PendingInput {
+            command_id: "idle-compact:9999999999999:test".into(),
+            command: "compact".into(),
+            text: "/compact Keep exact errors and the last instruction verbatim.".into(),
+            ..Default::default()
+        };
+        assert_eq!(run(&mut process, 1, &[input], &sink).await.reason, Some(TurnEndReason::Completed));
+        assert_eq!(process.pgid, pgid, "compaction must use the existing CLI, not a quiet trim restart");
+        let received = std::fs::read_to_string(dir.path().join("compact-inputs.jsonl")).unwrap();
+        let wire: Value = serde_json::from_str(received.lines().next().unwrap()).unwrap();
+        assert_eq!(wire["message"]["content"], "/compact Keep exact errors and the last instruction verbatim.");
+        process.close().await;
     }
 
     #[tokio::test]

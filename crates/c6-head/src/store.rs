@@ -2091,6 +2091,36 @@ impl Store {
         insert_command(&mut conn, c, false).await
     }
 
+    /// A handover needs an unmixed turn in the source session. Retry an
+    /// existing deterministic command without writing a second input.
+    pub(crate) async fn enqueue_task_handover(&self, c: &NewCommand<'_>, offered_for: &str) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let existing: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM commands WHERE id = ? AND session_id = ?)")
+            .bind(c.id)
+            .bind(c.session_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if existing {
+            return Ok(true);
+        }
+        let ready: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1 AND worker_id = ?2 AND status = 'idle' AND archived = 0) \
+            AND EXISTS(SELECT 1 FROM task_shifts WHERE session_id = ?1 AND command_id = ?3 AND offered = 1) \
+            AND NOT EXISTS(SELECT 1 FROM commands WHERE session_id = ?1 AND state IN ('pending', 'held')) \
+            AND NOT EXISTS(SELECT 1 FROM session_moves WHERE session_id = ?1 AND state NOT IN ('done', 'failed'))",
+        )
+        .bind(c.session_id)
+        .bind(c.worker_id.to_string())
+        .bind(offered_for)
+        .fetch_one(&mut *tx)
+        .await?;
+        if ready {
+            insert_command(&mut tx, c, false).await?;
+        }
+        tx.commit().await?;
+        Ok(ready)
+    }
+
     pub(crate) async fn enqueue_placement_command(&self, c: &NewCommand<'_>) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let idle: bool = sqlx::query_scalar(

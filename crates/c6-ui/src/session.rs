@@ -1412,7 +1412,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                         let start = row.map(|s| (s.subagent_connection_id, s.subagent_model, s.subagent_effort)).unwrap_or_default();
                         let subagents = SubagentChoice::follow(events, start, choice.current);
                         view! {
-                            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) archived error model=choice files subagents no_claude_code ask recovery=feed.composer header_model=model_disclosure />
+                            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) archived error model=choice files subagents no_claude_code ask recovery=feed.composer header_model=model_disclosure shift_events=events />
                         }.into_any()
                     }
                 }
@@ -5900,6 +5900,8 @@ fn render_event(
             crate::tasks::ended_line(task_id, kind, description, state, *exit_code, *elapsed_ms).unwrap_or_else(|| ().into_any())
         }
         EventKind::User { text, command, task_notice: notice, .. } if command == "task-notification" => task_notice(text, notice.as_deref()),
+        EventKind::User { command_id, .. } if command_id.starts_with("idle-compact:") => notice_line("Compacting while idle", "", "low"),
+        EventKind::User { command_id, .. } if command_id.starts_with("task-handover:") => notice_line("Preparing a handover note", "", "low"),
         EventKind::User { text, command, .. } if command == "stop-hook" => view! {
             <p class="flex items-start gap-2 text-xs text-amber-700 dark:text-amber-400"><span>{crate::icons::rotate()}</span><span class="whitespace-pre-wrap">{text.clone()}</span></p>
         }
@@ -7034,6 +7036,96 @@ fn download(url: &str) {
 }
 
 #[component]
+fn TaskShiftCard(
+    session: String,
+    offer: c6_api::TaskShiftOffer,
+    running: Signal<bool>,
+    refresh: RwSignal<u64>,
+    start_fresh: Callback<(String, c6_api::TaskShiftHandover, RwSignal<bool>)>,
+) -> impl IntoView {
+    let session = StoredValue::new(session);
+    let command_id = StoredValue::new(offer.command_id);
+    let busy = RwSignal::new(false);
+    let hidden = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let draft = RwSignal::new(None::<c6_api::TaskShiftHandover>);
+    let yes = move |_| {
+        if busy.get_untracked() || running.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        let (session, id) = (session.get_value(), command_id.get_value());
+        spawn_local(async move {
+            match api::task_shift_handover(session, id).await {
+                Ok(handover) => {
+                    draft.try_set(Some(handover));
+                }
+                Err(e) => {
+                    error.try_set(Some(e));
+                }
+            }
+            busy.try_set(false);
+        });
+    };
+    let keep = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        let (session, id) = (session.get_value(), command_id.get_value());
+        spawn_local(async move {
+            match api::task_shift_choice(session, id, false).await {
+                Ok(()) => {
+                    hidden.try_set(true);
+                    refresh.try_update(|n| *n += 1);
+                }
+                Err(e) => {
+                    error.try_set(Some(e));
+                }
+            }
+            busy.try_set(false);
+        });
+    };
+    let has_draft = Memo::new(move |_| draft.with(Option::is_some));
+    view! {
+        <Show when=move || !hidden.get()>
+            <aside class="space-y-2 rounded-md border border-zinc-200 px-3 py-2 text-xs dark:border-zinc-800" aria-label="Fresh start suggestion">
+                <Show when=move || has_draft.get() fallback=move || view! {
+                    <p class="text-muted">"This looks like a new task. Start fresh with a handover note?"</p>
+                    <div class="flex gap-2">
+                        <button type="button" class=BUTTON disabled=move || busy.get() || running.get() title="The old session writes the note when idle" on:click=yes>"Yes"</button>
+                        <button type="button" class=BUTTON disabled=move || busy.get() on:click=keep>"Keep context"</button>
+                    </div>
+                    {move || busy.get().then(|| view! { <p role="status" class="text-muted">"Asking the old model for a handover…"</p> })}
+                }>
+                    <label class="block">
+                        <span class="text-muted">"Edit the first message for the new session. The old session stays as it is."</span>
+                        <textarea class="mt-1 block w-full rounded border border-zinc-300 bg-transparent p-2 dark:border-zinc-700" rows="6"
+                            prop:value=move || draft.with(|d| d.as_ref().map(|d| d.prompt.clone()).unwrap_or_default())
+                            disabled=move || busy.get()
+                            on:input=move |ev| draft.update(|d| { if let Some(d) = d { d.prompt = event_target_value(&ev); } }) />
+                    </label>
+                    <div class="flex gap-2">
+                        <button type="button" class=BUTTON disabled=move || busy.get() || draft.with(|d| d.as_ref().is_none_or(|d| d.prompt.trim().is_empty()))
+                            on:click=move |_| {
+                                if busy.get_untracked() { return; }
+                                if let Some(d) = draft.get_untracked().filter(|d| !d.prompt.trim().is_empty()) {
+                                    busy.set(true);
+                                    start_fresh.run((command_id.get_value(), d, busy));
+                                }
+                            }>"Start fresh"</button>
+                        <button type="button" class=BUTTON disabled=move || busy.get() on:click=keep>"Keep context"</button>
+                    </div>
+                </Show>
+                {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            </aside>
+        </Show>
+    }
+}
+
+#[component]
 fn Composer(
     id: String,
     running: Signal<bool>,
@@ -7066,6 +7158,9 @@ fn Composer(
     /// mail, chat and calendar (docs/ask.md §4).
     #[prop(optional)]
     ask: bool,
+    /// The main transcript's user/rewind events refresh its fresh-start offer.
+    #[prop(optional)]
+    shift_events: Option<RwSignal<Vec<Event>>>,
 ) -> impl IntoView {
     let archived = archived.unwrap_or_else(|| Signal::derive(|| false));
     let disabled = Signal::derive(move || disabled.get() || archived.get());
@@ -7206,6 +7301,94 @@ fn Composer(
     let update_mention = move || completion.update.run(());
     let add_files = move |ev: web_sys::Event| add_attachments(ev, attachments, error);
     let (col, ws) = (crate::workspace::use_column(), crate::workspace::use_workspace());
+    // /clear and an accepted handover start the same place/work with the
+    // composer's chosen model. Only the handover supplies a first message.
+    let start_fresh = move |handover: Option<(String, c6_api::TaskShiftHandover)>, pending: Option<RwSignal<bool>>| {
+        let Some(m) = model else { return };
+        let session_id = id.get_value();
+        let (connection_id, model, effort) = (m.connection.get_untracked(), m.model.get_untracked(), m.effort.get_untracked());
+        spawn_local(async move {
+            let result = async {
+                let d = api::session(session_id.clone()).await?;
+                // The requested cwd may be the repository root while Started
+                // resolved a worktree. Reuse the actual latest placement.
+                let cwd = api::placements(session_id.clone())
+                    .await?
+                    .last()
+                    .map(|place| place.cwd.clone())
+                    .filter(|cwd| !cwd.is_empty())
+                    .unwrap_or(d.session.cwd.clone());
+                let work = api::work_of(format!("session:{}", d.session.id)).await.ok().and_then(|w| w.first().map(|w| w.id.clone()));
+                let (command_id, prompt, attachments) = if let Some((command_id, handover)) = handover {
+                    if api::task_shift_offer(session_id.clone()).await?.is_none_or(|offer| offer.command_id != command_id) {
+                        return Err("That fresh-start offer is no longer current.".to_owned());
+                    }
+                    (Some(command_id), Some(handover.prompt), handover.attachments)
+                } else {
+                    (None, None, Vec::new())
+                };
+                let s = api::create_session(c6_api::CreateSession {
+                    work,
+                    work_refs: Vec::new(),
+                    todo: None,
+                    todos: Vec::new(),
+                    labels: d.session.labels,
+                    worker_id: d.session.worker_id,
+                    cwd,
+                    ssh: d.session.ssh,
+                    connection_id,
+                    model,
+                    title: None,
+                    prompt,
+                    attachments,
+                    effort: Some(effort).filter(|e| !e.is_empty()),
+                    worktree: false,
+                    worktree_options: None,
+                    realm: Some(d.session.realm),
+                })
+                .await?;
+                if let Some(command_id) = command_id {
+                    let _ = api::task_shift_choice(session_id, command_id, true).await;
+                }
+                Ok::<_, String>(s.id)
+            }
+            .await;
+            if let Some(pending) = pending {
+                pending.try_set(false);
+            }
+            match result {
+                Ok(id) => match col {
+                    Some(c) => c.replace(crate::workspace::View::session(id)),
+                    None => ws.open(None, crate::workspace::View::session(id), crate::workspace::How::Beside),
+                },
+                Err(e) => {
+                    error.try_set(Some(e));
+                }
+            }
+        });
+    };
+    let shift_refresh = RwSignal::new(0u64);
+    let shift_anchor = Memo::new(move |_| {
+        shift_events.and_then(|events| {
+            events.with(|evs| {
+                evs.iter()
+                    .rev()
+                    .find(|e| match &e.kind {
+                        EventKind::User { command_id, .. } => {
+                            !command_id.starts_with("task-handover:") && !command_id.starts_with("idle-compact:")
+                        }
+                        EventKind::Rewound { .. } => true,
+                        _ => false,
+                    })
+                    .map(|e| e.seq)
+            })
+        })
+    });
+    let shift_offer = LocalResource::new(move || {
+        shift_anchor.track();
+        shift_refresh.track();
+        async move { if shift_events.is_some() && !ask { api::task_shift_offer(id.get_value()).await.ok().flatten() } else { None } }
+    });
     // `now`: Send now (the agent gets it at once, not at its next step).
     let send_with = move |now: bool| {
         let t = text.get_untracked();
@@ -7287,48 +7470,12 @@ fn Composer(
                 return;
             }
             "/clear" if !inline && !custom("clear") => {
-                let Some(m) = model else { return };
+                if model.is_none() {
+                    return;
+                }
                 text.set(String::new());
                 command.set(None);
-                spawn_local(async move {
-                    // The fresh session is where this one is (worker, folder,
-                    // SSH target), with its labels.
-                    let d = match api::session(id.get_value()).await {
-                        Ok(d) => d,
-                        Err(e) => {
-                            error.set(Some(e));
-                            return;
-                        }
-                    };
-                    // It carries on this one's work (docs/work.md §4).
-                    let work = api::work_of(format!("session:{}", d.session.id)).await.ok().and_then(|w| w.first().map(|w| w.id.clone()));
-                    let req = c6_api::CreateSession {
-                        work,
-                        work_refs: Vec::new(),
-                        todo: None,
-                        todos: Vec::new(),
-                        labels: d.session.labels,
-                        worker_id: d.session.worker_id,
-                        cwd: d.session.cwd,
-                        ssh: d.session.ssh,
-                        connection_id: m.connection.get_untracked(),
-                        model: m.model.get_untracked(),
-                        title: None,
-                        prompt: None,
-                        attachments: Vec::new(),
-                        effort: Some(m.effort.get_untracked()).filter(|e| !e.is_empty()),
-                        worktree: false,
-                        worktree_options: None,
-                        realm: None,
-                    };
-                    match api::create_session(req).await {
-                        Ok(s) => match col {
-                            Some(c) => c.replace(crate::workspace::View::session(s.id)),
-                            None => ws.open(None, crate::workspace::View::session(s.id), crate::workspace::How::Beside),
-                        },
-                        Err(e) => error.set(Some(e)),
-                    }
-                });
+                start_fresh(None, None);
                 return;
             }
             _ => {}
@@ -7370,6 +7517,7 @@ fn Composer(
                 }
             } else {
                 error.set(None);
+                shift_refresh.try_update(|n| *n += 1);
             }
         });
     };
@@ -7455,6 +7603,12 @@ fn Composer(
                 {(!inline).then(|| view! { <crate::goal::GoalStrip session=id.get_value() /> })}
                 {(!inline).then(|| view! { <crate::capture::UpNext session=id.get_value() running=running /> })}
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+                <For each=move || shift_offer.get().flatten().into_iter().filter(|_| !disabled.get()).collect::<Vec<_>>()
+                    key=|offer| offer.command_id.clone() let:offer>
+                    <TaskShiftCard session=id.get_value() offer running refresh=shift_refresh start_fresh=Callback::new(move |(command_id, draft, pending)| {
+                        start_fresh(Some((command_id, draft)), Some(pending));
+                    }) />
+                </For>
                 <Show when=move || archived.get()>
                     <p class="text-xs text-muted" role="status">"This session is archived. Unarchive it to send messages."</p>
                 </Show>

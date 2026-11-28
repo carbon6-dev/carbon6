@@ -1589,6 +1589,27 @@ pub fn decisions(state: String) -> LocalBoxFuture<'static, Result<Vec<c6_api::De
     get_json(format!("/api/v1/decisions?state={state}"))
 }
 
+/// Whether the selected realm has the task-shift prerequisites configured.
+pub async fn task_shift_status() -> Result<c6_api::TaskShiftStatus, String> {
+    get_json(format!("/api/v1/settings/task-shift/status{}", in_realm('?'))).await
+}
+
+/// The current fresh-start offer, if any.
+pub async fn task_shift_offer(id: String) -> Result<Option<c6_api::TaskShiftOffer>, String> {
+    get_json(format!("/api/v1/sessions/{id}/task-shift")).await
+}
+
+pub async fn task_shift_choice(id: String, command_id: String, fresh: bool) -> Result<(), String> {
+    let req = Request::post(&format!("/api/v1/sessions/{id}/task-shift"))
+        .json(&c6_api::TaskShiftChoice { command_id, fresh })
+        .map_err(|e| e.to_string())?;
+    empty(req.send().await).await
+}
+
+pub async fn task_shift_handover(id: String, command_id: String) -> Result<c6_api::TaskShiftHandover, String> {
+    json(Request::post(&format!("/api/v1/sessions/{id}/task-shift/{command_id}/handover")).send().await).await
+}
+
 /// What you'd likely type next in a session (docs/suggestions.md); None when there's none.
 pub async fn session_suggestion(id: String) -> Result<Option<c6_api::Suggestion>, String> {
     let resp = check(Request::get(&format!("/api/v1/sessions/{id}/suggestion")).send().await).await?;

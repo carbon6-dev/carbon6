@@ -1497,6 +1497,7 @@ impl SessionManager {
                     hops: input.hops,
                     api_origin: input.api_origin,
                     human_origin: input.human_origin,
+                    trim_context: input.trim_context,
                     send_now: input.send_now,
                     prompt: input.prompt,
                     ..Default::default()
@@ -3684,6 +3685,7 @@ struct CacheWarmKey {
     connection_id: String,
     model: String,
     settings: c6_api::KeepWarmSettings,
+    idle_compact: bool,
 }
 
 fn cache_warm_timer(
@@ -3732,7 +3734,10 @@ fn cache_warm_timer(
             .or_else(|| ratio.map(|read_to_rewrite_ratio| CacheEconomics { read_to_rewrite_ratio, cache_observed: observed }));
         // Usage can be published long after a request began (especially by
         // Claude Code). Never count generation time as fresh cache lifetime.
-        let last_call_ms = if usage.keep_warm || kind == "claude_code" {
+        let last_call_ms = if usage.keep_warm || kind == "claude_code" || key.idle_compact {
+            // Idle compaction does not need a provider-ready ping snapshot,
+            // and works when keep-warm capture is disabled. The event-derived
+            // request boundary is conservative (never after the actual call).
             observation.last_call_started_ms
         } else {
             writer.journal.keep_warm_call_ms(&writer.session_id).await?
@@ -3756,8 +3761,16 @@ fn cache_warm_timer(
             projected_remaining_seconds: None,
             economics,
         };
-        let Some(due_ms) = crate::keep_warm::schedule(&key.settings, &input) else { return Ok(CacheWarmAction::Ineligible) };
-        gate.keep_warm_next_ms.store(due_ms.min(i64::MAX as u64) as i64, Ordering::Relaxed);
+        let due = if key.idle_compact {
+            crate::keep_warm::idle_compact_due(&key.settings, WaitingOn::User, input.context_tokens, ttl, last_call_ms, input.now_ms)
+        } else {
+            crate::keep_warm::schedule(&key.settings, &input)
+        };
+        let Some(due_ms) = due else { return Ok(CacheWarmAction::Ineligible) };
+        // Do not advertise idle compaction as a keep-warm request.
+        if !key.idle_compact {
+            gate.keep_warm_next_ms.store(due_ms.min(i64::MAX as u64) as i64, Ordering::Relaxed);
+        }
         let delay = due_ms.saturating_sub(writer.now_ms().max(0) as u64);
         tokio::time::sleep(Duration::from_millis(delay)).await;
         Ok(CacheWarmAction::Due { expires_ms: last_call_ms.saturating_add(ttl.unwrap_or(0).saturating_mul(1_000)) })
@@ -3770,6 +3783,46 @@ struct PendingTaskEvent {
     output: String,
     wake: bool,
     logged: bool,
+}
+
+fn is_idle_compact(input: &PendingInput) -> bool {
+    input.is_compact() && input.command_id.starts_with("idle-compact:")
+}
+
+fn idle_compact_expired(input: &PendingInput, now_ms: i64) -> bool {
+    is_idle_compact(input)
+        && input.command_id.split(':').nth(1).and_then(|ms| ms.parse::<i64>().ok()).is_none_or(|expires| now_ms >= expires)
+}
+
+/// Uses the most recent *request* clock, including successful keep-warm,
+/// rather than the delayed usage receipt or the end of generation.
+async fn forced_cold_resume(spec: &CreateSession, writer: &Writer) -> bool {
+    let observation = writer.cache_observation.lock().unwrap().clone();
+    let Some(model) = spec.model.as_ref() else { return false };
+    let Some((call_ms, usage)) = observation.usage else { return false };
+    let Some(started_ms) = observation.last_call_started_ms else { return false };
+    let connection = if usage.resolved_connection_id.is_empty() { &model.connection_id } else { &usage.resolved_connection_id };
+    let learned = writer
+        .link
+        .call(
+            "session.cache_lifetime",
+            serde_json::json!({
+                "session_id": writer.session_id, "connection_id": connection, "model": usage.model,
+            }),
+        )
+        .await
+        .ok();
+    let ttl = learned.as_ref().and_then(|v| v["lifetime_seconds"].as_u64()).or(match model.connection_kind.as_str() {
+        "claude_code" => Some(3_600),
+        "anthropic" => Some(300),
+        "openai" | "chatgpt" => Some(600),
+        _ => None,
+    });
+    cold_resume_due(started_ms.min(call_ms), writer.now_ms(), ttl)
+}
+
+fn cold_resume_due(last_call_ms: i64, now_ms: i64, lifetime_seconds: Option<u64>) -> bool {
+    lifetime_seconds.filter(|ttl| *ttl > 0).is_some_and(|ttl| now_ms.saturating_sub(last_call_ms).max(0) as u64 > ttl.saturating_mul(1_000))
 }
 
 struct CancelShellContexts(Arc<SessionTools>);
@@ -3823,7 +3876,7 @@ impl Actor {
             .and_then(|json| serde_json::from_str::<c6_api::KeepWarmSettings>(json).ok())
             .unwrap_or_default();
         let model = self.spec.model.as_ref()?;
-        if !settings.enabled || settings.disabled_connections.contains(&model.connection_id) {
+        if settings.disabled_connections.contains(&model.connection_id) {
             return None;
         }
         let waiting = crate::keep_warm::waiting_on(
@@ -3831,7 +3884,10 @@ impl Actor {
             self.claude.as_ref().is_some_and(|process| process.tasks_running()),
             self.running_flag.load(Ordering::Acquire),
         );
-        if waiting != crate::keep_warm::WaitingOn::Background {
+        let idle_compact = waiting == crate::keep_warm::WaitingOn::User && settings.idle_compact_enabled;
+        if (!idle_compact && (!settings.enabled || waiting != crate::keep_warm::WaitingOn::Background))
+            || (idle_compact && self.claude.as_ref().is_some_and(|process| !process.trim_quiet()))
+        {
             return None;
         }
         let observation = self.writer.cache_observation.lock().unwrap().clone();
@@ -3851,8 +3907,14 @@ impl Actor {
         if settings.disabled_connections.contains(&connection_id) {
             return None;
         }
-        let key =
-            CacheWarmKey { call_ms: *call_ms, wait_ms: observation.wait_started_ms?, connection_id, model: usage.model.clone(), settings };
+        let key = CacheWarmKey {
+            call_ms: *call_ms,
+            wait_ms: observation.wait_started_ms?,
+            connection_id,
+            model: usage.model.clone(),
+            settings,
+            idle_compact,
+        };
         Some((key, model.connection_kind.clone(), observation))
     }
 
@@ -4369,6 +4431,8 @@ impl Actor {
             let candidate = if rewind_blocked
                 || adoption_blocked
                 || running.is_some()
+                || retry_at.is_some()
+                || wake_at.is_some()
                 || !self.inbox.lock().unwrap().queue.is_empty()
                 || !self.link.is_connected()
             {
@@ -4998,6 +5062,27 @@ impl Actor {
                             // crashes before a reply. Ambiguous in-flight calls
                             // are never sent a second time after adoption.
                             let Some(key) = cache_warm_key.as_ref() else { continue };
+                            if key.idle_compact {
+                                // A real input or native task that arrived alongside the timer
+                                // wins above. This uses the existing /compact dispatch and
+                                // rewind machinery; it is not a new user instruction.
+                                let focus = spec_prompt(&self.spec, "session.idle_compact", c6_agent::IDLE_COMPACT_PROMPT);
+                                if let Err(e) = self.writer.append(session_event::Kind::Notice(c6_proto::Notice {
+                                    title: "Idle compaction attempted".into(), message: key.call_ms.to_string(),
+                                    priority: "low".into(), quiet: true,
+                                })).await {
+                                    error!(session = %self.writer.session_id, "claiming idle compaction: {e:#}");
+                                    return;
+                                }
+                                self.inbox.lock().unwrap().push(PendingInput {
+                                    command_id: format!("idle-compact:{expires_ms}:{}", uuid::Uuid::now_v7()),
+                                    command: "compact".into(),
+                                    text: format!("/compact {focus}"),
+                                    ..Default::default()
+                                }, None);
+                                cache_warm_key = None;
+                                continue;
+                            }
                             if let Err(e) = self.writer.append(session_event::Kind::Notice(c6_proto::Notice {
                                 title: "Cache maintenance attempted".into(), message: key.call_ms.to_string(),
                                 priority: "low".into(), quiet: true,
@@ -7133,6 +7218,7 @@ impl Actor {
         writer.ephemeral(ephemeral_event::Kind::Activity(SessionActivity { running: true, ..Default::default() }));
 
         let claude_code = self.runs_claude_code();
+        let idle_compact = self.inbox.lock().unwrap().queue.front().is_some_and(|(input, _)| is_idle_compact(input));
         let spec_for_claude = claude_code.then(|| self.spec.clone());
         let log = self.journal.clone();
         let checkpoints = self.checkpoints.clone();
@@ -7280,7 +7366,9 @@ impl Actor {
                     let events = log.events_after(&writer.session_id, 0, u32::MAX).await?;
                     let spec = spec_for_claude.as_ref().expect("a Claude Code turn");
                     let conversation = journal_claude_conversation(&log, &writer.session_id, spec, &events).await?;
-                    Ok::<_, anyhow::Error>((conversation, ClaudeTrim::from_events(spec, &events)))
+                    // An idle summary must read the warm prefix unchanged. A
+                    // trim/restart immediately beforehand would pay a rewrite.
+                    Ok::<_, anyhow::Error>((conversation, (!idle_compact).then(|| ClaudeTrim::from_events(spec, &events)).flatten()))
                 }
                 .await
                 {
@@ -7305,12 +7393,15 @@ impl Actor {
                     native: claude_native,
                 };
                 let process = claude.take();
+                let task_shift_trim = inbox.lock().unwrap().queue.iter().any(|(input, _)| input.trim_context);
+                let cold_resume = !idle_compact && process.is_none() && forced_cold_resume(&trim_spec, &writer).await;
                 let result = claude_turn(
                     &writer.session_id,
                     turn,
                     process,
                     &conversation,
                     trim,
+                    cold_resume || task_shift_trim,
                     launch,
                     &session_tools.cwd(),
                     &cfg.model,
@@ -7547,6 +7638,7 @@ async fn claude_turn(
     mut process: Option<crate::claude_code::Process>,
     conversation: &crate::claude_code::ClaudeConversation,
     trim: Option<ClaudeTrim>,
+    cold_resume: bool,
     launch: crate::claude_code::Launch,
     cwd: &Path,
     model: &str,
@@ -7561,6 +7653,17 @@ async fn claude_turn(
 ) -> anyhow::Result<Option<crate::claude_code::Process>> {
     use crate::claude_code::Process;
     let journal = observer.journal.clone();
+    let idle_input = inbox.lock().unwrap().queue.front().map(|(input, _)| input.clone()).filter(is_idle_compact);
+    if let Some(input) = idle_input.as_ref()
+        && (idle_compact_expired(input, c6_core::now_ms()) || process.as_ref().is_some_and(|p| !p.trim_quiet()))
+    {
+        // Do not interrupt native tasks even if one began after the timer.
+        let inputs = inbox.lock().unwrap().drain();
+        for input in inputs {
+            sink.append(input.event()).await?;
+        }
+        return Ok(process);
+    }
     let retirement = async |error: anyhow::Error| -> anyhow::Result<()> {
         if !error.is::<crate::claude_code::ReplacementBlocked>() {
             return Err(error);
@@ -7603,6 +7706,25 @@ async fn claude_turn(
         }
         if worth_trimming && let Some((path, trim)) = trim_path.as_ref().zip(trim.as_ref()) {
             trim.apply(path, sink).await?;
+        }
+    }
+    if cold_resume
+        && process.is_none()
+        && conversation.resume
+        && let Some(trim) = trim.as_ref()
+    {
+        // The idle process may have been retired hours ago. This was missing
+        // from the held-process trim path: reshape its transcript before the
+        // first resume input, but only after proving *all* native groups absent.
+        if journal.claude_processes(session).await?.is_empty()
+            && crate::claude_code::confirm_held_stopped(&claude_dir.join("held"), session).is_ok()
+            && let Some(path) = crate::claude_code::transcript_path(cwd, &conversation.id)
+        {
+            admission = crate::claude_code::replacement_admission(&journal, session, cancel).await?;
+            if admission.is_none() {
+                return Ok(None);
+            }
+            trim.apply(&path, sink).await?;
         }
     }
     let inputs = inbox.lock().unwrap().drain();
@@ -7654,6 +7776,12 @@ async fn claude_turn(
     }
     // A new conversation gets the preamble first (also when a resume finds
     // none: the first turn may have failed before Claude Code saved it).
+    if idle_input.as_ref().is_some_and(|input| idle_compact_expired(input, c6_core::now_ms())) {
+        for input in inputs {
+            sink.append(input.event()).await?;
+        }
+        return Ok(Some(p));
+    }
     let preamble = (p.needs_preamble() || (promoted && !conversation.resume)).then_some(conversation.preamble.as_deref()).flatten();
     let mut end = p.turn_admitted(turn, inputs.clone(), false, preamble, model, sink, &feed, &more, cancel, admission).await?;
     if end.no_conversation && journal.ownership(session).await?.0 != 0 {
@@ -7714,6 +7842,16 @@ async fn claude_turn(
             sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
         }
     }
+    if idle_input.is_some() && end.reason == Some(TurnEndReason::Completed) {
+        sink.append(session_event::Kind::Notice(c6_proto::Notice {
+            title: "Compacted while idle".into(),
+            message: "Claude Code compacted its context (token sizes not reported). Rewind is available before this maintenance turn."
+                .into(),
+            priority: "low".into(),
+            quiet: true,
+        }))
+        .await?;
+    }
     if end.alive {
         // A wait on carbon6-held shells or subagents starts now, not with
         // the next input. They survive this CLI's restart; its native tasks
@@ -7742,6 +7880,9 @@ async fn run_session_turn(
     sub: crate::subagent::Parent,
 ) -> anyhow::Result<()> {
     let first = inbox.lock().unwrap().drain();
+    let idle_compact = first.first().is_some_and(is_idle_compact);
+    let idle_input = first.first().filter(|input| is_idle_compact(input)).cloned();
+    let expired = first.first().is_some_and(|input| idle_compact_expired(input, writer.now_ms()));
     let compact = first.first().filter(|i| i.is_compact()).map(|i| i.text.trim_start_matches("/compact").trim().to_owned());
     let mut blocks = Vec::new();
     for input in first {
@@ -7749,6 +7890,9 @@ async fn run_session_turn(
         if !input.is_compact() {
             blocks.extend(input.blocks());
         }
+    }
+    if expired {
+        return Ok(());
     }
     match conv.history.last_mut() {
         Some(m) if m.role == Role::User => m.blocks.extend(blocks),
@@ -7778,7 +7922,14 @@ async fn run_session_turn(
             }
         };
     if let Some(focus) = compact {
-        c6_agent::compact_turn(turn, cfg, client.as_ref(), tools, sink, conv, &focus, cancel).await?;
+        if idle_compact {
+            if idle_input.as_ref().is_some_and(|input| idle_compact_expired(input, writer.now_ms())) {
+                return Ok(());
+            }
+            c6_agent::idle_compact_turn(turn, cfg, client.as_ref(), tools, sink, conv, &focus, cancel).await?;
+        } else {
+            c6_agent::compact_turn(turn, cfg, client.as_ref(), tools, sink, conv, &focus, cancel).await?;
+        }
         return Ok(());
     }
     let mut pending = || inbox.lock().unwrap().drain();
@@ -8531,12 +8682,17 @@ impl CacheObservation {
                 self.call_boundary_ms = Some(event.ts_ms);
                 self.call_started_ms = None;
             }
-            Some(session_event::Kind::Notice(notice)) if notice.quiet && notice.title == "Cache maintenance attempted" => {
+            Some(session_event::Kind::Notice(notice))
+                if notice.quiet && matches!(notice.title.as_str(), "Cache maintenance attempted" | "Idle compaction attempted") =>
+            {
                 self.last_attempt_call_ms = notice.message.parse().ok();
                 self.last_attempt_at_ms = Some(event.ts_ms);
             }
             Some(session_event::Kind::Notice(notice)) if notice.quiet && notice.title == "Cache maintenance failed" => {
                 self.wait_started_ms = None;
+            }
+            Some(session_event::Kind::Notice(notice)) if notice.quiet && notice.title == "Compacted while idle" => {
+                *self = Self::default();
             }
             Some(
                 session_event::Kind::ModelSwitched(_)
@@ -8996,6 +9152,25 @@ const SUBAGENT_TRIM_AT: u64 = 200_000;
 #[cfg(test)]
 mod claude_trim_tests {
     use super::*;
+
+    #[test]
+    fn cold_resume_counts_from_the_latest_request_including_keep_warm() {
+        assert!(!cold_resume_due(1_000, 3_601_000, Some(3_600)), "expiry is a strict gap");
+        assert!(cold_resume_due(1_000, 3_601_001, Some(3_600)));
+        assert!(!cold_resume_due(3_301_000, 3_601_001, Some(3_600)), "a successful keep-warm refreshes the clock");
+        assert!(!cold_resume_due(1_000, 9_000_000, None), "an unknown lifetime isn't expiry evidence");
+        assert!(!cold_resume_due(5_000, 1_000, Some(3_600)), "clock rollback cannot force a trim");
+    }
+
+    #[test]
+    fn idle_compaction_dispatch_rechecks_wall_expiry() {
+        let input = PendingInput { command_id: "idle-compact:123000:test".into(), command: "compact".into(), ..Default::default() };
+        assert!(is_idle_compact(&input));
+        assert!(!idle_compact_expired(&input, 122_999));
+        assert!(idle_compact_expired(&input, 123_000));
+        let malformed = PendingInput { command_id: "idle-compact:invalid".into(), ..input };
+        assert!(idle_compact_expired(&malformed, 0), "fail closed on malformed internal input");
+    }
 
     fn call(tokens: u64, window: u64) -> SessionEvent {
         SessionEvent {

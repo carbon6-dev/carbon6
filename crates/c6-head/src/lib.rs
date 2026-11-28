@@ -76,6 +76,7 @@ pub mod slack;
 pub mod starts;
 pub mod store;
 pub mod suggestions;
+mod task_shift;
 pub mod telemetry;
 pub mod templates;
 pub mod terminals;

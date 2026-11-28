@@ -54,6 +54,28 @@ pub(crate) fn context_tokens(usage: &Usage) -> u64 {
     usage.input_tokens.saturating_add(usage.cache_read_tokens).saturating_add(usage.cache_write_tokens)
 }
 
+/// The boundary is measured from the request, never the end of generation.
+/// Unknown lifetimes and already cold caches are not maintenance opportunities.
+pub(crate) fn idle_compact_due(
+    settings: &KeepWarmSettings,
+    waiting: WaitingOn,
+    tokens: u64,
+    lifetime_seconds: Option<u64>,
+    last_call_ms: u64,
+    now_ms: u64,
+) -> Option<u64> {
+    if !settings.idle_compact_enabled || waiting != WaitingOn::User || tokens == 0 || tokens < settings.threshold_tokens {
+        return None;
+    }
+    let ttl_ms = lifetime_seconds?.checked_mul(1_000)?;
+    let expires = last_call_ms.checked_add(ttl_ms)?;
+    let margin = (ttl_ms / 5).min(300_000).max(60_000);
+    if ttl_ms <= margin || now_ms >= expires {
+        return None;
+    }
+    Some(last_call_ms.saturating_add(ttl_ms - margin).max(now_ms))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CacheEconomics {
     /// Cache-read price divided by the cost of rewriting the same prefix.
@@ -178,7 +200,26 @@ mod tests {
             margin_seconds: 300,
             cap_seconds: 12 * 60 * 60,
             disabled_connections: vec![],
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn idle_compaction_is_opt_in_and_only_at_a_warm_user_boundary() {
+        let mut policy = settings();
+        let due = |policy: &KeepWarmSettings, waiting, ttl, now| idle_compact_due(policy, waiting, 50_000, ttl, 1_000, now);
+        assert_eq!(due(&policy, WaitingOn::User, Some(3_600), 1_000), None);
+        policy.idle_compact_enabled = true;
+        policy.enabled = false; // Independent of background keep-warm.
+        assert_eq!(due(&policy, WaitingOn::User, Some(3_600), 1_000), Some(3_301_000));
+        assert_eq!(due(&policy, WaitingOn::User, Some(300), 1_000), Some(241_000));
+        assert_eq!(due(&policy, WaitingOn::User, Some(120), 1_000), Some(61_000), "at least a minute of margin");
+        assert_eq!(due(&policy, WaitingOn::User, Some(60), 1_000), None);
+        assert_eq!(due(&policy, WaitingOn::User, None, 1_000), None);
+        assert_eq!(due(&policy, WaitingOn::Background, Some(3_600), 1_000), None);
+        assert_eq!(due(&policy, WaitingOn::Nothing, Some(3_600), 1_000), None);
+        assert_eq!(due(&policy, WaitingOn::User, Some(3_600), 3_601_000), None, "never start after expiry");
+        assert_eq!(idle_compact_due(&policy, WaitingOn::User, 49_999, Some(3_600), 1_000, 1_000), None);
     }
 
     fn input(ttl: u64) -> KeepWarmInput<'static> {

@@ -194,12 +194,15 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/waiting", get(session_waiting))
         .route("/api/v1/sessions/{id}/suggestion", get(session_suggestion))
         .route("/api/v1/sessions/{id}/suggestion/seen", post(suggestion_seen))
+        .route("/api/v1/sessions/{id}/task-shift", get(task_shift_offer).post(task_shift_choice))
+        .route("/api/v1/sessions/{id}/task-shift/{command_id}/handover", post(task_shift_handover))
         .route("/api/v1/sessions/{id}/name/suggestion", get(session_name_suggestion))
         .route("/api/v1/sessions/{id}/catchup", get(session_catchup))
         .route("/api/v1/sessions/{id}/timeline", get(session_timeline))
         .route("/api/v1/sessions/{id}/prompts", get(session_prompts))
         .route("/api/v1/sessions/{id}/view", get(get_session_view).put(put_session_view))
         .route("/api/v1/settings/suggestions", get(get_suggestion_settings).put(put_suggestion_settings))
+        .route("/api/v1/settings/task-shift/status", get(task_shift_status))
         .route("/api/v1/settings/session_grouping", get(get_session_grouping).put(put_session_grouping))
         .route("/api/v1/settings/session_facets", get(get_session_facets).put(put_session_facets))
         .route("/api/v1/settings/transcript", get(get_transcript_settings).put(put_transcript_settings))
@@ -1422,6 +1425,50 @@ async fn session_suggestion(
         Some(s) => Json(s).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
     })
+}
+
+async fn task_shift_offer(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Option<api::TaskShiftOffer>>> {
+    let row = visible_session(&st, &caller, &id).await?;
+    Ok(Json(crate::task_shift::get(&st, &row).await?))
+}
+
+async fn task_shift_status(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(target): Query<api::InRealm>,
+) -> ApiResult<Json<api::TaskShiftStatus>> {
+    let realm = realm_for(&st, &caller, &target).await?;
+    Ok(Json(crate::task_shift::status(&st, &realm).await?))
+}
+
+async fn task_shift_choice(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(choice): Json<api::TaskShiftChoice>,
+) -> ApiResult<StatusCode> {
+    let row = visible_session(&st, &caller, &id).await?;
+    if !caller.human_origin(st.auth.required) {
+        return Err(crate::forbidden("Only the browser can answer a fresh-start offer").into());
+    }
+    crate::task_shift::choose(&st, &row, choice).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn task_shift_handover(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, command_id)): Path<(String, String)>,
+) -> ApiResult<Json<api::TaskShiftHandover>> {
+    let row = visible_session(&st, &caller, &id).await?;
+    if !caller.human_origin(st.auth.required) {
+        return Err(crate::forbidden("Only the browser can request a handover").into());
+    }
+    Ok(Json(crate::task_shift::handover(&st, &row, &command_id).await?))
 }
 
 /// A name for the session to start from (the Rename box's Suggest).

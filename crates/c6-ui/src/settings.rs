@@ -4214,6 +4214,10 @@ fn SecretsSetting() -> impl IntoView {
 #[component]
 fn SubagentLimitsSetting() -> impl IntoView {
     let setting = RwSignal::new(c6_api::SubagentLimits::default());
+    let shift_status = LocalResource::new(move || {
+        let _ = api::realm().get();
+        api::task_shift_status()
+    });
     // Reuse the shared input renderer; parse the draft values only when saving.
     let threshold_tokens = RwSignal::new(setting.with_untracked(|s| s.keep_warm.threshold_tokens.to_string()));
     let margin_seconds = RwSignal::new(setting.with_untracked(|s| s.keep_warm.margin_seconds.to_string()));
@@ -4243,7 +4247,7 @@ fn SubagentLimitsSetting() -> impl IntoView {
             status.set(Some(
                 api::put_setting("subagent-limits", v)
                     .await
-                    .map(|_| "Saved. Running sessions take up the new agent limits and keep-warm settings."),
+                    .map(|_| "Saved. Running sessions take up the new agent limits and context-economy settings."),
             ));
         });
     };
@@ -4291,6 +4295,39 @@ fn SubagentLimitsSetting() -> impl IntoView {
                 }, false)}
                 {connection_field("Disabled connection IDs (comma separated)", disabled_connections, Signal::stored(""), ConnectionInput::default(), false)}
             </div>
+            <div>
+                <h3 class="font-medium">"Context economy at task boundaries"</h3>
+                <p class="text-sm text-muted">
+                    "Cold resumes apply pending tool-output trimming before the first request, using the existing trim threshold and at least 20% savings. Claude Code is never restarted while its native tasks or agents run. Full history remains available to Rewind."
+                </p>
+            </div>
+            <label class="flex items-center gap-2 text-sm">
+                <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || setting.with(|s| s.keep_warm.idle_compact_enabled)
+                    on:change=move |ev| setting.update(|s| s.keep_warm.idle_compact_enabled = event_target_checked(&ev)) />
+                "Compact while idle on me (experimental, off by default)"
+            </label>
+            <p class="text-xs text-muted">
+                "Uses the session's own model before its learned cache lifetime expires, only after a normally completed turn with nothing running. The margin is 20% of the lifetime, capped at 5 minutes and at least 1 minute. Uses the minimum context size above. This has not been measured; enabling it spends a model call. Edit session.idle_compact in Prompts."
+            </p>
+            <label class="flex items-center gap-2 text-sm">
+                <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || setting.with(|s| s.keep_warm.task_shift_enabled)
+                    on:change=move |ev| setting.update(|s| s.keep_warm.task_shift_enabled = event_target_checked(&ev)) />
+                "Detect new tasks and offer a handover (experimental, off by default)"
+            </label>
+            <p class="text-xs text-muted">
+                "Inactive without a Memex embedding model and a task:shift or task:suggest API routing rule. Only borderline matches use that small model. A new task can trim old tool output; only your Yes starts a fresh session. Keep context preserves everything. Edit session.task_shift and session.handover in Prompts."
+            </p>
+            {move || shift_status.get().map(|result| {
+                let text = match result {
+                    Ok(s) if s.embedding_configured && s.routing_configured => "Embedding and routing configured (session-label routing rules still apply).".to_owned(),
+                    Ok(s) => format!("Task detection inactive: {}{}{}.",
+                        if s.embedding_configured { "" } else { "choose a Memex embedding model" },
+                        if !s.embedding_configured && !s.routing_configured { "; " } else { "" },
+                        if s.routing_configured { "" } else { "add a task:shift or task:suggest API routing rule" }),
+                    Err(e) => format!("Task detection configuration could not be checked: {e}"),
+                };
+                view! { <p class="text-xs text-muted" role="status">{text}</p> }
+            })}
             <div>
                 <h3 class="font-medium">"Automatic notice delivery"</h3>
                 <p class="text-sm text-muted">

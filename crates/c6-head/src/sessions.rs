@@ -1433,6 +1433,33 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "", None, false).await
 }
 
+/// A Yes click requests the draft from the original session, with no routing
+/// or model switch. Queue it only at an idle boundary, without @ expansion or
+/// reclassification of the internal prompt.
+pub(crate) async fn queue_task_handover(
+    st: &HeadState,
+    session: &SessionRow,
+    offered_for: &str,
+    id: &str,
+    text: String,
+) -> anyhow::Result<()> {
+    takes_input(session)?;
+    if let Some(why) = crate::usage::blocked(st, &session.all_labels(), &session.realm).await? {
+        return Err(bad_request(format!("handover not sent: {why}")));
+    }
+    let worker_id = session.worker_id.parse()?;
+    let data = input_command(id, &session.id, UserInput { text, labels: session.head_labels(), ..Default::default() });
+    let command = NewCommand { id, session_id: &session.id, worker_id, data, text: Some("Preparing a handover note") };
+    if !st.store.enqueue_task_handover(&command, offered_for).await? {
+        return Err(conflict(
+            "The old session is not idle or the offer has changed. Wait for the current turn before asking for a handover.",
+        ));
+    }
+    publish_queue(st, &session.id).await;
+    st.registry.deliver(worker_id);
+    Ok(())
+}
+
 /// A button sends your message as typed, marked so Watchers do not mistake
 /// the card's title for a correction. A closed proposer need not hear it.
 pub async fn card_answer(st: &HeadState, session_id: &str, text: String) -> anyhow::Result<()> {
@@ -1538,7 +1565,15 @@ async fn send_input_with(
         UserInput { text: text.to_owned(), model, attachments: files, wake, send_now: req.send_now, ..input },
     )
     .await?;
-    let input = UserInput { prompt: mentioned(st, &session, text).await, ..input };
+    let mut input = UserInput { prompt: mentioned(st, &session, text).await, ..input };
+    let shift = match crate::task_shift::classify(st, &session, &input).await {
+        Ok(shift) => shift,
+        Err(e) => {
+            debug!(%session_id, "task shift unavailable: {e:#}");
+            None
+        }
+    };
+    input.trim_context = matches!(shift, Some(crate::task_shift::Shift::New | crate::task_shift::Shift::Unrelated));
     // Send now to a connected worker that doesn't know it (an older one):
     // as before, the turn stops and this starts the next.
     if req.send_now && !sends_now(st, worker_id) {
@@ -1546,6 +1581,11 @@ async fn send_input_with(
     }
     let data = input_command(&id, session_id, input);
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&shown) }).await?;
+    if let Some(shift) = shift
+        && let Err(e) = crate::task_shift::record(st, &session, &id, shift).await
+    {
+        warn!(%session_id, "saving task shift: {e:#}");
+    }
     publish_queue(st, session_id).await;
     st.registry.deliver(worker_id);
     Ok(api::QueuedInput { command_id: id, text: shown, created_at: now_ms(), rejected: None, with_agent: false })
@@ -1638,6 +1678,7 @@ pub async fn edit_queued(
         input.api_origin = caller.api_origin();
         input.human_origin = caller.human_origin(st.auth.required);
         input.task_card_origin = 0;
+        input.trim_context = false; // This text was not the one classified.
         input.attachments.retain(|a| !a.name.starts_with("@memex:"));
         input.command.clear();
         input.command_candidates_json.clear();
@@ -1679,6 +1720,7 @@ pub async fn edit_queued(
     if !st.store.update_pending_command(command_id, &input_command(command_id, session_id, new_input), Some(&shown)).await? {
         return Err(conflict("that message is on its way to the agent now; wait for its turn"));
     }
+    crate::task_shift::invalidate(st, session_id, command_id).await;
     publish_queue(st, session_id).await;
     st.registry.deliver(worker_id);
     Ok(api::QueuedInput { command_id: command_id.to_owned(), text: shown, created_at, rejected: None, with_agent: false })
@@ -1719,6 +1761,7 @@ pub async fn cancel_queued(st: &HeadState, session_id: &str, command_id: &str) -
     if !st.store.cancel_pending_command(command_id).await? {
         return Err(conflict("that message is on its way to the agent now; wait for its turn"));
     }
+    crate::task_shift::invalidate(st, session_id, command_id).await;
     publish_queue(st, session_id).await;
     Ok(())
 }
@@ -1766,6 +1809,7 @@ pub async fn take_back_message(st: &HeadState, session_id: &str, command_id: &st
     if !st.store.take_back_pending_input(session_id, command_id).await? {
         return Err(conflict(TAKEN));
     }
+    crate::task_shift::invalidate(st, session_id, command_id).await;
     publish_queue(st, session_id).await;
     Ok(())
 }
@@ -1812,6 +1856,7 @@ pub async fn pull_queued(st: &HeadState, session_id: &str, command_id: &str) -> 
         if !st.store.cancel_pending_command(&row.id).await? {
             return Err(conflict("that message is on its way to the agent now; wait for its turn"));
         }
+        crate::task_shift::invalidate(st, session_id, &row.id).await;
     }
     publish_queue(st, session_id).await;
     Ok(rows
@@ -2734,6 +2779,7 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                     crate::projects::ROUTE_LABEL,
                     "task:transcribe",
                     "task:tidy",
+                    "task:shift",
                 ]
                 .contains(&l.as_str())
             });
@@ -2742,7 +2788,7 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                     c,
                     &format!(
                         "routing rule {:?} (unless it applies to assistant, task:suggest, task:catchup, task:timeline, task:name, \
-                         task:work, task:projects, task:transcribe or task:tidy)",
+                         task:work, task:projects, task:transcribe, task:tidy or task:shift)",
                         r.name
                     ),
                 )?;

@@ -1,6 +1,6 @@
 # Context economy — Design
 
-Status: proposed (2026-11-26). Builds on trimming old tool output (docs/subagents.md, 4d941b9; for Claude Code sessions in progress), the replay evals (docs/replay-eval.md), quiet-turn restarts (docs/restarts.md) and the Machines sampler (docs/machines.md).
+Status: implemented, with boundary compaction and task-shift detection experimental and opt-in (2026-11-28). Builds on trimming old tool output (docs/subagents.md, 4d941b9; Claude Code quiet trimming, bdea458), quiet-turn restarts (docs/restarts.md) and the Machines sampler (docs/machines.md). No new model evaluations have been run; do not run them without the user's explicit request.
 
 ## 1. Why
 
@@ -30,22 +30,30 @@ When a turn ends and the session waits on its own background work:
    - Cost: each ping is a cache read of the context (about a tenth of a full read) against a full rewrite on the next real call; for a 1.5-hour build, one ping instead of one rewrite.
 
 ### 3.2 Idle and waiting on you: compact at the boundary, while the cache is warm
-When a turn ended normally, nothing runs, and the session has been idle for most of its cache lifetime (the same margin as keep-warm: the smaller of 5 minutes and 20% of the lifetime before expiry):
+Built as `subagent-limits.keep_warm.idle_compact_enabled`, **false by default**, in Settings → Limits. It is independent of background keep-warm's enabled switch and shares its minimum-context threshold and excluded connections. When a turn ended normally, nothing runs, and the session reaches the warm boundary (the smaller of 5 minutes and 20% of the learned lifetime before expiry, with at least 1 minute of margin):
 - **Compact with the session's own model** while its cache is still warm (so the compaction reads the context at cache-read price), with a focused prompt (`session.idle_compact`: keep the plan, files changed, what failed and why, exact errors, open questions; keep your last instruction and the last few turns word for word).
 - When you come back, the first call writes about 30k tokens instead of about 1M.
 - **Default off until measured** (§4): the evals measured compaction mid-task, not at boundaries.
+- carbon6's loop uses its existing `/compact` machinery and mechanically retains the recent instructions/turns verbatim in the durable summary. Claude Code receives `/compact <focus>` through its native input transport; it is not restarted to compact. Native tasks, agents, pending output and undelivered native notifications all block this dispatch.
+- The timer is canceled by new input, work, a schedule, runtime/spec changes, Rewind or ownership changes. Expiry is checked again when dispatching: waking the machine after cache expiry is not permission to make a cold summary request. A durable attempt marker prevents duplicate maintenance after recovery.
+- A quiet “Compacted while idle” line reports the result (carbon6 estimates token sizes; Claude Code may not report sizes). Rewind before that maintenance turn restores the earlier context. Its full log remains available. Unknown or too-short cache lifetimes cannot schedule idle compaction.
 
 ### 3.3 Your new message starts a different task: trim, and offer a fresh start
-When your message arrives, carbon6 compares it with the session's recent context (embeddings of the message against recent topics and files touched, which the memex already computes) and a small model classifies it as continuing, related or new:
+Built as `subagent-limits.keep_warm.task_shift_enabled`, **false by default**, in Settings → Limits. It is inactive without both a Memex embedding model and an applicable `task:shift` or `task:suggest` API model-routing rule; it never silently falls back to the session's expensive model. When a human message arrives, carbon6 compares embeddings of it with the last six turns' user prompts and file paths using the realm's existing Memex embedder. High similarity continues the task; clearly low similarity detects a new/unrelated task without a classifier call. Only borderline scores use the small routed model with editable `session.task_shift`:
 - **New:** trim old tool output before the agent's next call.
 - **Clearly unrelated:** a quiet card, "This looks like a new task. Start fresh with a handover note? [Yes] [Keep context]". carbon6 never drops context on its own here; your choices tune the threshold.
+- Yes asks the original session, at an idle boundary, to draft a note using editable `session.handover`. The draft is editable; **Start fresh** then uses the composer's `/clear` session-creation path. The original request and its attachments accompany the note, with an instruction to continue unfinished work rather than repeat completed actions. Worker, actual folder/worktree, model, labels and work remain the same. The old session remains intact. Keep context dismisses the offer without discarding any context. Handover drafting is deduplicated and accepts only the exact completed source turn; creation of the new session is not an atomic cross-tab operation.
+- Feedback is session-local: each Yes raises the unrelated cutoff by 0.025, each Keep context lowers it by 0.025, capped at four steps either way from 0.22. The new-task cutoff (0.40) and high-similarity cutoff (0.74) do not move. Ignoring a card does not train it. Embedding/model failures leave input unchanged; commands, send-now and short interjections bypass detection.
+- Trimming still uses the existing threshold, protected recent outputs and ≥20% savings rule. A native CLI with its own work defers the trim until quiet; this feature never kills that work or resets the session without Yes.
 
 ### 3.4 After a long gap anyway: reshape for free
 If a session resumes after its cache has expired regardless (no keep-warm applied: it was waiting on you, or keep-warm was off), any pending trimming is applied before that first call: the rewrite is happening anyway, so reshaping costs nothing extra.
 
+Built using the connection/account/model's learned lifetime (provider defaults until learned). The gap is measured from the latest request start, not generation completion or the delayed usage receipt; a successful keep-warm advances that clock. carbon6's own loop already checks pending trims before **every** request, so cold resume requires no extra model call or separate threshold. A held Claude Code process uses the existing quiet-restart trim path. If the idle CLI has already exited, the cold-resume path also reshapes its saved transcript before spawning/resuming and delivering input, after proving all native process groups absent. Unknown lifetimes, small contexts, disabled trimming or <20% savings leave the transcript untouched. No second “cold” setting overrides the existing trimming controls.
+
 ## 4. Measuring before defaults
 
-The replay eval (scripts/replay-eval.py) gains two kinds of points from real sessions — **idle boundaries** (a turn ended, nothing running, long idle) and **task shifts** (a new message unlike the context) — and two arms: boundary compaction (3.2) and shift trimming (3.3), each with the noise control (baseline replayed again, every pair judged twice). A policy is on by default only if it stays within the noise; otherwise it stays opt-in.
+Future work, **only when the user explicitly requests an eval**: the replay eval (scripts/replay-eval.py) could gain two kinds of points from real sessions — **idle boundaries** (a turn ended, nothing running, long idle) and **task shifts** (a new message unlike the context) — and two arms: boundary compaction (3.2) and shift trimming (3.3), each with the noise control (baseline replayed again, every pair judged twice). Those eval arms are not built or run by this change. Both new policies stay opt-in; implementation verification uses deterministic clocks, stand-in CLIs and mocked model/embedding responses, not the user's plans.
 
 ## 5. Shorter waits: a shared compile cache per worker
 
@@ -68,9 +76,9 @@ Built as a **per-worker opt-in**, configured in Machines. carbon6 never edits a 
 
 1. Cache lifetime learning per connection; "waiting on" classification.
 2. Keep-warm (3.1) for every connection, Claude Code included; trim at the start of a background wait for carbon6's loop and for Claude Code waiting on carbon6-held work, and after the wait for Claude Code waiting on its own background tasks.
-3. Reshape at a forced cold resume (3.4).
-4. The eval arms (§4).
-5. Idle boundary compaction (3.2) and task-shift trimming and suggestion (3.3), defaults per §4.
+3. **Built:** reshape at a forced cold resume (3.4), including an already-retired native CLI.
+4. **Not run:** the eval arms (§4). Evals require an explicit user request; do not spend model plans automatically.
+5. **Built, opt-in:** idle boundary compaction (3.2) and task-shift trimming and suggestion (3.3). Both remain off by default because no boundary/shift quality evaluation was requested.
 6. The shared compile cache and build-folder cleanup (§5).
 
 Tests (docs/testing.md, injected clocks): keep-warm pings exactly before expiry while background work runs and never while waiting on you; trimming once at a wait's start for carbon6's loop and for Claude Code waiting on carbon6-held work; no restart (so no trim) while Claude Code's own background tasks run, and a trim at the next quiet moment after they finish; the cold-resume reshape; lifetime learning from synthetic usage; the shift classifier's suggestion card; sccache environment set only where enabled; cleanup never removes an active worktree's build folder.
@@ -93,4 +101,4 @@ Native requests retain the provider-ready prefix (system, tools, history, cache 
 
 Claude Code receives the editable `session.keep_warm` input through its existing process, without a human User event, turn boundaries, notice-guard spending, or goal/watcher progress. The maintenance UUID and output cursor are persisted before writing so attachment does not resend an ambiguous ping. If it starts actual work instead of acknowledging the input, that work is logged normally. Its native background tasks and agents must never be restarted for maintenance. The actor retains the process while carbon6-held work runs as well.
 
-A durable journal attempt marker fences duplicate sends across recovery and moves. Cache timers and pre-dispatch checks observe both monotonic and wall-clock expiry, so machine sleep cannot extend cache freshness. Maintenance usage is flagged and included in costs, with a separate keep-warm subtotal. Quiet maintenance events do not advance the session's task-progress timestamp. Rewrite savings are **not measured**: multiple pings can protect only one eventual resume, so reporting a rewrite saved per ping would overstate savings. Trimming has a separate integration hook at the start of the background wait; idle compaction, task-shift classification, cold-resume reshaping and the shared compile cache are separate policies, not implemented by keep-warm itself.
+A durable journal attempt marker fences duplicate sends across recovery and moves. Cache timers and pre-dispatch checks observe both monotonic and wall-clock expiry, so machine sleep cannot extend cache freshness. Maintenance usage is flagged and included in costs, with a separate keep-warm subtotal. Quiet maintenance events do not advance the session's task-progress timestamp. Rewrite savings are **not measured**: multiple pings can protect only one eventual resume, so reporting a rewrite saved per ping would overstate savings. Trimming has a separate integration hook at the start of the background wait; idle compaction, task-shift classification, cold-resume reshaping and the shared compile cache are separate policies. Boundary maintenance was added on November 28, 2026 (§3.2–3.4); this does not change keep-warm's economics or its defaults.

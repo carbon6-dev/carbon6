@@ -975,6 +975,8 @@ message UserInput {
   // Head-authored task-card provenance. The head restores this onto the
   // event from its saved command even when an old worker ignores this field.
   TaskCardOrigin task_card_origin = 17;
+  // A new task: ask the worker to trim old tool output before its next safe call.
+  bool trim_context = 19;
 }
 
 message Interrupt {

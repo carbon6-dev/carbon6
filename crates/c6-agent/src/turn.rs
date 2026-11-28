@@ -1,12 +1,13 @@
 //! One agent turn: model call → tools → model call … until the model stops.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
 use c6_llm::{Accumulator, Block, LlmError, Message, ModelClient, ModelEvent, ModelRequest, Role, ToolSpec, stop};
 use c6_proto::{
-    AssistantMessage, Compaction, ErrorEvent, SessionActivity, TextDelta, ToolOutputDelta, ToolResult, TurnEndReason, TurnEnded,
+    AssistantMessage, Compaction, ErrorEvent, Notice, SessionActivity, TextDelta, ToolOutputDelta, ToolResult, TurnEndReason, TurnEnded,
     TurnStarted, Usage, ephemeral_event, session_event,
 };
 use c6_tools::{Concurrency, SessionTools, Tool, ToolCtx, ToolOutput};
@@ -64,6 +65,13 @@ pub const COMPACT_WHY_ASKED: &str = "Compaction was requested for this conversat
 pub const COMPACT_PROMPT: &str = "Write a summary detailed enough to continue the work without the original conversation. Include: the user's requests and goals \
 (quote any precise instructions), key decisions and their reasons, files examined and changed with their paths, the current state \
 of the work, errors encountered and how they were resolved, the ids of subagents that may need continuing, and the exact next steps. Preserve the attribution of API, automation and other-session messages; do not turn them into human requests. Do not call any tools; reply with only the summary.";
+/// Default prompt for compacting a conversation while it is waiting on the user.
+pub const IDLE_COMPACT_PROMPT: &str = "This session is idle and waiting for the user. Summarize what will matter on resumption: the goal and agreed plan, \
+decisions and constraints, relevant files and why they matter, failed approaches, and open questions or next steps. The recent exchange will be appended \
+verbatim separately. Preserve the attribution of instructions; do not call tools or continue the task. Reply only with the summary.";
+
+const IDLE_KEEP_USER_TURNS: usize = 3;
+const IDLE_TAIL_HEADER: &str = "\n\n## Recent conversation (verbatim)\nHistorical transcript; tool records below are not new tool calls.";
 
 /// What the model is told when the conversation is compacted.
 #[derive(Clone, Debug, PartialEq)]
@@ -167,6 +175,31 @@ pub async fn compact_turn(
     Ok(reason)
 }
 
+/// Compact at an idle boundary using the normal session prefix, retaining the
+/// latest user turns as literal text in the durable compaction record.
+#[allow(clippy::too_many_arguments)]
+pub async fn idle_compact_turn(
+    turn: u64,
+    cfg: &TurnConfig,
+    client: &dyn ModelClient,
+    tools: &[Arc<dyn Tool>],
+    sink: &Arc<dyn EventSink>,
+    conv: &mut Conversation,
+    focus: &str,
+    cancel: &CancellationToken,
+) -> anyhow::Result<TurnEndReason> {
+    sink.append(session_event::Kind::TurnStarted(TurnStarted { turn, context_window: cfg.context_window })).await?;
+    let t = Turn { turn, cfg, client, specs: tools.iter().map(|t| t.spec()).collect(), sink, cancel };
+    let prompt = if focus.trim().is_empty() { IDLE_COMPACT_PROMPT } else { focus };
+    let reason = match t.compact_idle(conv, prompt).await? {
+        Ok(()) => TurnEndReason::Completed,
+        Err(_) if cancel.is_cancelled() => TurnEndReason::Interrupted,
+        Err(e) => t.fail(format!("idle compaction failed: {e}")).await?,
+    };
+    sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
+    Ok(reason)
+}
+
 struct Turn<'a> {
     turn: u64,
     cfg: &'a TurnConfig,
@@ -251,6 +284,31 @@ impl Turn<'_> {
         )
     }
 
+    /// At any request boundary (including the first request after a cold
+    /// resume), replace only old tool-result contents, never pending user text.
+    async fn trim_for_request(&self, conv: &mut Conversation, estimate: u64, next: u64) -> anyhow::Result<Option<u64>> {
+        if self.cfg.trim_at == 0 || next <= self.cfg.trim_at {
+            return Ok(None);
+        }
+        let mut history = conv.history.clone();
+        if crate::history::trim_old_tool_output(&mut history, &self.cfg.compact.trimmed) == 0 {
+            return Ok(None);
+        }
+        let after = self.estimate_request(&history, &self.specs);
+        // Rewriting a prefix is only worthwhile when it saves at least a fifth.
+        if u128::from(after) * 5 > u128::from(estimate) * 4 {
+            return Ok(None);
+        }
+        self.context_notice("Trimmed old tool output", format!("Estimated context: {estimate} → {after} tokens.")).await?;
+        conv.history = history;
+        Ok(Some(after))
+    }
+
+    async fn context_notice(&self, title: &str, message: String) -> anyhow::Result<()> {
+        self.sink.append(session_event::Kind::Notice(Notice { title: title.into(), message, priority: "low".into(), quiet: true })).await?;
+        Ok(())
+    }
+
     /// Streams one model call, forwarding deltas live when `live` is set.
     async fn call(&self, req: &ModelRequest, live: bool) -> Result<Response, LlmError> {
         let mut stream = tokio::select! {
@@ -322,19 +380,10 @@ impl Turn<'_> {
             }
             let mut estimate = self.estimate_request(&conv.history, &self.specs);
             let mut next = next_tokens(conv.context_tokens, estimate, reported);
-            // Old tool output goes before the context nears full: only when
-            // it saves at least a fifth, so the cached prefix changes rarely.
-            if self.cfg.trim_at > 0 && next > self.cfg.trim_at {
-                let mut trimmed = conv.history.clone();
-                if crate::history::trim_old_tool_output(&mut trimmed, &self.cfg.compact.trimmed) > 0 {
-                    let after = self.estimate_request(&trimmed, &self.specs);
-                    if after * 5 <= estimate * 4 {
-                        conv.history = trimmed;
-                        reported = None;
-                        estimate = after;
-                        next = next_tokens(conv.context_tokens, estimate, reported);
-                    }
-                }
+            if let Some(after) = self.trim_for_request(conv, estimate, next).await? {
+                reported = None;
+                estimate = after;
+                next = after;
             }
             if self.cfg.context_window > 0
                 && next as f64 > self.cfg.context_window as f64 * compact_share(self.cfg.context_window, self.cfg.compact_at)
@@ -503,6 +552,67 @@ impl Turn<'_> {
         Ok(())
     }
 
+    async fn compact_idle(&self, conv: &mut Conversation, prompt: &str) -> anyhow::Result<Result<(), String>> {
+        if self.cancel.is_cancelled() {
+            return Ok(Err("interrupted".into()));
+        }
+        let Some(tail) = idle_tail(&conv.history) else {
+            return Ok(Ok(()));
+        };
+        let before = self.estimate_request(&conv.history, &self.specs);
+        let to_request = |summary: &str| self.estimate_request(&[Message::user_text(compacted_context(summary))], &self.specs);
+        let base = to_request("");
+        // Idle compaction is optional: only send a warm request if there's
+        // room to write a useful summary and keep the full tail below both
+        // the normal compaction limit and the size of the original request.
+        let room = self.summary_room().min(before.saturating_sub(base).saturating_sub(1));
+        let tail_tokens = to_request(&tail).saturating_sub(base);
+        let output = room.saturating_sub(tail_tokens).min(u64::from(COMPACT_MAX_OUTPUT)) as u32;
+        if output < COMPACT_MIN_OUTPUT {
+            return Ok(Ok(()));
+        }
+        let estimate = next_tokens(conv.context_tokens, before, self.reported_estimate(conv));
+        let mut summary = match self.summarize_history(&conv.history, prompt, output, estimate).await? {
+            Ok(summary) => summary,
+            // Don't recast the prefix as a cold digest for optional maintenance.
+            Err(NoSummary::Overflow(_)) => return Ok(Ok(())),
+            Err(NoSummary::Answered(e) | NoSummary::Failed(e)) => return Ok(Err(e)),
+        };
+        if self.cancel.is_cancelled() {
+            return Ok(Err("interrupted".into()));
+        }
+        summary.push_str(&tail);
+        let after = to_request(&summary);
+        if after.saturating_sub(base) > room {
+            return Ok(Ok(()));
+        }
+        let result = self.compacted(conv, summary).await?;
+        self.context_notice("Compacted while idle", format!("Estimated context: {before} → {after} tokens. Rewind is available.")).await?;
+        Ok(result)
+    }
+
+    /// Append only the summarization instruction to retain the session's
+    /// cache key, system message, tools, and original conversation prefix.
+    async fn summarize_history(
+        &self,
+        history: &[Message],
+        prompt: &str,
+        output: u32,
+        estimated_tokens: u64,
+    ) -> anyhow::Result<Result<String, NoSummary>> {
+        let prompt_tokens = self.estimate_request(&[Message::user_text(prompt)], &[]).saturating_sub(self.estimate_request(&[], &[]));
+        let summary_tokens = estimated_tokens.saturating_add(prompt_tokens);
+        if self.cfg.context_window > 0 && summary_tokens >= self.cfg.context_window {
+            return Ok(Err(NoSummary::Overflow("the conversation is too large to summarize in full".into())));
+        }
+        let mut msgs = history.to_vec();
+        match msgs.last_mut() {
+            Some(m) if m.role == Role::User => m.blocks.push(Block::Text(prompt.to_owned())),
+            _ => msgs.push(Message::user_text(prompt)),
+        }
+        self.summarize(self.request(msgs, Some(output)), summary_tokens).await
+    }
+
     /// Simple compaction: the model summarizes the conversation (same model,
     /// system and tools, so the cached prefix is reused) and the summary
     /// replaces the whole history. Nothing older is replayed, so no earlier
@@ -534,23 +644,11 @@ impl Turn<'_> {
         if !focus.trim().is_empty() {
             prompt.push_str(&format!("\n\nThe requested focus for the summary is: {}", focus.trim()));
         }
-        let prompt_tokens =
-            self.estimate_request(&[Message::user_text(prompt.clone())], &[]).saturating_sub(self.estimate_request(&[], &[]));
-        let summary_tokens = estimated_tokens.saturating_add(prompt_tokens);
-        let mut msgs = conv.history.clone();
-        match msgs.last_mut() {
-            Some(m) if m.role == Role::User => m.blocks.push(Block::Text(prompt.clone())),
-            _ => msgs.push(Message::user_text(prompt.clone())),
-        }
-        let first = if self.cfg.context_window == 0 || summary_tokens < self.cfg.context_window {
-            match self.summarize(self.request(msgs, Some(output)), summary_tokens).await? {
-                Ok(summary) => return self.compacted(conv, summary).await,
-                // A request that failed may fail again; an interrupt is final.
-                Err(NoSummary::Failed(e)) => return Ok(Err(e)),
-                Err(NoSummary::Answered(e) | NoSummary::Overflow(e)) => e,
-            }
-        } else {
-            "the conversation is too large to summarize in full".into()
+        let first = match self.summarize_history(&conv.history, &prompt, output, estimated_tokens).await? {
+            Ok(summary) => return self.compacted(conv, summary).await,
+            // A request that failed may fail again; an interrupt is final.
+            Err(NoSummary::Failed(e)) => return Ok(Err(e)),
+            Err(NoSummary::Answered(e) | NoSummary::Overflow(e)) => e,
         };
         warn!(error = %first, "compaction: asking with a bounded digest and no tools");
 
@@ -712,6 +810,78 @@ enum NoSummary {
     Failed(String),
 }
 
+/// Take the last three user messages containing instructions, not the
+/// result-only user-role messages used by the model protocol. Adjacent user
+/// inputs can share one model message; keep all of them at a boundary.
+/// Neither a previous summary nor a runtime handoff is a user turn: until
+/// there are three fresh turns, leave their retained transcripts alone.
+fn idle_tail(history: &[Message]) -> Option<String> {
+    let compacted = compacted_context("");
+    let compacted_header = compacted.split_once("\n\n")?.0;
+    let mut start = None;
+    let mut users = 0;
+    for (i, msg) in history.iter().enumerate().rev().filter(|(_, msg)| msg.role == Role::User) {
+        if i == 0
+            && msg
+                .blocks
+                .first()
+                .and_then(Block::text)
+                .is_some_and(|s| s.starts_with(compacted_header) || s.starts_with("<carbon6-handoff "))
+        {
+            return None;
+        }
+        if msg.blocks.iter().enumerate().any(|(j, block)| {
+            block.text().is_some_and(|s| {
+                let tool_image_label = s.starts_with("[image from ")
+                    && (matches!(msg.blocks.get(j + 1), Some(Block::Image { .. })) || s.ends_with("] (an earlier image, no longer shown)"));
+                !tool_image_label
+            })
+        }) {
+            start = Some(i);
+            users += 1;
+            if users == IDLE_KEEP_USER_TURNS {
+                break;
+            }
+        }
+    }
+    let mut start = start?;
+    // A new instruction can be delivered in the same message as results
+    // from the preceding turn. Include their corresponding assistant call.
+    if history[start].blocks.iter().any(|b| matches!(b, Block::ToolResult { .. })) {
+        start = start.checked_sub(1)?;
+    }
+    let mut tail = IDLE_TAIL_HEADER.to_owned();
+    let mut calls = HashSet::new();
+    for msg in &history[start..] {
+        for block in &msg.blocks {
+            let (heading, text) = match block {
+                Block::Text(text) | Block::AnnotatedText { text, .. } => (format!("{:?}", msg.role), text),
+                Block::ToolUse { id, name, input_json } => {
+                    if !calls.insert(id.as_str()) {
+                        return None;
+                    }
+                    (format!("Tool call {name:?} id={id:?}"), input_json)
+                }
+                Block::ToolResult { id, content, is_error } => {
+                    if !calls.remove(id.as_str()) {
+                        return None;
+                    }
+                    (format!("Tool result id={id:?} error={is_error}"), content)
+                }
+                // A summary's text cannot replay a native attachment. Don't
+                // compact rather than silently dropping it from this tail.
+                Block::Image { .. } | Block::Document { .. } => return None,
+                // Reasoning and provider-specific payloads are not transcript text.
+                _ => continue,
+            };
+            // Frame each payload by its UTF-8 length; don't escape, trim or
+            // normalize even quotes, line breaks and trailing whitespace.
+            let _ = write!(tail, "\n\n### {heading} ({} bytes)\n{text}", text.len());
+        }
+    }
+    calls.is_empty().then_some(tail)
+}
+
 /// Reported usage plus estimated growth; without a report, estimate it all.
 fn next_tokens(context_tokens: u64, estimate: u64, reported: Option<u64>) -> u64 {
     reported.map_or(estimate, |before| context_tokens.saturating_add(estimate.saturating_sub(before)))
@@ -845,6 +1015,175 @@ fn clip(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod compact_tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Journal(Mutex<Vec<session_event::Kind>>);
+
+    #[async_trait::async_trait]
+    impl EventSink for Journal {
+        async fn append(&self, kind: session_event::Kind) -> anyhow::Result<u64> {
+            let mut events = self.0.lock().unwrap();
+            events.push(kind);
+            Ok(events.len() as u64)
+        }
+
+        fn ephemeral(&self, _: ephemeral_event::Kind) {}
+    }
+
+    #[derive(Default)]
+    struct Model(Mutex<Vec<ModelRequest>>);
+
+    #[async_trait::async_trait]
+    impl ModelClient for Model {
+        async fn stream(&self, req: &ModelRequest) -> Result<c6_llm::EventStream, LlmError> {
+            self.0.lock().unwrap().push(req.clone());
+            let events =
+                [ModelEvent::TextDelta("Plan only; I omitted all quotes.".into()), ModelEvent::Done { stop_reason: "stop".into() }];
+            Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
+        }
+    }
+
+    fn cfg() -> TurnConfig {
+        TurnConfig {
+            model: "mock".into(),
+            system_prompt: "Same system prefix".into(),
+            max_output_tokens: None,
+            cache_key: "same-session".into(),
+            effort: None,
+            context_window: 128_000,
+            web_search: true,
+            compact: CompactPrompts::default(),
+            compact_at: 0,
+            trim_at: 0,
+        }
+    }
+
+    fn assistant(block: Block) -> Message {
+        Message { role: Role::Assistant, blocks: vec![block] }
+    }
+
+    fn tool_result(id: &str, text: &str) -> Block {
+        Block::ToolResult { id: id.into(), content: text.into(), is_error: false }
+    }
+
+    #[tokio::test]
+    async fn idle_compaction_persists_verbatim_tail_with_matched_tools() {
+        let cfg = cfg();
+        let model = Model::default();
+        let journal = Arc::new(Journal::default());
+        let sink: Arc<dyn EventSink> = journal.clone();
+        let tools = c6_tools::default_tools();
+        let final_instruction = "Message sent by an automation, not typed by the user:\nQuote \"ε\" exactly.\n\tEnd.  ";
+        let raw_args = "{ \n  \"path\": \"file\" }";
+        let raw_output = "begin\n\"result\"\n  ";
+        let history = vec![
+            Message::user_text("Old directive that should not be attached"),
+            assistant(Block::Text("older words ".repeat(500))),
+            assistant(Block::ToolUse { id: "call-old".into(), name: "Read".into(), input_json: raw_args.into() }),
+            // The third-most-recent user turn shares the tool result; the
+            // matching call belongs to the previous turn.
+            Message { role: Role::User, blocks: vec![tool_result("call-old", raw_output), Block::Text("Third instruction".into())] },
+            assistant(Block::Text("Third answer".into())),
+            Message::user_text("Second instruction"),
+            assistant(Block::Text("Second answer".into())),
+            Message::user_text(final_instruction),
+            assistant(Block::AnnotatedText { text: "Verbatim last answer.".into(), annotations_json: "[]".into() }),
+        ];
+        let mut conv = Conversation { history: history.clone(), context_tokens: 0 };
+
+        let reason = idle_compact_turn(5, &cfg, &model, &tools, &sink, &mut conv, "", &CancellationToken::new()).await.unwrap();
+        assert_eq!(reason, TurnEndReason::Completed);
+        let requests = model.0.lock().unwrap();
+        let [request] = requests.as_slice() else { panic!("expected one warm summary request") };
+        assert_eq!(&request.messages[..history.len()], history.as_slice());
+        assert_eq!(request.messages.last().unwrap(), &Message::user_text(IDLE_COMPACT_PROMPT));
+        assert_eq!(request.model, cfg.model);
+        assert_eq!(request.system, cfg.system_prompt);
+        assert_eq!(request.cache_key.as_deref(), Some(cfg.cache_key.as_str()));
+        assert!(request.web_search);
+        assert!(!tools.is_empty());
+        assert_eq!(request.tools.len(), tools.len());
+
+        let events = journal.0.lock().unwrap();
+        let [
+            session_event::Kind::TurnStarted(_),
+            session_event::Kind::Compaction(compacted),
+            session_event::Kind::Notice(notice),
+            session_event::Kind::TurnEnded(_),
+        ] = events.as_slice()
+        else {
+            panic!("expected durable compaction and quiet notice")
+        };
+        let summary = &compacted.summary;
+        assert!(summary.starts_with("Plan only; I omitted all quotes."));
+        for exact in [
+            raw_args,
+            raw_output,
+            "Tool call \"Read\" id=\"call-old\"",
+            "Tool result id=\"call-old\"",
+            "Third instruction",
+            "Third answer",
+            "Second instruction",
+            "Second answer",
+            final_instruction,
+            "Verbatim last answer.",
+        ] {
+            assert!(summary.contains(exact), "forgot {exact:?}: {summary}");
+        }
+        assert!(!summary.contains("Old directive"));
+        assert_eq!(conv.history, [Message::user_text(compacted_context(summary))]);
+        assert_eq!(notice.title, "Compacted while idle");
+        assert!(notice.quiet && notice.message.contains(" → ") && notice.message.contains("Rewind"));
+    }
+
+    #[tokio::test]
+    async fn idle_compaction_does_not_drop_a_tail_that_cannot_fit() {
+        let cfg = TurnConfig { context_window: 1_000, ..cfg() };
+        let model = Model::default();
+        let journal = Arc::new(Journal::default());
+        let sink: Arc<dyn EventSink> = journal.clone();
+        let history = vec![Message::user_text("First"), assistant(Block::Text("answer".into())), Message::user_text("Keep ".repeat(1_000))];
+        let mut conv = Conversation { history: history.clone(), context_tokens: 2_000 };
+
+        idle_compact_turn(1, &cfg, &model, &[], &sink, &mut conv, "", &CancellationToken::new()).await.unwrap();
+
+        assert_eq!(conv.history, history);
+        assert_eq!(conv.context_tokens, 2_000);
+        assert!(model.0.lock().unwrap().is_empty());
+        assert!(matches!(journal.0.lock().unwrap().as_slice(), [session_event::Kind::TurnStarted(_), session_event::Kind::TurnEnded(_)]));
+    }
+
+    #[tokio::test]
+    async fn cold_resume_trims_before_the_first_request_but_keeps_new_user_input() {
+        let cfg = TurnConfig { trim_at: 1_000, ..cfg() };
+        let model = Model::default();
+        let journal = Arc::new(Journal::default());
+        let sink: Arc<dyn EventSink> = journal.clone();
+        let mut history = vec![Message::user_text("Read all the files")];
+        for n in 0..30 {
+            let id = format!("call-{n}");
+            history.push(assistant(Block::ToolUse { id: id.clone(), name: "Read".into(), input_json: "{}".into() }));
+            history.push(Message { role: Role::User, blocks: vec![tool_result(&id, &"x".repeat(500))] });
+        }
+        let new_instruction = Block::Text("Resume, but do not edit anything.\n  This is the new request.".into());
+        history.last_mut().unwrap().blocks.push(new_instruction.clone());
+        let mut conv = Conversation { history, context_tokens: 4_500 };
+        let dir = tempfile::tempdir().unwrap();
+        let session_tools = Arc::new(SessionTools::new(dir.path().to_owned()));
+
+        run_turn(1, &cfg, &model, &[], &session_tools, &sink, &mut conv, &mut Vec::new, &CancellationToken::new()).await.unwrap();
+
+        let requests = model.0.lock().unwrap();
+        let [request] = requests.as_slice() else { panic!("no extra request is needed to trim") };
+        assert_eq!(request.messages.last().unwrap().blocks.last(), Some(&new_instruction));
+        assert!(request.messages.iter().flat_map(|m| &m.blocks).any(|b| {
+            matches!(b, Block::ToolResult { id, content, .. } if id == "call-5" && content.contains("Earlier output of Read removed"))
+        }));
+        assert!(journal.0.lock().unwrap().iter().any(|event| {
+            matches!(event, session_event::Kind::Notice(notice) if notice.quiet && notice.title == "Trimmed old tool output")
+        }));
+    }
 
     #[test]
     fn large_windows_compact_sooner_unless_set() {

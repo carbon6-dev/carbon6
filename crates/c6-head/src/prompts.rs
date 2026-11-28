@@ -199,6 +199,21 @@ pub const DEFAULTS: &[Prompt] = &[
         default: c6_agent::KEEP_WARM_NOTE,
     },
     Prompt {
+        name: "session.task_shift",
+        description: "Whether a new message continues, relates to, or starts a different task. Placeholders: {{recent}}, {{message}}.",
+        default: crate::task_shift::CLASSIFIER_PROMPT,
+    },
+    Prompt {
+        name: "session.handover",
+        description: "Ask the old session to write an editable handover note before a fresh start. Placeholder: {{message}}.",
+        default: crate::task_shift::HANDOVER_PROMPT,
+    },
+    Prompt {
+        name: "session.idle_compact",
+        description: "How an idle-boundary summary retains the plan, files, failures, open questions, and recent instructions.",
+        default: c6_agent::IDLE_COMPACT_PROMPT,
+    },
+    Prompt {
         name: "session.claude_code",
         description: "Told to Claude Code sessions about carbon6, at the start of what carbon6 adds to Claude Code's system prompt (its guidance for memory, task cards and the memex follows).",
         default: c6_agent::CLAUDE_CODE_NOTE,
@@ -539,6 +554,7 @@ pub async fn for_worker(st: &HeadState, realm: &str) -> String {
                 || k == "session.task_cards"
                 || k == "session.claude_code"
                 || k == "session.keep_warm"
+                || k == "session.idle_compact"
                 || k == "session.carbon6"
         })
         .collect();

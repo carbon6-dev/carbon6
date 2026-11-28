@@ -2228,6 +2228,10 @@ pub struct SendMessage {
 #[serde(default)]
 pub struct KeepWarmSettings {
     pub enabled: bool,
+    /// Compact at an idle user boundary before cache expiry. Unmeasured; opt-in.
+    pub idle_compact_enabled: bool,
+    /// Compare incoming user messages with recent context using configured models.
+    pub task_shift_enabled: bool,
     /// Minimum context size before keeping a cache warm is worthwhile.
     pub threshold_tokens: u64,
     /// Maximum lead time before expiry; the scheduler also caps this at 20% of the lifetime.
@@ -2240,7 +2244,15 @@ pub struct KeepWarmSettings {
 
 impl Default for KeepWarmSettings {
     fn default() -> Self {
-        Self { enabled: true, threshold_tokens: 50_000, margin_seconds: 300, cap_seconds: 43_200, disabled_connections: Vec::new() }
+        Self {
+            enabled: true,
+            idle_compact_enabled: false,
+            task_shift_enabled: false,
+            threshold_tokens: 50_000,
+            margin_seconds: 300,
+            cap_seconds: 43_200,
+            disabled_connections: Vec::new(),
+        }
     }
 }
 
@@ -2525,6 +2537,8 @@ mod notice_settings_tests {
     fn keep_warm_defaults_and_explicit_settings_round_trip() {
         let defaults = KeepWarmSettings::default();
         assert!(defaults.enabled);
+        assert!(!defaults.idle_compact_enabled, "idle compaction is unmeasured and must remain opt-in");
+        assert!(!defaults.task_shift_enabled, "task-shift classification is opt-in");
         assert_eq!((defaults.threshold_tokens, defaults.margin_seconds, defaults.cap_seconds), (50_000, 300, 43_200));
         assert_eq!(serde_json::from_str::<SubagentLimits>("{}").unwrap().keep_warm, defaults);
         let settings: SubagentLimits = serde_json::from_str(r#"{"keep_warm":{"enabled":false,"disabled_connections":["local"]}}"#).unwrap();
@@ -6691,4 +6705,33 @@ pub struct ContactCandidate {
     /// Messages you sent them, and they sent you.
     pub sent: u32,
     pub received: u32,
+}
+
+/// A quiet offer to start a new session without dropping the old one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskShiftOffer {
+    pub command_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskShiftChoice {
+    pub command_id: String,
+    /// True after starting fresh; false for Keep context.
+    pub fresh: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskShiftHandover {
+    pub prompt: String,
+    pub attachments: Vec<AttachmentUpload>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskShiftStatus {
+    pub embedding_configured: bool,
+    pub routing_configured: bool,
 }

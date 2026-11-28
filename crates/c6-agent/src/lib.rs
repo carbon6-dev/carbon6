@@ -17,8 +17,8 @@ pub use history::{
 };
 pub use prompt::build_system_prompt;
 pub use turn::{
-    COMPACT_AT, COMPACT_AT_LARGE, COMPACT_PROMPT, COMPACT_WHY, COMPACT_WHY_ASKED, CompactPrompts, Conversation, LARGE_WINDOW, TurnConfig,
-    compact_share, compact_turn, run_turn,
+    COMPACT_AT, COMPACT_AT_LARGE, COMPACT_PROMPT, COMPACT_WHY, COMPACT_WHY_ASKED, CompactPrompts, Conversation, IDLE_COMPACT_PROMPT,
+    LARGE_WINDOW, TurnConfig, compact_share, compact_turn, idle_compact_turn, run_turn,
 };
 
 /// What a subagent is told (docs/os.md §4.6: an editable prompt).
@@ -139,6 +139,8 @@ pub struct PendingInput {
     /// Send now: a running turn gets it at once, not at its next step
     /// (docs/background.md §4). Not logged.
     pub send_now: bool,
+    /// Head-classified task shift: request old tool-output trimming at a safe boundary.
+    pub trim_context: bool,
 }
 
 impl PendingInput {

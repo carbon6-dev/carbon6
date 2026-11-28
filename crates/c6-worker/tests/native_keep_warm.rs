@@ -115,11 +115,18 @@ impl Fixture {
     }
 
     async fn with_mock(mock: MockLlm, threshold: u64, cap: u32) -> Self {
+        Self::with_settings(
+            mock,
+            c6_api::KeepWarmSettings { enabled: true, threshold_tokens: threshold, cap_seconds: cap, ..Default::default() },
+        )
+        .await
+    }
+
+    async fn with_settings(mock: MockLlm, settings: c6_api::KeepWarmSettings) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
         let model =
             ModelSpec { connection_id: "mock".into(), connection_kind: "openai_compat".into(), model: "m".into(), ..Default::default() };
-        let settings = c6_api::KeepWarmSettings { enabled: true, threshold_tokens: threshold, cap_seconds: cap, ..Default::default() };
         let spec = CreateSession {
             model: Some(model.clone()),
             cwd: dir.path().display().to_string(),
@@ -271,6 +278,75 @@ fn pause_clock() -> tokio_util::task::AbortOnDropHandle<()> {
 
 fn warm_count(events: &[SessionEvent]) -> usize {
     events.iter().filter(|e| matches!(&e.kind, Some(session_event::Kind::Usage(u)) if u.keep_warm)).count()
+}
+
+async fn idle_fixture() -> Fixture {
+    let (mock, provider) = Provider::start();
+    let mut fixture = Fixture::with_settings(
+        mock,
+        c6_api::KeepWarmSettings { enabled: false, idle_compact_enabled: true, threshold_tokens: 1, ..Default::default() },
+    )
+    .await;
+    fixture._provider = Some(provider);
+    fixture
+}
+
+#[tokio::test]
+async fn idle_compaction_uses_the_warm_model_at_the_boundary_and_only_once() {
+    let f = idle_fixture().await;
+    let _clock = pause_clock();
+    // The last three turns are retained verbatim. Leave enough older history
+    // for a summary to actually save space; a one-turn session correctly skips.
+    for turn in 0..4 {
+        let text = if turn == 0 { "Earlier detailed investigation. ".repeat(1_000) } else { "Your turn. Exact error: E123.".into() };
+        f.mock.push(Reply::Text(text));
+        f.input_text(&format!("user-{turn}"), "Continue the investigation.").await;
+        f.wait("idle boundary", |events| {
+            events.iter().filter(|e| matches!(&e.kind, Some(session_event::Kind::TurnEnded(_)))).count() == turn + 1
+        })
+        .await;
+    }
+    f.armed(1).await;
+    tokio::time::advance(INTERVAL - Duration::from_secs(1)).await;
+    f.settle().await;
+    assert_eq!(f.mock.requests().len(), 4, "not before the warm boundary");
+    f.mock.push(Reply::Text("Plan: finished; waiting for instructions. No files changed. Error E123.".into()));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    f.wait("idle compaction", |events| {
+        events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::Notice(n)) if n.title == "Compacted while idle"))
+    })
+    .await;
+    let events = f.events().await;
+    assert!(events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::Compaction(_)))));
+    assert_eq!(warm_count(&events), 0, "a summary is not a keep-warm ping");
+    assert_eq!(f.mock.requests()[0]["model"], f.mock.requests()[1]["model"]);
+    tokio::time::advance(2 * INTERVAL).await;
+    f.settle().await;
+    assert_eq!(f.mock.requests().len(), 5, "a summary cannot schedule another summary of itself");
+}
+
+#[tokio::test]
+async fn idle_compaction_never_runs_during_background_work_even_when_enabled() {
+    let f = idle_fixture().await;
+    let _clock = pause_clock();
+    f.start_background().await;
+    tokio::time::advance(2 * INTERVAL).await;
+    f.settle().await;
+    assert_eq!(f.mock.requests().len(), 2, "background work is not an idle user boundary");
+    assert!(!f.events().await.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::Compaction(_)))));
+}
+
+#[tokio::test]
+async fn idle_compaction_never_starts_after_sleeping_past_expiry() {
+    let f = idle_fixture().await;
+    let _clock = pause_clock();
+    f.mock.push(Reply::Text("Your turn.".into()));
+    f.input().await;
+    f.wait("idle boundary", |events| events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::TurnEnded(_))))).await;
+    f.armed(1).await;
+    tokio::time::advance(Duration::from_secs(3_601)).await;
+    f.settle().await;
+    assert_eq!(f.mock.requests().len(), 1, "a cold summary would pay an unnecessary rewrite");
 }
 
 #[tokio::test]
