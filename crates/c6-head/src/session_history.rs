@@ -304,8 +304,18 @@ mod tests {
         assert_eq!(range.prompts.iter().map(|p| p.seq).collect::<Vec<_>>(), [3]);
         assert!(range.queued.is_empty());
         assert!(get(&head.state, "session", &Default::default(), &Caller::in_realm("other")).await.is_err());
-        let denied = http.get(&url).header("x-c6-realm", "admin").send().await.unwrap();
-        assert_eq!(denied.status(), reqwest::StatusCode::NOT_FOUND);
+        crate::realms::create(&head.state, &api::RealmIn { id: "other".into(), name: "Other".into(), ..Default::default() }, "you")
+            .await
+            .unwrap();
+        let token = head.state.store.create_api_token("other", Some("other")).await.unwrap().token.unwrap();
+        for request in [http.get(&url).header("x-c6-realm", "other"), http.get(&url).bearer_auth(token)] {
+            let denied = request.send().await.unwrap();
+            assert_eq!(denied.status(), reqwest::StatusCode::NOT_FOUND);
+        }
+        // The administration console is intentionally allowed to read every
+        // realm; it is not an unauthorized caller for a realm-denial test.
+        let admin = http.get(&url).header("x-c6-realm", "admin").send().await.unwrap();
+        assert_eq!(admin.status(), reqwest::StatusCode::OK);
         let invalid = http.get(format!("{url}?after_ts=100")).send().await.unwrap();
         assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
         assert!(mock.requests().is_empty(), "history must not call any model");
