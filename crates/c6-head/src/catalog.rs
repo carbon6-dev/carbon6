@@ -481,6 +481,8 @@ fn build() -> Vec<Op> {
         op!("sessions.decisions", "sessions", "GET" "/api/v1/sessions/{id}/decisions", Read, Input::None, "A session's open decisions: what its agent raised or asked without stopping, grants it asked for, and what it was started to work on (its tool approvals and questions are in its log).", choices = &[("id", "sessions.list")]),
         op!("sessions.waiting", "sessions", "GET" "/api/v1/sessions/{id}/waiting", Read, Input::None, "What waits on the user in this session: its open decisions and task cards, and tool approvals and questions in it and its subagents at any depth. Returns AttentionItem rows; offered task cards have kind task. Snoozed decisions appear once due; side chats are independent.", choices = &[("id", "sessions.list")]),
         op!("sessions.suggestion", "sessions", "GET" "/api/v1/sessions/{id}/suggestion", Read, Input::None, "The message the user would likely send next, once a session's turn finished (made by a cheap model, at most once per turn; 204 when there is none).", choices = &[("id", "sessions.list")]),
+        op!("sessions.task_shift.get", "sessions", "GET" "/api/v1/sessions/{id}/task-shift", Read, Input::None, "The session's pending fresh-start offer, if any. Reading it does not classify a message, answer the offer or request a handover; those choices belong to the user.", choices = &[("id", "sessions.list")]),
+        op!("sessions.task_shift.status", "sessions", "GET" "/api/v1/settings/task-shift/status", Read, Input::Query(schema::<api::InRealm>), "Whether the realm has the embedding and model-routing prerequisites for opt-in task-shift detection. Does not enable detection or call a model."),
         op!("sessions.name.suggest", "sessions", "GET" "/api/v1/sessions/{id}/name/suggestion", Read, Input::None, "A short name for a session from how it started (its first message and reply), made now by a cheap model (a task:name routing rule's, else task:suggest's, else the session's own). It isn't applied: sessions.update renames.", choices = &[("id", "sessions.list")]),
         op!("sessions.suggestion.seen", "sessions", "POST" "/api/v1/sessions/{id}/suggestion/seen", Write, Input::Body(schema::<api::SuggestionSeen>), "Records that a suggestion was shown, and whether it was taken.", choices = &[("id", "sessions.list")]),
         op!("sessions.catchup", "sessions", "GET" "/api/v1/sessions/{id}/catchup", Read, Input::Query(schema::<api::CatchupQuery>), "What a session did since the user last looked (the later of the last finished turn they saw and looked_at, when their page last had it on screen; or their last message to it, if later): its steps, counted rows (waiting on you, finished, files changed and commits, commands, messages delivered), whether it's worth a card (5 steps or more, or something waiting), and with summary=true a paragraph from a small model (a task:catchup routing rule's, else task:suggest's, else the session's own). 204 while its catch-up is off.", choices = &[("id", "sessions.list")]),
@@ -1002,6 +1004,13 @@ pub const NOT_OPERATIONS: &[(&str, &str, &str, Scope)] = &[
     ("GET", "/api/v1/openapi.json", "this catalog, as OpenAPI", Scope::Shared),
     ("POST", "/api/v1/catalog/call", "this catalog", Scope::Admin),
     ("POST", "/api/v1/sessions/{id}/answers/{call_id}", "answers the assistant's questions (the UI's forms)", Scope::Realm),
+    ("POST", "/api/v1/sessions/{id}/task-shift", "only the human browser may answer a fresh-start offer", Scope::Realm),
+    (
+        "POST",
+        "/api/v1/sessions/{id}/task-shift/{command_id}/handover",
+        "only the human browser may request a fresh-start handover",
+        Scope::Realm,
+    ),
 ];
 
 /// An operation's input schema: path parameters, then the body (under
@@ -1471,6 +1480,20 @@ mod tests {
         assert_eq!(find("system.liveness").unwrap().effect, Effect::Read);
         assert_eq!(route_scope("GET", "/api/v1/liveness"), Scope::Realm);
         assert_eq!(route_scope("GET", "/api/v1/system/activity"), Scope::Admin);
+    }
+
+    #[test]
+    fn task_shift_reads_are_realm_scoped_and_human_choices_are_not_operations() {
+        for name in ["sessions.task_shift.get", "sessions.task_shift.status"] {
+            let op = find(name).unwrap();
+            assert_eq!(op.effect, Effect::Read);
+            assert_eq!(scope(name), Some(Scope::Realm));
+        }
+        for path in ["/api/v1/sessions/{id}/task-shift", "/api/v1/sessions/{id}/task-shift/{command_id}/handover"] {
+            assert_eq!(route_scope("POST", &path.replace("{id}", "session").replace("{command_id}", "command")), Scope::Realm);
+            assert!(NOT_OPERATIONS.iter().any(|(method, route, _, scope)| *method == "POST" && *route == path && *scope == Scope::Realm));
+            assert!(!ops().iter().any(|op| matches!(op.via, Via::Http { method: "POST", path: route } if route == path)));
+        }
     }
 
     #[test]
