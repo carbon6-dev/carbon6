@@ -149,8 +149,10 @@ async fn announce(st: &HeadState, d: &api::Decision, reference: &str) {
         title: format!("Decision needed: {}", d.title),
         message: d.document.chars().take(600).collect(),
         priority: if d.priority == "high" { "high" } else { "normal" },
-        session_id: (!d.options.is_empty()).then(|| "dc:".to_owned()),
-        call_id: (!d.options.is_empty()).then(|| d.id.to_string()),
+        // Policy acceptance needs the browser's authenticated origin, not
+        // an actionable notification bearer link.
+        session_id: (!d.options.is_empty() && !reference.starts_with("contract:")).then(|| "dc:".to_owned()),
+        call_id: (!d.options.is_empty() && !reference.starts_with("contract:")).then(|| d.id.to_string()),
         labels: Vec::new(),
         path: None,
     });
@@ -342,6 +344,7 @@ async fn act(
             }
         }
         (Some("docwrite"), Some(_), Some(_)) => crate::docs::session::decided(st, reference, option).await?,
+        (Some("contract"), Some(_), Some(_)) => crate::project_contract::decided(st, d, option).await?,
         (Some("agentop"), Some(_), Some(_)) => crate::agent_ops::decided(st, d, option).await?,
         (Some("watch"), Some(_), Some(_)) => crate::watchers::decided(st, d, option).await?,
         (Some("workflow"), Some(run), Some(step)) => {

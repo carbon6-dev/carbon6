@@ -52,6 +52,7 @@ mod operations;
 mod outputs;
 mod packages;
 mod policies;
+mod project_contracts;
 mod projects;
 mod prompts;
 mod providers;

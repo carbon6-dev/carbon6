@@ -7,6 +7,7 @@ pub mod docs_archive;
 pub mod labels;
 pub mod machines;
 pub mod marks;
+pub mod project_contract;
 pub mod projects;
 pub mod prompts;
 pub mod slides;

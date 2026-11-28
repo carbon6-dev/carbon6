@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, history_from_events, run_turn};
+use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, history_from_events, run_turn, run_turn_with_tool_reminders};
 use c6_llm::{Block, Message, ModelClient, ModelEvent, ModelRequest, Role, openai_chat::OpenAiChat, stop};
 use c6_proto::{SessionEvent, TurnEndReason, ephemeral_event, session_event};
 use c6_testkit::{MockLlm, Reply};
@@ -15,6 +15,8 @@ use tokio_util::sync::CancellationToken;
 struct VecSink {
     events: Mutex<Vec<SessionEvent>>,
     ephemeral: Mutex<Vec<ephemeral_event::Kind>>,
+    tool_failures: Mutex<Vec<(String, String, String)>>,
+    defer_shell: bool,
 }
 
 #[async_trait]
@@ -27,6 +29,23 @@ impl EventSink for VecSink {
     }
     fn ephemeral(&self, kind: ephemeral_event::Kind) {
         self.ephemeral.lock().unwrap().push(kind);
+    }
+
+    fn defer_tools(&self, calls: &[(String, String, String)], _: &dyn Fn(&str) -> bool) -> Vec<Option<String>> {
+        if !self.defer_shell {
+            return Vec::new();
+        }
+        calls
+            .iter()
+            .map(|(_, tool, _)| (tool == "bash").then(|| "Deferred: this tool was not run. Review the sample capability.".into()))
+            .collect()
+    }
+
+    fn tool_failed(&self, name: &str, input: &str, output: &str) {
+        assert!(
+            matches!(&self.events.lock().unwrap().last().unwrap().kind, Some(session_event::Kind::ToolResult(r)) if r.is_error && r.tool == name)
+        );
+        self.tool_failures.lock().unwrap().push((name.into(), input.into(), output.into()));
     }
 }
 
@@ -79,9 +98,9 @@ impl Tool for SideEffect {
     fn concurrency(&self) -> c6_tools::Concurrency {
         c6_tools::Concurrency::Exclusive
     }
-    async fn call(&self, _ctx: &c6_tools::ToolCtx, _input: serde_json::Value) -> c6_tools::ToolOutput {
+    async fn call(&self, _ctx: &c6_tools::ToolCtx, input: serde_json::Value) -> c6_tools::ToolOutput {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        c6_tools::ToolOutput::ok("done")
+        if input["fail"].as_bool() == Some(true) { c6_tools::ToolOutput::err("sample failure") } else { c6_tools::ToolOutput::ok("done") }
     }
 }
 
@@ -300,6 +319,118 @@ async fn mid_turn_input(input: PendingInput, expected: &str) {
     let mut rebuilt = vec![Message::user_text("make hello.txt")];
     rebuilt.extend(history_from_events(&events));
     assert_eq!(rebuilt, conv.history);
+}
+
+#[tokio::test]
+async fn tool_reminder_reaches_only_the_next_request_without_editing_the_tool_result() {
+    let mock = MockLlm::start().await;
+    mock.push(Reply::ToolCalls(vec![("side_effect".into(), r#"{"label":"widget"}"#.into())]));
+    mock.push(Reply::ToolCalls(vec![("side_effect".into(), "{}".into())]));
+    mock.push(Reply::Text("Finished.".into()));
+    let client = OpenAiChat::new(&mock.base_url(), "test-key", HashMap::new()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let session = Arc::new(SessionTools::new(dir.path().to_owned()));
+    let events = Arc::new(VecSink::default());
+    let sink: Arc<dyn EventSink> = events.clone();
+    let mut conv = Conversation { history: vec![Message::user_text("Inspect the sample.")], context_tokens: 0 };
+    let reminder = "Use the widget inspection capability if applicable.";
+    let render = |evidence: &[(&str, &str, &str)]| {
+        assert_eq!(evidence.len(), 1);
+        let (tool, input, output) = evidence[0];
+        assert_eq!((tool, output), ("side_effect", "done"));
+        input.contains("widget").then(|| reminder.into())
+    };
+    let reason = run_turn_with_tool_reminders(
+        1,
+        &cfg(),
+        &client,
+        &[Arc::new(SideEffect(Default::default()))],
+        &session,
+        &sink,
+        &mut conv,
+        &mut Vec::new,
+        &CancellationToken::new(),
+        Some(&render),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reason, TurnEndReason::Completed);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[0].to_string().contains(reminder));
+    let messages = requests[1]["messages"].as_array().unwrap();
+    assert_eq!(messages[messages.len() - 2]["content"], "done");
+    assert_eq!(messages.last().unwrap()["content"], reminder);
+    assert!(!requests[2].to_string().contains(reminder));
+    let events = events.events.lock().unwrap();
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            Some(session_event::Kind::ToolResult(result)) => Some(result.output.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results, ["done", "done"]);
+}
+
+#[tokio::test]
+async fn failure_observer_only_receives_errors_from_invoked_tools() {
+    let mock = MockLlm::start().await;
+    let failed = r#"{"fail":true}"#;
+    mock.push(Reply::ToolCalls(vec![
+        ("unavailable".into(), failed.into()),
+        ("side_effect".into(), "{}".into()),
+        ("side_effect".into(), failed.into()),
+    ]));
+    mock.push(Reply::Text("Finished.".into()));
+    let client = OpenAiChat::new(&mock.base_url(), "test-key", HashMap::new()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let session = Arc::new(SessionTools::new(dir.path().to_owned()));
+    let events = Arc::new(VecSink::default());
+    let sink: Arc<dyn EventSink> = events.clone();
+    let mut conv = Conversation { history: vec![Message::user_text("Inspect the sample.")], context_tokens: 0 };
+    let reason = run_turn(
+        1,
+        &cfg(),
+        &client,
+        &[Arc::new(SideEffect(Default::default()))],
+        &session,
+        &sink,
+        &mut conv,
+        &mut Vec::new,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reason, TurnEndReason::Completed);
+    assert_eq!(*events.tool_failures.lock().unwrap(), [("side_effect".to_owned(), failed.to_owned(), "sample failure".to_owned())]);
+}
+
+#[tokio::test]
+async fn preflight_deferral_delivers_the_reminder_without_running_shell() {
+    let mock = MockLlm::start().await;
+    mock.push(Reply::ToolCalls(vec![
+        ("bash".into(), r#"{"command":"printf hello > sample.txt"}"#.into()),
+        ("bash".into(), r#"{"command":"printf again > sample.txt"}"#.into()),
+    ]));
+    mock.push(Reply::Text("The shell was deferred.".into()));
+    let client = OpenAiChat::new(&mock.base_url(), "test-key", HashMap::new()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let session = Arc::new(SessionTools::new(dir.path().to_owned()));
+    let events = Arc::new(VecSink { defer_shell: true, ..Default::default() });
+    let sink: Arc<dyn EventSink> = events.clone();
+    let mut conv = Conversation { history: vec![Message::user_text("Inspect the sample.")], context_tokens: 0 };
+    let reason = run_turn(1, &cfg(), &client, &default_tools(), &session, &sink, &mut conv, &mut Vec::new, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(reason, TurnEndReason::Completed);
+    assert!(!dir.path().join("sample.txt").try_exists().unwrap());
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    let replies: Vec<_> = requests[1]["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").collect();
+    assert_eq!(replies.len(), 2);
+    assert!(replies.iter().all(|m| m["content"] == "Deferred: this tool was not run. Review the sample capability."));
+    assert!(events.tool_failures.lock().unwrap().is_empty());
 }
 
 #[derive(Default)]

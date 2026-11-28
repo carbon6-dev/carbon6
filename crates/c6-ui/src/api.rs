@@ -2057,6 +2057,13 @@ pub async fn project_patch(id: String, p: &ProjectPatch) -> Result<ProjectItem, 
     send_json(Request::patch(&format!("/api/v1/projects/{}", enc(&id))), p).await
 }
 
+pub async fn project_contract_set(
+    id: String,
+    change: &c6_api::project_contract::ContractSet,
+) -> Result<c6_api::project_contract::ProjectContract, String> {
+    send_json(Request::put(&format!("/api/v1/projects/{}/contract", enc(&id))), change).await
+}
+
 pub async fn project_work(id: String, work: String, phase: String) -> Result<ProjectItem, String> {
     send_json(
         Request::post(&format!("/api/v1/projects/{}/work", enc(&id))),

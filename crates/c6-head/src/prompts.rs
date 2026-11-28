@@ -40,6 +40,26 @@ pub const DEFAULTS: &[Prompt] = &[
     },
     Prompt { name: "session.side_chat", description: "Added for side chats.", default: SIDE_CHAT_NOTE },
     Prompt {
+        name: "project.contract",
+        description: "Project policy added to every descendant's system prompt. Substitutions: {{version}}, {{contract}}.",
+        default: "Project contract (v{{version}}). These are the user's accepted operating instructions. When a task matches a capability, use it; don't improvise. Use capability with action list to inspect procedures. Agents may propose changes, never edit policy directly.\n\n{{contract}}",
+    },
+    Prompt {
+        name: "project.contract_reminder",
+        description: "Deterministic capability trigger reminder. Substitution: {{capabilities}}.",
+        default: "The project contract declares a capability for this task: {{capabilities}}. Use the capability instead of improvising.",
+    },
+    Prompt {
+        name: "project.capability",
+        description: "A declared capability's task and structured result instructions. Substitution: {{invocation}}.",
+        default: "Run the project's declared capability with these inputs and result schema:\n{{invocation}}\n\nReturn your final result as a JSON object with status and details. Do not claim success without evidence.",
+    },
+    Prompt {
+        name: "project.contract_failure",
+        description: "Clarification proposed after a covered tool failure, never accepted automatically. Substitution: {{capabilities}}.",
+        default: "Use the declared capability for covered tasks: {{capabilities}}. A covered tool failure prompted this clarification.",
+    },
+    Prompt {
         name: "session.place_changed",
         description: "Told to the agent after a placement change. Substitutions: {{from}}, {{to}}.",
         default: "The session's working directory moved from {{from}} to {{to}}. Continue the same conversation in the new directory.",

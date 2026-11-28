@@ -349,6 +349,14 @@ async fn create_linked_with_origin(
         None => row,
     };
     let mut spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
+    // Membership is persisted after creation; the initial turn must already
+    // carry explicitly selected project policy.
+    if let Some(work) = req.work.as_deref()
+        && let Some(contract) = crate::project_contract::for_work(st, work, &row.realm).await?
+    {
+        spec.project_contract_json = Some(serde_json::to_string(&contract)?);
+        spec.project_contract_prompt = Some(crate::project_contract::render(st, &row.realm, &contract).await);
+    }
     spec.depth = link.as_ref().map_or(0, |l| l.depth);
     // How its worktree is made (docs/dev-starts.md §2): {{name}} from its
     // title; the worker fills in {{id}}.
@@ -706,6 +714,12 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
 /// Realm/instance-derived settings, shared by creation and refresh. Session
 /// identity, model choices, transcript and runtime state are not settings.
 async fn session_config(st: &HeadState, row: &SessionRow) -> anyhow::Result<CreateSession> {
+    let contract = crate::project_contract::for_row(st, row).await?;
+    let project_contract_json = contract.as_ref().map(|(_, contract)| serde_json::to_string(contract)).transpose()?;
+    let project_contract_prompt = match contract {
+        Some((_, contract)) => Some(crate::project_contract::render(st, &row.realm, &contract).await),
+        None => None,
+    };
     let memex = crate::memex::ready(st);
     let scope = crate::memex::scope_for(st, &row.realm, &row.all_labels()).await;
     let connections = st.store.effective_connections().await?;
@@ -717,6 +731,8 @@ async fn session_config(st: &HeadState, row: &SessionRow) -> anyhow::Result<Crea
         if row.fork_seq.is_some() { format!("{base}\n\n{}", crate::prompts::get(st, "session.side_chat", &row.realm).await) } else { base };
     Ok(CreateSession {
         base_prompt,
+        project_contract_json,
+        project_contract_prompt,
         mcp_servers_json: st.store.setting_in(MCP_SERVERS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),
         skills_json: st.store.setting_in(SKILLS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),
         hooks_json: st.store.setting_in(HOOKS, &row.realm, &row.instance).await?.unwrap_or_else(|| "[]".into()),

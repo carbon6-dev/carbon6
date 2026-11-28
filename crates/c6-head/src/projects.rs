@@ -1366,6 +1366,9 @@ pub fn routes() -> Router<Arc<HeadState>> {
         .route("/api/v1/projects", axum::routing::get(list_projects).post(add_project))
         .route("/api/v1/projects/{id}", axum::routing::get(get_project).patch(patch_project))
         .route("/api/v1/projects/{id}/work", post(work_project))
+        .route("/api/v1/projects/{id}/contract", axum::routing::get(get_contract).put(set_contract))
+        .route("/api/v1/projects/{id}/contract/history", axum::routing::get(contract_history))
+        .route("/api/v1/projects/{id}/contract/propose", post(propose_contract))
         .route("/api/v1/projects/{id}/detach", post(detach_project))
         .route("/api/v1/projects/{id}/merge", post(merge_project))
         .route("/api/v1/projects/{id}/docs", post(doc_project))
@@ -1501,6 +1504,40 @@ async fn list_projects(
     Query(q): Query<ProjectQuery>,
 ) -> ApiResult<Json<Vec<ProjectItem>>> {
     Ok(Json(list(&st, &caller, q.closed).await?))
+}
+
+async fn get_contract(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Option<api::project_contract::ProjectContract>>> {
+    Ok(Json(crate::project_contract::history(&st, &id, &caller).await?.pop()))
+}
+
+async fn contract_history(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<api::project_contract::ProjectContract>>> {
+    Ok(Json(crate::project_contract::history(&st, &id, &caller).await?))
+}
+
+async fn set_contract(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(change): Json<api::project_contract::ContractSet>,
+) -> ApiResult<Json<api::project_contract::ProjectContract>> {
+    Ok(Json(crate::project_contract::set(&st, &id, &change, &caller).await?))
+}
+
+async fn propose_contract(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(change): Json<api::project_contract::ContractSet>,
+) -> ApiResult<Json<api::Decision>> {
+    Ok(Json(crate::project_contract::propose(&st, &id, &change, &caller, &crate::docs::by_of(&caller)).await?))
 }
 
 async fn add_project(

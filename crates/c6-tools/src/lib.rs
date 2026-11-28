@@ -6,6 +6,7 @@ pub mod apps;
 mod background;
 mod bash;
 pub mod browser;
+pub mod capabilities;
 mod files;
 pub mod hooks;
 pub mod kits;

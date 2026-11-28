@@ -35,6 +35,19 @@ Each level does the one above it the same way: a to-do starts a session for its 
 | status | active, paused, done or dropped. You set it |
 | realm, labels | as for work |
 | opened, last moved, closed | times |
+| **project contract** | optional accepted operating instructions, versioned with per-item provenance; the project page has its editor and history |
+
+### Project contract
+
+An optional contract carries the user's build policy, declared capabilities, integration rules, architecture rules and decision ledger. All values live in the head's store, not in application defaults or repository fixtures. Every new or changed item records who accepted it and when, with the suggesting agent recorded separately when applicable. Existing projects need no contract.
+
+The project page's **Project contract** section edits structured JSON and displays accepted revisions. Save uses optimistic concurrency (`expected_version`, initially zero); a stale editor must reload rather than overwrite another accepted change. Item provenance is assigned by the head; client-supplied provenance cannot impersonate an acceptance. Environment entries should reference credentials rather than contain secrets.
+
+Catalog operations: `projects.contract.get` reads the current revision or null; `projects.contract.history` reads the ledger; `projects.contract.set` is user-only; `projects.contract.propose` makes a decision card. Accepting the card applies its version-checked change. Agents cannot write the contract directly or accept their own proposal through the agent catalog. Contract writes and card acceptance reject token-origin requests, including root tokens.
+
+Capabilities use the project's own names and describe input and result-detail object schemas, a template or worker/folder placement, and optional literal `trigger_phrases` / `command_patterns`. The `capability` tool (`Capability` in the external-agent bridge) lists procedures, starts a linked subagent, and reads its run's structured status: queued, running, infrastructure-failed, product-failed, skipped, unknown or succeeded. Terminal replies must be JSON with `status` and `details`; missing or schema-invalid results remain unknown. The built-in guardian matches literal triggers without a model call, defers a matching tool once to remind the agent, and proposes clarifications after actual covered failures. It does not enforce a build lease or stage gate.
+
+The contract is rendered through editable prompts for project sessions and descendants, including per-session watchers. Session-spec refresh updates idle sessions before the next turn and gives active turns the new policy at their next safe boundary. No contract means no added prompt section or capability tool. See docs/factory.md §2.1 for the implementation boundary, including the remaining native-agent guardian and memory-note matching work.
 
 **Projects are flat.** A project doesn't contain projects, and work items don't depend on each other.
 

@@ -56,6 +56,9 @@ pub struct ProjectFields {
     /// The template its work starts with (docs/dev-starts.md §4).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub start_with: String,
+    /// Accepted operating contract revisions, oldest first. User data only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contract_history: Vec<crate::project_contract::ProjectContract>,
 }
 
 /// A session in the project with no work item of its own.

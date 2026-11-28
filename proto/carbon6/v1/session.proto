@@ -854,6 +854,10 @@ message CreateSession {
   optional string keep_warm_snapshot_json = 50;
   // Session state, not derived configuration. SetSubagentModel owns this.
   bool subagent_target_explicit = 53;
+  // The session's effective project contract (JSON c6_api::ProjectContract).
+  optional string project_contract_json = 54;
+  // Rendered section, applied separately so named-agent overrides preserve it.
+  optional string project_contract_prompt = 55;
 }
 
 // How a new git worktree is made: the branch ({{id}} is the session's

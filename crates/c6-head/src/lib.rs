@@ -56,6 +56,9 @@ pub mod operations;
 pub mod packages;
 pub mod pki;
 pub mod pools;
+pub mod project_contract;
+#[cfg(test)]
+mod project_contract_tests;
 pub mod projects;
 pub mod prompts;
 pub mod providers;

@@ -3,13 +3,17 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
-use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, build_system_prompt, history_from_events, run_turn};
+use c6_agent::{
+    Conversation, EventSink, PendingInput, ToolReminders, TurnConfig, build_system_prompt, history_from_events,
+    run_turn_with_tool_reminders,
+};
+use c6_api::project_contract::ProjectContract;
 use c6_llm::{Block, Message, Provider, Role, ToolProfile, model_info};
 use c6_proto::{
     BackgroundTask, Checkpoint, CreateSession, EphemeralEvent, ErrorEvent, ModelSpec, ModelSwitched, Notice, Rewound, SessionActivity,
@@ -3508,6 +3512,7 @@ struct TurnSink {
     writer: Arc<Writer>,
     inbox: Arc<Mutex<Inbox>>,
     task_fence: Option<TaskFenceSender>,
+    contract: Option<Arc<ProjectContractGuardian>>,
 }
 
 /// Background starts are sent synchronously by the tool before it returns,
@@ -3570,6 +3575,24 @@ impl EventSink for TurnSink {
             inbox.recorded(&input.command_id);
         }
         Ok(())
+    }
+
+    fn tool_failed(&self, name: &str, input_json: &str, output: &str) {
+        let Some(proposal) = self.contract.as_ref().and_then(|guardian| guardian.claim_failure(name, input_json, output)) else { return };
+        let link = self.writer.link.clone();
+        let session_id = self.writer.session_id.clone();
+        // Advisory only; never block or fail the running turn on head I/O.
+        tokio::spawn(async move {
+            let (capabilities, detail) = proposal;
+            let params = serde_json::json!({"session_id": session_id, "capabilities": capabilities, "detail": detail});
+            if link.call("session.contract_failure", params).await.is_err() {
+                warn!(session = %session_id, "could not report project capability failure to the head");
+            }
+        });
+    }
+
+    fn defer_tools(&self, calls: &[(String, String, String)], is_available: &dyn Fn(&str) -> bool) -> Vec<Option<String>> {
+        self.contract.as_ref().map_or_else(Vec::new, |guardian| guardian.defer_tools(calls, is_available))
     }
 
     fn ephemeral(&self, kind: ephemeral_event::Kind) {
@@ -6849,8 +6872,8 @@ impl Actor {
             // editable catalog or its inherited base_prompt. Read their
             // original provenance, never an already refreshed runtime prompt.
             let events = if spec.delegation.is_some() { self.journal.events_after(&sid, 0, u32::MAX).await? } else { Vec::new() };
-            let instructions = named_child_instructions(&spec, &events).unwrap_or(&spec.base_prompt);
-            let base = build_system_prompt(instructions, &cwd, &date);
+            let instructions = named_child_instructions(&spec, &events);
+            let base = build_system_prompt(instructions.as_deref().unwrap_or(&spec.base_prompt), &cwd, &date);
             let mut runtime_spec = spec.clone();
             if spec.delegation.is_some() {
                 runtime_spec.tools = crate::subagent::saved_tools(&self.spec, &self.started).into_iter().collect();
@@ -6875,6 +6898,10 @@ impl Actor {
             "This session's prompts were updated".into()
         } else {
             "This session's configuration was updated".into()
+        };
+        let (title, message) = match contract_only_refresh_notice(&self.spec, &spec) {
+            Some(title) => (title, String::new()),
+            None => ("Session configuration refreshed".into(), message),
         };
         // Commit before publishing the runtime. Replay sees exactly this
         // prompt and allowlist even if a later diagnostic write fails.
@@ -6909,14 +6936,7 @@ impl Actor {
             });
         }
         self.session_tools.set_hooks(if self.runs_claude_code() { None } else { own_loop_hooks(&self.policies, &self.hooks) });
-        self.writer
-            .append(session_event::Kind::Notice(c6_proto::Notice {
-                title: "Session configuration refreshed".into(),
-                message,
-                priority: "low".into(),
-                quiet: true,
-            }))
-            .await?;
+        self.writer.append(session_event::Kind::Notice(c6_proto::Notice { title, message, priority: "low".into(), quiet: true })).await?;
         for message in errors {
             self.writer.append(session_event::Kind::Error(ErrorEvent { message })).await?;
         }
@@ -7273,7 +7293,9 @@ impl Actor {
         let task_fence = (subagent || self.spec.depth > 0).then(|| self.task_fence.clone());
         let task = tokio::spawn(async move {
             let _build_use = journal.build_folder_lifecycle.clone().read_owned().await;
-            let sink: Arc<dyn EventSink> = Arc::new(TurnSink { writer: writer.clone(), inbox: inbox.clone(), task_fence });
+            let contract = if claude_code { None } else { ProjectContractGuardian::new(&sub.spec).map(Arc::new) };
+            let sink: Arc<dyn EventSink> =
+                Arc::new(TurnSink { writer: writer.clone(), inbox: inbox.clone(), task_fence, contract: contract.clone() });
             if !claude_code {
                 cfg.context_window = link.context_window(&on_behalf_of, &model).await;
                 // As the window the connection says, not the model's default.
@@ -7431,6 +7453,7 @@ impl Actor {
                     &inbox,
                     &c,
                     sub,
+                    contract.as_deref(),
                 )
                 .await
             };
@@ -7862,6 +7885,117 @@ async fn claude_turn(
     Ok(None)
 }
 
+fn contract_only_refresh_notice(old: &CreateSession, new: &CreateSession) -> Option<String> {
+    if old.project_contract_json == new.project_contract_json && old.project_contract_prompt == new.project_contract_prompt {
+        return None;
+    }
+    let mut otherwise = new.derived();
+    otherwise.project_contract_json.clone_from(&old.project_contract_json);
+    otherwise.project_contract_prompt.clone_from(&old.project_contract_prompt);
+    if otherwise != old.derived() {
+        return None;
+    }
+    match new.project_contract_json.as_deref() {
+        Some(json) => {
+            let contract: ProjectContract = serde_json::from_str(json).ok()?;
+            Some(format!("project contract updated (v{})", contract.version))
+        }
+        None if new.project_contract_prompt.is_none() => Some("project contract removed".into()),
+        None => None,
+    }
+}
+
+struct ProjectContractGuardian {
+    contract: ProjectContract,
+    template: String,
+    reported_failure: AtomicBool,
+    advised_before_execution: Mutex<HashSet<String>>,
+}
+
+impl ProjectContractGuardian {
+    fn new(spec: &CreateSession) -> Option<Self> {
+        let contract = match serde_json::from_str(spec.project_contract_json.as_deref()?) {
+            Ok(contract) => contract,
+            Err(err) => {
+                // Don't log project contract content or offending strings.
+                warn!(line = err.line(), column = err.column(), "ignoring invalid project contract in session spec");
+                return None;
+            }
+        };
+        Some(Self {
+            contract,
+            template: spec_prompt(spec, "project.contract_reminder", c6_agent::PROJECT_CONTRACT_REMINDER),
+            reported_failure: AtomicBool::new(false),
+            advised_before_execution: Mutex::default(),
+        })
+    }
+
+    fn matched_capabilities(&self, evidence: &[(&str, &str, &str)]) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut names = Vec::new();
+        for &(name, input, output) in evidence {
+            // Match fields separately: adjoining arbitrary fields must not
+            // manufacture a literal match across their boundary.
+            for field in [name, input, output] {
+                for capability in self.contract.reminders(field) {
+                    if !capability.trim().is_empty() && seen.insert(capability.clone()) {
+                        names.push(capability);
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    fn reminder(&self, evidence: &[(&str, &str, &str)]) -> Option<String> {
+        let mut names = self.matched_capabilities(evidence);
+        let advised = self.advised_before_execution.lock().unwrap();
+        names.retain(|name| !advised.contains(name));
+        (!names.is_empty()).then(|| self.template.replace("{{capabilities}}", &names.join(", ")))
+    }
+
+    fn defer_tools(&self, calls: &[(String, String, String)], is_available: &dyn Fn(&str) -> bool) -> Vec<Option<String>> {
+        let mut advised = self.advised_before_execution.lock().unwrap();
+        let mut newly_advised = HashSet::new();
+        let deferrals = calls
+            .iter()
+            .map(|(_, tool, input)| {
+                if tool.eq_ignore_ascii_case("capability") || !is_available(tool) {
+                    return None;
+                }
+                let mut names = self.matched_capabilities(&[(tool, input, "")]);
+                names.retain(|name| !advised.contains(name));
+                if names.is_empty() || serde_json::from_str::<serde_json::Value>(input).is_err() {
+                    return None;
+                }
+                newly_advised.extend(names.iter().cloned());
+                let reminder = self.template.replace("{{capabilities}}", &names.join(", "));
+                Some(format!(
+                    "Deferred: this tool was not run. {reminder}\n\nIf the capability is not suitable, you may retry the original tool."
+                ))
+            })
+            .collect();
+        // The model has not seen this batch's results yet: defer duplicate
+        // matches in that batch too. Only a later request can be a retry.
+        advised.extend(newly_advised);
+        deferrals
+    }
+
+    fn claim_failure(&self, name: &str, input_json: &str, output: &str) -> Option<(Vec<String>, String)> {
+        if self.reported_failure.load(Ordering::Relaxed) {
+            return None;
+        }
+        let names = self.matched_capabilities(&[(name, input_json, output)]);
+        if names.is_empty() || self.reported_failure.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        // Don't copy commands, arguments, or untrusted output into the card.
+        let detail =
+            format!("Tool `{name}` returned an error after matching a declared project capability. See its result in the session.");
+        Some((names, detail))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session_turn(
     turn: u64,
@@ -7878,6 +8012,7 @@ async fn run_session_turn(
     inbox: &Mutex<Inbox>,
     cancel: &CancellationToken,
     sub: crate::subagent::Parent,
+    contract: Option<&ProjectContractGuardian>,
 ) -> anyhow::Result<()> {
     let first = inbox.lock().unwrap().drain();
     let idle_compact = first.first().is_some_and(is_idle_compact);
@@ -7934,8 +8069,21 @@ async fn run_session_turn(
     }
     let mut pending = || inbox.lock().unwrap().drain();
     let visible = delegation_tools_for_turn(&sub.spec, tools);
+    let render = |evidence: &[(&str, &str, &str)]| contract.and_then(|guardian| guardian.reminder(evidence));
     session_tools.set_subagents(Some(Arc::new(crate::subagent::Runner::new(sub, tools))));
-    let result = run_turn(turn, cfg, client.as_ref(), &visible, session_tools, sink, conv, &mut pending, cancel).await;
+    let result = run_turn_with_tool_reminders(
+        turn,
+        cfg,
+        client.as_ref(),
+        &visible,
+        session_tools,
+        sink,
+        conv,
+        &mut pending,
+        cancel,
+        contract.map(|_| &render as &ToolReminders<'_>),
+    )
+    .await;
     session_tools.set_subagents(None);
     result?;
     Ok(())
@@ -7999,6 +8147,7 @@ pub(crate) async fn own_runtime(
         prompt.push_str("\n\n");
         prompt.push_str(&Skill::index(&built.skills, SkillTool::tool_name(profile == ToolProfile::Claude)));
     }
+    append_project_contract_prompt(&mut prompt, spec);
     OwnRuntime { profile, tools: built.tools, prompt, errors: built.errors }
 }
 
@@ -8210,6 +8359,9 @@ fn builtin_tools(
     tools.push(Arc::new(c6_tools::kits::KitRun::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::kits::KitShell::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::templates::TemplateStart::new(profile == ToolProfile::Claude)));
+    if spec.project_contract_json.is_some() {
+        tools.push(Arc::new(c6_tools::capabilities::Capability::new(profile == ToolProfile::Claude)));
+    }
     tools.push(Arc::new(c6_tools::apps::AppCall::new(profile == ToolProfile::Claude)));
     // The work the session belongs to (docs/work.md §4).
     tools.push(Arc::new(c6_tools::records::Work::new(profile == ToolProfile::Claude)));
@@ -8525,6 +8677,7 @@ fn claude_code_system_prompt(spec: &CreateSession, labels: &[String], tools: &[A
         prompt.push_str("\n\n# Subagents unavailable\n\n");
         prompt.push_str(&reason);
     }
+    append_project_contract_prompt(&mut prompt, spec);
     prompt
 }
 
@@ -9061,11 +9214,29 @@ pub(crate) fn prompt_for_tools(spec: &CreateSession, prompt: &str, tools: &[Arc<
     c6_agent::base_prompt_for_tools(prompt, &tools.iter().map(|t| t.spec().name).collect::<Vec<_>>(), profile)
 }
 
+/// Appended last so children can remove the inherited copy before applying
+/// their own prompt and tool adjustments.
+pub(crate) fn append_project_contract_prompt(prompt: &mut String, spec: &CreateSession) {
+    if let Some(section) = spec.project_contract_prompt.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+        prompt.push_str("\n\n");
+        prompt.push_str(section);
+    }
+}
+
+pub(crate) fn without_project_contract_prompt<'a>(prompt: &'a str, spec: &CreateSession) -> &'a str {
+    spec.project_contract_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .and_then(|section| prompt.strip_suffix(section)?.strip_suffix("\n\n"))
+        .unwrap_or(prompt)
+}
+
 /// Local named agents replace the inherited system prompt at creation. The
 /// durable delegation names the agent even after its catalog entry is removed;
 /// Started retains its instructions independently of later runtime snapshots.
 /// Claude Code children instead received their instructions in their input.
-fn named_child_instructions<'a>(spec: &CreateSession, events: &'a [SessionEvent]) -> Option<&'a str> {
+fn named_child_instructions<'a>(spec: &CreateSession, events: &'a [SessionEvent]) -> Option<std::borrow::Cow<'a, str>> {
     let delegation = spec.delegation.as_ref()?;
     let agent: serde_json::Value = serde_json::from_str(&delegation.agent_json).ok()?;
     if agent.get("name")?.as_str()?.is_empty() {
@@ -9078,15 +9249,20 @@ fn named_child_instructions<'a>(spec: &CreateSession, events: &'a [SessionEvent]
     if started.tool_profile == crate::claude_code::PROFILE {
         return None;
     }
+    // New project children save raw instructions separately: the contract
+    // can itself contain examples with an Environment heading.
+    if let Some(instructions) = agent.get("instructions").and_then(serde_json::Value::as_str) {
+        return Some(std::borrow::Cow::Owned(instructions.to_owned()));
+    }
     // subagent::Runner appends this environment after the explicit prompt,
     // before prompt_for_tools. Use the last marker: instructions may contain
     // their own Environment heading. Do not retain stale derived sections.
-    Some(
+    Some(std::borrow::Cow::Borrowed(
         started
             .system_prompt
             .rsplit_once("\n\n# Environment\n\nWorking directory: ")
             .map_or(started.system_prompt.as_str(), |(instructions, _)| instructions),
-    )
+    ))
 }
 
 /// The heading of the system prompt's skills index.
@@ -9339,13 +9515,102 @@ mod spec_generation_tests {
 #[cfg(test)]
 mod route_tool_tests {
     use super::*;
+    use c6_api::project_contract::{Capability, CapabilityLocation, ContractItem};
     use prost::Message;
+
+    fn contract_spec(version: u64) -> CreateSession {
+        let mut contract = ProjectContract { version, ..Default::default() };
+        for (name, trigger, pattern) in
+            [("inspect widget", "inspect_widget", "widget-check [all]"), ("read sample", "SAMPLE STATUS", "read-sample")]
+        {
+            contract.content.capabilities.push(ContractItem {
+                value: Capability {
+                    name: name.into(),
+                    description: String::new(),
+                    location: CapabilityLocation::Template { name: "example".into() },
+                    inputs: serde_json::json!({}),
+                    result_schema: serde_json::json!({}),
+                    trigger_phrases: vec![trigger.into()],
+                    command_patterns: vec![pattern.into()],
+                },
+                provenance: Default::default(),
+            });
+        }
+        CreateSession {
+            project_contract_json: Some(serde_json::to_string(&contract).unwrap()),
+            project_contract_prompt: Some(format!("# Project contract\n\nWidget contract version {version}")),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn project_guardian_matches_literal_tool_evidence_and_deduplicates() {
+        let mut spec = contract_spec(3);
+        spec.prompts_json = r#"{"project.contract_reminder":"Available: {{capabilities}}"}"#.into();
+        let guardian = ProjectContractGuardian::new(&spec).unwrap();
+        assert_eq!(
+            guardian.reminder(&[("Inspect_Widget", r#"{"cmd":"WIDGET-CHECK [ALL]"}"#, "sample status")]).as_deref(),
+            Some("Available: inspect widget, read sample"),
+        );
+        assert_eq!(guardian.reminder(&[("unrelated", r#"{"cmd":"widget-check a"}"#, "sample"), ("status", "{}", "ok")]), None);
+        assert!(ProjectContractGuardian::new(&CreateSession::default()).is_none());
+        spec.project_contract_json = Some("not JSON".into());
+        assert!(ProjectContractGuardian::new(&spec).is_none());
+    }
+
+    #[test]
+    fn project_guardian_reports_only_the_first_matching_failure_each_turn() {
+        let spec = contract_spec(3);
+        let guardian = ProjectContractGuardian::new(&spec).unwrap();
+        assert!(guardian.claim_failure("other_tool", "{}", "unrelated failure").is_none());
+        let (names, detail) = guardian.claim_failure("Inspect_Widget", "{}", "sample status: omit this text").unwrap();
+        assert_eq!(names, ["inspect widget", "read sample"]);
+        assert!(detail.contains("Inspect_Widget") && !detail.contains("omit this text"));
+        assert!(guardian.claim_failure("Inspect_Widget", "{}", "failed again").is_none());
+        assert!(ProjectContractGuardian::new(&spec).unwrap().claim_failure("Inspect_Widget", "{}", "new turn").is_some());
+    }
+
+    #[test]
+    fn project_guardian_defers_all_new_matches_in_a_batch_then_allows_retries() {
+        let spec = contract_spec(3);
+        let guardian = ProjectContractGuardian::new(&spec).unwrap();
+        let call = |tool: &str, input: &str| (String::new(), tool.to_owned(), input.to_owned());
+        let matches = call("bash", r#"{"command":"widget-check [all]"}"#);
+        let calls = [
+            call("Capability", r#"{"name":"widget-check [all]"}"#),
+            call("unavailable", r#"{"command":"widget-check [all]"}"#),
+            call("bash", "invalid JSON widget-check [all]"),
+            matches.clone(),
+            matches.clone(),
+            call("bash", r#"{"command":"ordinary work"}"#),
+        ];
+        let deferrals = guardian.defer_tools(&calls, &|tool| tool != "unavailable");
+        assert_eq!(deferrals.iter().map(Option::is_some).collect::<Vec<_>>(), [false, false, false, true, true, false]);
+        assert!(deferrals[3].as_ref().unwrap().contains("inspect widget"));
+        assert!(guardian.reminder(&[("bash", &matches.2, "")]).is_none());
+        assert_eq!(guardian.defer_tools(std::slice::from_ref(&matches), &|_| true), [None]);
+        assert!(guardian.defer_tools(&[call("bash", r#"{"command":"read-sample"}"#)], &|_| true)[0].is_some());
+        assert!(ProjectContractGuardian::new(&spec).unwrap().defer_tools(&[matches], &|_| true)[0].is_some());
+    }
+
+    #[test]
+    fn contract_only_refresh_notice_and_native_prompt() {
+        let old = contract_spec(1);
+        let mut new = contract_spec(2);
+        assert_eq!(contract_only_refresh_notice(&old, &new).as_deref(), Some("project contract updated (v2)"));
+        assert_eq!(contract_only_refresh_notice(&old, &CreateSession::default()).as_deref(), Some("project contract removed"));
+        assert!(contract_only_refresh_notice(&old, &old).is_none());
+        assert!(claude_code_system_prompt(&new, &[], &[]).ends_with("Widget contract version 2"));
+        new.tools.push("read".into());
+        assert!(contract_only_refresh_notice(&old, &new).is_none());
+    }
 
     #[tokio::test]
     async fn named_child_refresh_preserves_original_instructions_after_catalog_removal() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
         let model = ModelSpec { connection_kind: "anthropic".into(), model: "claude-sonnet-5-5".into(), ..Default::default() };
+        let instructions = "ONLY REVIEW, NEVER EDIT.\n\n# Environment\n\nWorking directory: an example in the instructions";
         let old = CreateSession {
             model: Some(model.clone()),
             cwd: dir.path().display().to_string(),
@@ -9356,17 +9621,19 @@ mod route_tool_tests {
             delegation: Some(c6_proto::Delegation {
                 parent_session_id: "parent".into(),
                 root_session_id: "parent".into(),
-                agent_json: r#"{"name":"reader","tools":["Read","Skill"]}"#.into(),
+                agent_json: serde_json::json!({"name":"reader","tools":["Read","Skill"],"instructions":instructions}).to_string(),
                 ..Default::default()
             }),
-            ..Default::default()
+            project_contract_prompt: Some("# Project contract\n\n# Environment\n\nWorking directory: an example in the contract".into()),
+            ..contract_spec(0)
         };
-        let instructions = "ONLY REVIEW, NEVER EDIT.\n\n# Environment\n\nWorking directory: an example in the instructions";
+        let mut system_prompt = format!("{instructions}\n\n# Environment\n\nWorking directory: {}\nToday's date: 2026-01-01", old.cwd);
+        append_project_contract_prompt(&mut system_prompt, &old);
         let started = SessionStarted {
             model: Some(model),
             cwd: old.cwd.clone(),
             tool_profile: ToolProfile::Claude.as_str().into(),
-            system_prompt: format!("{instructions}\n\n# Environment\n\nWorking directory: {}\nToday's date: 2026-01-01", old.cwd),
+            system_prompt,
             tools: old.tools.clone(),
             ..Default::default()
         };
@@ -9379,14 +9646,14 @@ mod route_tool_tests {
             .await
             .unwrap();
         let manager = SessionManager::new(journal.clone(), Arc::new(HeadLink::default()), dir.path().join("worktrees"));
-        for base in ["NEW ROOT PROMPT", "ANOTHER ROOT PROMPT"] {
+        for (version, base) in [(1, "NEW ROOT PROMPT"), (2, "ANOTHER ROOT PROMPT")] {
             let fresh = CreateSession {
                 base_prompt: base.into(),
                 agents_json: "[]".into(),
                 skills_json: "[]".into(),
                 // Force a second rebuild without changing the child's identity.
                 prompts_json: serde_json::json!({"session.task_cards": base}).to_string(),
-                ..Default::default()
+                ..contract_spec(version)
             };
             manager
                 .handle(SessionCommand {
@@ -9417,7 +9684,7 @@ mod route_tool_tests {
         }
         let (spec, events) = journal.load_session("named").await.unwrap().unwrap();
         assert_eq!(spec.agents_json, "[]", "the catalog entry really was removed");
-        assert_eq!(named_child_instructions(&spec, &events), Some(instructions));
+        assert_eq!(named_child_instructions(&spec, &events).as_deref(), Some(instructions));
         let refreshes: Vec<_> = events
             .iter()
             .filter_map(|event| match &event.kind {
@@ -9426,8 +9693,10 @@ mod route_tool_tests {
             })
             .collect();
         assert_eq!(refreshes.len(), 2);
-        for refresh in refreshes {
+        for (i, refresh) in refreshes.into_iter().enumerate() {
             assert!(refresh.system_prompt.starts_with(instructions), "{}", refresh.system_prompt);
+            assert!(refresh.system_prompt.ends_with(&format!("Widget contract version {}", i + 1)));
+            assert_eq!(refresh.system_prompt.matches("# Project contract").count(), 1);
             assert!(!refresh.system_prompt.contains("INHERITED PARENT PROMPT"));
             assert!(!refresh.system_prompt.contains("ROOT PROMPT"));
             assert!(!refresh.system_prompt.contains("2026-01-01"), "old environment is rebuilt");
@@ -14806,7 +15075,7 @@ mod writer_tests {
         let background = c6_tools::Background::default();
         background.set_sink(Some(task_tx));
         let (task_id, _) = background.start_agent("nested work", true);
-        let sink = TurnSink { writer: writer.clone(), inbox: Arc::default(), task_fence: Some(fence) };
+        let sink = TurnSink { writer: writer.clone(), inbox: Arc::default(), task_fence: Some(fence), contract: None };
         sink.start_turn(1, &[]).await.unwrap();
         let end = tokio::spawn(async move {
             sink.append(session_event::Kind::TurnEnded(TurnEnded { turn: 1, reason: TurnEndReason::Completed as i32 })).await
@@ -14849,7 +15118,7 @@ mod writer_tests {
                 inbox.lock().unwrap().push(input.clone(), None);
             }
             assert_eq!(inbox.lock().unwrap().drain(), inputs);
-            let sink = TurnSink { writer: writer.clone(), inbox: inbox.clone(), task_fence: None };
+            let sink = TurnSink { writer: writer.clone(), inbox: inbox.clone(), task_fence: None, contract: None };
             let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
             let mut fault = sqlx::SqliteConnection::connect_with(&opts).await.unwrap();
             let trigger = if fail_boundary {

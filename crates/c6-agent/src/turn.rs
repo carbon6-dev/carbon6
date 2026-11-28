@@ -139,9 +139,29 @@ pub async fn run_turn(
     pending: &mut (dyn FnMut() -> Vec<PendingInput> + Send),
     cancel: &CancellationToken,
 ) -> anyhow::Result<TurnEndReason> {
+    run_turn_with_tool_reminders(turn, cfg, client, tools, session_tools, sink, conv, pending, cancel, None).await
+}
+
+/// Renders an optional model-only advisory from the latest tool exchange, in
+/// result order. Each entry is (tool name, input JSON, result text).
+pub type ToolReminders<'a> = dyn Fn(&[(&str, &str, &str)]) -> Option<String> + Send + Sync + 'a;
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_turn_with_tool_reminders(
+    turn: u64,
+    cfg: &TurnConfig,
+    client: &dyn ModelClient,
+    tools: &[Arc<dyn Tool>],
+    session_tools: &Arc<SessionTools>,
+    sink: &Arc<dyn EventSink>,
+    conv: &mut Conversation,
+    pending: &mut (dyn FnMut() -> Vec<PendingInput> + Send),
+    cancel: &CancellationToken,
+    reminders: Option<&ToolReminders<'_>>,
+) -> anyhow::Result<TurnEndReason> {
     sink.append(session_event::Kind::TurnStarted(TurnStarted { turn, context_window: cfg.context_window })).await?;
     let t = Turn { turn, cfg, client, specs: tools.iter().map(|t| t.spec()).collect(), sink, cancel };
-    let reason = t.run(tools, session_tools, conv, pending).await?;
+    let reason = t.run(tools, session_tools, conv, pending, reminders).await?;
     sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
     Ok(reason)
 }
@@ -286,7 +306,7 @@ impl Turn<'_> {
 
     /// At any request boundary (including the first request after a cold
     /// resume), replace only old tool-result contents, never pending user text.
-    async fn trim_for_request(&self, conv: &mut Conversation, estimate: u64, next: u64) -> anyhow::Result<Option<u64>> {
+    async fn trim_for_request(&self, conv: &mut Conversation, estimate: u64, next: u64, extra_tokens: u64) -> anyhow::Result<Option<u64>> {
         if self.cfg.trim_at == 0 || next <= self.cfg.trim_at {
             return Ok(None);
         }
@@ -294,7 +314,7 @@ impl Turn<'_> {
         if crate::history::trim_old_tool_output(&mut history, &self.cfg.compact.trimmed) == 0 {
             return Ok(None);
         }
-        let after = self.estimate_request(&history, &self.specs);
+        let after = self.estimate_request(&history, &self.specs) + extra_tokens;
         // Rewriting a prefix is only worthwhile when it saves at least a fifth.
         if u128::from(after) * 5 > u128::from(estimate) * 4 {
             return Ok(None);
@@ -365,6 +385,7 @@ impl Turn<'_> {
         session_tools: &Arc<SessionTools>,
         conv: &mut Conversation,
         pending: &mut (dyn FnMut() -> Vec<PendingInput> + Send),
+        reminders: Option<&ToolReminders<'_>>,
     ) -> anyhow::Result<TurnEndReason> {
         let by_name: HashMap<String, Arc<dyn Tool>> = self.specs.iter().map(|s| s.name.clone()).zip(tools.iter().cloned()).collect();
         let mut compacted_for_overflow = false;
@@ -373,14 +394,21 @@ impl Turn<'_> {
         // Recompacting unchanged history cannot help, even if the fixed
         // prefix alone exceeds the threshold.
         let mut compacted_estimate = None;
+        let mut reminder = None;
 
         for _ in 0..MAX_STEPS {
             if self.cancel.is_cancelled() {
                 return Ok(TurnEndReason::Interrupted);
             }
-            let mut estimate = self.estimate_request(&conv.history, &self.specs);
+            // Derive before compaction can remove the tool exchange. Carry the
+            // advisory through overflow recovery, but not into later requests.
+            if reminder.is_none() {
+                reminder = reminders.and_then(|render| latest_tool_reminder(&conv.history, render));
+            }
+            let reminder_tokens = reminder.as_ref().map_or(0, |text| (2 * (text.chars().count() as u64 + 48)).div_ceil(7));
+            let mut estimate = self.estimate_request(&conv.history, &self.specs) + reminder_tokens;
             let mut next = next_tokens(conv.context_tokens, estimate, reported);
-            if let Some(after) = self.trim_for_request(conv, estimate, next).await? {
+            if let Some(after) = self.trim_for_request(conv, estimate, next, reminder_tokens).await? {
                 reported = None;
                 estimate = after;
                 next = after;
@@ -398,11 +426,18 @@ impl Turn<'_> {
                         return self.fail(format!("compaction failed: {e}")).await;
                     }
                     reported = None;
-                    compacted_estimate = Some(self.estimate_request(&conv.history, &self.specs));
+                    compacted_estimate = Some(self.estimate_request(&conv.history, &self.specs) + reminder_tokens);
                 }
             }
 
-            let req = self.request(conv.history.clone(), self.cfg.max_output_tokens);
+            let mut messages = conv.history.clone();
+            if let Some(text) = &reminder {
+                match messages.last_mut() {
+                    Some(last) if last.role == Role::User => last.blocks.push(Block::Text(text.clone())),
+                    _ => messages.push(Message::user_text(text.clone())),
+                }
+            }
+            let req = self.request(messages, self.cfg.max_output_tokens);
             let resp = match self.call_retrying(&req).await {
                 Ok(r) => r,
                 Err(LlmError::ContextOverflow(_)) if !compacted_for_overflow => {
@@ -411,11 +446,12 @@ impl Turn<'_> {
                         return self.fail(format!("context window exceeded and compaction failed: {e}")).await;
                     }
                     reported = None;
-                    compacted_estimate = Some(self.estimate_request(&conv.history, &self.specs));
+                    compacted_estimate = Some(self.estimate_request(&conv.history, &self.specs) + reminder_tokens);
                     continue;
                 }
                 Err(e) => return self.fail(format!("model request failed: {e}")).await,
             };
+            reminder = None;
 
             let complete = !resp.interrupted && resp.error.is_none();
             if let Some(msg) = resp.message {
@@ -434,7 +470,7 @@ impl Turn<'_> {
             if resp.usage != Default::default() {
                 let u = resp.usage;
                 conv.context_tokens = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens + u.output_tokens;
-                reported = (conv.context_tokens > 0).then(|| self.estimate_request(&conv.history, &self.specs));
+                reported = (conv.context_tokens > 0).then(|| self.estimate_request(&conv.history, &self.specs) + reminder_tokens);
             }
             if resp.interrupted {
                 return Ok(TurnEndReason::Interrupted);
@@ -465,9 +501,9 @@ impl Turn<'_> {
                 // The last call's input may be cut off; run none of them.
                 calls
                     .iter()
-                    .map(|(id, name, _)| {
-                        let out = ToolOutput::err("Not run: your response hit the output token limit, so this call may be incomplete. Do the work in smaller steps.");
-                        (id.clone(), name.clone(), out, 0)
+                    .map(|_| {
+                        let output = ToolOutput::err("Not run: your response hit the output token limit, so this call may be incomplete. Do the work in smaller steps.");
+                        ToolRun { output, elapsed: 0, failure_output_len: None }
                     })
                     .collect()
             } else {
@@ -475,12 +511,12 @@ impl Turn<'_> {
             };
             // Images tools return go after all the results, each labelled.
             let mut images: Vec<Block> = Vec::new();
-            for (id, name, output, elapsed) in results {
+            for ((id, name, input), ToolRun { output, elapsed, failure_output_len }) in calls.into_iter().zip(results) {
                 images.extend(crate::history::tool_image_blocks(&name, &output.images));
                 self.sink
                     .append(session_event::Kind::ToolResult(ToolResult {
                         call_id: id.clone(),
-                        tool: name,
+                        tool: name.clone(),
                         output: output.content.clone(),
                         is_error: output.is_error,
                         truncated: output.truncated,
@@ -497,6 +533,9 @@ impl Turn<'_> {
                             .collect(),
                     }))
                     .await?;
+                if let Some(len) = failure_output_len {
+                    self.sink.tool_failed(&name, &input, &output.content[..len]);
+                }
                 user_blocks.push(Block::ToolResult { id, content: output.content, is_error: output.is_error });
             }
             user_blocks.extend(images);
@@ -929,6 +968,34 @@ async fn fail(sink: &dyn EventSink, message: String) -> anyhow::Result<TurnEndRe
     Ok(TurnEndReason::Error)
 }
 
+fn latest_tool_reminder(history: &[Message], render: &ToolReminders<'_>) -> Option<String> {
+    let [.., assistant, user] = history else { return None };
+    if assistant.role != Role::Assistant || user.role != Role::User {
+        return None;
+    }
+    let calls: HashMap<_, _> = assistant.tool_uses().map(|(id, name, input)| (id, (name, input))).collect();
+    let evidence: Vec<_> = user
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::ToolResult { id, content, .. } => {
+                let &(name, input) = calls.get(id.as_str())?;
+                Some((name, input, content.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    if evidence.is_empty() { None } else { render(&evidence) }
+}
+
+struct ToolRun {
+    output: ToolOutput,
+    elapsed: u64,
+    // The failed invocation's output, without appended PostToolUse feedback.
+    // Synthetic errors for calls that never ran do not have this marker.
+    failure_output_len: Option<usize>,
+}
+
 /// Runs calls in order: consecutive shared (read-only) calls concurrently,
 /// exclusive ones alone. Returns results in call order.
 async fn run_tools(
@@ -937,13 +1004,25 @@ async fn run_tools(
     session_tools: &Arc<SessionTools>,
     sink: &Arc<dyn EventSink>,
     cancel: &CancellationToken,
-) -> Vec<(String, String, ToolOutput, u64)> {
+) -> Vec<ToolRun> {
     let mut out = Vec::with_capacity(calls.len());
+    let deferrals = if cancel.is_cancelled() { Vec::new() } else { sink.defer_tools(calls, &|name| by_name.contains_key(name)) };
     let mut i = 0;
     while i < calls.len() {
         let shared = |c: &(String, String, String)| by_name.get(&c.1).is_some_and(|t| t.concurrency() == Concurrency::Shared);
         let end = if shared(&calls[i]) { i + calls[i..].iter().take_while(|c| shared(c)).count() } else { i + 1 };
-        let batch = calls[i..end].iter().map(|(id, name, input)| run_one(id, name, input, by_name, session_tools, sink, cancel));
+        let batch = calls[i..end].iter().enumerate().map(|(offset, (id, name, input))| {
+            let advisory = deferrals.get(i + offset).and_then(Option::as_ref);
+            async move {
+                if let Some(advisory) = advisory {
+                    // Not an invocation or failure: policies and tool code have
+                    // not run. The synthetic reply closes the provider's call ID.
+                    ToolRun { output: ToolOutput::ok(advisory.clone()), elapsed: 0, failure_output_len: None }
+                } else {
+                    run_one(id, name, input, by_name, session_tools, sink, cancel).await
+                }
+            }
+        });
         out.extend(join_all(batch).await);
         i = end;
     }
@@ -958,8 +1037,9 @@ async fn run_one(
     session_tools: &Arc<SessionTools>,
     sink: &Arc<dyn EventSink>,
     cancel: &CancellationToken,
-) -> (String, String, ToolOutput, u64) {
+) -> ToolRun {
     let started = Instant::now();
+    let mut failure_output_len = None;
     let output = if cancel.is_cancelled() {
         ToolOutput::err("Not run: the turn was interrupted.")
     } else {
@@ -984,6 +1064,9 @@ async fn run_one(
                     let stream_to = sink_output(sink, call_id);
                     let ctx = ToolCtx { session: session_tools.clone(), cancel: cancel.clone(), output: stream_to, call_id: id.to_owned() };
                     let mut output = tool.call(&ctx, value.clone()).await;
+                    if output.is_error && !cancel.is_cancelled() {
+                        failure_output_len = Some(output.content.len());
+                    }
                     if let Some(h) = &hooks
                         && let Some(feedback) = h.post_tool_use(name, &value, &output.content, output.is_error).await
                     {
@@ -994,7 +1077,7 @@ async fn run_one(
             }
         }
     };
-    (id.to_owned(), name.to_owned(), output, started.elapsed().as_millis() as u64)
+    ToolRun { output, elapsed: started.elapsed().as_millis() as u64, failure_output_len }
 }
 
 fn sink_output(sink: &Arc<dyn EventSink>, call_id: String) -> c6_tools::OutputSink {

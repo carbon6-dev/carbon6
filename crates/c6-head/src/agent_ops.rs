@@ -103,6 +103,7 @@ const READ_OK: &[&str] = &[
 
 /// Yours alone, wherever they are.
 const NEVER: &[&str] = &[
+    "projects.contract.set",
     "voice.transcribe",
     "voice.tidy",
     // Watchers are yours to set and run (docs/watchers.md).
@@ -188,6 +189,7 @@ const NEVER: &[&str] = &[
 
 /// Makes something new, even inside something that isn't its own.
 const MAKE: &[&str] = &[
+    "projects.contract.propose",
     "work.add",
     "work.todos.add",
     "projects.add",

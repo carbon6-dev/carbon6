@@ -28,6 +28,8 @@ impl CreateSession {
         }
         copy!(
             base_prompt,
+            project_contract_json,
+            project_contract_prompt,
             mcp_servers_json,
             skills_json,
             hooks_json,
@@ -125,6 +127,8 @@ mod tests {
         let state = spec.clone();
         let fresh = CreateSession {
             base_prompt: "today's prompt".into(),
+            project_contract_json: Some(r#"{"version":1}"#.into()),
+            project_contract_prompt: Some("Widget contract".into()),
             tools: vec!["Task".into(), "SendMessage".into()],
             subagent_connections_json: "[]".into(),
             subagent_target: Some(ModelSpec::default()),
@@ -133,6 +137,8 @@ mod tests {
         spec.apply_derived(&fresh);
         let mut expected = state;
         expected.base_prompt.clone_from(&fresh.base_prompt);
+        expected.project_contract_json.clone_from(&fresh.project_contract_json);
+        expected.project_contract_prompt.clone_from(&fresh.project_contract_prompt);
         expected.tools.clone_from(&fresh.tools);
         expected.subagent_connections_json.clone_from(&fresh.subagent_connections_json);
         assert_eq!(spec, expected);
@@ -142,6 +148,11 @@ mod tests {
         assert!(snapshot.delegation.is_none() && snapshot.labels.is_empty());
         assert!(snapshot.keep_warm_snapshot_json.is_none() && snapshot.memex_brief.is_empty());
         assert!(!snapshot.subagent_target_explicit);
+        assert_eq!(snapshot.project_contract_json, fresh.project_contract_json);
+        assert_eq!(snapshot.project_contract_prompt, fresh.project_contract_prompt);
+        spec.apply_derived(&CreateSession::default());
+        assert!(spec.project_contract_json.is_none());
+        assert!(spec.project_contract_prompt.is_none());
     }
 
     #[test]

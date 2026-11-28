@@ -763,6 +763,10 @@ async fn wake(st: &HeadState, name: &str, key: &str, forced: &[String], message:
     let agenda = crate::prompts::get(st, &d.agenda, &realm).await;
     let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let mut prompt = api::prompts::fill(&agenda, &pairs);
+    if let Some((_, contract)) = crate::project_contract::for_session(st, &s.session_id).await? {
+        prompt.push_str("\n\n");
+        prompt.push_str(&crate::project_contract::render(st, &realm, &contract).await);
+    }
     if let Some(input) = message {
         prompt.push_str(&format!("\n\nMessage from {}: {}", input_source(input), input.text));
     }

@@ -379,6 +379,24 @@ pub async fn start_subagent(
     let Some((t, layer)) = templates_in(st, &realm, None).await?.into_iter().find(|(t, _)| t.name == name) else {
         return Err(not_found(format!("no template named {name:?}; {}", agent_list(st, &realm).await)));
     };
+    let acting = match &layer {
+        crate::lists::Layer::Instance(n) => n.clone(),
+        _ => String::new(),
+    };
+    start_subagent_with(st, parent, req, &t, &acting).await
+}
+
+/// Shared placement and delegation limits for saved templates and an exact
+/// worker/folder capability explicitly accepted in a project contract.
+pub(crate) async fn start_subagent_with(
+    st: &HeadState,
+    parent: &crate::store::SessionRow,
+    req: &SubagentStart<'_>,
+    t: &api::Template,
+    acting: &str,
+) -> anyhow::Result<(api::Session, api::RemoteSubagent)> {
+    let name = req.template;
+    let realm = parent.realm.clone();
     if !t.enabled {
         return Err(bad_request(format!("template {name:?} is switched off")));
     }
@@ -389,10 +407,6 @@ pub async fn start_subagent(
             agent_list(st, &realm).await
         )));
     }
-    let acting = match &layer {
-        crate::lists::Layer::Instance(n) => n.clone(),
-        _ => String::new(),
-    };
     // Its tree's limits: how deep, and how many subagents run at once.
     let limits = crate::sessions::subagent_limits(st, Some(&realm)).await?;
     let max_depth = if limits.max_depth == 0 { api::DEFAULT_SUBAGENT_DEPTH } else { limits.max_depth };
@@ -408,7 +422,7 @@ pub async fn start_subagent(
             )));
         }
     }
-    let (targets, errors) = targets(st, name, &t, &realm, Some(parent)).await?;
+    let (targets, errors) = targets(st, name, t, &realm, Some(parent)).await?;
     let names: Vec<String> = targets.iter().map(target_name).collect();
     let target = match targets.len() {
         0 => return Err(bad_request(format!("template {name:?}: nowhere to run ({})", errors.join("; ")))),
@@ -426,7 +440,7 @@ pub async fn start_subagent(
     }
     let tname = target_name(&target);
     let (w, ssh) = target;
-    let connection_id = connection_of(st, name, &t).await?;
+    let connection_id = connection_of(st, name, t).await?;
     let mut labels = t.labels.clone();
     labels.push(format!("template:{name}"));
     labels.push(format!("run:{}", run_id()));
@@ -460,7 +474,7 @@ pub async fn start_subagent(
         template: name.to_owned(),
         colour: parent.colour.clone(),
     };
-    let session = crate::sessions::create_linked(st, create, &acting, Some(link)).await?;
+    let session = crate::sessions::create_linked(st, create, acting, Some(link)).await?;
     let remote = api::RemoteSubagent {
         template: name.to_owned(),
         worker_id: w.id.to_string(),

@@ -153,6 +153,8 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
         // A side chat or subagent works for its parent's conversation.
         let target = session.parent_id.clone().unwrap_or(session_id);
         return match what {
+            "capability" => crate::project_contract::capability(st, &session, &params).await,
+            "contract_failure" => crate::project_contract::failure(st, &session, &params).await,
             "cache_lifetime" => Ok(serde_json::to_value(crate::cache_lifetime::for_session(st, &session, &params).await?)?),
             "todo" | "todo_resolve" | "decision" => crate::decisions::from_session(st, &target, what, &params).await,
             // Task cards (docs/task-cards.md).

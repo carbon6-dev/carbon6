@@ -129,6 +129,9 @@ async fn digest(st: &HeadState, child_id: &str, status: &str) -> anyhow::Result<
 /// its outcome; a turn no call waited on (you messaged the subagent) comes
 /// to the parent as a notice.
 pub async fn turn_ended(st: &HeadState, session_id: &str, end_seq: u64, reason: i32) {
+    if let Err(e) = crate::project_contract::ended(st, session_id).await {
+        warn!(session = %session_id, "recording a capability result: {e:#}");
+    }
     if let Err(e) = relay(st, session_id, end_seq, reason).await {
         warn!(session = %session_id, "relaying a remote subagent's turn to its parent: {e:#}");
         delivery_failed(st, session_id, &end_seq.to_string(), &e).await;
@@ -200,6 +203,9 @@ fn turn_report_seq(child: &str, id: &str) -> Option<u64> {
 /// A background-only completion has no TurnEnded of its own. Revisit the
 /// latest deferred turn unless the child is working on a new turn.
 pub(crate) async fn background_ended(st: &HeadState, session_id: &str) {
+    if let Err(e) = crate::project_contract::ended(st, session_id).await {
+        warn!(session = %session_id, "recording a capability's background completion: {e:#}");
+    }
     if let Err(e) = flush_pending_turn(st, session_id).await {
         warn!(session = %session_id, "checking a remote subagent's deferred report: {e:#}");
     }

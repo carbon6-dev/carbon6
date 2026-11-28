@@ -18,8 +18,11 @@ pub use history::{
 pub use prompt::build_system_prompt;
 pub use turn::{
     COMPACT_AT, COMPACT_AT_LARGE, COMPACT_PROMPT, COMPACT_WHY, COMPACT_WHY_ASKED, CompactPrompts, Conversation, IDLE_COMPACT_PROMPT,
-    LARGE_WINDOW, TurnConfig, compact_share, compact_turn, idle_compact_turn, run_turn,
+    LARGE_WINDOW, ToolReminders, TurnConfig, compact_share, compact_turn, idle_compact_turn, run_turn, run_turn_with_tool_reminders,
 };
+
+pub const PROJECT_CONTRACT_REMINDER: &str = "Project contract reminder: The recent tool activity matches these documented capabilities: \
+    {{capabilities}}. Check the project contract and use the appropriate capability if it applies, before improvising an alternative.";
 
 /// What a subagent is told (docs/os.md §4.6: an editable prompt).
 pub const SUBAGENT_NOTE: &str = "You are a subagent working for another agent, which does not receive this conversation automatically. \
@@ -101,6 +104,17 @@ pub trait EventSink: Send + Sync {
     }
 
     fn ephemeral(&self, kind: ephemeral_event::Kind);
+
+    /// Optional preflight for a whole model-proposed batch. Entries are in
+    /// call order (id, name, input JSON); an advisory at an index replaces
+    /// that invocation's result. An empty vector defers nothing.
+    fn defer_tools(&self, _calls: &[(String, String, String)], _is_available: &dyn Fn(&str) -> bool) -> Vec<Option<String>> {
+        Vec::new()
+    }
+
+    /// A tool actually ran and returned an error, and its result has been
+    /// recorded. Advisory observers must not block the turn or change its result.
+    fn tool_failed(&self, _name: &str, _input_json: &str, _output: &str) {}
 }
 
 /// A user message waiting for the next model request boundary.

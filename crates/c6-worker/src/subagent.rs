@@ -251,6 +251,8 @@ struct AgentJson {
     tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     hidden_delegation_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
 }
 
 /// The tools a subagent has, of its parent's: those its named agent
@@ -423,8 +425,9 @@ impl Subagents for Runner {
             let parent = (!claude_code_parent).then_some((self.tools.as_slice(), search_allowed));
             (filter_tools(built.tools, parent, agent), Some(built.skills))
         };
+        let inherited_prompt = crate::session::without_project_contract_prompt(&p.started.system_prompt, &p.spec);
         let mut system_prompt = match &skills {
-            None => crate::session::without_task_cards(&p.started.system_prompt),
+            None => crate::session::without_task_cards(inherited_prompt),
             Some(skills) => {
                 let base = if claude_code_parent {
                     // Claude Code's prompt is its own: write the one a
@@ -442,7 +445,7 @@ impl Subagents for Runner {
                     prompt.push_str(&crate::session::context_sections(&spec, &labels, &tools));
                     prompt
                 } else {
-                    crate::session::without_skills(&crate::session::without_task_cards(&p.started.system_prompt))
+                    crate::session::without_skills(&crate::session::without_task_cards(inherited_prompt))
                 };
                 if skills.is_empty() || !tools.iter().any(|t| t.spec().name == SkillTool::tool_name(profile == ToolProfile::Claude)) {
                     base
@@ -464,6 +467,7 @@ impl Subagents for Runner {
             system_prompt = crate::claude_code::SYSTEM_PROMPT.to_owned();
         } else {
             system_prompt = crate::session::prompt_for_tools(&spec, &system_prompt, &tools, profile);
+            crate::session::append_project_contract_prompt(&mut system_prompt, &spec);
         }
         // The parent's log links to the child before the child's exists.
         p.log
@@ -491,6 +495,7 @@ impl Subagents for Runner {
                 name: agent.map(|a| a.name.clone()).unwrap_or_default(),
                 tools: agent.map(|a| a.tools.clone()).unwrap_or_default(),
                 hidden_delegation_tools,
+                instructions: agent.filter(|_| !on_claude_code && spec.project_contract_prompt.is_some()).map(|a| a.prompt.clone()),
             };
             spec.delegation.as_mut().unwrap().agent_json = serde_json::to_string(&metadata).unwrap_or_default();
         }

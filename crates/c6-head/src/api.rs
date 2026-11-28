@@ -1325,9 +1325,17 @@ async fn create_session(
     if let Some(p) = crate::projects::with_context(&st, work.as_deref(), &prompt).await {
         req.prompt = Some(p);
     }
+    // Preserve explicit membership long enough to build the first session
+    // spec, before on_new_session stores the attachment below.
+    req.work = work.clone();
     let s = crate::sessions::create_from(&st, req, &caller).await?;
     // The work it belongs to (docs/work.md §4), and the to-do it's on.
     crate::work::on_new_session(&st, &s, work.as_deref(), &refs, &prompt, &todos).await;
+    if crate::project_contract::for_session(&st, &s.id).await?.is_some()
+        && let Err(error) = crate::sessions::refresh_specs(&st, None).await
+    {
+        tracing::warn!("refreshing project membership after session creation: {error:#}");
+    }
     // Its worktree may be its work's place (docs/dev-starts.md §4).
     crate::starts::record_place(&st, &s.id).await;
     Ok(Json(s))
@@ -4286,6 +4294,18 @@ fn refreshes_session_specs(method: &axum::http::Method, path: &str) -> bool {
     if path.starts_with("/api/v1/settings/") {
         return true;
     }
+    // Moving sessions or work between projects also changes inherited policy.
+    if let Some(tail) = path.strip_prefix("/api/v1/projects/") {
+        let operation = tail.split_once('/').map(|(_, op)| op).unwrap_or_default();
+        if matches!(operation, "sessions" | "work" | "detach" | "merge") || operation.ends_with("/promote") {
+            return true;
+        }
+    }
+    if let Some(tail) = path.strip_prefix("/api/v1/work/") {
+        if !tail.contains('/') && method == axum::http::Method::PATCH || tail.ends_with("/attach") || tail.ends_with("/detach") {
+            return true;
+        }
+    }
     for prefix in ["/api/v1/connections", "/api/v1/memories", "/api/v1/installs", "/api/v1/realms", "/api/v1/grants"] {
         if path == prefix || path.strip_prefix(prefix).is_some_and(|tail| tail.starts_with('/')) {
             return true;
@@ -5570,6 +5590,13 @@ async fn answer_decision(
 ) -> ApiResult<Json<api::Decision>> {
     // Realm scope is not an auth origin: browsers can be in a realm,
     // while root API tokens have no realm. Auth supplies names, not secrets.
+    let is_contract: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM decisions WHERE id = ? AND ref LIKE 'contract:%')")
+        .bind(id)
+        .fetch_one(&st.store.pool)
+        .await?;
+    if is_contract && !caller.human_origin(st.auth.required) {
+        return Err(crate::forbidden("only the user may accept a project contract proposal").into());
+    }
     let via = match caller.api_token_name.as_deref() {
         Some(name) => {
             let name = name.trim();

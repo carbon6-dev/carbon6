@@ -335,6 +335,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                                 <span class="text-zinc-600 dark:text-zinc-400">{p.why.clone()}</span>
                             </div>
                         </header>
+                        <ContractEditor project=p.clone() />
                         {p.fields.offer.clone().filter(|_| active).map(|o| view! {
                             <div class="flex flex-wrap items-center gap-2 rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-sm dark:border-emerald-800 dark:bg-emerald-950/30">
                                 <span class="min-w-0 flex-1">{format!("Looks done: {}", o.evidence)}</span>
@@ -490,6 +491,81 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                 }
             })}
         </main>
+    }
+}
+
+fn contract_edit(text: &str, expected_version: u64) -> Result<c6_api::project_contract::ContractSet, String> {
+    let contract = serde_json::from_str(text).map_err(|e| format!("Invalid contract: {e}"))?;
+    Ok(c6_api::project_contract::ContractSet { expected_version, contract })
+}
+
+/// Structured JSON keeps the full schema editable without hiding fields.
+#[component]
+fn ContractEditor(project: ProjectItem) -> impl IntoView {
+    use c6_api::project_contract::ContractContent;
+    let id = StoredValue::new(project.id);
+    let history = RwSignal::new(project.fields.contract_history);
+    let current = history.get_untracked().last().cloned();
+    let version = RwSignal::new(current.as_ref().map_or(0, |c| c.version));
+    let text = RwSignal::new(
+        serde_json::to_string_pretty(&current.map(|c| c.content).unwrap_or_else(ContractContent::default)).unwrap_or_default(),
+    );
+    let error = RwSignal::new(None::<String>);
+    let saving = RwSignal::new(false);
+    let save = move |_| {
+        let change = match contract_edit(&text.get_untracked(), version.get_untracked()) {
+            Ok(change) => change,
+            Err(e) => {
+                error.set(Some(e));
+                return;
+            }
+        };
+        saving.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match api::project_contract_set(id.get_value(), &change).await {
+                Ok(contract) => {
+                    version.set(contract.version);
+                    text.set(serde_json::to_string_pretty(&contract.content).unwrap_or_default());
+                    history.update(|h| h.push(contract));
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            saving.set(false);
+        });
+    };
+    view! {
+        <details class="rounded-lg border p-3 text-sm">
+            <summary class="cursor-pointer font-medium">{move || format!("Project contract (v{})", version.get())}</summary>
+            <p class="my-2 text-muted">"Accepted operating instructions for every session in this project. Save creates a revision; agents may only propose changes. Item provenance is assigned when you save. Do not put secret values here; use references."</p>
+            {move || error.get().map(|message| view! { <ErrorBox message /> })}
+            <textarea class=format!("{INPUT} min-h-[20rem] font-mono text-xs") aria-label="Project contract JSON"
+                prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev)) />
+            <button class=BUTTON disabled=move || saving.get() on:click=save>"Save contract"</button>
+            <details class="mt-3">
+                <summary class="cursor-pointer">"Change history"</summary>
+                {move || history.get().into_iter().rev().map(|c| view! {
+                    <details class="my-2">
+                        <summary>{format!("v{} · {} · {}", c.version, c.provenance.by, c.provenance.at)}</summary>
+                        <pre class="overflow-auto whitespace-pre-wrap text-xs">{serde_json::to_string_pretty(&c).unwrap_or_default()}</pre>
+                    </details>
+                }).collect_view()}
+            </details>
+        </details>
+    }
+}
+
+#[cfg(test)]
+mod contract_editor_tests {
+    use super::contract_edit;
+
+    #[test]
+    fn contract_editor_validates_json_and_keeps_the_base_version() {
+        let edit = contract_edit(r#"{"architecture_rules":[{"value":"Keep interfaces small"}]}"#, 7).unwrap();
+        assert_eq!(edit.expected_version, 7);
+        assert_eq!(edit.contract.architecture_rules[0].value, "Keep interfaces small");
+        assert!(contract_edit("not json", 7).is_err());
+        assert!(contract_edit(r#"{"unrecognized_policy":true}"#, 7).is_err());
     }
 }
 
