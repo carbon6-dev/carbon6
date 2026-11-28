@@ -19,7 +19,11 @@ cd "$(dirname "$0")/.."
 # breakdown, combined with quiet-turn trim controls, measure 11,528,007 raw
 # bytes after sharing the existing Settings field renderers. Retain these
 # controls rather than remove functionality to fit the previous allowance.
-accepted_raw=11528007
+# 2026-11-28: versioned project-contract schemas, provenance and the revision
+# editor add 117,414 raw / 21,876 Brotli bytes to the preceding integrated UI.
+# Record the measured Linux release rather than remove typed policy validation
+# or revision history to fit the older allowance.
+accepted_raw=11973351
 # 2026-11-26: adding worker compile-cache settings/statistics and confirmed
 # build-folder cleanup to keep-warm measures 11,588,494 raw / 2,888,277 Brotli
 # bytes in the Linux release build, within the existing allowance below.
@@ -28,7 +32,7 @@ accepted_raw=11528007
 # 2,790,904 bytes Brotli (82,824 above the previous accepted build); raw WASM
 # still fits its existing allowance, so retain that baseline.
 # The same combined Linux release measures 2,874,984 Brotli bytes.
-accepted_br=2874984
+accepted_br=2975111
 dist=${UI_DIST:-crates/c6-ui/dist}
 shopt -s nullglob
 wasm=("$dist"/*_bg.wasm)
