@@ -7603,7 +7603,7 @@ fn Composer(
                 {(!inline).then(|| view! { <crate::goal::GoalStrip session=id.get_value() /> })}
                 {(!inline).then(|| view! { <crate::capture::UpNext session=id.get_value() running=running /> })}
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-                <For each=move || shift_offer.get().flatten().into_iter().filter(|_| !disabled.get()).collect::<Vec<_>>()
+                <For each=move || { shift_offer.get().flatten().into_iter().filter(|_| !disabled.get()).collect::<Vec<_>>() }
                     key=|offer| offer.command_id.clone() let:offer>
                     <TaskShiftCard session=id.get_value() offer running refresh=shift_refresh start_fresh=Callback::new(move |(command_id, draft, pending)| {
                         start_fresh(Some((command_id, draft)), Some(pending));

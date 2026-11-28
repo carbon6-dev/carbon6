@@ -69,7 +69,7 @@ pub(crate) fn idle_compact_due(
     }
     let ttl_ms = lifetime_seconds?.checked_mul(1_000)?;
     let expires = last_call_ms.checked_add(ttl_ms)?;
-    let margin = (ttl_ms / 5).min(300_000).max(60_000);
+    let margin = (ttl_ms / 5).clamp(60_000, 300_000);
     if ttl_ms <= margin || now_ms >= expires {
         return None;
     }

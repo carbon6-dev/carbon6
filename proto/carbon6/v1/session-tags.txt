@@ -449,3 +449,4 @@ carbon6.v1.SessionEvent 34 SpecRefreshed spec_refreshed
 carbon6.v1.SpecRefreshed 1 CreateSession spec
 carbon6.v1.SpecRefreshed 2 string system_prompt
 carbon6.v1.SpecRefreshed 3 repeated:string tools
+carbon6.v1.UserInput 19 bool trim_context
