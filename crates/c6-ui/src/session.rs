@@ -1088,6 +1088,15 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         reach_to.run(seq);
         reveal_when_rendered(meta_root.get_value(), el, "[]".into(), feed.navigation);
     });
+    let history = crate::session_history::History::new(
+        id.clone(),
+        Signal::derive(move || (own_session.get().map_or(0, |s| s.last_seq), queued.get(), feed.synced.get())),
+        jump,
+    );
+    let history_sheet = RwSignal::new(false);
+    let history_panel = NodeRef::<leptos::html::Div>::new();
+    crate::util::modal(history_sheet, history_panel);
+    let history_present = crate::util::presence(move || history_sheet.get());
     // Its catch-up, where it isn't the glance column's first section: a
     // popover from the pill over the transcript, or a phone's sheet.
     let cards = crate::catchup::cards();
@@ -1148,6 +1157,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         details,
         view_settings,
         timeline,
+        history,
         reach_to,
         go_latest,
         navigation: feed.navigation,
@@ -1269,6 +1279,15 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             <SessionStrip chrome />
         </Show>
         <div class="relative flex min-h-0 min-w-0 flex-1 flex-col">
+        <div class="relative flex min-h-0 flex-1 flex-col">
+        // This overlay is outside ScrollBox: refreshing history cannot change
+        // transcript scroll height, following state, or the drawing window.
+        <div class=format!("pointer-events-none absolute inset-x-0 inset-y-6 z-20 {READING_ROW}")>
+            <div class=format!("relative {READING}")>
+                <crate::session_history::Scrubber history open_sheet=history_sheet />
+            </div>
+            {glance_room(wide)}
+        </div>
         // At the transcript's right edge, not the column's.
         {move || find_open.get().then(|| view! {
             <div class=format!("pointer-events-none absolute inset-x-0 top-0 z-30 {READING_ROW}")>
@@ -1362,6 +1381,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }
         })}
         </ScrollBox>
+        </div>
             <div class="hidden md:contents"><SubagentWaiting chrome /></div>
             <PhoneStatus chrome streaming=feed.streaming latest=Signal::derive(move || feed.to.get().is_none()) />
             <Show when=move || own_session.with(Option::is_some) fallback=|| view! { <p class="px-3 py-2 text-xs text-muted">"Loading session…"</p> }>
@@ -1419,6 +1439,13 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     <crate::catchup::CatchupBody session=id_stored.get_value() jump on_done=move |()| catch_sheet.set(false) />
                 </div>
             </BottomSheet>
+            </leptos::portal::Portal>
+        </Show>
+        <Show when=move || history_present.get()>
+            <leptos::portal::Portal>
+                <BottomSheet open=history_sheet label="Your prompts" panel=history_panel>
+                    <crate::session_history::PromptList history on_go=move |()| history_sheet.set(false) />
+                </BottomSheet>
             </leptos::portal::Portal>
         </Show>
         </div>
@@ -1568,6 +1595,7 @@ pub struct SessionChrome {
     view_settings: RwSignal<Option<c6_api::SessionViewSettings>>,
     /// Its turns (the glance's outline), and which finished turns fold.
     pub(crate) timeline: crate::timeline::Timeline,
+    pub(crate) history: crate::session_history::History,
     /// To an event in the transcript: loaded back to it, its turn open.
     reach_to: Callback<u64>,
     pub(crate) go_latest: Callback<()>,

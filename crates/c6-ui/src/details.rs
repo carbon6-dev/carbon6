@@ -332,7 +332,8 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
                 <div class=HEADING>"Newest outputs"</div>
                 <crate::outputs::Recent events on_pick=show_output />
             </Show>
-            // Its turns by hour, each going to its place in the transcript.
+            <crate::session_history::PromptList history=chrome.history on_go=move |()| done() />
+            // Legacy disabled turn outline; prompt history above replaces it.
             {crate::timeline::SHOWN.then(|| view! {
                 <div class=HEADING>"Timeline"</div>
                 <crate::timeline::Outline timeline=chrome.timeline on_go=move |t: c6_api::TimelineTurn| {

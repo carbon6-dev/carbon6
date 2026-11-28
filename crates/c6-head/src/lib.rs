@@ -69,6 +69,7 @@ pub mod schema;
 pub mod search;
 pub mod secrets;
 pub mod series;
+pub mod session_history;
 mod session_moves;
 pub mod sessions;
 pub mod slack;

@@ -1635,6 +1635,27 @@ pub async fn timeline(id: String, hour: Option<i64>) -> Result<Vec<c6_api::Timel
     get_json(format!("/api/v1/sessions/{id}/timeline{hour}")).await
 }
 
+/// Read the complete, compact prompt index independently of transcript paging.
+pub async fn session_prompts(id: String) -> Result<c6_api::PromptsPage, String> {
+    let mut out: Option<c6_api::PromptsPage> = None;
+    let mut cursor = String::new();
+    loop {
+        let page: c6_api::PromptsPage = get_json(format!("/api/v1/sessions/{id}/prompts?limit=1000{cursor}")).await?;
+        let next = page.next_ts.zip(page.next_seq);
+        match &mut out {
+            Some(out) => out.prompts.extend(page.prompts),
+            None => out = Some(page),
+        }
+        let Some((ts, seq)) = next else { break };
+        let next = format!("&after_ts={ts}&after_seq={seq}");
+        if next == cursor {
+            return Err("Prompt history returned a repeated page".into());
+        }
+        cursor = next;
+    }
+    Ok(out.unwrap_or_default())
+}
+
 /// A suggestion was shown, or (`accepted`) taken.
 pub async fn suggestion_seen(id: String, for_seq: i64, accepted: bool) {
     let body = c6_api::SuggestionSeen { for_seq, accepted };

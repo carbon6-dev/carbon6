@@ -56,6 +56,7 @@ mod resources;
 mod search;
 mod session;
 mod session_archive;
+mod session_history;
 mod session_ring;
 mod sessions;
 mod settings;

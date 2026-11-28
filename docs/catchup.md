@@ -31,6 +31,11 @@ on desktop and phones; the link includes its realm.
 
 ## 3. Timeline
 
+**Superseded by [Session history](session-history.md) (2026-11-28):** the new
+history indexes the user's prompts and timestamps deterministically, with no
+model calls. The disabled turn-outline design below is historical, not the
+new history's specification.
+
 **Off until it is redesigned (2026-11-03):** one line per turn was too low-level to be useful. The page shows no outline in the glance and no folded turns (nor their switches), and the head makes no model call for an hour's lines (`LINES` in crates/c6-head/src/timeline.rs; `SHOWN` in crates/c6-ui/src/timeline.rs turns the page's side back on). What follows is how it was built.
 
 Two views of a session's turns (decided as "A + B as a switch"):

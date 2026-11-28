@@ -197,6 +197,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/name/suggestion", get(session_name_suggestion))
         .route("/api/v1/sessions/{id}/catchup", get(session_catchup))
         .route("/api/v1/sessions/{id}/timeline", get(session_timeline))
+        .route("/api/v1/sessions/{id}/prompts", get(session_prompts))
         .route("/api/v1/sessions/{id}/view", get(get_session_view).put(put_session_view))
         .route("/api/v1/settings/suggestions", get(get_suggestion_settings).put(put_suggestion_settings))
         .route("/api/v1/settings/session_grouping", get(get_session_grouping).put(put_session_grouping))
@@ -1472,6 +1473,15 @@ async fn session_timeline(
     Query(q): Query<api::TimelineQuery>,
 ) -> ApiResult<Json<Vec<api::TimelineTurn>>> {
     Ok(Json(crate::timeline::get(&st, &id, &q, &caller).await?))
+}
+
+async fn session_prompts(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(q): Query<api::PromptsQuery>,
+) -> ApiResult<Json<api::PromptsPage>> {
+    Ok(Json(crate::session_history::get(&st, &id, &q, &caller).await?))
 }
 
 async fn get_session_view(

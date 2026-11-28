@@ -63,7 +63,7 @@ function acquireLock(env) {
 
 const suites = ['workspace-open', 'motion', 'comment-sheet', 'phone-picker', 'phone-bar', 'theme',
   'settings-lists', 'resource-lifecycle', 'machines-scroll', 'markdown-html', 'status-row', 'stale-transcript', 'ring-render',
-  'transcript-press', 'transcript-times', 'selection-capture', 'message-edit', 'message-origin', 'comments-design', 'session-sheet', 'navigation-errors', 'copy-actions'];
+  'transcript-press', 'transcript-times', 'selection-capture', 'message-edit', 'message-origin', 'comments-design', 'session-sheet', 'navigation-errors', 'copy-actions', 'session-history'];
 const quick = ['workspace-open', 'motion', 'settings-lists', 'markdown-html', 'transcript-press', 'transcript-times', 'stale-transcript'];
 const words = value => value.trim().split(/[\s,]+/).filter(Boolean);
 const positive = (name, value) => {

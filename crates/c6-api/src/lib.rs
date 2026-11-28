@@ -5964,7 +5964,53 @@ pub struct CatchupItem {
     pub failed: bool,
 }
 
-/// `GET /api/v1/sessions/{id}/timeline`.
+/// Deterministic input history. Time bounds are inclusive/exclusive; the
+/// exclusive (after_ts, after_seq) cursor preserves equal-time messages.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PromptsQuery {
+    pub since: Option<UnixMs>,
+    pub until: Option<UnixMs>,
+    pub after_ts: Option<UnixMs>,
+    pub after_seq: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionPrompt {
+    /// Zero only for an input still Up next (identified by command_id).
+    pub seq: u64,
+    pub ts: UnixMs,
+    pub command_id: String,
+    pub text: String,
+    pub first_line: String,
+    /// user, session, or follow_up. Original server provenance is retained too.
+    pub origin: String,
+    pub from_session_id: String,
+    pub from_title: String,
+    pub provenance: Option<Box<MessageOrigin>>,
+    pub queued: bool,
+    pub turn: Option<u64>,
+    pub start: Option<UnixMs>,
+    pub end: Option<UnixMs>,
+    pub duration_ms: Option<i64>,
+    pub reply: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PromptsPage {
+    pub prompts: Vec<SessionPrompt>,
+    pub queued: Vec<SessionPrompt>,
+    pub first_ts: Option<UnixMs>,
+    pub last_ts: Option<UnixMs>,
+    /// Both set only if another page remains.
+    pub next_ts: Option<UnixMs>,
+    pub next_seq: Option<u64>,
+}
+
+/// `GET /api/v1/sessions/{id}/timeline` (legacy disabled turn outline).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TimelineQuery {

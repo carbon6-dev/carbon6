@@ -34,6 +34,8 @@ const CACHE_LIMIT: usize = 2_000;
 /// looked at, kept until it restarts.
 #[derive(Default)]
 pub struct Cache {
+    /// Deterministic input history, incrementally read from the stored log.
+    pub(crate) prompts: Mutex<HashMap<String, crate::session_history::Index>>,
     /// Catch-up paragraphs, by (session, since, last event).
     summaries: Mutex<HashMap<(String, u64, u64), String>>,
     /// Each session's turns, as far as they were read.
