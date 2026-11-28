@@ -408,6 +408,18 @@ async fn head_restart_preserves_a_new_subagent_and_never_replays_its_tools() {
         env.mock.push_gated_about(&scope, Reply::ToolCalls(vec![("bash".into(), json!({"command": "echo after-reconnect"}).to_string())]));
     env.mock.push_about(&scope, Reply::Text("Both steps finished, exactly once.".into()));
     let (parent, child) = remote_task(&env, &parent_worker, "restart-child", project.path(), prompt, true).await;
+    let task = env
+        .events(&parent)
+        .await
+        .into_iter()
+        .find_map(|e| match e.kind {
+            EventKind::SubagentSpawned { child_session_id, background_task_id, .. } if child_session_id == child => {
+                Some(background_task_id)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(!task.is_empty(), "the child is owned by a background Task");
     model_requested(&env, &child, prompt).await;
     env.mock.push_about(&user_prompt_scope(REMOTE_PARENT_PROMPT), Reply::Text("I received the successful report.".into()));
 
@@ -456,22 +468,47 @@ async fn head_restart_preserves_a_new_subagent_and_never_replays_its_tools() {
     .await;
     second.notify_one();
     assert_eq!(end_after(&env, &child, 0).await, TurnEndReason::Completed);
-    let notice = eventually("the parent's successful child report", async || {
-        env.events(&parent).await.into_iter().find_map(|e| match e.kind {
-            EventKind::User { task_notice: Some(n), .. } if n.session_id == child => Some(n),
-            _ => None,
-        })
-    })
-    .await;
-    assert_eq!(notice.status, "completed");
+    // A live background waiter consumes DelegationEnded and reports through
+    // its task callback, not the direct, session-keyed unasked-report path.
     eventually("the background Task to finish", async || {
         env.events(&parent)
             .await
             .iter()
-            .any(|e| matches!(&e.kind, EventKind::BackgroundTask { state, .. } if state == "finished"))
+            .any(|e| matches!(&e.kind, EventKind::BackgroundTask { task_id, state, .. } if task_id == &task && state == "finished"))
             .then_some(())
     })
     .await;
+    let notice_id = format!("task:{task}:finished");
+    let (notice_seq, notice) = eventually_or(
+        "the parent's successful background child report",
+        async || {
+            env.events(&parent).await.into_iter().find_map(|e| match e.kind {
+                EventKind::User { command_id, task_notice: Some(n), .. } if command_id == notice_id => Some((e.seq, n)),
+                _ => None,
+            })
+        },
+        || env.mock.log(),
+    )
+    .await;
+    assert_eq!(notice.status, "finished");
+    assert!(notice.markdown.contains("Both steps finished, exactly once."), "{notice:?}");
+    assert_eq!(end_after(&env, &parent, notice_seq).await, TurnEndReason::Completed);
+    let parent_events = env.events(&parent).await;
+    let outcomes: Vec<_> = parent_events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::BackgroundTask { task_id, state, exit_code, .. } if task_id == &task && state != "started" => {
+                Some((state.as_str(), *exit_code))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outcomes, [("finished", 0)], "one successful outcome for the exact child's task");
+    assert_eq!(
+        parent_events.iter().filter(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == &notice_id)).count(),
+        1,
+        "the parent receives the report exactly once"
+    );
     let outputs: Vec<String> = env
         .events(&child)
         .await
