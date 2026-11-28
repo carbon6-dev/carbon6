@@ -258,6 +258,9 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
       json = suggestion;
     }
     else if (p.endsWith('/sessions/parent/catchup')) return route.fulfill({ status: 204 });
+    else if (/\/sessions\/[^/]+\/prompts$/.test(p)) json = {
+      prompts: [], queued: [], first_ts: null, last_ts: null, next_ts: null, next_seq: null,
+    };
     else if (p.endsWith('/sessions/parent/view')) {
       if (request.method() === 'PUT') {
         const value = request.postDataJSON(), pending = deferredView;
